@@ -23,6 +23,7 @@ use std::collections::{BinaryHeap, HashSet};
 use nodedb_codec::vector_quant::codec::VectorCodec;
 
 use crate::distance::scalar::l2_squared;
+use crate::error::{VectorError, check_dim};
 use crate::vamana::graph::VamanaGraph;
 use crate::vamana::node_fetcher::NodeFetcher;
 
@@ -82,6 +83,14 @@ impl Ord for Candidate {
 /// # Returns
 ///
 /// Up to `k` results sorted by ascending distance.
+///
+/// The query arrives already prepared by the codec, so its dimension is
+/// checked where the caller prepares it; [`rerank`] checks the FP32 query.
+///
+/// # Errors
+///
+/// [`VectorError::InvalidInput`] when `quantized` does not hold one vector
+/// per graph node.
 pub fn beam_search<C, F>(
     graph: &VamanaGraph,
     query: &C::Query,
@@ -90,13 +99,22 @@ pub fn beam_search<C, F>(
     fetcher: &mut F,
     k: usize,
     l_search: usize,
-) -> Vec<BeamSearchResult>
+) -> Result<Vec<BeamSearchResult>, VectorError>
 where
     C: VectorCodec,
     F: NodeFetcher,
 {
     if graph.is_empty() || quantized.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+    if quantized.len() != graph.len() {
+        return Err(VectorError::InvalidInput {
+            detail: format!(
+                "Vamana search got {} quantized vectors for {} graph nodes",
+                quantized.len(),
+                graph.len()
+            ),
+        });
     }
 
     let l = l_search.max(k);
@@ -173,12 +191,13 @@ where
     });
     out.truncate(k);
 
-    out.into_iter()
+    Ok(out
+        .into_iter()
         .map(|c| BeamSearchResult {
             id: graph.external_id(c.idx as usize),
             distance: c.dist,
         })
-        .collect()
+        .collect())
 }
 
 /// Rerank a candidate list using full-precision FP32 vectors from `fetcher`.
@@ -192,13 +211,21 @@ where
 /// them without re-submitting.
 ///
 /// This is the "SSD fetch + rerank" step described in the DiskANN paper.
+///
+/// # Errors
+///
+/// - [`VectorError::DimensionMismatch`] when `query_fp32` does not have the
+///   graph dimension.
+/// - [`VectorError::StoredDimensionMismatch`] when a fetched vector does not
+///   have the graph dimension.
 pub fn rerank<F: NodeFetcher>(
     candidates: Vec<BeamSearchResult>,
     query_fp32: &[f32],
     fetcher: &mut F,
     graph: &VamanaGraph,
     k: usize,
-) -> Vec<BeamSearchResult> {
+) -> Result<Vec<BeamSearchResult>, VectorError> {
+    check_dim(graph.dim, query_fp32.len())?;
     // Build id → internal index map.
     let id_to_idx: std::collections::HashMap<u64, usize> =
         graph.iter().map(|(idx, node)| (node.id, idx)).collect();
@@ -210,18 +237,25 @@ pub fn rerank<F: NodeFetcher>(
         .collect();
     fetcher.prefetch_batch(&candidate_indices);
 
-    let mut reranked: Vec<BeamSearchResult> = candidates
-        .into_iter()
-        .filter_map(|c| {
-            let idx = *id_to_idx.get(&c.id)?;
-            let vec = fetcher.fetch_fp32(idx as u32)?;
-            let d = l2_squared(query_fp32, &vec);
-            Some(BeamSearchResult {
-                id: c.id,
-                distance: d,
-            })
-        })
-        .collect();
+    let mut reranked: Vec<BeamSearchResult> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let Some(&idx) = id_to_idx.get(&c.id) else {
+            continue;
+        };
+        let Some(vec) = fetcher.fetch_fp32(idx as u32) else {
+            continue;
+        };
+        if vec.len() != graph.dim {
+            return Err(VectorError::StoredDimensionMismatch {
+                expected: graph.dim,
+                got: vec.len(),
+            });
+        }
+        reranked.push(BeamSearchResult {
+            id: c.id,
+            distance: l2_squared(query_fp32, &vec),
+        });
+    }
 
     reranked.sort_by(|a, b| {
         a.distance
@@ -229,7 +263,7 @@ pub fn rerank<F: NodeFetcher>(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     reranked.truncate(k);
-    reranked
+    Ok(reranked)
 }
 
 #[cfg(test)]
@@ -293,14 +327,14 @@ mod tests {
         let ids: Vec<u64> = (0..n as u64).collect();
         let quantized: Vec<L2Quantized> = vecs.iter().map(|v| codec.encode(v)).collect();
 
-        let graph = build_vamana(&vecs, &ids, &codec, &quantized, 8, 1.2, 20);
+        let graph = build_vamana(&vecs, &ids, &codec, &quantized, 8, 1.2, 20).unwrap();
 
         // Query with the vector at index 7; it should be the nearest result.
         let query_vec = vecs[7].clone();
         let query = codec.prepare_query(&query_vec);
         let mut fetcher = InMemoryFetcher::new(dim, vecs.clone());
 
-        let results = beam_search(&graph, &query, &codec, &quantized, &mut fetcher, 5, 20);
+        let results = beam_search(&graph, &query, &codec, &quantized, &mut fetcher, 5, 20).unwrap();
 
         assert!(
             !results.is_empty(),
@@ -314,5 +348,41 @@ mod tests {
             results[0].distance < 1e-6,
             "distance to self must be near zero"
         );
+    }
+
+    #[test]
+    fn wrong_dimension_is_a_typed_error() {
+        let dim = 4;
+        let codec = L2Codec;
+        let vecs = random_vecs(10, dim, 7);
+        let ids: Vec<u64> = (0..10).collect();
+        let quantized: Vec<L2Quantized> = vecs.iter().map(|v| codec.encode(v)).collect();
+        let graph = build_vamana(&vecs, &ids, &codec, &quantized, 4, 1.2, 8).unwrap();
+        let mut fetcher = InMemoryFetcher::new(dim, vecs.clone());
+        let query = codec.prepare_query(&vecs[0]);
+        let candidates =
+            beam_search(&graph, &query, &codec, &quantized, &mut fetcher, 3, 8).unwrap();
+        assert!(matches!(
+            rerank(candidates, &[0.0; 3], &mut fetcher, &graph, 3),
+            Err(VectorError::DimensionMismatch {
+                expected: 4,
+                got: 3
+            })
+        ));
+
+        let mut ragged = vecs.clone();
+        ragged[3] = vec![0.0; 2];
+        let ragged_q: Vec<L2Quantized> = ragged.iter().map(|v| codec.encode(v)).collect();
+        assert!(matches!(
+            build_vamana(&ragged, &ids, &codec, &ragged_q, 4, 1.2, 8),
+            Err(VectorError::DimensionMismatch {
+                expected: 4,
+                got: 2
+            })
+        ));
+        assert!(matches!(
+            beam_search(&graph, &query, &codec, &quantized[..5], &mut fetcher, 3, 8),
+            Err(VectorError::InvalidInput { .. })
+        ));
     }
 }

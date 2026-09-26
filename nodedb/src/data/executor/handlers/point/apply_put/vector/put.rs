@@ -7,6 +7,17 @@ use crate::data::executor::vector_string::floats_from_value;
 
 use super::types::{VectorFieldInsert, VectorIndexDelta, VectorIndexPutParams};
 
+/// A document vector field whose width differs from its index: the
+/// caller's data error, SQLSTATE `22000`, naming the field.
+fn field_dimension_mismatch(field_name: &str, expected: usize, got: usize) -> crate::Error {
+    crate::Error::DataException {
+        detail: format!(
+            "{field_name}: {}",
+            nodedb_vector::error::VectorError::DimensionMismatch { expected, got }
+        ),
+    }
+}
+
 impl CoreLoop {
     /// HNSW vector indexing side-effect: index declared strict-schema
     /// `Vector(dim)` columns, or (schemaless) fields matched by registered
@@ -65,11 +76,11 @@ impl CoreLoop {
                         Self::vector_index_key(database_id, tid, collection, field_name);
                     self.check_vector_width(&index_key, field_name, floats.len())?;
                     if floats.len() != *dim as usize {
-                        return Err(crate::Error::RejectedConstraint {
-                            collection: collection.to_string(),
-                            constraint: format!("vector dimension on '{field_name}'"),
-                            detail: format!("column declares {dim}, got {}", floats.len()),
-                        });
+                        return Err(field_dimension_mismatch(
+                            field_name,
+                            *dim as usize,
+                            floats.len(),
+                        ));
                     }
                     let params = self
                         .vector_params
@@ -89,15 +100,17 @@ impl CoreLoop {
                     if skip {
                         continue;
                     }
-                    if let Some(delta) = self.remove_then_insert_vector_field(VectorFieldInsert {
-                        database_id,
-                        tid,
-                        index_key,
-                        collection,
-                        field_name,
-                        storage_key,
-                        floats,
-                    }) {
+                    if let Some(delta) =
+                        self.remove_then_insert_vector_field(VectorFieldInsert {
+                            database_id,
+                            tid,
+                            index_key,
+                            collection,
+                            field_name,
+                            storage_key,
+                            floats,
+                        })?
+                    {
                         inserts.push(delta);
                     }
                 }
@@ -164,15 +177,17 @@ impl CoreLoop {
                     if skip {
                         continue;
                     }
-                    if let Some(delta) = self.remove_then_insert_vector_field(VectorFieldInsert {
-                        database_id,
-                        tid,
-                        index_key: store_key,
-                        collection,
-                        field_name,
-                        storage_key,
-                        floats,
-                    }) {
+                    if let Some(delta) =
+                        self.remove_then_insert_vector_field(VectorFieldInsert {
+                            database_id,
+                            tid,
+                            index_key: store_key,
+                            collection,
+                            field_name,
+                            storage_key,
+                            floats,
+                        })?
+                    {
                         inserts.push(delta);
                     }
                 }
@@ -194,22 +209,16 @@ impl CoreLoop {
         field_name: &str,
         got: usize,
     ) -> crate::Result<()> {
-        let mismatch = |expected: usize, source: &str| crate::Error::RejectedConstraint {
-            collection: index_key.2.clone(),
-            constraint: format!("vector dimension on '{field_name}'"),
-            detail: format!("index {source} {expected}, got {got}"),
-        };
-
         if let Some(&declared) = self.declared_dims.get(index_key)
             && declared != 0
             && declared != got
         {
-            return Err(mismatch(declared, "declares"));
+            return Err(field_dimension_mismatch(field_name, declared, got));
         }
         if let Some(existing) = self.vector_collections.get(index_key)
             && existing.dim() != got
         {
-            return Err(mismatch(existing.dim(), "has"));
+            return Err(field_dimension_mismatch(field_name, existing.dim(), got));
         }
         Ok(())
     }
@@ -228,13 +237,14 @@ impl CoreLoop {
     /// Binds the vector node to the document's global surrogate so
     /// cross-engine identity holds: a search hit resolves back to this row's
     /// surrogate (and thus its user PK at the response boundary) instead of
-    /// leaking a headless local node id. Returns `None` if `index_key`'s
+    /// leaking a headless local node id. Returns `Ok(None)` if `index_key`'s
     /// `VectorCollection` was somehow absent (defensive — it was just
-    /// populated via `entry().or_insert_with()` by the caller).
+    /// populated via `entry().or_insert_with()` by the caller), and the
+    /// collection's typed error when the vector does not fit it.
     fn remove_then_insert_vector_field(
         &mut self,
         params: VectorFieldInsert<'_>,
-    ) -> Option<VectorIndexDelta> {
+    ) -> crate::Result<Option<VectorIndexDelta>> {
         let VectorFieldInsert {
             database_id,
             tid,
@@ -251,8 +261,10 @@ impl CoreLoop {
             field_name,
             storage_key,
         );
-        let coll = self.vector_collections.get_mut(&index_key)?;
-        let vector_id = coll.insert_with_surrogate(floats, storage_key.surrogate());
+        let Some(coll) = self.vector_collections.get_mut(&index_key) else {
+            return Ok(None);
+        };
+        let vector_id = coll.insert_with_surrogate(floats, storage_key.surrogate())?;
         self.vector_doc_map.insert(
             (
                 index_key.0,
@@ -263,13 +275,13 @@ impl CoreLoop {
             ),
             vector_id,
         );
-        Some(VectorIndexDelta {
+        Ok(Some(VectorIndexDelta {
             index_key,
             vector_id,
             collection: collection.to_string(),
             field: field_name.to_string(),
             doc_id: storage_key,
-        })
+        }))
     }
 }
 
@@ -549,7 +561,7 @@ mod tests {
             });
 
             assert!(
-                matches!(res, Err(crate::Error::RejectedConstraint { .. })),
+                matches!(res, Err(crate::Error::DataException { .. })),
                 "malformed embedding '{bad}' must reject the put"
             );
             assert_eq!(

@@ -166,7 +166,8 @@ mod tests {
 
     fn collection_with_one_vector() -> VectorCollection {
         let mut coll = VectorCollection::new(4, HnswParams::default());
-        coll.insert_with_surrogate(vec![0.1, 0.2, 0.3, 0.4], Surrogate::new(1));
+        coll.insert_with_surrogate(vec![0.1, 0.2, 0.3, 0.4], Surrogate::new(1))
+            .unwrap();
         coll
     }
 

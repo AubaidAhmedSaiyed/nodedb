@@ -188,13 +188,16 @@ mod tests {
     #[test]
     fn a_rolled_back_insert_returns_the_id_counter_and_the_binding() {
         let mut coll = collection();
-        coll.insert_with_surrogate(vec![0.1, 0.2], Surrogate::new(1));
+        coll.insert_with_surrogate(vec![0.1, 0.2], Surrogate::new(1))
+            .unwrap();
         let mark = coll.write_mark(&[Surrogate::new(2)], &[]);
-        coll.insert_with_surrogate(vec![0.3, 0.4], Surrogate::new(2));
+        coll.insert_with_surrogate(vec![0.3, 0.4], Surrogate::new(2))
+            .unwrap();
         assert!(coll.roll_back_to(mark));
         assert_eq!(coll.local_for_surrogate(Surrogate::new(2)), None);
         assert_eq!(
-            coll.insert_with_surrogate(vec![0.5, 0.6], Surrogate::new(3)),
+            coll.insert_with_surrogate(vec![0.5, 0.6], Surrogate::new(3))
+                .unwrap(),
             1,
             "the next insert takes the id the rolled-back insert took"
         );
@@ -203,9 +206,12 @@ mod tests {
     #[test]
     fn a_rolled_back_rebind_restores_the_replaced_node() {
         let mut coll = collection();
-        let first = coll.insert_with_surrogate(vec![0.1, 0.2], Surrogate::new(7));
+        let first = coll
+            .insert_with_surrogate(vec![0.1, 0.2], Surrogate::new(7))
+            .unwrap();
         let mark = coll.write_mark(&[Surrogate::new(7)], &[]);
-        coll.insert_with_surrogate(vec![0.3, 0.4], Surrogate::new(7));
+        coll.insert_with_surrogate(vec![0.3, 0.4], Surrogate::new(7))
+            .unwrap();
         assert!(!coll.is_live(first));
         assert!(coll.roll_back_to(mark));
         assert!(coll.is_live(first));
@@ -215,7 +221,9 @@ mod tests {
     #[test]
     fn a_rolled_back_delete_restores_the_node_and_its_binding() {
         let mut coll = collection();
-        let id = coll.insert_with_surrogate(vec![0.1, 0.2], Surrogate::new(4));
+        let id = coll
+            .insert_with_surrogate(vec![0.1, 0.2], Surrogate::new(4))
+            .unwrap();
         let mark = coll.write_mark(&[], &[id]);
         coll.delete(id);
         assert!(coll.roll_back_to(mark));
@@ -227,7 +235,8 @@ mod tests {
     fn a_seal_after_the_mark_refuses_the_rollback() {
         let mut coll = VectorCollection::with_seal_threshold(2, HnswParams::default(), 1);
         let mark = coll.write_mark(&[Surrogate::new(1)], &[]);
-        coll.insert_with_surrogate(vec![0.1, 0.2], Surrogate::new(1));
+        coll.insert_with_surrogate(vec![0.1, 0.2], Surrogate::new(1))
+            .unwrap();
         assert!(coll.seal("k").is_some());
         assert!(!coll.roll_back_to(mark));
     }
@@ -235,10 +244,10 @@ mod tests {
     #[test]
     fn a_detached_empty_collection_continues_the_id_counter() {
         let mut coll = collection();
-        coll.insert(vec![0.1, 0.2]);
-        coll.insert(vec![0.3, 0.4]);
+        coll.insert(vec![0.1, 0.2]).unwrap();
+        coll.insert(vec![0.3, 0.4]).unwrap();
         let mut fresh = coll.detached_empty();
         assert_eq!(fresh.live_count(), 0);
-        assert_eq!(fresh.insert(vec![0.5, 0.6]), 2);
+        assert_eq!(fresh.insert(vec![0.5, 0.6]).unwrap(), 2);
     }
 }

@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 
 use crate::distance::distance;
+use crate::error::{VectorError, check_dim};
 use nodedb_types::vector_distance::DistanceMetric;
 
 /// Secondary in-memory index that absorbs fresh inserts before they are
@@ -38,9 +39,12 @@ impl DeltaIndex {
     }
 
     /// Stage a fresh insert.  Does not deduplicate — callers must ensure IDs
-    /// are unique across the delta and the main HNSW.
-    pub fn insert(&mut self, id: u32, vector: Vec<f32>) {
+    /// are unique across the delta and the main HNSW. A vector without the
+    /// index dimension fails with [`VectorError::DimensionMismatch`].
+    pub fn insert(&mut self, id: u32, vector: Vec<f32>) -> Result<(), VectorError> {
+        check_dim(self.dim, vector.len())?;
         self.fresh.push((id, vector));
+        Ok(())
     }
 
     /// Mark `id` as tombstoned.  It will be excluded from `search` results
@@ -60,10 +64,17 @@ impl DeltaIndex {
     }
 
     /// Brute-force scan over fresh vectors (excluding tombstones), returning
-    /// the top-`k` results sorted ascending by distance.
-    pub fn search(&self, query: &[f32], k: usize, metric: DistanceMetric) -> Vec<(u32, f32)> {
+    /// the top-`k` results sorted ascending by distance. A query without
+    /// the index dimension fails with [`VectorError::DimensionMismatch`].
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        metric: DistanceMetric,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        check_dim(self.dim, query.len())?;
         if k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut scored: Vec<(u32, f32)> = self
@@ -83,7 +94,7 @@ impl DeltaIndex {
 
         scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        scored
+        Ok(scored)
     }
 
     /// Drain all staged fresh vectors for patching into the main HNSW.
@@ -113,7 +124,7 @@ mod tests {
         let mut d = DeltaIndex::new(3, 16);
         for i in 0u32..10 {
             let v = vec![i as f32, 0.0, 0.0];
-            d.insert(i, v);
+            d.insert(i, v).unwrap();
         }
         d
     }
@@ -122,7 +133,7 @@ mod tests {
     fn top_k_returns_nearest() {
         let d = make_delta();
         let query = [0.0f32, 0.0, 0.0];
-        let results = d.search(&query, 3, DistanceMetric::L2);
+        let results = d.search(&query, 3, DistanceMetric::L2).unwrap();
         assert_eq!(results.len(), 3);
         // Nearest to [0,0,0] with L2^2 are ids 0,1,2
         assert_eq!(results[0].0, 0);
@@ -135,7 +146,7 @@ mod tests {
         let mut d = make_delta();
         d.tombstone(0);
         let query = [0.0f32, 0.0, 0.0];
-        let results = d.search(&query, 3, DistanceMetric::L2);
+        let results = d.search(&query, 3, DistanceMetric::L2).unwrap();
         assert!(results.iter().all(|(id, _)| *id != 0));
     }
 
@@ -143,10 +154,10 @@ mod tests {
     fn is_full_triggers_at_threshold() {
         let mut d = DeltaIndex::new(3, 3);
         assert!(!d.is_full());
-        d.insert(0, vec![0.0, 0.0, 0.0]);
-        d.insert(1, vec![1.0, 0.0, 0.0]);
+        d.insert(0, vec![0.0, 0.0, 0.0]).unwrap();
+        d.insert(1, vec![1.0, 0.0, 0.0]).unwrap();
         assert!(!d.is_full());
-        d.insert(2, vec![2.0, 0.0, 0.0]);
+        d.insert(2, vec![2.0, 0.0, 0.0]).unwrap();
         assert!(d.is_full());
     }
 
@@ -167,5 +178,24 @@ mod tests {
         assert_eq!(ts.len(), 2);
         assert!(!d.is_tombstoned(3));
         assert!(!d.is_tombstoned(7));
+    }
+
+    #[test]
+    fn wrong_dimension_is_a_typed_error() {
+        let mut d = DeltaIndex::new(3, 8);
+        assert!(matches!(
+            d.insert(0, vec![0.0; 2]),
+            Err(VectorError::DimensionMismatch {
+                expected: 3,
+                got: 2
+            })
+        ));
+        assert!(matches!(
+            d.search(&[0.0; 4], 1, DistanceMetric::L2),
+            Err(VectorError::DimensionMismatch {
+                expected: 3,
+                got: 4
+            })
+        ));
     }
 }

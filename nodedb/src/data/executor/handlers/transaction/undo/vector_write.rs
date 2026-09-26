@@ -258,16 +258,18 @@ mod tests {
         let vecs = vectors();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
         let mut index = IvfPqIndex::new(4, params());
-        index.train(
-            &refs,
-            nodedb_mem::ScopedMemory::new(
-                crate::data::executor::core_loop::test_governor(),
-                DatabaseId::DEFAULT,
-                TenantId::new(TID),
-                nodedb_mem::EngineId::Vector,
-            ),
-        );
-        index.add_batch(&refs[..4]);
+        index
+            .train(
+                &refs,
+                nodedb_mem::ScopedMemory::new(
+                    crate::data::executor::core_loop::test_governor(),
+                    DatabaseId::DEFAULT,
+                    TenantId::new(TID),
+                    nodedb_mem::EngineId::Vector,
+                ),
+            )
+            .unwrap();
+        index.add_batch(&refs[..4]).unwrap();
         core.ivf_indexes.insert(key.clone(), index);
 
         let undo = core
@@ -281,7 +283,7 @@ mod tests {
             })
             .expect("capture undo");
         if let Some(index) = core.ivf_indexes.get_mut(&key) {
-            index.add_batch(&refs[4..]);
+            index.add_batch(&refs[4..]).unwrap();
         }
         let UndoEntry::VectorWrite(undo) = undo else {
             panic!("a vector write captures a VectorWrite undo");
@@ -293,7 +295,7 @@ mod tests {
         assert_eq!(index.len(), 4);
         assert!(index.is_trained());
         assert!(
-            index.search(&vecs[6], 8).iter().all(|r| r.id < 4),
+            index.search(&vecs[6], 8).unwrap().iter().all(|r| r.id < 4),
             "no vector the write added is found"
         );
     }

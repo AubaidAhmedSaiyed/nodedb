@@ -35,6 +35,9 @@ impl CoreLoop {
         ))
     }
 
+    /// Install the snapshot's vectors into their collection. A vector whose
+    /// width differs from the collection's fails the restore before any of
+    /// the collection's vectors lands.
     pub(super) fn restore_vector_collection(
         &mut self,
         database_id: u64,
@@ -42,9 +45,9 @@ impl CoreLoop {
         coll_key: &str,
         vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)>,
         replace_mode: bool,
-    ) {
+    ) -> crate::Result<()> {
         if vectors.is_empty() {
-            return;
+            return Ok(());
         }
         let dim = vectors[0].1.len();
         let map_key = (
@@ -70,9 +73,12 @@ impl CoreLoop {
         let coll = self.vector_collections.entry(map_key).or_insert_with(|| {
             crate::engine::vector::collection::VectorCollection::new(dim, params)
         });
-        for (_, data, surrogate) in vectors {
-            coll.insert_with_surrogate(data, surrogate.unwrap_or(nodedb_types::Surrogate::ZERO));
-        }
+        let (data, surrogates): (Vec<Vec<f32>>, Vec<nodedb_types::Surrogate>) = vectors
+            .into_iter()
+            .map(|(_, data, surrogate)| (data, surrogate.unwrap_or(nodedb_types::Surrogate::ZERO)))
+            .unzip();
+        coll.insert_batch_with_surrogates(&data, &surrogates)?;
+        Ok(())
     }
 
     pub(super) fn restore_kv_table(

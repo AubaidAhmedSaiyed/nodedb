@@ -76,20 +76,12 @@ impl CoreLoop {
             return Ok(None);
         };
         if existing.dim() != spec.dim {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!(
-                    "vector dimension mismatch: index has {}, got {}",
-                    existing.dim(),
-                    spec.dim
-                ),
-            });
+            return Err(super::vector::dimension_mismatch(existing.dim(), spec.dim));
         }
         let existing_dtype = existing.params().dtype;
         if existing_dtype != spec.storage_dtype {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!(
+            return Err(ErrorCode::DataException {
+                detail: format!(
                     "vector storage_dtype mismatch: index has {existing_dtype}, got {}; \
                      dtype is immutable after collection creation",
                     spec.storage_dtype
@@ -252,7 +244,9 @@ impl CoreLoop {
                 detail: format!("vector index for '{collection}' vanished during a direct write"),
             });
         };
-        let node_id = coll.insert_with_surrogate(vector.to_vec(), surrogate);
+        let node_id = coll
+            .insert_with_surrogate(vector.to_vec(), surrogate)
+            .map_err(|e| ErrorCode::from(crate::Error::from(e)))?;
         coll.payload.insert_row(node_id, fields);
 
         let key = StorageKey::for_surrogate(surrogate);

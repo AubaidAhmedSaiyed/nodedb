@@ -28,7 +28,7 @@ fn params() -> HnswParams {
 /// so the next inserts land at `base_id == seal_count`.
 fn seal_one(coll: &mut VectorCollection, count: usize) {
     for i in 0..count {
-        coll.insert(vec![i as f32, 0.0]);
+        coll.insert(vec![i as f32, 0.0]).unwrap();
     }
     let req = coll.seal("k").expect("seal produced request");
     let mut idx = HnswIndex::new(req.dim, req.params.clone());
@@ -59,7 +59,9 @@ fn bitmap_filter_targets_second_segment_global_ids() {
     // segment's bitmap lookup tests local id 25 against a bitmap that
     // contains global 75 → zero matches.
     let bytes = bitmap_bytes([75u32]);
-    let results = coll.search_with_bitmap_bytes(&[75.0, 0.0], 1, 64, &bytes);
+    let results = coll
+        .search_with_bitmap_bytes(&[75.0, 0.0], 1, 64, &bytes)
+        .unwrap();
 
     assert_eq!(
         results.len(),
@@ -79,7 +81,9 @@ fn bitmap_filter_recovers_many_globals_across_segments() {
     let wanted: Vec<u32> = (60..70).collect();
     let bytes = bitmap_bytes(wanted.iter().copied());
 
-    let results = coll.search_with_bitmap_bytes(&[65.0, 0.0], 10, 128, &bytes);
+    let results = coll
+        .search_with_bitmap_bytes(&[65.0, 0.0], 10, 128, &bytes)
+        .unwrap();
 
     assert_eq!(
         results.len(),
@@ -107,7 +111,9 @@ fn bitmap_filter_first_segment_still_works() {
     seal_one(&mut coll, 50);
 
     let bytes = bitmap_bytes([10u32, 20, 30]);
-    let results = coll.search_with_bitmap_bytes(&[20.0, 0.0], 3, 64, &bytes);
+    let results = coll
+        .search_with_bitmap_bytes(&[20.0, 0.0], 3, 64, &bytes)
+        .unwrap();
     let got: std::collections::HashSet<u32> = results.iter().map(|r| r.id).collect();
     let expected: std::collections::HashSet<u32> = [10u32, 20, 30].into_iter().collect();
     assert_eq!(got, expected);

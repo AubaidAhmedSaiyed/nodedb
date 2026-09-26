@@ -6,6 +6,24 @@ use nodedb_types::error::sqlstate;
 
 use crate::bridge::envelope::ErrorCode;
 
+/// The SQLSTATE for a rejected constraint of kind `constraint`.
+///
+/// `not_null` and `unique` keep their specific codes; `generated_always`
+/// (a write to a generated column) is `428C9`. A CRDT delta refusal carries
+/// its violation kind: `fk_missing` is `23503`, and `rls_policy` /
+/// `permission_denied` are `42501`. Every other kind is the generic
+/// integrity class `23000`, never `unique_violation`.
+pub fn constraint_sqlstate(constraint: &str) -> &'static str {
+    match constraint {
+        "not_null" => sqlstate::NOT_NULL_VIOLATION,
+        "unique" => sqlstate::UNIQUE_VIOLATION,
+        "generated_always" => sqlstate::GENERATED_ALWAYS,
+        "fk_missing" => sqlstate::FOREIGN_KEY_VIOLATION,
+        "rls_policy" | "permission_denied" => sqlstate::INSUFFICIENT_PRIVILEGE,
+        _ => sqlstate::INTEGRITY_CONSTRAINT_VIOLATION,
+    }
+}
+
 /// Map a Data Plane `ErrorCode` to SQLSTATE.
 pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, String) {
     match code {
@@ -15,11 +33,7 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             "query cancelled due to deadline".into(),
         ),
         ErrorCode::RejectedConstraint { constraint, detail } => {
-            let code = if constraint == "not_null" {
-                sqlstate::NOT_NULL_VIOLATION
-            } else {
-                sqlstate::UNIQUE_VIOLATION
-            };
+            let code = constraint_sqlstate(constraint);
             (
                 "ERROR",
                 code,
@@ -244,5 +258,52 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
                  split the transaction into smaller batches"
             ),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a unique-key refusal is `23505`; every other constraint kind
+    /// keeps its own class.
+    #[test]
+    fn constraint_kinds_map_to_their_own_sqlstate() {
+        assert_eq!(constraint_sqlstate("unique"), sqlstate::UNIQUE_VIOLATION);
+        assert_eq!(
+            constraint_sqlstate("not_null"),
+            sqlstate::NOT_NULL_VIOLATION
+        );
+        assert_eq!(
+            constraint_sqlstate("generated_always"),
+            sqlstate::GENERATED_ALWAYS
+        );
+        assert_eq!(
+            constraint_sqlstate("fk_missing"),
+            sqlstate::FOREIGN_KEY_VIOLATION
+        );
+        assert_eq!(
+            constraint_sqlstate("rls_policy"),
+            sqlstate::INSUFFICIENT_PRIVILEGE
+        );
+        assert_eq!(
+            constraint_sqlstate("crdt_single_document_delta"),
+            sqlstate::INTEGRITY_CONSTRAINT_VIOLATION
+        );
+    }
+
+    /// A vector of the wrong width is a data exception, not a constraint.
+    #[test]
+    fn vector_dimension_mismatch_is_a_data_exception() {
+        let code = ErrorCode::DataException {
+            detail: nodedb_vector::error::VectorError::DimensionMismatch {
+                expected: 3,
+                got: 2,
+            }
+            .to_string(),
+        };
+        let (_, state, message) = error_code_to_sqlstate(&code);
+        assert_eq!(state, sqlstate::DATA_EXCEPTION);
+        assert_eq!(message, "vector dimension mismatch: expected 3, got 2");
     }
 }

@@ -64,7 +64,7 @@ fn unique_centroid_count(codec: &PqCodec, vectors: &[Vec<f32>]) -> usize {
 fn pq_kmeans_produces_diverse_centroids_on_duplicate_heavy_data() {
     let vecs = clustered_with_duplicates();
     let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-    let codec = PqCodec::train(&refs, 4, 2, 16, 20, test_memory());
+    let codec = PqCodec::train(&refs, 4, 2, 16, 20, test_memory()).unwrap();
 
     let unique = unique_centroid_count(&codec, &vecs);
     assert!(
@@ -83,7 +83,7 @@ fn pq_distance_table_separates_duplicates_from_outliers() {
     // codebook entries alias to one point so all distances look similar.
     let vecs = clustered_with_duplicates();
     let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-    let codec = PqCodec::train(&refs, 4, 2, 16, 20, test_memory());
+    let codec = PqCodec::train(&refs, 4, 2, 16, 20, test_memory()).unwrap();
 
     let query = [0.0f32, 0.0, 0.0, 0.0];
     let table = codec
@@ -121,15 +121,15 @@ fn ivf_pq_training_does_not_collapse_on_duplicate_heavy_data() {
             metric: DistanceMetric::L2,
         },
     );
-    idx.train(&refs, test_memory());
+    idx.train(&refs, test_memory()).unwrap();
     for v in &vecs {
-        idx.add(v);
+        idx.add(v).unwrap();
     }
 
     // Query at the origin. Correct training assigns near-duplicates to
     // one cell and outliers to another; the nearest result must come
     // from the duplicate cluster (original indices 0..190).
-    let results = idx.search(&[0.0, 0.0, 0.0, 0.0], 5);
+    let results = idx.search(&[0.0, 0.0, 0.0, 0.0], 5).unwrap();
     assert!(!results.is_empty(), "IVF-PQ returned no results");
     for r in &results {
         assert!(

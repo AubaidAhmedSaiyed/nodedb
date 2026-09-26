@@ -70,7 +70,9 @@ impl VectorCollection {
             return None;
         }
 
-        let codec = Sq8Codec::calibrate(&refs, dim);
+        // The refs are live vectors of this index, so calibration fails only
+        // for a zero dimension, which has nothing to quantize.
+        let codec = Sq8Codec::calibrate(&refs, dim).ok()?;
 
         let mut data = Vec::with_capacity(dim * n);
         for i in 0..n {
@@ -109,7 +111,16 @@ impl VectorCollection {
         }
         let refs_slices: Vec<&[f32]> = refs.iter().map(|v| v.as_slice()).collect();
         let k = 256usize.min(refs.len());
-        let codec = PqCodec::train(&refs_slices, dim, pq_m, k, 20, memory);
+        // A PQ shape the codec cannot train (a codebook over its byte limit,
+        // a dimension over its decode limit) leaves the segment on plain
+        // HNSW, which answers the same queries exactly.
+        let codec = match PqCodec::train(&refs_slices, dim, pq_m, k, 20, memory) {
+            Ok(codec) => codec,
+            Err(e) => {
+                tracing::warn!(error = %e, dim, pq_m, "PQ training refused; segment stays unquantized");
+                return None;
+            }
+        };
         let codes = codec.encode_batch(&refs_slices).ok()?;
         Some((codec, codes))
     }

@@ -250,12 +250,12 @@ mod tests {
                 .applied_prefix
                 .observe_outcome_floor(Lsn::new(10));
             let mut collection = VectorCollection::new(3, HnswParams::default());
-            collection.insert(vec![0.0, 0.0, 1.0]);
+            collection.insert(vec![0.0, 0.0, 1.0]).unwrap();
             core.vector_collections.insert(key.clone(), collection);
             core.floors.applied_prefix.note_applied(Lsn::new(30));
             core.checkpoint_vector_indexes().expect("checkpoint");
             if let Some(collection) = core.vector_collections.get_mut(&key) {
-                collection.insert(vec![1.0, 0.0, 0.0]);
+                collection.insert(vec![1.0, 0.0, 0.0]).unwrap();
             }
             core.floors.applied_prefix.note_applied(Lsn::new(20));
             core.vector_collections.get(&key).map(|c| c.len())

@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::distance::scalar::scalar_distance;
+use crate::error::{VectorError, check_dim};
 use nodedb_types::vector_distance::DistanceMetric;
 
 use super::storage::MultiVectorStore;
@@ -258,9 +259,18 @@ impl PlaidPruner {
     ///
     /// The query centroid bag is the set of nearest centroids for each query
     /// vector.
-    pub fn candidates(&self, query: &[Vec<f32>]) -> Vec<u32> {
-        if self.centroids.is_empty() || query.is_empty() {
-            return Vec::new();
+    ///
+    /// A query vector without the centroid dimension fails with
+    /// [`VectorError::DimensionMismatch`].
+    pub fn candidates(&self, query: &[Vec<f32>]) -> Result<Vec<u32>, VectorError> {
+        let Some(first) = self.centroids.first() else {
+            return Ok(Vec::new());
+        };
+        for v in query {
+            check_dim(first.len(), v.len())?;
+        }
+        if query.is_empty() {
+            return Ok(Vec::new());
         }
 
         // Build query centroid bag.
@@ -277,11 +287,12 @@ impl PlaidPruner {
             .collect();
 
         // Collect docs that share at least one centroid with the query.
-        self.doc_centroids
+        Ok(self
+            .doc_centroids
             .iter()
             .filter(|(_, doc_ids)| doc_ids.iter().any(|id| query_bag.contains(id)))
             .map(|(&doc_id, _)| doc_id)
-            .collect()
+            .collect())
     }
 }
 
@@ -351,7 +362,7 @@ mod tests {
 
         // A query near cluster A should return at least some candidates.
         let query = vec![vec![0.0f32, 0.0f32]];
-        let cands = pruner.candidates(&query);
+        let cands = pruner.candidates(&query).unwrap();
         assert!(!cands.is_empty(), "expected at least one candidate");
     }
 
@@ -361,7 +372,7 @@ mod tests {
         let store = MultiVectorStore::new(2, MultiVecMode::PerToken);
         let pruner = PlaidPruner::train(&store, 3, 5, 1);
         let query = vec![vec![0.0f32, 0.0f32]];
-        assert!(pruner.candidates(&query).is_empty());
+        assert!(pruner.candidates(&query).unwrap().is_empty());
     }
 
     #[test]
@@ -375,7 +386,7 @@ mod tests {
             vec![10.0f32, 0.0f32],
             vec![0.0f32, 10.0f32],
         ];
-        let mut cands = pruner.candidates(&query);
+        let mut cands = pruner.candidates(&query).unwrap();
         cands.sort_unstable();
         cands.dedup();
         assert_eq!(cands.len(), 9, "all docs should be candidates: {:?}", cands);

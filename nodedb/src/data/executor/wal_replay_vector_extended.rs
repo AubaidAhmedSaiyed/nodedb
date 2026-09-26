@@ -570,7 +570,8 @@ mod tests {
         // A restored checkpoint holding the first write, whose stamp names its
         // LSN. The second write is the WAL tail the checkpoint does not hold.
         let mut coll = VectorCollection::new(3, HnswParams::default());
-        coll.insert_with_surrogate(vec![1.0, 2.0, 3.0], Surrogate::new(1));
+        coll.insert_with_surrogate(vec![1.0, 2.0, 3.0], Surrogate::new(1))
+            .unwrap();
         h.core.vector_collections.insert(du_index_key(), coll);
         h.core.floors.replay_floors.vector.set(
             crate::data::executor::applied_prefix::ReplayStamp::through(records[0].header.lsn),

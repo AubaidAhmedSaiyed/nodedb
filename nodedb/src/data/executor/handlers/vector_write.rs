@@ -30,25 +30,15 @@ impl CoreLoop {
         // Every vector is checked before any is inserted, so a dimension
         // refusal applies nothing.
         if let Some(bad) = vectors.iter().find(|vector| vector.len() != dim) {
-            return self.response_error(
-                task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: format!(
-                        "dimension mismatch in batch: expected {dim}, got {}",
-                        bad.len()
-                    ),
-                },
-            );
+            return self.response_error(task, super::vector::dimension_mismatch(dim, bad.len()));
         }
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, "");
         // A committed-redo install seals once the whole record landed.
         let defer_seal = self.recording_redo_undo();
         match self.get_or_create_vector_index(database_id, tid, collection, dim, "") {
             Ok(collection_ref) => {
-                for (i, vector) in vectors.iter().enumerate() {
-                    let s = surrogates.get(i).copied().unwrap_or(Surrogate::ZERO);
-                    collection_ref.insert_with_surrogate(vector.clone(), s);
+                if let Err(e) = collection_ref.insert_batch_with_surrogates(vectors, surrogates) {
+                    return self.response_error(task, crate::Error::from(e));
                 }
                 let seal_key = CoreLoop::vector_build_key(&index_key);
                 if !defer_seal
@@ -287,6 +277,7 @@ mod tests {
                 .get_or_create_vector_index(0, 1, "docs", 2, "")
                 .expect("create index");
             coll.insert_with_surrogate(vec![1.0, 2.0], surrogate)
+                .unwrap()
         };
         // The internal node id must differ from the surrogate for this test
         // to actually distinguish the two key spaces.

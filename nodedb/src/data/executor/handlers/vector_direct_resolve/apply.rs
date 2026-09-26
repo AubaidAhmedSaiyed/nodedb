@@ -135,23 +135,17 @@ impl CoreLoop {
                     && declared != 0
                     && declared != vector.len()
                 {
-                    return Err(ErrorCode::RejectedConstraint {
-                        detail: String::new(),
-                        constraint: format!(
-                            "dimension mismatch: index declares {declared}, got {}",
-                            vector.len()
-                        ),
-                    });
+                    return Err(super::super::vector::dimension_mismatch(
+                        declared,
+                        vector.len(),
+                    ));
                 }
                 match width {
                     Some(first) if first != vector.len() => {
-                        return Err(ErrorCode::RejectedConstraint {
-                            detail: String::new(),
-                            constraint: format!(
-                                "vector dimension mismatch: the write's first vector has {first}, got {}",
-                                vector.len()
-                            ),
-                        });
+                        return Err(super::super::vector::dimension_mismatch(
+                            first,
+                            vector.len(),
+                        ));
                     }
                     Some(_) => {}
                     None => width = Some(vector.len()),
@@ -710,7 +704,7 @@ mod tests {
         assert!(
             matches!(
                 resp.error_code.as_deref(),
-                Some(ErrorCode::RejectedConstraint { .. })
+                Some(ErrorCode::DataException { .. })
             ),
             "got {:?}",
             resp.error_code

@@ -12,7 +12,9 @@
 use roaring::RoaringBitmap;
 
 use crate::distance::{DistanceMetric, distance};
+use crate::error::{VectorError, check_dim};
 use crate::hnsw::SearchResult;
+use crate::hnsw::search::decode_filter_bitmap;
 
 /// Default threshold below which collections use flat index instead of HNSW.
 pub const DEFAULT_FLAT_INDEX_THRESHOLD: usize = 10_000;
@@ -41,20 +43,16 @@ impl FlatIndex {
         }
     }
 
-    /// Insert a vector. Returns the assigned vector ID.
-    pub fn insert(&mut self, vector: Vec<f32>) -> u32 {
-        assert_eq!(
-            vector.len(),
-            self.dim,
-            "dimension mismatch: expected {}, got {}",
-            self.dim,
-            vector.len()
-        );
+    /// Insert a vector. Returns the assigned vector ID, or
+    /// [`VectorError::DimensionMismatch`] when `vector` does not have the
+    /// index dimension.
+    pub fn insert(&mut self, vector: Vec<f32>) -> Result<u32, VectorError> {
+        check_dim(self.dim, vector.len())?;
         let id = self.len() as u32;
         self.data.extend_from_slice(&vector);
         self.deleted.push(false);
         self.live_count += 1;
-        id
+        Ok(id)
     }
 
     /// Soft-delete a vector by ID.
@@ -92,83 +90,22 @@ impl FlatIndex {
         query: &[f32],
         top_k: usize,
         metric: DistanceMetric,
-    ) -> Vec<SearchResult> {
-        assert_eq!(query.len(), self.dim);
-        let n = self.len();
-        if n == 0 || top_k == 0 {
-            return Vec::new();
-        }
-
-        let mut candidates: Vec<SearchResult> = Vec::with_capacity(n.min(top_k * 2));
-        for i in 0..n {
-            if self.deleted[i] {
-                continue;
-            }
-            let start = i * self.dim;
-            let vec_slice = &self.data[start..start + self.dim];
-            let dist = distance(query, vec_slice, metric);
-            candidates.push(SearchResult {
-                id: i as u32,
-                distance: dist,
-            });
-        }
-
-        if candidates.len() > top_k {
-            candidates.select_nth_unstable_by(top_k, |a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            candidates.truncate(top_k);
-        }
-        candidates.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        candidates
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        self.scan(query, top_k, metric, None)
     }
 
     /// Brute-force k-NN search. Exact results — no approximation.
-    pub fn search(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
-        assert_eq!(query.len(), self.dim);
-        let n = self.len();
-        if n == 0 || top_k == 0 {
-            return Vec::new();
-        }
-
-        let mut candidates: Vec<SearchResult> = Vec::with_capacity(n.min(top_k * 2));
-        for i in 0..n {
-            if self.deleted[i] {
-                continue;
-            }
-            let start = i * self.dim;
-            let vec_slice = &self.data[start..start + self.dim];
-            let dist = distance(query, vec_slice, self.metric);
-            candidates.push(SearchResult {
-                id: i as u32,
-                distance: dist,
-            });
-        }
-
-        if candidates.len() > top_k {
-            candidates.select_nth_unstable_by(top_k, |a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            candidates.truncate(top_k);
-        }
-        candidates.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        candidates
+    pub fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<SearchResult>, VectorError> {
+        self.scan(query, top_k, self.metric, None)
     }
 
     /// Search with a pre-filter bitmap (byte-array format).
-    pub fn search_filtered(&self, query: &[f32], top_k: usize, bitmap: &[u8]) -> Vec<SearchResult> {
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        bitmap: &[u8],
+    ) -> Result<Vec<SearchResult>, VectorError> {
         self.search_filtered_offset(query, top_k, bitmap, 0)
     }
 
@@ -180,89 +117,57 @@ impl FlatIndex {
         bitmap: &[u8],
         id_offset: u32,
         metric: DistanceMetric,
-    ) -> Vec<SearchResult> {
-        assert_eq!(query.len(), self.dim);
-        let n = self.len();
-        if n == 0 || top_k == 0 {
-            return Vec::new();
-        }
-
-        let parsed = RoaringBitmap::deserialize_from(bitmap).ok();
-
-        let mut candidates: Vec<SearchResult> = Vec::with_capacity(top_k * 2);
-        for i in 0..n {
-            if self.deleted[i] {
-                continue;
-            }
-            if let Some(ref bm) = parsed {
-                let global = (i as u32).saturating_add(id_offset);
-                if !bm.contains(global) {
-                    continue;
-                }
-            }
-            let start = i * self.dim;
-            let vec_slice = &self.data[start..start + self.dim];
-            let dist = distance(query, vec_slice, metric);
-            candidates.push(SearchResult {
-                id: i as u32,
-                distance: dist,
-            });
-        }
-
-        if candidates.len() > top_k {
-            candidates.select_nth_unstable_by(top_k, |a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            candidates.truncate(top_k);
-        }
-        candidates.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        candidates
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        let filter = decode_filter_bitmap(bitmap)?;
+        self.scan(query, top_k, metric, Some((&filter, id_offset)))
     }
 
     /// Search with a pre-filter bitmap applying a global id offset.
     ///
     /// `bitmap` is a serialized `RoaringBitmap` (matching the HNSW filter
     /// format). Bit `i + id_offset` tests local id `i`. Used by multi-segment
-    /// collections where the bitmap holds GLOBAL vector ids. If the bytes
-    /// fail to deserialize, the search degrades to unfiltered.
+    /// collections where the bitmap holds GLOBAL vector ids. Bytes that do
+    /// not decode fail with [`VectorError::InvalidFilterBitmap`].
     pub fn search_filtered_offset(
         &self,
         query: &[f32],
         top_k: usize,
         bitmap: &[u8],
         id_offset: u32,
-    ) -> Vec<SearchResult> {
-        assert_eq!(query.len(), self.dim);
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        self.search_filtered_offset_with_metric(query, top_k, bitmap, id_offset, self.metric)
+    }
+
+    /// Exact scan of every live vector under `metric`, restricted to ids
+    /// whose `local + offset` is in the filter when one is given.
+    fn scan(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: DistanceMetric,
+        filter: Option<(&RoaringBitmap, u32)>,
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        check_dim(self.dim, query.len())?;
         let n = self.len();
         if n == 0 || top_k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let parsed = RoaringBitmap::deserialize_from(bitmap).ok();
-
-        let mut candidates: Vec<SearchResult> = Vec::with_capacity(top_k * 2);
+        let mut candidates: Vec<SearchResult> = Vec::with_capacity(n.min(top_k * 2));
         for i in 0..n {
             if self.deleted[i] {
                 continue;
             }
-            if let Some(ref bm) = parsed {
-                let global = (i as u32).saturating_add(id_offset);
-                if !bm.contains(global) {
-                    continue;
-                }
+            if let Some((bitmap, id_offset)) = filter
+                && !bitmap.contains((i as u32).saturating_add(id_offset))
+            {
+                continue;
             }
             let start = i * self.dim;
             let vec_slice = &self.data[start..start + self.dim];
-            let dist = distance(query, vec_slice, self.metric);
             candidates.push(SearchResult {
                 id: i as u32,
-                distance: dist,
+                distance: distance(query, vec_slice, metric),
             });
         }
 
@@ -279,7 +184,7 @@ impl FlatIndex {
                 .partial_cmp(&b.distance)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        candidates
+        Ok(candidates)
     }
 
     pub fn len(&self) -> usize {
@@ -337,19 +242,13 @@ impl FlatIndex {
     }
 
     /// Insert a vector that is already tombstoned (for checkpoint restore).
-    pub fn insert_tombstoned(&mut self, vector: Vec<f32>) -> u32 {
-        assert_eq!(
-            vector.len(),
-            self.dim,
-            "dimension mismatch: expected {}, got {}",
-            self.dim,
-            vector.len()
-        );
+    pub fn insert_tombstoned(&mut self, vector: Vec<f32>) -> Result<u32, VectorError> {
+        check_dim(self.dim, vector.len())?;
         let id = self.len() as u32;
         self.data.extend_from_slice(&vector);
         self.deleted.push(true);
         // No live_count increment — it's dead on arrival.
-        id
+        Ok(id)
     }
 
     pub fn dim(&self) -> usize {
@@ -373,12 +272,12 @@ mod tests {
     fn insert_and_search() {
         let mut idx = FlatIndex::new(3, DistanceMetric::L2);
         for i in 0..100u32 {
-            idx.insert(vec![i as f32, 0.0, 0.0]);
+            idx.insert(vec![i as f32, 0.0, 0.0]).unwrap();
         }
         assert_eq!(idx.len(), 100);
         assert_eq!(idx.live_count(), 100);
 
-        let results = idx.search(&[50.0, 0.0, 0.0], 3);
+        let results = idx.search(&[50.0, 0.0, 0.0], 3).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].id, 50);
         assert!(results[0].distance < 0.01);
@@ -387,14 +286,14 @@ mod tests {
     #[test]
     fn delete_excludes_from_search() {
         let mut idx = FlatIndex::new(2, DistanceMetric::L2);
-        idx.insert(vec![0.0, 0.0]);
-        idx.insert(vec![1.0, 0.0]);
-        idx.insert(vec![2.0, 0.0]);
+        idx.insert(vec![0.0, 0.0]).unwrap();
+        idx.insert(vec![1.0, 0.0]).unwrap();
+        idx.insert(vec![2.0, 0.0]).unwrap();
 
         assert!(idx.delete(1));
         assert_eq!(idx.live_count(), 2);
 
-        let results = idx.search(&[1.0, 0.0], 3);
+        let results = idx.search(&[1.0, 0.0], 3).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.id != 1));
     }
@@ -402,11 +301,11 @@ mod tests {
     #[test]
     fn exact_results() {
         let mut idx = FlatIndex::new(2, DistanceMetric::Cosine);
-        idx.insert(vec![1.0, 0.0]);
-        idx.insert(vec![0.0, 1.0]);
-        idx.insert(vec![1.0, 1.0]);
+        idx.insert(vec![1.0, 0.0]).unwrap();
+        idx.insert(vec![0.0, 1.0]).unwrap();
+        idx.insert(vec![1.0, 1.0]).unwrap();
 
-        let results = idx.search(&[1.0, 0.0], 1);
+        let results = idx.search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 0);
     }
@@ -414,7 +313,7 @@ mod tests {
     #[test]
     fn empty_search() {
         let idx = FlatIndex::new(3, DistanceMetric::L2);
-        let results = idx.search(&[1.0, 0.0, 0.0], 5);
+        let results = idx.search(&[1.0, 0.0, 0.0], 5).unwrap();
         assert!(results.is_empty());
     }
 
@@ -422,12 +321,67 @@ mod tests {
     fn filtered_search() {
         let mut idx = FlatIndex::new(2, DistanceMetric::L2);
         for i in 0..8u32 {
-            idx.insert(vec![i as f32, 0.0]);
+            idx.insert(vec![i as f32, 0.0]).unwrap();
         }
-        let bitmap = vec![0b11001100u8];
-        let results = idx.search_filtered(&[3.0, 0.0], 2, &bitmap);
+        let filter: RoaringBitmap = [2u32, 3, 6, 7].into_iter().collect();
+        let mut bitmap = Vec::new();
+        filter.serialize_into(&mut bitmap).unwrap();
+        let results = idx.search_filtered(&[4.0, 0.0], 2, &bitmap).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, 3);
-        assert_eq!(results[1].id, 2);
+        assert!(results.iter().all(|r| filter.contains(r.id)), "{results:?}");
+    }
+
+    #[test]
+    fn wrong_dimension_is_a_typed_error() {
+        let mut idx = FlatIndex::new(2, DistanceMetric::L2);
+        assert!(matches!(
+            idx.insert(vec![1.0, 2.0, 3.0]),
+            Err(VectorError::DimensionMismatch {
+                expected: 2,
+                got: 3
+            })
+        ));
+        assert!(matches!(
+            idx.insert_tombstoned(vec![1.0]),
+            Err(VectorError::DimensionMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+        idx.insert(vec![1.0, 0.0]).unwrap();
+        let filter: RoaringBitmap = [0u32].into_iter().collect();
+        let mut bitmap = Vec::new();
+        filter.serialize_into(&mut bitmap).unwrap();
+        let short = [1.0_f32];
+        for result in [
+            idx.search(&short, 1),
+            idx.search_with_metric(&short, 1, DistanceMetric::Cosine),
+            idx.search_filtered(&short, 1, &bitmap),
+            idx.search_filtered_offset(&short, 1, &bitmap, 0),
+            idx.search_filtered_offset_with_metric(&short, 1, &bitmap, 0, DistanceMetric::L2),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(VectorError::DimensionMismatch {
+                        expected: 2,
+                        got: 1
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn undecodable_filter_bitmap_is_a_typed_error() {
+        let mut idx = FlatIndex::new(2, DistanceMetric::L2);
+        idx.insert(vec![1.0, 0.0]).unwrap();
+        let result = idx.search_filtered(&[1.0, 0.0], 1, &[0b1100_1100]);
+        assert!(
+            matches!(result, Err(VectorError::InvalidFilterBitmap { .. })),
+            "{result:?}"
+        );
     }
 }

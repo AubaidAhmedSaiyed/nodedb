@@ -52,11 +52,11 @@ pub fn check_generated_readonly<V>(
     for (field, _) in update_fields {
         if specs.iter().any(|s| s.name == *field) {
             return Err(ErrorCode::RejectedConstraint {
-                constraint: format!(
+                constraint: "generated_always".into(),
+                detail: format!(
                     "cannot UPDATE generated column '{field}': \
                      generated columns are computed automatically"
                 ),
-                detail: String::new(),
             });
         }
     }
@@ -119,9 +119,10 @@ fn topological_sort(specs: &[GeneratedColumnSpec]) -> Result<Vec<usize>, ErrorCo
     }
 
     if order.len() != n {
-        return Err(ErrorCode::RejectedConstraint {
-            constraint: "cycle detected in generated column dependencies".into(),
-            detail: String::new(),
+        return Err(ErrorCode::Unsupported {
+            detail: "generated columns whose expressions depend on each other in a cycle \
+                     are not supported"
+                .into(),
         });
     }
 

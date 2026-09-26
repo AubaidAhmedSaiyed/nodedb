@@ -2673,7 +2673,7 @@ mod tests {
         // Seed a base index with one vector.
         let key = CoreLoop::vector_index_key(DatabaseId::DEFAULT.as_u64(), TID, "emb", "");
         let mut coll = VectorCollection::new(3, HnswParams::default());
-        coll.insert(vec![7.0, 7.0, 7.0]);
+        coll.insert(vec![7.0, 7.0, 7.0]).unwrap();
         core.vector_collections.insert(key.clone(), coll);
 
         let plan = PhysicalPlan::Vector(VectorOp::Insert {

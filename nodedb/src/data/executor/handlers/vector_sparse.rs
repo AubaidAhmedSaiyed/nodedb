@@ -73,9 +73,8 @@ impl CoreLoop {
             Err(e) => {
                 return self.response_error(
                     task,
-                    ErrorCode::RejectedConstraint {
-                        detail: String::new(),
-                        constraint: e.to_string(),
+                    ErrorCode::DataException {
+                        detail: e.to_string(),
                     },
                 );
             }
@@ -133,9 +132,8 @@ impl CoreLoop {
             Err(e) => {
                 return self.response_error(
                     task,
-                    ErrorCode::RejectedConstraint {
-                        detail: String::new(),
-                        constraint: e.to_string(),
+                    ErrorCode::DataException {
+                        detail: e.to_string(),
                     },
                 );
             }

@@ -277,13 +277,9 @@ impl CoreLoop {
         if let Some(dim) = declared_dim
             && dim != spec.dim
         {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!(
-                    "vector dimension mismatch: collection declares {dim}, got {}",
-                    spec.dim
-                ),
-            });
+            return Err(crate::data::executor::handlers::vector::dimension_mismatch(
+                dim, spec.dim,
+            ));
         }
         Ok(CoreLoop::vector_index_key(
             ctx.database_id,

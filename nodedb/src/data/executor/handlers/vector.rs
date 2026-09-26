@@ -59,6 +59,14 @@ pub(in crate::data::executor) struct VectorInsertInner<'a> {
     pub surrogate: Surrogate,
 }
 
+/// A vector whose dimension differs from the index's: the caller's data
+/// error, SQLSTATE `22000`, in the vector engine's message shape.
+pub(in crate::data::executor) fn dimension_mismatch(expected: usize, got: usize) -> ErrorCode {
+    ErrorCode::DataException {
+        detail: nodedb_vector::error::VectorError::DimensionMismatch { expected, got }.to_string(),
+    }
+}
+
 impl CoreLoop {
     /// Get or create a vector collection, validating dimension compatibility.
     pub(in crate::data::executor) fn get_or_create_vector_index(
@@ -79,22 +87,13 @@ impl CoreLoop {
             && declared != 0
             && declared != dim
         {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!("dimension mismatch: index declares {declared}, got {dim}"),
-            });
+            return Err(dimension_mismatch(declared, dim));
         }
 
         if let Some(existing) = self.vector_collections.get(&index_key)
             && existing.dim() != dim
         {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!(
-                    "dimension mismatch: index has {}, got {dim}",
-                    existing.dim()
-                ),
-            });
+            return Err(dimension_mismatch(existing.dim(), dim));
         }
         let core_id = self.core_id;
         let params = self
@@ -196,16 +195,7 @@ impl CoreLoop {
             surrogate,
         } = args;
         if vector.len() != dim {
-            return self.response_error(
-                task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: format!(
-                        "vector dimension mismatch: expected {dim}, got {}",
-                        vector.len()
-                    ),
-                },
-            );
+            return self.response_error(task, dimension_mismatch(dim, vector.len()));
         }
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
@@ -224,7 +214,9 @@ impl CoreLoop {
         let defer_seal = self.recording_redo_undo();
         match self.get_or_create_vector_index(database_id, tid, collection, dim, field_name) {
             Ok(collection_ref) => {
-                collection_ref.insert_with_surrogate(vector.to_vec(), surrogate);
+                if let Err(e) = collection_ref.insert_with_surrogate(vector.to_vec(), surrogate) {
+                    return self.response_error(task, crate::Error::from(e));
+                }
                 let seal_key = CoreLoop::vector_build_key(&index_key);
                 if !defer_seal
                     && collection_ref.needs_seal()
@@ -287,10 +279,15 @@ impl CoreLoop {
                 index_key.1,
                 nodedb_mem::EngineId::Vector,
             );
-            ivf.train(&refs, memory);
+            if let Err(e) = ivf.train(&refs, memory) {
+                return self.response_error(task, crate::Error::from(e));
+            }
         }
 
-        let vector_id = ivf.add(vector);
+        let vector_id = match ivf.add(vector) {
+            Ok(id) => id,
+            Err(e) => return self.response_error(task, crate::Error::from(e)),
+        };
 
         // Register surrogate mapping using the actual IVF-assigned vector ID.
         if surrogate != Surrogate::ZERO {

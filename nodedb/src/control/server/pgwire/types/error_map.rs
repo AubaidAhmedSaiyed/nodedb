@@ -121,14 +121,11 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         ),
         crate::Error::RejectedConstraint {
             constraint, detail, ..
-        } => {
-            let code = if constraint == "not_null" {
-                sqlstate::NOT_NULL_VIOLATION
-            } else {
-                sqlstate::UNIQUE_VIOLATION
-            };
-            ("ERROR", code, detail.clone())
-        }
+        } => (
+            "ERROR",
+            crate::control::server::shared::ddl::sqlstate::constraint_sqlstate(constraint),
+            detail.clone(),
+        ),
         crate::Error::TxnOverlayMemoryExceeded { .. } => {
             ("ERROR", sqlstate::PROGRAM_LIMIT_EXCEEDED, err.to_string())
         }

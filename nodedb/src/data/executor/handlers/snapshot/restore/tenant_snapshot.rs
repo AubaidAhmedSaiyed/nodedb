@@ -227,13 +227,15 @@ impl CoreLoop {
                     };
                 let count = vectors.len() as u64;
                 let (database_id, coll_key) = parse_vector_snapshot_key(key, tenant_id);
-                self.restore_vector_collection(
+                if let Err(e) = self.restore_vector_collection(
                     database_id,
                     tenant_id,
                     coll_key,
                     vectors,
                     replace_mode,
-                );
+                ) {
+                    return self.response_error(task, e);
+                }
                 vectors_written += count;
             }
 

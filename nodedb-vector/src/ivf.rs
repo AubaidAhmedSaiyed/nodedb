@@ -8,6 +8,7 @@
 use nodedb_mem::ScopedMemory;
 
 use crate::distance::{DistanceMetric, distance};
+use crate::error::{VectorError, check_dim};
 use crate::hnsw::SearchResult;
 use crate::quantize::pq::PqCodec;
 
@@ -67,15 +68,27 @@ impl IvfPqIndex {
 
     /// Train the index from a set of vectors, tracking PQ codebook
     /// allocations against `memory`.
-    pub fn train(&mut self, vectors: &[&[f32]], memory: ScopedMemory) {
-        assert!(!vectors.is_empty());
-        assert!(self.dim > 0);
-        assert!(
-            self.dim.is_multiple_of(self.params.pq_m),
-            "dim {} must be divisible by pq_m {}",
-            self.dim,
-            self.params.pq_m
-        );
+    ///
+    /// An empty set, a zero dimension, or a `pq_m` that does not divide the
+    /// dimension fails with [`VectorError::InvalidInput`]; a vector without
+    /// the index dimension fails with [`VectorError::DimensionMismatch`].
+    pub fn train(&mut self, vectors: &[&[f32]], memory: ScopedMemory) -> Result<(), VectorError> {
+        if vectors.is_empty() {
+            return Err(VectorError::InvalidInput {
+                detail: "IVF-PQ training needs at least one vector".into(),
+            });
+        }
+        if self.dim == 0 || self.params.pq_m == 0 || !self.dim.is_multiple_of(self.params.pq_m) {
+            return Err(VectorError::InvalidInput {
+                detail: format!(
+                    "IVF-PQ dimension {} must be non-zero and divisible by pq_m {}",
+                    self.dim, self.params.pq_m
+                ),
+            });
+        }
+        for v in vectors {
+            check_dim(self.dim, v.len())?;
+        }
 
         let n_cells = self.params.n_cells.min(vectors.len());
         self.centroids = kmeans_centroids(vectors, self.dim, n_cells, 20);
@@ -99,16 +112,22 @@ impl IvfPqIndex {
             self.params.pq_k,
             20,
             memory,
-        ));
+        )?);
+        Ok(())
     }
 
     /// Add a vector to the index. Returns the assigned ID.
-    pub fn add(&mut self, vector: &[f32]) -> u32 {
-        assert_eq!(vector.len(), self.dim);
-        let pq = self
-            .pq
-            .as_ref()
-            .expect("index must be trained before add()");
+    ///
+    /// A vector without the index dimension fails with
+    /// [`VectorError::DimensionMismatch`]; an untrained index fails with
+    /// [`VectorError::InvalidInput`].
+    pub fn add(&mut self, vector: &[f32]) -> Result<u32, VectorError> {
+        check_dim(self.dim, vector.len())?;
+        let Some(pq) = self.pq.as_ref() else {
+            return Err(VectorError::InvalidInput {
+                detail: "IVF-PQ index must be trained before add".into(),
+            });
+        };
 
         let cell = self.nearest_centroid(vector);
         let residual: Vec<f32> = vector
@@ -120,7 +139,7 @@ impl IvfPqIndex {
         let id = self.count;
         self.cells[cell].push((id, code));
         self.count += 1;
-        id
+        Ok(id)
     }
 
     /// Whether the index holds a trained codebook.
@@ -145,23 +164,27 @@ impl IvfPqIndex {
         self.count = self.count.min(count);
     }
 
-    /// Batch add vectors.
-    pub fn add_batch(&mut self, vectors: &[&[f32]]) {
+    /// Batch add vectors. Stops at the first vector that fails to add.
+    pub fn add_batch(&mut self, vectors: &[&[f32]]) -> Result<(), VectorError> {
         for v in vectors {
-            self.add(v);
+            self.add(v)?;
         }
+        Ok(())
     }
 
     /// Search: find top-k nearest neighbors.
-    pub fn search(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
-        assert_eq!(query.len(), self.dim);
+    ///
+    /// A query without the index dimension fails with
+    /// [`VectorError::DimensionMismatch`]. A distance table that exceeds the
+    /// memory budget fails the search: skipping its cell would drop results.
+    pub fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<SearchResult>, VectorError> {
+        check_dim(self.dim, query.len())?;
         if self.centroids.is_empty() || self.count == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let pq = match &self.pq {
-            Some(p) => p,
-            None => return Vec::new(),
+        let Some(pq) = &self.pq else {
+            return Ok(Vec::new());
         };
 
         let nprobe = self.params.nprobe.min(self.centroids.len());
@@ -181,13 +204,7 @@ impl IvfPqIndex {
                 .zip(&self.centroids[cell_idx])
                 .map(|(q, c)| q - c)
                 .collect();
-            let table = match pq.build_distance_table(&residual_query) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(error = %e, "IVF PQ build_distance_table budget exhausted; skipping cell");
-                    continue;
-                }
-            };
+            let table = pq.build_distance_table(&residual_query)?;
 
             for (id, code) in &self.cells[cell_idx] {
                 let dist = pq.asymmetric_distance(&table, code);
@@ -211,7 +228,7 @@ impl IvfPqIndex {
                 .partial_cmp(&b.distance)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        candidates
+        Ok(candidates)
     }
 
     fn nearest_centroid(&self, vector: &[f32]) -> usize {
@@ -280,8 +297,8 @@ fn kmeans_centroids(data: &[&[f32]], dim: usize, k: usize, max_iter: usize) -> V
             }
             chosen
         };
-        centroids.push(data[next_idx].to_vec());
-        let last = centroids.last().expect("just pushed");
+        let last = data[next_idx];
+        centroids.push(last.to_vec());
         for (i, point) in data.iter().enumerate() {
             let d = distance(point, last, DistanceMetric::L2);
             if d < min_dists[i] {
@@ -357,13 +374,13 @@ mod tests {
                 metric: DistanceMetric::L2,
             },
         );
-        idx.train(&refs, test_memory());
-        idx.add_batch(&refs);
+        idx.train(&refs, test_memory()).unwrap();
+        idx.add_batch(&refs).unwrap();
 
         assert_eq!(idx.len(), 1000);
 
         let query = &vecs[500];
-        let results = idx.search(query, 5);
+        let results = idx.search(query, 5).unwrap();
         assert_eq!(results.len(), 5);
         assert!(
             results.iter().any(|r| r.id == 500),
@@ -386,17 +403,22 @@ mod tests {
         let vecs = make_vectors(64, 8);
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
         let mut idx = IvfPqIndex::new(8, small_params());
-        idx.train(&refs, test_memory());
-        idx.add_batch(&refs[..40]);
+        idx.train(&refs, test_memory()).unwrap();
+        idx.add_batch(&refs[..40]).unwrap();
         let mark = idx.len() as u32;
-        let before: Vec<u32> = idx.search(&vecs[5], 40).iter().map(|r| r.id).collect();
+        let before: Vec<u32> = idx
+            .search(&vecs[5], 40)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
 
-        idx.add_batch(&refs[40..]);
+        idx.add_batch(&refs[40..]).unwrap();
         idx.roll_back_to(mark, true);
 
         assert_eq!(idx.len(), 40);
         assert!(idx.is_trained(), "the training the index held stays");
-        let after = idx.search(&vecs[5], 64);
+        let after = idx.search(&vecs[5], 64).unwrap();
         assert!(
             after.iter().all(|r| r.id < mark),
             "no vector added after the mark is found"
@@ -405,7 +427,7 @@ mod tests {
         assert_eq!(after_ids, before, "the search reads as before the adds");
 
         // The next add takes the first id past the mark again.
-        assert_eq!(idx.add(&vecs[63]), mark);
+        assert_eq!(idx.add(&vecs[63]).unwrap(), mark);
     }
 
     #[test]
@@ -413,20 +435,67 @@ mod tests {
         let vecs = make_vectors(16, 8);
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
         let mut idx = IvfPqIndex::new(8, small_params());
-        idx.train(&refs, test_memory());
-        idx.add_batch(&refs);
+        idx.train(&refs, test_memory()).unwrap();
+        idx.add_batch(&refs).unwrap();
 
         idx.roll_back_to(0, false);
 
         assert!(idx.is_empty());
         assert!(!idx.is_trained());
         assert_eq!(idx.n_cells(), 0);
-        assert!(idx.search(&vecs[0], 5).is_empty());
+        assert!(idx.search(&vecs[0], 5).unwrap().is_empty());
     }
 
     #[test]
     fn empty_index() {
         let idx = IvfPqIndex::new(8, IvfPqParams::default());
-        assert!(idx.search(&[0.0; 8], 5).is_empty());
+        assert!(idx.search(&[0.0; 8], 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn wrong_dimension_is_a_typed_error() {
+        let vecs: Vec<Vec<f32>> = (0..32)
+            .map(|i| (0..8).map(|d| ((i * 8 + d) % 17) as f32).collect())
+            .collect();
+        let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
+        let mut idx = IvfPqIndex::new(
+            8,
+            IvfPqParams {
+                n_cells: 4,
+                pq_m: 4,
+                pq_k: 8,
+                nprobe: 2,
+                metric: DistanceMetric::L2,
+            },
+        );
+        assert!(matches!(
+            idx.add(&[0.0; 8]),
+            Err(VectorError::InvalidInput { .. })
+        ));
+        idx.train(&refs, test_memory()).unwrap();
+        idx.add_batch(&refs).unwrap();
+        assert!(matches!(
+            idx.search(&[0.0; 3], 5),
+            Err(VectorError::DimensionMismatch {
+                expected: 8,
+                got: 3
+            })
+        ));
+        assert!(matches!(
+            idx.add(&[0.0; 3]),
+            Err(VectorError::DimensionMismatch {
+                expected: 8,
+                got: 3
+            })
+        ));
+        let short = [0.0_f32; 3];
+        let mut untrained = IvfPqIndex::new(8, IvfPqParams::default());
+        assert!(matches!(
+            untrained.train(&[&short], test_memory()),
+            Err(VectorError::DimensionMismatch {
+                expected: 8,
+                got: 3
+            })
+        ));
     }
 }

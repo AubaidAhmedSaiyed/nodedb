@@ -309,11 +309,14 @@ impl VectorCollection {
         let mut growing = FlatIndex::new(snap.dim, metric);
         for (i, v) in snap.growing_vectors.iter().enumerate() {
             let deleted = snap.growing_deleted.get(i).copied().unwrap_or(false);
-            if deleted {
-                growing.insert_tombstoned(v.clone());
+            let inserted = if deleted {
+                growing.insert_tombstoned(v.clone())
             } else {
-                growing.insert(v.clone());
-            }
+                growing.insert(v.clone())
+            };
+            inserted.map_err(|e| VectorError::CheckpointDeserializationError {
+                detail: format!("growing-segment replay insert: {e}"),
+            })?;
         }
 
         let mut sealed = Vec::with_capacity(snap.sealed_segments.len());
@@ -503,7 +506,7 @@ mod tests {
             for (d, slot) in v.iter_mut().enumerate() {
                 *slot = ((i as f32) * 0.01 + (d as f32) * 0.1).sin();
             }
-            coll.insert(v);
+            coll.insert(v).unwrap();
         }
         let req = coll.seal("sq8_test").expect("seal produced request");
         let mut idx = HnswIndex::new(req.dim, req.params.clone());
@@ -551,14 +554,14 @@ mod tests {
             },
         );
         for i in 0..50u32 {
-            coll.insert(vec![i as f32, 0.0, 0.0]);
+            coll.insert(vec![i as f32, 0.0, 0.0]).unwrap();
         }
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
         let restored = VectorCollection::from_checkpoint(&bytes, None, test_memory()).unwrap();
         assert_eq!(restored.len(), 50);
         assert_eq!(restored.dim(), 3);
 
-        let results = restored.search(&[25.0, 0.0, 0.0], 1, 64);
+        let results = restored.search(&[25.0, 0.0, 0.0], 1, 64).unwrap();
         assert_eq!(results[0].id, 25);
     }
 
@@ -579,7 +582,7 @@ mod tests {
                 ..HnswParams::default()
             },
         );
-        coll.insert(vec![1.0, 0.0, 0.0]);
+        coll.insert(vec![1.0, 0.0, 0.0]).unwrap();
         coll.note_checkpoint_lsn(42);
         assert_eq!(coll.applied_wal_lsn(), 42);
         assert_eq!(
@@ -634,7 +637,7 @@ mod tests {
         coll.payload
             .add_index("category".to_string(), PayloadIndexKind::Equality);
         for i in 0u32..10 {
-            let node_id = coll.insert(vec![i as f32, 0.0, 0.0]);
+            let node_id = coll.insert(vec![i as f32, 0.0, 0.0]).unwrap();
             let mut fields = HashMap::new();
             let cat = if i % 2 == 0 { "A" } else { "B" };
             fields.insert("category".to_string(), Value::String(cat.to_string()));

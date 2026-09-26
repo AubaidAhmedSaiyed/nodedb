@@ -260,10 +260,12 @@ impl VectorCollection {
             .position(|b| b.segment_id == segment_id)
         {
             let building = self.building.remove(pos);
-            let use_codec_dispatch = matches!(
-                self.quantization,
-                VectorQuantization::RaBitQ | VectorQuantization::Bbq
-            );
+            let codec_dispatch_tag = match self.quantization {
+                VectorQuantization::RaBitQ => Some("rabitq"),
+                VectorQuantization::Bbq => Some("bbq"),
+                _ => None,
+            };
+            let use_codec_dispatch = codec_dispatch_tag.is_some();
             let use_pq = !use_codec_dispatch && self.index_config.index_type == IndexType::HnswPq;
             let (sq8, pq) = if use_codec_dispatch {
                 (None, None)
@@ -287,15 +289,14 @@ impl VectorCollection {
                 mmap_vectors,
             });
 
-            if use_codec_dispatch {
-                let tag = match self.quantization {
-                    VectorQuantization::RaBitQ => "rabitq",
-                    VectorQuantization::Bbq => "bbq",
-                    _ => unreachable!(
-                        "invariant: use_codec_dispatch is only true for RaBitQ and Bbq quantization variants"
-                    ),
-                };
-                self.build_codec_dispatch(tag);
+            if let Some(tag) = codec_dispatch_tag {
+                let built = self.build_codec_dispatch(tag).map(|_| ());
+                if let Err(e) = built {
+                    // Without the codec index the sealed segments are searched
+                    // by their own HNSW graphs, which answer the same queries.
+                    tracing::error!(error = %e, tag, "codec-dispatch build failed; searching sealed segments directly");
+                    self.codec_dispatch = None;
+                }
             }
         }
     }

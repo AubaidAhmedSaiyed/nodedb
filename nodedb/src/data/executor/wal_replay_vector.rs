@@ -300,7 +300,17 @@ impl CoreLoop {
                     // `SurrogateBind` replay path. Engine inserts here are
                     // local-id-only and bind to `Surrogate::ZERO`.
                     let _ = doc_id;
-                    index.insert_with_surrogate(vector, nodedb_types::Surrogate::ZERO);
+                    if let Err(e) =
+                        index.insert_with_surrogate(vector, nodedb_types::Surrogate::ZERO)
+                    {
+                        self.replay_record_rejected(
+                            "vector",
+                            record_lsn,
+                            None,
+                            &format!("vector record for '{collection}': {e}"),
+                        );
+                        continue;
+                    }
                     inserted += 1;
                 } else if let Ok((collection, vector, dim)) =
                     zerompk::from_msgpack::<(String, Vec<f32>, usize)>(&record.payload)
@@ -370,7 +380,15 @@ impl CoreLoop {
                         );
                         continue;
                     }
-                    index.insert(vector);
+                    if let Err(e) = index.insert(vector) {
+                        self.replay_record_rejected(
+                            "vector",
+                            record_lsn,
+                            None,
+                            &format!("vector record for '{collection}': {e}"),
+                        );
+                        continue;
+                    }
                     inserted += 1;
                 } else if let Ok((collection, vectors, dim)) =
                     zerompk::from_msgpack::<(String, Vec<Vec<f32>>, usize)>(&record.payload)
@@ -413,8 +431,16 @@ impl CoreLoop {
                         .vector_collections
                         .entry(index_key)
                         .or_insert_with(|| VectorCollection::new(dim, params));
-                    for vector in vectors {
-                        index.insert(vector);
+                    // Checked as a whole before any vector lands, so a record
+                    // holding one vector of another width applies nothing.
+                    if let Err(e) = index.insert_batch_with_surrogates(&vectors, &[]) {
+                        self.replay_record_rejected(
+                            "vector",
+                            record_lsn,
+                            None,
+                            &format!("vector batch record for '{collection}': {e}"),
+                        );
+                        continue;
                     }
                     inserted += 1;
                 }
@@ -524,7 +550,7 @@ mod tests {
     ) {
         let dim = vector.len();
         let mut coll = VectorCollection::new(dim, HnswParams::default());
-        coll.insert(vector);
+        coll.insert(vector).unwrap();
         let key = CoreLoop::vector_index_key(0, tenant_id, collection, "");
         core.vector_collections.insert(key, coll);
         core.floors.replay_floors.vector.set(stamp);

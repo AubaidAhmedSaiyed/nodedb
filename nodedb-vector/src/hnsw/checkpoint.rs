@@ -235,8 +235,8 @@ mod tests {
         assert_eq!(restored.max_layer(), idx.max_layer());
 
         let query = vec![1.0, 2.0, 3.0];
-        let orig_results = idx.search(&query, 5, 32);
-        let rest_results = restored.search(&query, 5, 32);
+        let orig_results = idx.search(&query, 5, 32).unwrap();
+        let rest_results = restored.search(&query, 5, 32).unwrap();
         assert_eq!(orig_results.len(), rest_results.len());
         for (a, b) in orig_results.iter().zip(rest_results.iter()) {
             assert_eq!(a.id, b.id);

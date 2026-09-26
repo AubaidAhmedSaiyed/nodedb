@@ -422,7 +422,7 @@ mod tests {
     fn vector_searchable(core: &Core) -> bool {
         core.vector_collections
             .get(&vector_key())
-            .map(|coll| !coll.search(&[1.0, 2.0, 3.0], 1, 16).is_empty())
+            .map(|coll| !coll.search(&[1.0, 2.0, 3.0], 1, 16).unwrap().is_empty())
             .unwrap_or(false)
     }
 

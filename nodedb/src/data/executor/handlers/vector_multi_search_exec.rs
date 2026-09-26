@@ -12,7 +12,6 @@ use tracing::debug;
 
 use super::vector_search::{
     VectorMultiSearchParams, build_search_hit, effective_ef, encode_hits_response,
-    surrogate_bitmap_to_global_ids,
 };
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -52,33 +51,46 @@ impl CoreLoop {
         };
 
         let mut all_results: Vec<Vec<crate::engine::vector::hnsw::SearchResult>> = Vec::new();
+        // The width of a field index the query could not be compared with.
+        // Fields of other widths are skipped; when no field has the query's
+        // width, the query is the caller's data error.
+        let mut other_width: Option<usize> = None;
+        let mut any_field_of_width = false;
 
         for (key, coll) in &self.vector_collections {
             if key.0 != db || key.1 != tenant_id {
                 continue;
             }
             if key == &plain_key || key.2.starts_with(&field_prefix) {
-                if coll.is_empty() || coll.dim() != query_vector.len() {
+                if coll.dim() != query_vector.len() {
+                    other_width = Some(coll.dim());
+                    continue;
+                }
+                any_field_of_width = true;
+                if coll.is_empty() {
                     continue;
                 }
                 let ef = effective_ef(ef_search, fetch_k);
-                let results = match filter_bitmap {
-                    Some(surrogate_bm) => {
-                        let local_bm = surrogate_bitmap_to_global_ids(coll, surrogate_bm);
-                        let mut buf = Vec::with_capacity(local_bm.serialized_size());
-                        if local_bm.serialize_into(&mut buf).is_ok() {
-                            coll.search_with_bitmap_bytes(query_vector, fetch_k, ef, &buf)
-                        } else {
-                            coll.search(query_vector, fetch_k, ef)
-                        }
-                    }
-                    None => coll.search(query_vector, fetch_k, ef),
-                };
-                all_results.push(results);
+                match super::vector_search::search_vector_leg(
+                    coll,
+                    query_vector,
+                    fetch_k,
+                    ef,
+                    filter_bitmap,
+                ) {
+                    Ok(results) => all_results.push(results),
+                    Err(code) => return self.response_error(task, code),
+                }
             }
         }
 
         if all_results.is_empty() {
+            if !any_field_of_width && let Some(width) = other_width {
+                return self.response_error(
+                    task,
+                    super::vector::dimension_mismatch(width, query_vector.len()),
+                );
+            }
             return self.response_error(task, ErrorCode::NotFound);
         }
 

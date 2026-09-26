@@ -171,7 +171,7 @@ mod tests {
         fields.insert("owner".to_string(), Value::String("a".into()));
         for (i, v) in [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]].into_iter().enumerate() {
             let s = Surrogate::new(i as u32 + 1);
-            let id = coll.insert_with_surrogate(v.to_vec(), s);
+            let id = coll.insert_with_surrogate(v.to_vec(), s).unwrap();
             coll.payload.insert_row(id, &fields);
         }
         assert!(
@@ -204,7 +204,7 @@ mod tests {
         assert!(hits.is_empty(), "payload rows cleared");
 
         let s = Surrogate::new(42);
-        let id = coll.insert_with_surrogate(vec![0.5, 0.5], s);
+        let id = coll.insert_with_surrogate(vec![0.5, 0.5], s).unwrap();
         assert_eq!(coll.local_for_surrogate(s), Some(id));
         assert_eq!(coll.live_count(), 1);
     }

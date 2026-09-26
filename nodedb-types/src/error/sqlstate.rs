@@ -78,6 +78,10 @@ pub const INVALID_PARAMETER_VALUE: &str = "22023";
 /// `23000` — `integrity_constraint_violation` (generic)
 pub const INTEGRITY_CONSTRAINT_VIOLATION: &str = "23000";
 
+/// `428C9` — `generated_always` (a write names a generated column; its
+/// value is computed from other columns)
+pub const GENERATED_ALWAYS: &str = "428C9";
+
 /// `23502` — `not_null_violation`
 pub const NOT_NULL_VIOLATION: &str = "23502";
 
@@ -362,6 +366,7 @@ mod tests {
             INVALID_LIMIT_VALUE,
             INVALID_TEXT_REPRESENTATION,
             INTEGRITY_CONSTRAINT_VIOLATION,
+            GENERATED_ALWAYS,
             NOT_NULL_VIOLATION,
             FOREIGN_KEY_VIOLATION,
             UNIQUE_VIOLATION,

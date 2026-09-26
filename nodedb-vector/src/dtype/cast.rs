@@ -26,6 +26,9 @@ pub enum DtypeError {
         expected: usize,
         actual: usize,
     },
+    /// A storage dtype this build has no decoder for.
+    #[error("no f32 decoder for vector storage dtype {dtype}")]
+    Unsupported { dtype: VectorStorageDtype },
 }
 
 /// Verify that `bytes.len() == dtype.bytes_for_dim(dim)`.
@@ -100,9 +103,9 @@ pub fn cast_to_f32(
                 .collect();
             Ok(out)
         }
-        // `VectorStorageDtype` is #[non_exhaustive]; this arm is required by
-        // the compiler but unreachable with any currently-defined variant.
-        _ => unreachable!("unrecognised VectorStorageDtype variant in cast_to_f32"),
+        // `VectorStorageDtype` is #[non_exhaustive]: a dtype added upstream
+        // without a decoder here fails the read instead of the process.
+        _ => Err(DtypeError::Unsupported { dtype }),
     }
 }
 
@@ -241,55 +244,55 @@ mod tests {
     #[test]
     fn bad_byte_len_f32_mismatch() {
         let err = cast_to_f32(&[0u8; 7], VectorStorageDtype::F32, 2).unwrap_err();
-        match err {
-            DtypeError::BadByteLen {
-                dtype,
-                dim,
-                expected,
-                actual,
-            } => {
-                assert_eq!(dtype, VectorStorageDtype::F32);
-                assert_eq!(dim, 2);
-                assert_eq!(expected, 8);
-                assert_eq!(actual, 7);
-            }
-        }
+        let DtypeError::BadByteLen {
+            dtype,
+            dim,
+            expected,
+            actual,
+        } = err
+        else {
+            panic!("expected BadByteLen, got {err:?}");
+        };
+        assert_eq!(dtype, VectorStorageDtype::F32);
+        assert_eq!(dim, 2);
+        assert_eq!(expected, 8);
+        assert_eq!(actual, 7);
     }
 
     #[test]
     fn bad_byte_len_f16_odd_byte_count() {
         let err = cast_to_f32(&[0u8; 3], VectorStorageDtype::F16, 2).unwrap_err();
-        match err {
-            DtypeError::BadByteLen {
-                dtype,
-                dim,
-                expected,
-                actual,
-            } => {
-                assert_eq!(dtype, VectorStorageDtype::F16);
-                assert_eq!(dim, 2);
-                assert_eq!(expected, 4);
-                assert_eq!(actual, 3);
-            }
-        }
+        let DtypeError::BadByteLen {
+            dtype,
+            dim,
+            expected,
+            actual,
+        } = err
+        else {
+            panic!("expected BadByteLen, got {err:?}");
+        };
+        assert_eq!(dtype, VectorStorageDtype::F16);
+        assert_eq!(dim, 2);
+        assert_eq!(expected, 4);
+        assert_eq!(actual, 3);
     }
 
     #[test]
     fn bad_byte_len_bf16_mismatch() {
         let err = cast_to_f32(&[0u8; 5], VectorStorageDtype::BF16, 3).unwrap_err();
-        match err {
-            DtypeError::BadByteLen {
-                dtype,
-                dim,
-                expected,
-                actual,
-            } => {
-                assert_eq!(dtype, VectorStorageDtype::BF16);
-                assert_eq!(dim, 3);
-                assert_eq!(expected, 6);
-                assert_eq!(actual, 5);
-            }
-        }
+        let DtypeError::BadByteLen {
+            dtype,
+            dim,
+            expected,
+            actual,
+        } = err
+        else {
+            panic!("expected BadByteLen, got {err:?}");
+        };
+        assert_eq!(dtype, VectorStorageDtype::BF16);
+        assert_eq!(dim, 3);
+        assert_eq!(expected, 6);
+        assert_eq!(actual, 5);
     }
 
     // ── validate_byte_len independently ──────────────────────────────────────
@@ -304,13 +307,13 @@ mod tests {
     fn validate_byte_len_off_by_one_fails() {
         let bytes = [0u8; 11]; // should be 12
         let err = validate_byte_len(&bytes, VectorStorageDtype::F32, 3).unwrap_err();
-        match err {
-            DtypeError::BadByteLen {
-                expected, actual, ..
-            } => {
-                assert_eq!(expected, 12);
-                assert_eq!(actual, 11);
-            }
-        }
+        let DtypeError::BadByteLen {
+            expected, actual, ..
+        } = err
+        else {
+            panic!("expected BadByteLen, got {err:?}");
+        };
+        assert_eq!(expected, 12);
+        assert_eq!(actual, 11);
     }
 }

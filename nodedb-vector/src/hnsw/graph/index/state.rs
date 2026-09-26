@@ -191,7 +191,7 @@ mod tests {
         for i in 0..10u32 {
             idx.insert(vec![i as f32, 0.0, 0.0]).unwrap();
         }
-        let results = idx.search(&[5.0, 0.0, 0.0], 3, 32);
+        let results = idx.search(&[5.0, 0.0, 0.0], 3, 32).unwrap();
         assert_eq!(results.len(), 3);
         // Results must be in monotonically non-decreasing distance order.
         for w in results.windows(2) {
@@ -210,7 +210,7 @@ mod tests {
         for i in 0..10u32 {
             idx.insert(vec![i as f32, 0.0, 0.0]).unwrap();
         }
-        let results = idx.search(&[5.0, 0.0, 0.0], 3, 32);
+        let results = idx.search(&[5.0, 0.0, 0.0], 3, 32).unwrap();
         assert_eq!(results.len(), 3);
         for w in results.windows(2) {
             assert!(
@@ -376,7 +376,7 @@ mod tests {
                     dim: 4,
                     served: vec![vec![0.0; 4], vec![0.0; 4]],
                 })),
-                Err(VectorError::DimensionMismatch { .. })
+                Err(VectorError::StoredDimensionMismatch { .. })
             ),
             "a backing with the wrong dim must be refused"
         );
@@ -405,7 +405,7 @@ mod tests {
             .unwrap()
             .expect("graph checkpoint must be recognized");
 
-        let results = idx.search(&[1.0, 2.0, 3.0], 5, 16);
+        let results = idx.search(&[1.0, 2.0, 3.0], 5, 16).unwrap();
         for r in &results {
             assert!(
                 r.distance.is_infinite(),

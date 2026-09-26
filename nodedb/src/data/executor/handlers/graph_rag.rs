@@ -188,12 +188,18 @@ impl CoreLoop {
         };
         // An empty vector leg is an empty score set, not an empty response:
         // the other fusion legs still rank, and the envelope keeps its shape.
-        if index.is_empty() {
-            return Ok((Vec::new(), HashMap::new(), Vec::new()));
-        }
-
+        // A query of the wrong width fails first, on an empty index too.
         let ef = vector_top_k.saturating_mul(4).max(64);
-        let vector_results = index.search(query_vector, vector_top_k, ef);
+        let vector_results = match super::vector_search::search_vector_leg(
+            index,
+            query_vector,
+            vector_top_k,
+            ef,
+            None,
+        ) {
+            Ok(results) => results,
+            Err(code) => return Err(self.response_error(task, code)),
+        };
 
         if vector_results.is_empty() {
             return Ok((Vec::new(), HashMap::new(), Vec::new()));

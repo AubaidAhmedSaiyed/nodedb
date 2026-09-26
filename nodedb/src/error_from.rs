@@ -124,11 +124,18 @@ impl From<crate::storage::quarantine::engines::FtsOrQuarantine> for Error {
 }
 
 impl From<nodedb_vector::error::VectorError> for Error {
-    /// Checkpoint failures fail-stop because replay history may be truncated.
+    /// An input vector of the wrong dimension, or index input the engine
+    /// cannot use, is the caller's data error: SQLSTATE `22000`. Checkpoint
+    /// and stored-data failures fail-stop because replay history may be
+    /// truncated.
     fn from(e: nodedb_vector::error::VectorError) -> Self {
         use nodedb_vector::error::VectorError as Ve;
         let detail = e.to_string();
         match e {
+            Ve::DimensionMismatch { .. } | Ve::InvalidInput { .. } => {
+                Self::DataException { detail }
+            }
+            Ve::InvalidFilterBitmap { .. } => Self::Internal { detail },
             Ve::BudgetExhausted(_) => Self::MemoryExhausted {
                 engine: "vector".to_string(),
             },
@@ -136,7 +143,7 @@ impl From<nodedb_vector::error::VectorError> for Error {
                 engine: "vector".to_string(),
                 detail,
             },
-            Ve::DimensionMismatch { .. }
+            Ve::StoredDimensionMismatch { .. }
             | Ve::UnsupportedVersion { .. }
             | Ve::InvalidMagic
             | Ve::DeserializationFailed(_)
@@ -444,5 +451,32 @@ mod tests {
             }
             other => panic!("expected Error::DataPlane, got {other:?}"),
         }
+    }
+
+    /// An input vector of the wrong width is the caller's data error; stored
+    /// data of the wrong width is corruption.
+    #[test]
+    fn vector_dimension_errors_classify_by_source() {
+        use nodedb_vector::error::VectorError;
+        let input: Error = VectorError::DimensionMismatch {
+            expected: 3,
+            got: 2,
+        }
+        .into();
+        match input {
+            Error::DataException { detail } => {
+                assert_eq!(detail, "vector dimension mismatch: expected 3, got 2");
+            }
+            other => panic!("expected Error::DataException, got {other:?}"),
+        }
+        let stored: Error = VectorError::StoredDimensionMismatch {
+            expected: 3,
+            got: 2,
+        }
+        .into();
+        assert!(
+            matches!(stored, Error::SegmentCorrupted { .. }),
+            "{stored:?}"
+        );
     }
 }

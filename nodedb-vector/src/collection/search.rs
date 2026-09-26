@@ -10,7 +10,7 @@
 //! never silently dropped.
 
 use crate::distance::{DistanceMetric, distance};
-use crate::error::VectorError;
+use crate::error::{VectorError, check_dim};
 use crate::hnsw::SearchResult;
 
 use super::lifecycle::VectorCollection;
@@ -50,7 +50,7 @@ fn quantized_search(
     metric: DistanceMetric,
 ) -> Result<Vec<SearchResult>, VectorError> {
     let rerank_k = top_k.saturating_mul(3).max(20);
-    let hnsw_candidates = seg.index.search(query, rerank_k, ef);
+    let hnsw_candidates = seg.index.search(query, rerank_k, ef)?;
 
     // Phase 1: rank candidates by quantized distance.
     let mut scored: Vec<(u32, f32)> = if let Some((codec, codes)) = &seg.pq {
@@ -118,92 +118,92 @@ fn quantized_search(
     Ok(reranked)
 }
 
+/// Search one sealed segment: through its quantized codec when it has one,
+/// else its HNSW graph. A codec pass that exceeds the memory budget falls
+/// back to the HNSW graph, which answers the same query from FP32 vectors.
+/// Every other error fails the search.
+fn search_sealed(
+    seg: &SealedSegment,
+    query: &[f32],
+    top_k: usize,
+    ef: usize,
+    metric: DistanceMetric,
+) -> Result<Vec<SearchResult>, VectorError> {
+    if seg.pq.is_none() && seg.sq8.is_none() {
+        return seg.index.search(query, top_k, ef);
+    }
+    match quantized_search(seg, query, top_k, ef, metric) {
+        Ok(results) => Ok(results),
+        Err(VectorError::BudgetExhausted(e)) => {
+            tracing::warn!(error = %e, "quantized search over budget; searching the HNSW graph");
+            seg.index.search(query, top_k, ef)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Shift segment-local result ids to global ids and append them.
+fn push_shifted(all: &mut Vec<SearchResult>, results: Vec<SearchResult>, base_id: u32) {
+    all.extend(results.into_iter().map(|mut r| {
+        r.id += base_id;
+        r
+    }));
+}
+
+/// Order merged results by distance and keep the `top_k` nearest.
+fn finish(mut all: Vec<SearchResult>, top_k: usize) -> Vec<SearchResult> {
+    all.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all.truncate(top_k);
+    all
+}
+
 impl VectorCollection {
     /// Search across all segments, merging results by distance.
-    pub fn search(&self, query: &[f32], top_k: usize, ef: usize) -> Vec<SearchResult> {
-        // Codec-dispatch fast path: if a collection-level HnswCodecIndex has
-        // been built (RaBitQ or BBQ), use it exclusively for sealed-segment
-        // results and fall back to the growing/building flat segments only.
-        if let Some(ref dispatch) = self.codec_dispatch {
-            let mut all: Vec<SearchResult> = Vec::new();
-
-            let codec_results = dispatch.search(query, top_k, ef);
-            for r in codec_results {
-                all.push(SearchResult {
-                    id: r.id,
-                    distance: r.distance,
-                });
-            }
-
-            // Growing segment (brute-force, not yet in codec index).
-            let growing_results = self.growing.search(query, top_k);
-            for mut r in growing_results {
-                r.id += self.growing_base_id;
-                all.push(r);
-            }
-
-            // Building segments (brute-force while codec index rebuilds).
-            for seg in &self.building {
-                let results = seg.flat.search(query, top_k);
-                for mut r in results {
-                    r.id += seg.base_id;
-                    all.push(r);
-                }
-            }
-
-            all.sort_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            all.truncate(top_k);
-            return all;
-        }
-
+    ///
+    /// A query without the collection dimension fails with
+    /// [`VectorError::DimensionMismatch`] before any segment is read.
+    pub fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ef: usize,
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        check_dim(self.dim, query.len())?;
         let mut all: Vec<SearchResult> = Vec::new();
 
-        // Search growing segment (brute-force).
-        let growing_results = self.growing.search(query, top_k);
-        for mut r in growing_results {
-            r.id += self.growing_base_id;
-            all.push(r);
-        }
-
-        // Search sealed segments.
-        for seg in &self.sealed {
-            let results = if seg.pq.is_some() || seg.sq8.is_some() {
-                match quantized_search(seg, query, top_k, ef, self.params.metric) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "quantized_search budget exhausted; skipping segment");
-                        seg.index.search(query, top_k, ef)
-                    }
-                }
-            } else {
-                seg.index.search(query, top_k, ef)
-            };
-            for mut r in results {
-                r.id += seg.base_id;
-                all.push(r);
+        // Codec-dispatch fast path: a collection-level HnswCodecIndex (RaBitQ
+        // or BBQ) answers for the sealed segments; the growing and building
+        // segments are read by brute force beside it.
+        if let Some(ref dispatch) = self.codec_dispatch {
+            all.extend(
+                dispatch
+                    .search(query, top_k, ef)?
+                    .into_iter()
+                    .map(|r| SearchResult {
+                        id: r.id,
+                        distance: r.distance,
+                    }),
+            );
+        } else {
+            for seg in &self.sealed {
+                let results = search_sealed(seg, query, top_k, ef, self.params.metric)?;
+                push_shifted(&mut all, results, seg.base_id);
             }
         }
 
-        // Search building segments (brute-force while HNSW builds).
+        push_shifted(
+            &mut all,
+            self.growing.search(query, top_k)?,
+            self.growing_base_id,
+        );
         for seg in &self.building {
-            let results = seg.flat.search(query, top_k);
-            for mut r in results {
-                r.id += seg.base_id;
-                all.push(r);
-            }
+            push_shifted(&mut all, seg.flat.search(query, top_k)?, seg.base_id);
         }
-
-        all.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all.truncate(top_k);
-        all
+        Ok(finish(all, top_k))
     }
 
     /// Search across all segments using an explicit metric override.
@@ -212,88 +212,53 @@ impl VectorCollection {
     /// during candidate reranking. Growing and building segments apply it exactly
     /// via brute-force. The HNSW graph structure was built with the collection
     /// metric; using a different metric affects the scoring but not graph traversal.
+    /// A codec-dispatch index scores with the collection metric.
     pub fn search_with_metric(
         &self,
         query: &[f32],
         top_k: usize,
         ef: usize,
         metric: DistanceMetric,
-    ) -> Vec<SearchResult> {
-        // Codec-dispatch fast path: codec dispatch does not yet support per-query
-        // metric override — fall through to the non-codec path which does.
-        // When a codec index is active, we search only the growing/building
-        // segments with the override and add codec results with collection metric
-        // (approximate cross-metric search for the codec-indexed segments).
-        if let Some(ref dispatch) = self.codec_dispatch {
-            let mut all: Vec<SearchResult> = Vec::new();
-            let codec_results = dispatch.search(query, top_k, ef);
-            for r in codec_results {
-                all.push(SearchResult {
-                    id: r.id,
-                    distance: r.distance,
-                });
-            }
-            for mut r in self.growing.search_with_metric(query, top_k, metric) {
-                r.id += self.growing_base_id;
-                all.push(r);
-            }
-            for seg in &self.building {
-                for mut r in seg.flat.search_with_metric(query, top_k, metric) {
-                    r.id += seg.base_id;
-                    all.push(r);
-                }
-            }
-            all.sort_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            all.truncate(top_k);
-            return all;
-        }
-
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        check_dim(self.dim, query.len())?;
         let mut all: Vec<SearchResult> = Vec::new();
 
-        for mut r in self.growing.search_with_metric(query, top_k, metric) {
-            r.id += self.growing_base_id;
-            all.push(r);
-        }
-
-        for seg in &self.sealed {
-            let results = if seg.pq.is_some() || seg.sq8.is_some() {
-                match quantized_search(seg, query, top_k, ef, metric) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "quantized_search budget exhausted; skipping segment");
-                        seg.index.search(query, top_k, ef)
-                    }
-                }
-            } else {
-                seg.index.search(query, top_k, ef)
-            };
-            for mut r in results {
-                r.id += seg.base_id;
-                all.push(r);
+        if let Some(ref dispatch) = self.codec_dispatch {
+            all.extend(
+                dispatch
+                    .search(query, top_k, ef)?
+                    .into_iter()
+                    .map(|r| SearchResult {
+                        id: r.id,
+                        distance: r.distance,
+                    }),
+            );
+        } else {
+            for seg in &self.sealed {
+                let results = search_sealed(seg, query, top_k, ef, metric)?;
+                push_shifted(&mut all, results, seg.base_id);
             }
         }
 
+        push_shifted(
+            &mut all,
+            self.growing.search_with_metric(query, top_k, metric)?,
+            self.growing_base_id,
+        );
         for seg in &self.building {
-            for mut r in seg.flat.search_with_metric(query, top_k, metric) {
-                r.id += seg.base_id;
-                all.push(r);
-            }
+            push_shifted(
+                &mut all,
+                seg.flat.search_with_metric(query, top_k, metric)?,
+                seg.base_id,
+            );
         }
-
-        all.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all.truncate(top_k);
-        all
+        Ok(finish(all, top_k))
     }
 
     /// Search with a pre-filter bitmap (byte-array format) and explicit metric override.
+    ///
+    /// Bitmap bytes that do not decode fail with
+    /// [`VectorError::InvalidFilterBitmap`].
     pub fn search_with_bitmap_bytes_and_metric(
         &self,
         query: &[f32],
@@ -301,103 +266,88 @@ impl VectorCollection {
         ef: usize,
         bitmap: &[u8],
         metric: DistanceMetric,
-    ) -> Vec<SearchResult> {
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        check_dim(self.dim, query.len())?;
         let mut all: Vec<SearchResult> = Vec::new();
 
-        let growing_results = self.growing.search_filtered_offset_with_metric(
-            query,
-            top_k,
-            bitmap,
-            self.growing_base_id,
-            metric,
-        );
-        for mut r in growing_results {
-            r.id += self.growing_base_id;
-            all.push(r);
-        }
-
-        for seg in &self.sealed {
-            let results =
-                seg.index
-                    .search_with_bitmap_bytes_offset(query, top_k, ef, bitmap, seg.base_id);
-            for mut r in results {
-                // Rerank with the requested metric using the stored FP32 vector.
-                if let Some(v) = seg.index.get_vector(r.id.wrapping_sub(seg.base_id)) {
-                    r.distance = crate::distance::distance(query, v, metric);
-                }
-                r.id += seg.base_id;
-                all.push(r);
-            }
-        }
-
-        for seg in &self.building {
-            let results = seg.flat.search_filtered_offset_with_metric(
+        push_shifted(
+            &mut all,
+            self.growing.search_filtered_offset_with_metric(
                 query,
                 top_k,
                 bitmap,
-                seg.base_id,
+                self.growing_base_id,
                 metric,
-            );
-            for mut r in results {
-                r.id += seg.base_id;
-                all.push(r);
+            )?,
+            self.growing_base_id,
+        );
+
+        for seg in &self.sealed {
+            let mut results =
+                seg.index
+                    .search_with_bitmap_bytes_offset(query, top_k, ef, bitmap, seg.base_id)?;
+            // Rerank with the requested metric using the stored FP32 vector.
+            for r in &mut results {
+                if let Some(v) = seg.index.get_vector(r.id) {
+                    r.distance = distance(query, v, metric);
+                }
             }
+            push_shifted(&mut all, results, seg.base_id);
         }
 
-        all.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all.truncate(top_k);
-        all
+        for seg in &self.building {
+            push_shifted(
+                &mut all,
+                seg.flat.search_filtered_offset_with_metric(
+                    query,
+                    top_k,
+                    bitmap,
+                    seg.base_id,
+                    metric,
+                )?,
+                seg.base_id,
+            );
+        }
+        Ok(finish(all, top_k))
     }
 
     /// Search with a pre-filter bitmap (byte-array format).
+    ///
+    /// Bitmap bytes that do not decode fail with
+    /// [`VectorError::InvalidFilterBitmap`].
     pub fn search_with_bitmap_bytes(
         &self,
         query: &[f32],
         top_k: usize,
         ef: usize,
         bitmap: &[u8],
-    ) -> Vec<SearchResult> {
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        check_dim(self.dim, query.len())?;
         let mut all: Vec<SearchResult> = Vec::new();
 
-        let growing_results =
+        push_shifted(
+            &mut all,
             self.growing
-                .search_filtered_offset(query, top_k, bitmap, self.growing_base_id);
-        for mut r in growing_results {
-            r.id += self.growing_base_id;
-            all.push(r);
-        }
-
+                .search_filtered_offset(query, top_k, bitmap, self.growing_base_id)?,
+            self.growing_base_id,
+        );
         for seg in &self.sealed {
-            let results =
+            push_shifted(
+                &mut all,
                 seg.index
-                    .search_with_bitmap_bytes_offset(query, top_k, ef, bitmap, seg.base_id);
-            for mut r in results {
-                r.id += seg.base_id;
-                all.push(r);
-            }
+                    .search_with_bitmap_bytes_offset(query, top_k, ef, bitmap, seg.base_id)?,
+                seg.base_id,
+            );
         }
-
         for seg in &self.building {
-            let results = seg
-                .flat
-                .search_filtered_offset(query, top_k, bitmap, seg.base_id);
-            for mut r in results {
-                r.id += seg.base_id;
-                all.push(r);
-            }
+            push_shifted(
+                &mut all,
+                seg.flat
+                    .search_filtered_offset(query, top_k, bitmap, seg.base_id)?,
+                seg.base_id,
+            );
         }
-
-        all.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all.truncate(top_k);
-        all
+        Ok(finish(all, top_k))
     }
 
     /// Search with a structured payload predicate.
@@ -418,23 +368,24 @@ impl VectorCollection {
         top_k: usize,
         ef: usize,
         predicate: &FilterPredicate,
-    ) -> (Vec<SearchResult>, bool) {
+    ) -> Result<(Vec<SearchResult>, bool), VectorError> {
         match self.payload.pre_filter(predicate) {
             Some(bm) => {
                 // Serialize the bitmap to the byte format expected by
                 // `search_with_bitmap_bytes`.
                 let mut bm_bytes = Vec::new();
                 if bm.serialize_into(&mut bm_bytes).is_ok() {
-                    let results = self.search_with_bitmap_bytes(query, top_k, ef, &bm_bytes);
-                    (results, true)
+                    let results = self.search_with_bitmap_bytes(query, top_k, ef, &bm_bytes)?;
+                    Ok((results, true))
                 } else {
-                    // Serialization failure: fall back to unfiltered search.
-                    (self.search(query, top_k, ef), false)
+                    // Serialization failure: unfiltered search, and the
+                    // caller applies the predicate as a post-filter.
+                    Ok((self.search(query, top_k, ef)?, false))
                 }
             }
             None => {
                 // Un-indexed field present: full scan, caller must post-filter.
-                (self.search(query, top_k, ef), false)
+                Ok((self.search(query, top_k, ef)?, false))
             }
         }
     }
@@ -462,10 +413,10 @@ mod tests {
     fn insert_and_search() {
         let mut coll = make_collection();
         for i in 0..100u32 {
-            coll.insert(vec![i as f32, 0.0, 0.0]);
+            coll.insert(vec![i as f32, 0.0, 0.0]).unwrap();
         }
         assert_eq!(coll.len(), 100);
-        let results = coll.search(&[50.0, 0.0, 0.0], 3, 64);
+        let results = coll.search(&[50.0, 0.0, 0.0], 3, 64).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].id, 50);
     }
@@ -474,7 +425,7 @@ mod tests {
     fn seal_moves_to_building() {
         let mut coll = VectorCollection::new(2, HnswParams::default());
         for i in 0..DEFAULT_SEAL_THRESHOLD {
-            coll.insert(vec![i as f32, 0.0]);
+            coll.insert(vec![i as f32, 0.0]).unwrap();
         }
         assert!(coll.needs_seal());
 
@@ -483,7 +434,7 @@ mod tests {
         assert_eq!(coll.building.len(), 1);
         assert_eq!(coll.growing.len(), 0);
 
-        let results = coll.search(&[100.0, 0.0], 1, 64);
+        let results = coll.search(&[100.0, 0.0], 1, 64).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -491,7 +442,7 @@ mod tests {
     fn complete_build_promotes_to_sealed() {
         let mut coll = VectorCollection::new(2, HnswParams::default());
         for i in 0..100 {
-            coll.insert(vec![i as f32, 0.0]);
+            coll.insert(vec![i as f32, 0.0]).unwrap();
         }
         let req = coll.seal("test").unwrap();
 
@@ -504,7 +455,7 @@ mod tests {
         assert_eq!(coll.building.len(), 0);
         assert_eq!(coll.sealed.len(), 1);
 
-        let results = coll.search(&[50.0, 0.0], 3, 64);
+        let results = coll.search(&[50.0, 0.0], 3, 64).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -519,7 +470,7 @@ mod tests {
         );
 
         for i in 0..100 {
-            coll.insert(vec![i as f32, 0.0]);
+            coll.insert(vec![i as f32, 0.0]).unwrap();
         }
         let req = coll.seal("test").unwrap();
         let mut idx = HnswIndex::new(2, req.params);
@@ -529,10 +480,10 @@ mod tests {
         coll.complete_build(req.segment_id, idx, test_memory());
 
         for i in 100..200 {
-            coll.insert(vec![i as f32, 0.0]);
+            coll.insert(vec![i as f32, 0.0]).unwrap();
         }
 
-        let results = coll.search(&[150.0, 0.0], 3, 64);
+        let results = coll.search(&[150.0, 0.0], 3, 64).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].id, 150);
     }
@@ -541,12 +492,12 @@ mod tests {
     fn delete_across_segments() {
         let mut coll = VectorCollection::new(2, HnswParams::default());
         for i in 0..10 {
-            coll.insert(vec![i as f32, 0.0]);
+            coll.insert(vec![i as f32, 0.0]).unwrap();
         }
         assert!(coll.delete(5));
         assert_eq!(coll.live_count(), 9);
 
-        let results = coll.search(&[5.0, 0.0], 10, 64);
+        let results = coll.search(&[5.0, 0.0], 10, 64).unwrap();
         assert!(results.iter().all(|r| r.id != 5));
     }
 
@@ -561,7 +512,7 @@ mod tests {
             },
         );
         for i in 0..n {
-            coll.insert(vec![i as f32, 0.0]);
+            coll.insert(vec![i as f32, 0.0]).unwrap();
         }
         let req = coll.seal("seg").unwrap();
         let mut idx = HnswIndex::new(req.dim, req.params);
@@ -583,7 +534,7 @@ mod tests {
             .filter_map(|i| sealed.index.get_vector(i as u32).map(|v| v.to_vec()))
             .collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = Sq8Codec::calibrate(&refs, dim);
+        let codec = Sq8Codec::calibrate(&refs, dim).unwrap();
         let sq8_data: Vec<u8> = vecs.iter().flat_map(|v| codec.quantize(v)).collect();
         sealed.sq8 = Some((codec, sq8_data));
     }
@@ -593,7 +544,7 @@ mod tests {
         let mut coll = make_sealed_collection(200);
         attach_sq8(&mut coll);
 
-        let results = coll.search(&[100.0, 0.0], 5, 64);
+        let results = coll.search(&[100.0, 0.0], 5, 64).unwrap();
         assert!(!results.is_empty(), "expected non-empty results");
         assert_eq!(
             results[0].id, 100,
@@ -612,8 +563,8 @@ mod tests {
         let query = [250.0f32, 0.0];
         let top_k = 5;
 
-        let plain_results = coll_plain.search(&query, top_k, 64);
-        let sq8_results = coll_sq8.search(&query, top_k, 64);
+        let plain_results = coll_plain.search(&query, top_k, 64).unwrap();
+        let sq8_results = coll_sq8.search(&query, top_k, 64).unwrap();
 
         let plain_ids: std::collections::HashSet<u32> =
             plain_results.iter().map(|r| r.id).collect();
@@ -626,11 +577,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codec_dispatch_bbq_search_returns_results_and_stats_report_bbq() {
-        let dim = 4;
+    /// A collection whose first 50 vectors (`[i, 0, 0, 0]`) sit in one
+    /// sealed segment, with an empty growing segment.
+    fn sealed_dim4_collection() -> VectorCollection {
         let mut coll = VectorCollection::new(
-            dim,
+            4,
             HnswParams {
                 metric: DistanceMetric::L2,
                 m: 8,
@@ -638,14 +589,24 @@ mod tests {
                 ..HnswParams::default()
             },
         );
-
-        // Insert 50 vectors: vector i = [i as f32, 0, 0, 0].
         for i in 0u32..50 {
-            coll.insert(vec![i as f32, 0.0, 0.0, 0.0]);
+            coll.insert(vec![i as f32, 0.0, 0.0, 0.0]).unwrap();
         }
+        let req = coll.seal("codec").unwrap();
+        let mut idx = HnswIndex::new(req.dim, req.params);
+        for v in &req.vectors {
+            idx.insert(v.clone()).unwrap();
+        }
+        coll.complete_build(req.segment_id, idx, test_memory());
+        coll
+    }
 
-        // Build the collection-level BBQ dispatch index over current vectors.
-        let dispatch = coll.build_codec_dispatch("bbq");
+    #[test]
+    fn codec_dispatch_bbq_search_returns_results_and_stats_report_bbq() {
+        let mut coll = sealed_dim4_collection();
+
+        // Build the collection-level BBQ dispatch index over the sealed vectors.
+        let dispatch = coll.build_codec_dispatch("bbq").unwrap();
         assert!(
             dispatch.is_some(),
             "build_codec_dispatch(bbq) should return Some"
@@ -653,7 +614,7 @@ mod tests {
 
         // Query near id=25.
         let query = [25.0f32, 0.0, 0.0, 0.0];
-        let results = coll.search(&query, 5, 32);
+        let results = coll.search(&query, 5, 32).unwrap();
         assert!(
             !results.is_empty(),
             "BBQ codec-dispatch search should return results"
@@ -670,22 +631,10 @@ mod tests {
 
     #[test]
     fn codec_dispatch_rabitq_search_non_empty() {
-        let dim = 4;
-        let mut coll = VectorCollection::new(
-            dim,
-            HnswParams {
-                metric: DistanceMetric::L2,
-                m: 8,
-                ef_construction: 50,
-                ..HnswParams::default()
-            },
-        );
-        for i in 0u32..50 {
-            coll.insert(vec![i as f32, 0.0, 0.0, 0.0]);
-        }
-        coll.build_codec_dispatch("rabitq").unwrap();
+        let mut coll = sealed_dim4_collection();
+        coll.build_codec_dispatch("rabitq").unwrap().unwrap();
 
-        let results = coll.search(&[10.0, 0.0, 0.0, 0.0], 3, 32);
+        let results = coll.search(&[10.0, 0.0, 0.0, 0.0], 3, 32).unwrap();
         assert!(
             !results.is_empty(),
             "RaBitQ dispatch search should return results"
@@ -698,6 +647,71 @@ mod tests {
         );
     }
 
+    /// The codec index covers the sealed segments under their global ids;
+    /// the growing segment is read beside it. A growing vector is found under
+    /// its own id, once.
+    #[test]
+    fn codec_dispatch_keeps_global_ids_and_reads_growing_once() {
+        let mut coll = sealed_dim4_collection();
+        coll.build_codec_dispatch("bbq").unwrap().unwrap();
+        let far = coll.insert(vec![1000.0, 0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(far, 50, "the first growing vector takes the next global id");
+
+        let results = coll.search(&[1000.0, 0.0, 0.0, 0.0], 3, 32).unwrap();
+        assert_eq!(results[0].id, far);
+        assert_eq!(
+            results.iter().filter(|r| r.id == far).count(),
+            1,
+            "{results:?}"
+        );
+        assert!(results.iter().all(|r| r.id <= far), "{results:?}");
+    }
+
+    /// Every collection search entry point refuses a query of the wrong
+    /// dimension, on each segment kind and on the codec-dispatch path.
+    #[test]
+    fn wrong_dimension_query_is_a_typed_error() {
+        use crate::error::VectorError;
+        let mut coll = sealed_dim4_collection();
+        coll.insert(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let bytes = {
+            let bm: roaring::RoaringBitmap = (0..51u32).collect();
+            let mut out = Vec::new();
+            bm.serialize_into(&mut out).unwrap();
+            out
+        };
+        let short = [1.0_f32, 0.0];
+        let check = |coll: &VectorCollection| {
+            for result in [
+                coll.search(&short, 3, 32),
+                coll.search_with_metric(&short, 3, 32, DistanceMetric::Cosine),
+                coll.search_with_bitmap_bytes(&short, 3, 32, &bytes),
+                coll.search_with_bitmap_bytes_and_metric(&short, 3, 32, &bytes, DistanceMetric::L2),
+            ] {
+                assert!(
+                    matches!(
+                        result,
+                        Err(VectorError::DimensionMismatch {
+                            expected: 4,
+                            got: 2
+                        })
+                    ),
+                    "{result:?}"
+                );
+            }
+        };
+        check(&coll);
+        coll.build_codec_dispatch("rabitq").unwrap().unwrap();
+        check(&coll);
+        assert!(matches!(
+            coll.insert(vec![1.0; 3]),
+            Err(VectorError::DimensionMismatch {
+                expected: 4,
+                got: 3
+            })
+        ));
+    }
+
     #[test]
     fn sq8_search_does_not_scan_all_vectors() {
         // This test validates correctness of the SQ8 search path for a large
@@ -708,7 +722,7 @@ mod tests {
         let mut coll = make_sealed_collection(2000);
         attach_sq8(&mut coll);
 
-        let results = coll.search(&[1000.0, 0.0], 5, 64);
+        let results = coll.search(&[1000.0, 0.0], 5, 64).unwrap();
         assert!(!results.is_empty(), "expected non-empty results");
         assert_eq!(
             results[0].id, 1000,

@@ -774,7 +774,9 @@ mod tests {
             .vector_collections
             .entry(index_key.clone())
             .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
-        let vector_id = coll.insert_with_surrogate(vec![1.0, 2.0], nodedb_types::Surrogate::ZERO);
+        let vector_id = coll
+            .insert_with_surrogate(vec![1.0, 2.0], nodedb_types::Surrogate::ZERO)
+            .unwrap();
 
         // Seed as though the forward `apply_point_put_vector_indexes` insert had
         // run: it populates `vector_doc_map` alongside the HNSW insert.
@@ -813,7 +815,9 @@ mod tests {
             .vector_collections
             .entry(index_key.clone())
             .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
-        let vector_id = coll.insert_with_surrogate(vec![3.0, 4.0], nodedb_types::Surrogate::ZERO);
+        let vector_id = coll
+            .insert_with_surrogate(vec![3.0, 4.0], nodedb_types::Surrogate::ZERO)
+            .unwrap();
         coll.delete(vector_id);
 
         // The forward delete cascade already removed the reverse-map entry (as

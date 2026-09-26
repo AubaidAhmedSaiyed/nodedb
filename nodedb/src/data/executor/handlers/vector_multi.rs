@@ -64,19 +64,17 @@ impl CoreLoop {
         if count == 0 || dim == 0 {
             return self.response_error(
                 task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: "multi-vector count and dim must be > 0".into(),
+                ErrorCode::DataException {
+                    detail: "multi-vector count and dim must be > 0".into(),
                 },
             );
         }
         if vectors_flat.len() != count * dim {
             return self.response_error(
                 task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: format!(
-                        "data length mismatch: expected {} ({}×{}), got {}",
+                ErrorCode::DataException {
+                    detail: format!(
+                        "multi-vector data length mismatch: expected {} ({}×{}), got {}",
                         count * dim,
                         count,
                         dim,
@@ -93,16 +91,8 @@ impl CoreLoop {
         if let Some(existing) = self.vector_collections.get(&index_key)
             && existing.dim() != dim
         {
-            return self.response_error(
-                task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: format!(
-                        "dimension mismatch: index has {}, got {dim}",
-                        existing.dim()
-                    ),
-                },
-            );
+            return self
+                .response_error(task, super::vector::dimension_mismatch(existing.dim(), dim));
         }
 
         // Get or create the vector collection.
@@ -134,7 +124,10 @@ impl CoreLoop {
         coll.delete_multi_vector(document_surrogate);
 
         // Insert all vectors with shared surrogate.
-        let ids = coll.insert_multi_vector(&vector_slices, document_surrogate);
+        let ids = match coll.insert_multi_vector(&vector_slices, document_surrogate) {
+            Ok(ids) => ids,
+            Err(e) => return self.response_error(task, crate::Error::from(e)),
+        };
 
         // Auto-seal if needed.
         let seal_key = CoreLoop::vector_build_key(&index_key);
@@ -230,9 +223,8 @@ impl CoreLoop {
             None => {
                 return self.response_error(
                     task,
-                    ErrorCode::RejectedConstraint {
-                        detail: String::new(),
-                        constraint: format!(
+                    ErrorCode::DataException {
+                        detail: format!(
                             "unknown score mode '{mode_str}'; supported: max_sim, avg_sim, sum_sim"
                         ),
                     },
@@ -260,7 +252,10 @@ impl CoreLoop {
             over_fetch.saturating_mul(2).max(64)
         };
 
-        let candidates = coll.search(query_vector, over_fetch, ef);
+        let candidates = match coll.search(query_vector, over_fetch, ef) {
+            Ok(candidates) => candidates,
+            Err(e) => return self.response_error(task, crate::Error::from(e)),
+        };
 
         // Group by surrogate. For distance metrics where lower = better
         // (L2, cosine) we convert similarity = 1 / (1 + distance) so

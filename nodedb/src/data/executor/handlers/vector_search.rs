@@ -75,6 +75,45 @@ pub(super) fn surrogate_bitmap_to_global_ids(
     local_bm
 }
 
+/// Search one vector leg of a fused query (hybrid, triple): the whole index,
+/// or only the rows whose surrogates are in `filter_bitmap`.
+///
+/// The surrogate filter is translated to the index's node ids before the
+/// search. A query of the wrong width is the caller's data error (`22000`)
+/// even on an empty index. A filter that cannot be serialized fails the
+/// search: searching without it would return rows it excludes.
+pub(super) fn search_vector_leg(
+    index: &VectorCollection,
+    query_vector: &[f32],
+    fetch_k: usize,
+    ef: usize,
+    filter_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+) -> Result<Vec<crate::engine::vector::hnsw::SearchResult>, ErrorCode> {
+    if index.dim() != query_vector.len() {
+        return Err(super::vector::dimension_mismatch(
+            index.dim(),
+            query_vector.len(),
+        ));
+    }
+    if index.is_empty() {
+        return Ok(Vec::new());
+    }
+    let searched = match filter_bitmap {
+        Some(surrogate_bm) => {
+            let local_bm = surrogate_bitmap_to_global_ids(index, surrogate_bm);
+            let mut buf = Vec::with_capacity(local_bm.serialized_size());
+            local_bm
+                .serialize_into(&mut buf)
+                .map_err(|e| ErrorCode::Internal {
+                    detail: format!("vector search filter bitmap serialization: {e}"),
+                })?;
+            index.search_with_bitmap_bytes(query_vector, fetch_k, ef, &buf)
+        }
+        None => index.search(query_vector, fetch_k, ef),
+    };
+    searched.map_err(|e| ErrorCode::from(crate::Error::from(e)))
+}
+
 /// Encode search hits and return response.
 pub(super) fn encode_hits_response(
     core: &CoreLoop,
@@ -174,7 +213,8 @@ mod tests {
         let mut coll = VectorCollection::new(1, HnswParams::default());
         for i in 0..n {
             let surrogate = Surrogate(i as u32 + 1);
-            coll.insert_with_surrogate(vec![i as f32], surrogate);
+            coll.insert_with_surrogate(vec![i as f32], surrogate)
+                .unwrap();
         }
         coll
     }
@@ -256,7 +296,7 @@ mod tests {
         local_bm.serialize_into(&mut buf).unwrap();
 
         // Search for nearest neighbours — all results must be even surrogates.
-        let results = coll.search_with_bitmap_bytes(&[10.0], 5, 64, &buf);
+        let results = coll.search_with_bitmap_bytes(&[10.0], 5, 64, &buf).unwrap();
 
         assert!(!results.is_empty(), "expected at least one result");
         for r in &results {
@@ -307,7 +347,7 @@ mod tests {
         let mut buf = Vec::new();
         local_bm.serialize_into(&mut buf).unwrap();
 
-        let results = coll.search_with_bitmap_bytes(&[5.0], 5, 64, &buf);
+        let results = coll.search_with_bitmap_bytes(&[5.0], 5, 64, &buf).unwrap();
         assert!(results.is_empty(), "empty bitmap should yield no results");
     }
 }
