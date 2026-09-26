@@ -57,14 +57,7 @@ impl CoreLoop {
             &filters,
         ) {
             Ok(ids) => ids,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => return self.response_error(task, e),
         };
 
         let matching_set: HashSet<nodedb_types::StorageKey> =
@@ -79,14 +72,17 @@ impl CoreLoop {
         };
 
         for field in fields {
-            let counts = self.count_facet_field(
+            let counts = match self.count_facet_field(
                 task.request.database_id.as_u64(),
                 tid,
                 collection,
                 field,
                 &matching_set,
                 &matching_ids,
-            );
+            ) {
+                Ok(counts) => counts,
+                Err(e) => return self.response_error(task, e),
+            };
             let facet_values: Vec<serde_json::Value> = counts
                 .into_iter()
                 .take(effective_limit)
@@ -135,7 +131,8 @@ impl CoreLoop {
     /// Count distinct values for a single facet field, filtered to matching documents.
     ///
     /// Tries index-backed counting first (O(index_entries)), falls back to
-    /// document-scan counting (O(matching_docs)).
+    /// document-scan counting (O(matching_docs)). A storage read or value
+    /// transcoding error fails the count: a partial count is a wrong count.
     fn count_facet_field(
         &self,
         database_id: u64,
@@ -144,17 +141,17 @@ impl CoreLoop {
         field: &str,
         matching_set: &HashSet<nodedb_types::StorageKey>,
         matching_ids: &[nodedb_types::StorageKey],
-    ) -> Vec<(String, usize)> {
+    ) -> crate::Result<Vec<(String, usize)>> {
         // Fast path: index-backed counting with filtered doc set.
-        if let Ok(groups) = self.sparse.scan_index_groups_filtered(
+        let groups = self.sparse.scan_index_groups_filtered(
             database_id,
             tid,
             collection,
             field,
             matching_set,
-        ) && !groups.is_empty()
-        {
-            return groups;
+        )?;
+        if !groups.is_empty() {
+            return Ok(groups);
         }
 
         // Fallback: scan matching documents, extract field from msgpack, count.
@@ -172,29 +169,33 @@ impl CoreLoop {
         );
         let mut counts: HashMap<String, usize> = HashMap::new();
         for key in matching_ids {
-            if let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, key) {
+            if let Some(bytes) = self.sparse.get(database_id, tid, collection, key)? {
                 let mp = crate::data::executor::scan_normalize::sparse_body_to_msgpack(
                     &bytes,
                     body_format.as_format_ref(),
                 );
                 if let Some((start, end)) = nodedb_query::msgpack_scan::extract_field(&mp, 0, field)
                 {
-                    let value_str = if let Some(s) =
-                        nodedb_query::msgpack_scan::read_str(&mp, start)
-                    {
-                        s.to_string()
-                    } else if let Some(i) = nodedb_query::msgpack_scan::read_i64(&mp, start) {
-                        i.to_string()
-                    } else if let Some(f) = nodedb_query::msgpack_scan::read_f64(&mp, start) {
-                        f.to_string()
-                    } else if let Some(b) = nodedb_query::msgpack_scan::read_bool(&mp, start) {
-                        b.to_string()
-                    } else if nodedb_query::msgpack_scan::read_null(&mp, start) {
-                        continue;
-                    } else {
-                        // Complex value — stringify via transcoder.
-                        nodedb_types::msgpack_to_json_string(&mp[start..end]).unwrap_or_default()
-                    };
+                    let value_str =
+                        if let Some(s) = nodedb_query::msgpack_scan::read_str(&mp, start) {
+                            s.to_string()
+                        } else if let Some(i) = nodedb_query::msgpack_scan::read_i64(&mp, start) {
+                            i.to_string()
+                        } else if let Some(f) = nodedb_query::msgpack_scan::read_f64(&mp, start) {
+                            f.to_string()
+                        } else if let Some(b) = nodedb_query::msgpack_scan::read_bool(&mp, start) {
+                            b.to_string()
+                        } else if nodedb_query::msgpack_scan::read_null(&mp, start) {
+                            continue;
+                        } else {
+                            // Complex value — stringify via transcoder.
+                            nodedb_types::msgpack_to_json_string(&mp[start..end]).map_err(|e| {
+                                crate::Error::Serialization {
+                                    format: "msgpack".to_string(),
+                                    detail: format!("facet value of '{field}' in {key}: {e}"),
+                                }
+                            })?
+                        };
                     *counts.entry(value_str).or_default() += 1;
                 }
             }
@@ -202,7 +203,7 @@ impl CoreLoop {
 
         let mut result: Vec<(String, usize)> = counts.into_iter().collect();
         result.sort_by_key(|r| std::cmp::Reverse(r.1)); // Count descending.
-        result
+        Ok(result)
     }
 }
 

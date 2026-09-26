@@ -109,21 +109,21 @@ impl CoreLoop {
         };
 
         // 2. Text search (no surrogate prefilter for the text leg of hybrid search).
-        let text_results = self
-            .inverted
-            .search(
-                task.request.database_id.as_u64(),
-                tenant_id,
-                collection,
-                FtsSearchParams {
-                    query: query_text,
-                    top_k: fetch_k,
-                    fuzzy_enabled: fuzzy,
-                    mode: QueryMode::And,
-                    prefilter: None,
-                },
-            )
-            .unwrap_or_default();
+        let text_results = match self.inverted.search(
+            task.request.database_id.as_u64(),
+            tenant_id,
+            collection,
+            FtsSearchParams {
+                query: query_text,
+                top_k: fetch_k,
+                fuzzy_enabled: fuzzy,
+                mode: QueryMode::And,
+                prefilter: None,
+            },
+        ) {
+            Ok(results) => results,
+            Err(e) => return self.response_error(task, e),
+        };
 
         // 3. Build ranked lists for weighted RRF.
         // Higher weight → lower k → steeper rank discount → more influence.

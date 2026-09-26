@@ -364,3 +364,31 @@ async fn rrf_score_triple_with_two_k_constants_is_rejected() {
         "inconsistent arity (3 ranks + 2 k values) must return a typed error"
     );
 }
+
+// ── A failing text leg fails the three-source search ────────────────────────
+
+/// A NOT-only text query is refused by the FTS engine. The three-source
+/// search returns that error instead of fusing the vector and graph legs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rrf_score_triple_returns_the_text_leg_error() {
+    let server = TestServer::start().await;
+    create_triple_collection(&server, "t3_text_err").await;
+
+    let err = server
+        .query_rows(
+            "SELECT id, \
+             rrf_score(\
+               vector_distance(embedding, ARRAY[1.0, 0.0, 0.0]), \
+               bm25_score(body, 'NOT alpha'), \
+               graph_score(id, 'n1', depth => 1, label => 'hop') \
+             ) AS score \
+             FROM t3_text_err \
+             LIMIT 10",
+        )
+        .await
+        .expect_err("a three-source search whose text leg fails must fail");
+    assert!(
+        err.contains("at least one positive term"),
+        "the error must be the text leg's own error; got: {err}"
+    );
+}

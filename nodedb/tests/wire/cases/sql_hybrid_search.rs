@@ -272,3 +272,30 @@ async fn hybrid_search_id_is_user_primary_key_not_surrogate_hex() {
         );
     }
 }
+
+// ── A failing text leg fails the hybrid search ──────────────────────────────
+
+/// A NOT-only text query is refused by the FTS engine. The hybrid search
+/// returns that error instead of fusing the vector leg alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_search_returns_the_text_leg_error() {
+    let server = TestServer::start().await;
+    create_hybrid_collection(&server, "hs_text_err").await;
+
+    let err = server
+        .query_rows(
+            "SELECT id, \
+                    rrf_score(\
+                      vector_distance(embedding, ARRAY[0.1, 0.2, 0.3, 0.4]), \
+                      bm25_score(content, 'NOT consensus')\
+                    ) AS score \
+             FROM hs_text_err \
+             ORDER BY score DESC LIMIT 5",
+        )
+        .await
+        .expect_err("a hybrid search whose text leg fails must fail");
+    assert!(
+        err.contains("at least one positive term"),
+        "the error must be the text leg's own error; got: {err}"
+    );
+}

@@ -90,21 +90,21 @@ impl CoreLoop {
 
         // BM25 text search.
         let fetch_k = final_top_k.saturating_mul(3).max(20);
-        let text_results = self
-            .inverted
-            .search(
-                task.request.database_id.as_u64(),
-                tid_typed,
-                collection,
-                FtsSearchParams {
-                    query: bm25_query,
-                    top_k: fetch_k,
-                    fuzzy_enabled: true,
-                    mode: QueryMode::And,
-                    prefilter: None,
-                },
-            )
-            .unwrap_or_default();
+        let text_results = match self.inverted.search(
+            task.request.database_id.as_u64(),
+            tid_typed,
+            collection,
+            FtsSearchParams {
+                query: bm25_query,
+                top_k: fetch_k,
+                fuzzy_enabled: true,
+                mode: QueryMode::And,
+                prefilter: None,
+            },
+        ) {
+            Ok(results) => results,
+            Err(e) => return self.response_error(task, e),
+        };
 
         // Graph expansion seeded directly by the vector hits' surrogates.
         let expansion = self.expand_graph(GraphExpansionParams {

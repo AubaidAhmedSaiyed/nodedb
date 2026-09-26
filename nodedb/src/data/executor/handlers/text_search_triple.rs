@@ -116,21 +116,21 @@ impl CoreLoop {
         };
 
         // 2. BM25 text search.
-        let text_results = self
-            .inverted
-            .search(
-                task.request.database_id.as_u64(),
-                tenant_id,
-                collection,
-                FtsSearchParams {
-                    query: query_text,
-                    top_k: fetch_k,
-                    fuzzy_enabled: fuzzy,
-                    mode: QueryMode::And,
-                    prefilter: None,
-                },
-            )
-            .unwrap_or_default();
+        let text_results = match self.inverted.search(
+            task.request.database_id.as_u64(),
+            tenant_id,
+            collection,
+            FtsSearchParams {
+                query: query_text,
+                top_k: fetch_k,
+                fuzzy_enabled: fuzzy,
+                mode: QueryMode::And,
+                prefilter: None,
+            },
+        ) {
+            Ok(results) => results,
+            Err(e) => return self.response_error(task, e),
+        };
 
         // 3. Graph BFS from seed node.
         // The seed is named by the query itself, so it resolves to a surrogate
