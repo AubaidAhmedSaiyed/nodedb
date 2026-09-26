@@ -110,8 +110,7 @@ impl CoreLoop {
             sparse,
             crdt_engines: HashMap::new(),
             vector_collections: HashMap::new(),
-            build_tx: None,
-            build_rx: None,
+            vector_builds: super::vector_build_queue::VectorBuildQueue::spawn(core_id),
             vector_params: HashMap::new(),
             declared_dims: HashMap::new(),
             edge_store,
@@ -159,6 +158,7 @@ impl CoreLoop {
             query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
             graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
             ts_tuning: nodedb_types::config::tuning::TimeseriesToning::default(),
+            vector_tuning: nodedb_types::config::tuning::VectorTuning::default(),
             kv_engine: crate::engine::kv::KvEngine::from_tuning(
                 crate::engine::kv::current_ms(),
                 &nodedb_types::config::tuning::KvTuning::default(),

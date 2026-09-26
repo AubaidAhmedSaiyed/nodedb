@@ -388,7 +388,7 @@ async fn rrf_score_triple_returns_the_text_leg_error() {
         .await
         .expect_err("a three-source search whose text leg fails must fail");
     assert!(
-        err.contains("at least one positive term"),
-        "the error must be the text leg's own error; got: {err}"
+        err.contains("42601") && err.contains("at least one positive term"),
+        "the error must be the text leg's own error, as syntax_error; got: {err}"
     );
 }

@@ -13,7 +13,9 @@
 //!      signature of a rebuild that took an exclusive lock instead of
 //!      running concurrently
 //!   5. exactly one `atomic_cutover` tracing event was emitted by the
-//!      `nodedb::reindex` target during the rebuild phase
+//!      `nodedb::reindex` target during the rebuild phase. REINDEX rebuilds
+//!      each sealed segment and swaps it in on its own, one event per
+//!      segment, so the test force-seals its rows into one segment first.
 //!
 //! Why no p99 ratio: this test asserted `rebuild_p99 <= 2.0 * baseline_p99`,
 //! and the dataset had been shrunk to the point where the rebuild finished
@@ -127,6 +129,21 @@ async fn nn_query(server: &TestServer, query_vec: &[f32]) -> Duration {
     t.elapsed()
 }
 
+/// One numeric property of `SHOW VECTOR INDEX status ON vecs10k.emb`.
+async fn vector_index_status(server: &TestServer, property: &str) -> u64 {
+    let rows = server
+        .query_rows("SHOW VECTOR INDEX status ON vecs10k.emb")
+        .await
+        .expect("SHOW VECTOR INDEX failed");
+    let row = rows
+        .iter()
+        .find(|r| r[0] == property)
+        .unwrap_or_else(|| panic!("SHOW VECTOR INDEX must report {property}: {rows:?}"));
+    row[1]
+        .parse()
+        .unwrap_or_else(|e| panic!("{property} must be a number, got {:?}: {e}", row[1]))
+}
+
 /// Compute the p99 of a slice of `Duration` values (must be non-empty).
 fn p99(mut samples: Vec<Duration>) -> Duration {
     assert!(!samples.is_empty(), "p99: empty sample set");
@@ -232,6 +249,28 @@ async fn reindex_vector_concurrent_p99() {
         server.exec(&sql).await.unwrap();
     }
 
+    // ── Seal: REINDEX rebuilds sealed segments only ─────────────────────────
+    // The rows sit in the growing segment, far below the default seal
+    // threshold. Force-seal them into one segment and wait for its first
+    // build, so REINDEX has exactly one sealed segment to rebuild.
+    server
+        .exec("ALTER VECTOR INDEX ON vecs10k.emb SEAL")
+        .await
+        .unwrap();
+    let seal_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let sealed = vector_index_status(&server, "sealed_segments").await;
+        let building = vector_index_status(&server, "building_segments").await;
+        if sealed == 1 && building == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < seal_deadline,
+            "the sealed segment did not build: sealed={sealed} building={building}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     // ── Baseline phase: 200 sequential queries, record latencies ────────────
     let mut baseline_latencies: Vec<Duration> = Vec::with_capacity(BASELINE_QUERIES);
     let mut qseed: u64 = 0xCAFE_F00D_ABCD_EF01;
@@ -320,8 +359,9 @@ async fn reindex_vector_concurrent_p99() {
     });
 
     // Issue REINDEX CONCURRENTLY on the main client.
-    // This returns as soon as the background thread is started; the atomic
-    // cutover is applied on a later tick() — so we must wait for it.
+    // This returns once the segment's rebuild is queued on the core's builder
+    // thread. The core swaps the rebuilt segment in on a later tick, so the
+    // test waits for the cutover event.
     let rebuild_started = Instant::now();
     server.exec("REINDEX CONCURRENTLY vecs10k").await.unwrap();
 

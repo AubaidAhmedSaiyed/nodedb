@@ -94,6 +94,9 @@ pub async fn handle_show_vector_index(
             format!("{:.1}", stats.disk_bytes as f64 / (1024.0 * 1024.0)),
         ),
         ("build_in_progress", stats.build_in_progress.to_string()),
+        ("builds_queued", stats.builds_queued.to_string()),
+        ("builds_completed", stats.builds_completed.to_string()),
+        ("builds_failed", stats.builds_failed.to_string()),
         ("hnsw_m", stats.hnsw_m.to_string()),
         ("hnsw_m0", stats.hnsw_m0.to_string()),
         (

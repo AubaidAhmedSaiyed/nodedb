@@ -19,6 +19,7 @@ mod recovery;
 mod retention;
 mod shared;
 mod vector;
+mod vector_build;
 
 pub use catalog::{
     catalog_apply_orphan_row, collection_purge_row_missing, consumer_group_offsets_retained,
@@ -46,3 +47,7 @@ pub use recovery::{
 pub use retention::retention_autowire_orphaned;
 pub use shared::entry_kind;
 pub use vector::vector_index_not_applied;
+pub use vector_build::{
+    VectorBuildTarget, vector_build_failed, vector_builder_disconnected,
+    vector_builder_spawn_failed, vector_rebuild_unreadable,
+};

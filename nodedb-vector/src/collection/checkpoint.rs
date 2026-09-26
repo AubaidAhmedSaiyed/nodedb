@@ -24,7 +24,7 @@ use nodedb_types::{Surrogate, VectorQuantization};
 use serde::{Deserialize, Serialize};
 
 use crate::collection::payload_index::PayloadIndexSetSnapshot;
-use crate::collection::segment::{DEFAULT_SEAL_THRESHOLD, SealedSegment};
+use crate::collection::segment::{BuildingSegment, DEFAULT_SEAL_THRESHOLD, SealedSegment};
 use crate::collection::tier::StorageTier;
 use crate::distance::DistanceMetric;
 use crate::error::VectorError;
@@ -378,33 +378,29 @@ impl VectorCollection {
             });
         }
 
+        // A segment sealed but not yet built comes back as a building
+        // segment, searched by brute force; the owning core queues its build.
+        let mut next_segment_id = (sealed.len() + 1) as u32;
+        let mut building = Vec::with_capacity(snap.building_segments.len());
         for bs in &snap.building_segments {
-            let mut index = HnswIndex::new(snap.dim, params.clone());
-            for v in &bs.vectors {
-                index.insert(v.clone()).map_err(|e| {
-                    VectorError::CheckpointDeserializationError {
-                        detail: format!("building-segment replay insert: {e}"),
-                    }
+            let mut flat = FlatIndex::new(snap.dim, metric);
+            for (i, v) in bs.vectors.iter().enumerate() {
+                let inserted = if bs.deleted.get(i).copied().unwrap_or(false) {
+                    flat.insert_tombstoned(v.clone())
+                } else {
+                    flat.insert(v.clone())
+                };
+                inserted.map_err(|e| VectorError::CheckpointDeserializationError {
+                    detail: format!("building-segment replay insert: {e}"),
                 })?;
             }
-            // Replay building-segment tombstones onto the HNSW index.
-            for (i, &dead) in bs.deleted.iter().enumerate() {
-                if dead {
-                    index.delete(i as u32);
-                }
-            }
-            let sq8 = VectorCollection::build_sq8_for_index(&index);
-            sealed.push(SealedSegment {
-                index,
+            building.push(BuildingSegment {
+                flat,
                 base_id: bs.base_id,
-                sq8,
-                pq: None,
-                tier: StorageTier::L0Ram,
-                mmap_vectors: None,
+                segment_id: next_segment_id,
             });
+            next_segment_id += 1;
         }
-
-        let next_segment_id = (sealed.len() + 1) as u32;
 
         let index_config = crate::index_config::IndexConfig {
             hnsw: params.clone(),
@@ -419,7 +415,7 @@ impl VectorCollection {
             growing,
             growing_base_id: snap.growing_base_id,
             sealed,
-            building: Vec::new(),
+            building,
             params,
             next_id: snap.next_id,
             next_segment_id,
@@ -458,6 +454,8 @@ impl VectorCollection {
             arena_index: None,
             checkpoint_wal_lsn: snap.checkpoint_wal_lsn,
             applied_wal_lsn: snap.checkpoint_wal_lsn,
+            builds_completed: 0,
+            builds_failed: 0,
         })
     }
 }

@@ -27,6 +27,7 @@ mod state;
 mod test_governor;
 mod tick;
 mod ts_declared_schema;
+pub(in crate::data::executor) mod vector_build_queue;
 mod vector_index_rebuild;
 mod vector_index_seed;
 pub(in crate::data::executor) mod write_index;

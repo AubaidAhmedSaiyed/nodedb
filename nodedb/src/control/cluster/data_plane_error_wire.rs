@@ -180,6 +180,7 @@ impl From<ErrorCode> for DataPlaneErrorCode {
             ErrorCode::DataException { detail } => Self::DataException { detail },
             ErrorCode::DispatchCapacity { reason } => Self::DispatchCapacity { reason },
             ErrorCode::ExpiredBeforeExecution => Self::ExpiredBeforeExecution,
+            ErrorCode::BadRequest { detail } => Self::BadRequest { detail },
         }
     }
 }
@@ -309,6 +310,7 @@ impl From<DataPlaneErrorCode> for ErrorCode {
             DataPlaneErrorCode::DataException { detail } => Self::DataException { detail },
             DataPlaneErrorCode::DispatchCapacity { reason } => Self::DispatchCapacity { reason },
             DataPlaneErrorCode::ExpiredBeforeExecution => Self::ExpiredBeforeExecution,
+            DataPlaneErrorCode::BadRequest { detail } => Self::BadRequest { detail },
         }
     }
 }

@@ -63,6 +63,16 @@ pub struct SystemMetrics {
     pub vector_collections: AtomicU64,
     pub vector_vectors_stored: AtomicU64,
     pub vector_query_seconds: AtomicHistogram,
+    /// HNSW builds sent to a builder thread.
+    pub vector_builds_started: AtomicU64,
+    /// HNSW builds installed on their core.
+    pub vector_builds_completed: AtomicU64,
+    /// HNSW builds that failed or could not be read.
+    pub vector_builds_failed: AtomicU64,
+    /// Times a core found its builder queue full and kept the job waiting.
+    pub vector_builds_deferred: AtomicU64,
+    /// HNSW builds waiting for or running on a builder, across all cores.
+    pub vector_build_pending: AtomicU64,
 
     pub graph_traversals: AtomicU64,
     pub graph_nodes: AtomicU64,

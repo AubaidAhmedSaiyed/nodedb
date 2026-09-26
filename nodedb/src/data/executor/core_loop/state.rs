@@ -84,11 +84,9 @@ pub struct CoreLoop {
     pub(in crate::data::executor) vector_collections:
         HashMap<(DatabaseId, TenantId, String), VectorCollection>,
 
-    /// Background HNSW builder: send requests.
-    pub(in crate::data::executor) build_tx: Option<crate::engine::vector::builder::BuildSender>,
-    /// Background HNSW builder: receive completed builds.
-    pub(in crate::data::executor) build_rx:
-        Option<crate::engine::vector::builder::CompleteReceiver>,
+    /// This core's HNSW builder thread, its bounded queues and the backlog
+    /// of builds waiting for room.
+    pub(in crate::data::executor) vector_builds: super::vector_build_queue::VectorBuildQueue,
 
     /// Per-collection HNSW parameters set via DDL. If a collection has no
     /// entry here, `HnswParams::default()` is used on first insert.
@@ -347,6 +345,9 @@ pub struct CoreLoop {
     /// Read when a collection's `ColumnarMemtable` is created and by the ingest
     /// path's record-boundary admission gate.
     pub(in crate::data::executor) ts_tuning: nodedb_types::config::tuning::TimeseriesToning,
+    /// Vector engine tuning: the seal threshold new and restored collections
+    /// take, and the PQ / IVF defaults an index declaration leaves out.
+    pub(in crate::data::executor) vector_tuning: nodedb_types::config::tuning::VectorTuning,
 
     /// Per-core KV engine: hash tables + expiry wheel. `!Send`.
     pub(in crate::data::executor) kv_engine: crate::engine::kv::KvEngine,

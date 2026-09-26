@@ -87,7 +87,7 @@ impl VectorCollection {
     }
 
     /// Train a PQ codec from a built HNSW index's live vectors, tracking
-    /// codebook allocations against `memory`.
+    /// codebook allocations against `memory`, and encode every node.
     pub fn build_pq_for_index(
         index: &HnswIndex,
         pq_m: usize,
@@ -121,7 +121,19 @@ impl VectorCollection {
                 return None;
             }
         };
-        let codes = codec.encode_batch(&refs_slices).ok()?;
+        // One code per local node id, soft-deleted nodes included: search
+        // reads the code of node `id` at `id * pq_m`.
+        let zero = vec![0.0f32; dim];
+        let all: Vec<&[f32]> = (0..n as u32)
+            .map(|i| index.get_vector(i).unwrap_or(zero.as_slice()))
+            .collect();
+        let codes = match codec.encode_batch(&all) {
+            Ok(codes) => codes,
+            Err(e) => {
+                tracing::warn!(error = %e, dim, pq_m, "PQ encoding refused; segment stays unquantized");
+                return None;
+            }
+        };
         Some((codec, codes))
     }
 }

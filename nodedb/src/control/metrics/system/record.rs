@@ -172,6 +172,34 @@ impl SystemMetrics {
         self.vector_query_seconds.observe(latency_us);
     }
 
+    pub fn record_vector_build_started(&self) {
+        self.vector_builds_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_vector_build_completed(&self) {
+        self.vector_builds_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_vector_build_failed(&self) {
+        self.vector_builds_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_vector_build_deferred(&self) {
+        self.vector_builds_deferred.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Move the cross-core pending-build gauge from one core's previous
+    /// count `before` to its current count `after`.
+    pub fn move_vector_build_pending(&self, before: u64, after: u64) {
+        if after > before {
+            self.vector_build_pending
+                .fetch_add(after - before, Ordering::Relaxed);
+        } else if before > after {
+            self.vector_build_pending
+                .fetch_sub(before - after, Ordering::Relaxed);
+        }
+    }
+
     pub fn update_vector_stats(&self, collections: u64, vectors: u64) {
         self.vector_collections
             .store(collections, Ordering::Relaxed);

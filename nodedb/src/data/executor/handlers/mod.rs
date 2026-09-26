@@ -82,6 +82,7 @@ pub(super) mod update_from_join_types;
 pub(super) mod update_from_join_write;
 pub mod upsert;
 pub mod vector;
+pub mod vector_build;
 pub mod vector_direct_delete;
 pub mod vector_direct_resolve;
 pub mod vector_direct_row;

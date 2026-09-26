@@ -107,6 +107,12 @@ impl CoreLoop {
     /// captures these limits when it is CREATED and keeps them for its whole
     /// life, so a memtable built ahead of this call would silently keep the
     /// defaults.
+    /// Apply vector engine tuning. Must land before the checkpoint restore:
+    /// restored collections take its seal threshold.
+    pub fn set_vector_tuning(&mut self, tuning: nodedb_types::config::tuning::VectorTuning) {
+        self.vector_tuning = tuning;
+    }
+
     pub fn set_timeseries_tuning(
         &mut self,
         tuning: nodedb_types::config::tuning::TimeseriesToning,

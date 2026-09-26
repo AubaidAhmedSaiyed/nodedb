@@ -167,6 +167,10 @@ pub enum ErrorCode {
     /// answers for a task it stopped part way. Surfaces as the same
     /// query-cancelled error.
     ExpiredBeforeExecution,
+    /// The request itself is malformed: an FTS query with no positive term,
+    /// a value the target cannot hold. The same verdict the Control Plane
+    /// gives `crate::Error::BadRequest`: SQLSTATE `42601` (syntax_error).
+    BadRequest { detail: String },
 }
 
 /// An expression evaluation failure, as the Data Plane reports it.
@@ -198,11 +202,14 @@ impl From<crate::Error> for ErrorCode {
                 Self::RejectedPrevalidation { reason }
             }
             crate::Error::RetryableRefusal { reason } => Self::RetryableRefusal { reason },
-            crate::Error::CollectionNotFound { .. } | crate::Error::DocumentNotFound { .. } => {
-                Self::NotFound
-            }
+            crate::Error::CollectionNotFound { .. }
+            | crate::Error::CollectionDeactivated { .. }
+            | crate::Error::DocumentNotFound { .. } => Self::NotFound,
             crate::Error::RejectedAuthz { resource, .. } => Self::RejectedAuthz { resource },
-            crate::Error::ConflictRetry { .. } => Self::ConflictRetry,
+            // The Control Plane gives all three `40001` (serialization_failure).
+            crate::Error::ConflictRetry { .. }
+            | crate::Error::CalvinSerializationConflict
+            | crate::Error::SourceFrozen { .. } => Self::ConflictRetry,
             crate::Error::FanOutExceeded { .. } => Self::FanOutExceeded,
             crate::Error::MemoryExhausted { .. } => Self::ResourcesExhausted,
             crate::Error::Backpressure { .. } => Self::ResourcesExhausted,
@@ -281,6 +288,15 @@ impl From<crate::Error> for ErrorCode {
             crate::Error::DivisionByZero => Self::DivisionByZero,
             crate::Error::UndefinedFunction { name } => Self::UndefinedFunction { name },
             crate::Error::DataException { detail } => Self::DataException { detail },
+            // `42601` (syntax_error), as the Control Plane gives both.
+            crate::Error::BadRequest { detail } | crate::Error::PlanError { detail } => {
+                Self::BadRequest { detail }
+            }
+            // `0A000` (feature_not_supported), as the Control Plane gives both.
+            crate::Error::FeatureNotSupported { detail } => Self::Unsupported { detail },
+            unsupported @ crate::Error::CrossCollectionNotColocated { .. } => Self::Unsupported {
+                detail: unsupported.to_string(),
+            },
             crate::Error::UndefinedColumn { column } => Self::UndefinedColumn { column },
             // Same condition an undefined column reports at plan time, raised
             // here by the strict encoder for a transport the planner never

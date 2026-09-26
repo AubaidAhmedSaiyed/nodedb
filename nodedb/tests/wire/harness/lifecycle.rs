@@ -115,6 +115,36 @@ impl TestServer {
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
+    /// Spawn a single-core NodeDB server with a lowered vector seal threshold,
+    /// so a few hundred inserts seal segments and queue HNSW builds.
+    pub async fn start_with_vector_seal_threshold(vectors: usize) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spawned = process::spawn(
+            dir.path(),
+            AuthMode::Trust,
+            TuningOverrides::vector_seal_threshold(vectors),
+            1,
+        );
+        Self::connect_and_build(spawned, dir, AuthMode::Trust).await
+    }
+
+    /// Reopen `dir` with the lowered vector seal threshold a server started
+    /// by [`Self::start_with_vector_seal_threshold`] used.
+    pub async fn open_on_path_with_vector_seal_threshold(
+        dir: TestDataDir,
+        vectors: usize,
+    ) -> (Self, TestDataDir) {
+        let spawned = process::spawn(
+            dir.path(),
+            AuthMode::Trust,
+            TuningOverrides::vector_seal_threshold(vectors),
+            1,
+        );
+        let placeholder = tempfile::tempdir().expect("placeholder tempdir");
+        let server = Self::connect_and_build(spawned, placeholder, AuthMode::Trust).await;
+        (server, dir)
+    }
+
     /// Spawn a single-core NodeDB server with `single_node_calvin = false`:
     /// no cluster topology, so the planner emits the single-node plan forms
     /// (`ArrayOp::{Put, Delete, Slice, ...}`) rather than the `ClusterArrayOp`

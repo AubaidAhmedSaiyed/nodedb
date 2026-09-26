@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod budget;
+pub mod build;
 pub mod checkpoint;
 pub mod codec_build;
 pub mod codec_dispatch;
@@ -21,6 +22,6 @@ pub use lifecycle::VectorCollection;
 pub use payload_index::{FilterPredicate, PayloadIndex, PayloadIndexKind, PayloadIndexSet};
 pub use rollback::VectorWriteMark;
 pub use segment::{
-    BuildComplete, BuildRequest, BuildingSegment, DEFAULT_SEAL_THRESHOLD, SealedSegment,
+    BuildComplete, BuildKind, BuildRequest, BuildingSegment, DEFAULT_SEAL_THRESHOLD, SealedSegment,
 };
 pub use tier::StorageTier;

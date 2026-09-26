@@ -47,10 +47,11 @@ pub(super) fn replay_wal_and_rebuild_indexes(
     // checkpoint + WAL replay above already restored.
     core.rebuild_vector_indexes_from_store(vector_index_param_seed);
 
-    // Replay applies inserts without settling. An IVF-PQ collection whose
-    // restored buffer holds its training threshold trains here, so search
-    // uses IVF-PQ again from the first request.
-    core.train_ready_ivf_collections();
+    // Replay applies inserts without settling. Full growing segments seal,
+    // IVF-PQ buffers at their threshold train, and every segment sealed but
+    // not yet built queues on the builder thread, so search uses the built
+    // indexes again without waiting for a write.
+    core.settle_vector_collections_after_boot();
 
     // The in-memory R-tree spatial index needs no separate backstop here.
     // A document collection's geometry is indexed by the same

@@ -132,7 +132,10 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         // * `DuplicateWrite` — the idempotency gate fired because the write
         //   ALREADY applied under the original request; nothing to undo, and
         //   the duplicate record replays to the same state.
+        // * `BadRequest` — raised by many engine paths, some of them after a
+        //   multi-row plan already wrote rows.
         ErrorCode::DeadlineExceeded
+        | ErrorCode::BadRequest { .. }
         | ErrorCode::RollbackFailed { .. }
         | ErrorCode::ResourcesExhausted
         | ErrorCode::Internal { .. }

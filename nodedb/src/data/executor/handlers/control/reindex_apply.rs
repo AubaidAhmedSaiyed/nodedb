@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Background-thread rebuild functions and Data-Plane cutover appliers for
-//! concurrent index rebuild. See `reindex.rs` for the dispatch/poll surface.
+//! concurrent FTS and CSR rebuild. See `reindex.rs` for the dispatch/poll
+//! surface. HNSW rebuilds go through the core's HNSW builder thread.
 //!
 //! All functions in this module either run on a plain OS thread (operating on
 //! pure `Send` data) or run on the owning Data Plane core during cutover. They
@@ -15,8 +16,6 @@ use crate::types::TenantId;
 // ── Background-thread output types (all Send) ────────────────────────────────
 
 pub(super) enum RebuildOutput {
-    /// Serialized rebuilt HNSW index bytes.
-    Hnsw { bytes: Vec<u8> },
     /// Serialized rebuilt CSR bytes.
     Csr { bytes: Vec<u8> },
     /// Compacted FTS data ready for write-back.
@@ -34,28 +33,6 @@ pub(super) struct FtsRebuild {
 }
 
 // ── Background thread rebuild functions (pure Send, no !Send types) ──────────
-
-pub(super) fn rebuild_hnsw_thread(
-    vectors: Vec<Vec<f32>>,
-    dim: usize,
-    params: nodedb_vector::HnswParams,
-) -> crate::Result<RebuildOutput> {
-    let mut index = nodedb_vector::HnswIndex::new(dim, params);
-    for v in vectors {
-        index.insert(v).map_err(|e| crate::Error::Storage {
-            engine: "vector".to_string(),
-            detail: format!("HNSW insert: {e}"),
-        })?;
-    }
-    Ok(RebuildOutput::Hnsw {
-        bytes: index
-            .checkpoint_to_bytes()
-            .map_err(|e| crate::Error::Storage {
-                engine: "vector".to_string(),
-                detail: format!("HNSW checkpoint encode: {e}"),
-            })?,
-    })
-}
 
 pub(super) fn rebuild_fts_thread(input: FtsRebuild) -> crate::Result<RebuildOutput> {
     // Compact: deduplicate posting entries by surrogate, keeping highest TF.
@@ -110,58 +87,6 @@ pub(super) fn rebuild_csr_thread(
 }
 
 // ── Cutover: apply rebuilt state to Data Plane in-memory structures ───────────
-
-pub(super) fn apply_hnsw(
-    core: &mut CoreLoop,
-    database_id: &nodedb_types::DatabaseId,
-    tenant_id: &TenantId,
-    collection_key: &str,
-    bytes: Vec<u8>,
-) {
-    use nodedb_vector::HnswIndex;
-    use nodedb_vector::collection::segment::SealedSegment;
-    use nodedb_vector::collection::tier::StorageTier;
-
-    let index = match HnswIndex::from_checkpoint(&bytes) {
-        Ok(Some(idx)) => idx,
-        Ok(None) => {
-            warn!(
-                core = core.core_id,
-                collection = %collection_key,
-                "HNSW rebuild: checkpoint had no magic; skipping cutover"
-            );
-            return;
-        }
-        Err(e) => {
-            error!(
-                core = core.core_id,
-                collection = %collection_key,
-                error = %e,
-                "HNSW rebuild: restore failed; live index unchanged"
-            );
-            return;
-        }
-    };
-
-    let key = (*database_id, *tenant_id, collection_key.to_string());
-    if let Some(coll) = core.vector_collections.get_mut(&key) {
-        let new_seg = SealedSegment {
-            index,
-            base_id: 0,
-            sq8: None,
-            pq: None,
-            tier: StorageTier::L0Ram,
-            mmap_vectors: None,
-        };
-        coll.replace_sealed(vec![new_seg]);
-        info!(
-            target: "nodedb::reindex",
-            core = core.core_id,
-            collection = %collection_key,
-            "atomic_cutover",
-        );
-    }
-}
 
 pub(super) fn apply_fts(
     core: &mut CoreLoop,

@@ -33,9 +33,17 @@ impl CoreLoop {
             field.to_string(),
             storage_key,
         );
-        let vector_id = self.vector_doc_map.remove(&doc_key)?;
+        let recorded = self.vector_doc_map.remove(&doc_key)?;
         let index_key = Self::vector_index_key(database_id, tid, collection, field);
+        // The row's live node is the one bound to its surrogate. A later
+        // insert under the same surrogate (a vector write over this row)
+        // replaces the recorded node, so the recorded id can name a node that
+        // is already soft-deleted while the live one keeps scoring.
+        let mut vector_id = recorded;
         if let Some(coll) = self.vector_collections.get_mut(&index_key) {
+            if let Some(bound) = coll.local_for_surrogate(storage_key.surrogate()) {
+                vector_id = bound;
+            }
             coll.delete(vector_id);
         }
         Some(VectorIndexDelta {

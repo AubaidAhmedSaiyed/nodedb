@@ -95,6 +95,7 @@ impl CoreLoop {
         }
 
         let core_id = self.core_id;
+        let seal_threshold = self.vector_tuning.seal_threshold.max(1);
         match self.vector_collections.entry(index_key) {
             Entry::Occupied(entry) => {
                 let existing = entry.into_mut();
@@ -108,7 +109,13 @@ impl CoreLoop {
                     vector_index_config_for(&self.index_configs, &self.vector_params, entry.key());
                 check_ivf_dim(&config, dim).map_err(ErrorCode::from)?;
                 debug!(core = core_id, dim, index_type = ?config.index_type, "creating vector collection");
-                Ok(entry.insert(VectorCollection::with_index_config(dim, config)))
+                Ok(
+                    entry.insert(VectorCollection::with_seal_threshold_and_config(
+                        dim,
+                        config,
+                        seal_threshold,
+                    )),
+                )
             }
         }
     }

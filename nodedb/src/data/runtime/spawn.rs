@@ -113,6 +113,10 @@ pub fn spawn_core(
             // whole life regardless of what the operator configured.
             core.set_timeseries_tuning(compaction_config.timeseries);
 
+            // 2f. Apply vector tuning, also before the checkpoint restore:
+            // restored collections take its seal threshold.
+            core.set_vector_tuning(compaction_config.vector);
+
             // 3 → 3b → 4. Boot recovery runs in exactly this order and no other:
             // restore the checkpoints, THEN seed the catalog state, THEN replay
             // the WAL. Each checkpoint restores state as of the LSN it was

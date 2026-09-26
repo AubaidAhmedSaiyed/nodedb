@@ -178,11 +178,13 @@ impl CoreLoop {
             }
         }
 
-        // A committed-redo install trains once the whole record landed, so a
-        // rollback finds its inserts in the growing segment.
+        // A full growing segment seals and queues its HNSW build, and an IVF-PQ
+        // collection at its threshold trains. A committed-redo install settles
+        // once the whole record landed, so a rollback finds its inserts in the
+        // growing segment.
         if !self.recording_redo_undo() {
             for delta in &inserts {
-                self.train_ivf_if_ready(&delta.index_key);
+                self.settle_vector_collection(&delta.index_key);
             }
         }
         Ok(inserts)
@@ -469,6 +471,45 @@ mod tests {
             live_count(core, db_id, tid, collection, "title_vec"),
             1,
             "the `title_vec` field must have exactly one live node"
+        );
+    }
+
+    /// A vector write over an indexed row replaces the node the document put
+    /// recorded. Deleting the row must remove the node that replaced it, or
+    /// the deleted row's vector keeps scoring in searches.
+    #[test]
+    fn deleting_a_row_removes_the_node_a_vector_write_bound_to_it() {
+        let mut harness = make_core();
+        let core = &mut harness.core;
+        let (db_id, tid, collection) = (0u64, 1u64, "docs");
+        let surrogate = Surrogate::new(1);
+        let storage_key = crate::engine::document::store::StorageKey::for_surrogate(surrogate);
+        register_bare_field(core, db_id, tid, collection);
+
+        let doc = doc_with_vectors(&[("embedding", &[1.0, 0.0, 0.0])]);
+        core.apply_point_put_vector_indexes(VectorIndexPutParams {
+            database_id: db_id,
+            tid,
+            collection,
+            storage_key,
+            value: &doc,
+            wal_lsn: 0,
+        })
+        .expect("vector indexing must accept this fixture");
+        let key = CoreLoop::vector_index_key(db_id, tid, collection, "embedding");
+        core.vector_collections
+            .get_mut(&key)
+            .expect("collection")
+            .insert_with_surrogate(vec![0.0, 1.0, 0.0], surrogate)
+            .expect("vector write");
+        assert_eq!(live_count(core, db_id, tid, collection, "embedding"), 1);
+
+        let removed = core.remove_document_vector_indexes(db_id, tid, collection, storage_key);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            live_count(core, db_id, tid, collection, "embedding"),
+            0,
+            "the node bound to the deleted row must be gone"
         );
     }
 

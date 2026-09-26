@@ -219,6 +219,8 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             format!("function {name}() does not exist"),
         ),
         ErrorCode::DataException { detail } => ("ERROR", sqlstate::DATA_EXCEPTION, detail.clone()),
+        // The same SQLSTATE the Control Plane gives `crate::Error::BadRequest`.
+        ErrorCode::BadRequest { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
         // Transient: the client retries after a backoff.
         ErrorCode::DispatchCapacity { reason } => {
             ("ERROR", sqlstate::SERVER_OVERLOAD, reason.clone())
@@ -305,5 +307,16 @@ mod tests {
         let (_, state, message) = error_code_to_sqlstate(&code);
         assert_eq!(state, sqlstate::DATA_EXCEPTION);
         assert_eq!(message, "vector dimension mismatch: expected 3, got 2");
+    }
+
+    /// A request the Data Plane rejects as malformed is a syntax error, the
+    /// same SQLSTATE the Control Plane returns for it.
+    #[test]
+    fn a_bad_request_from_the_data_plane_is_a_syntax_error() {
+        let code = ErrorCode::from(crate::Error::BadRequest {
+            detail: "bad text query".into(),
+        });
+        let (_, state, _) = error_code_to_sqlstate(&code);
+        assert_eq!(state, sqlstate::SYNTAX_ERROR);
     }
 }

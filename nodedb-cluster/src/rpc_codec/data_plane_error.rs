@@ -156,6 +156,10 @@ pub enum DataPlaneErrorCode {
         hold: DataPlaneSyncHold,
         applied_seq: u64,
     },
+    /// The request itself is malformed (SQLSTATE `42601`).
+    BadRequest {
+        detail: String,
+    },
 }
 
 /// Wire mirror of `nodedb::bridge::envelope::SyncHold`.

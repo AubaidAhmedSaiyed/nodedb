@@ -13,10 +13,26 @@ use crate::quantize::sq8::Sq8Codec;
 /// 64K vectors × 768 dims × 4 bytes = ~192 MiB per segment.
 pub const DEFAULT_SEAL_THRESHOLD: usize = 65_536;
 
-/// Request to build an HNSW index from sealed vectors (sent to builder thread).
+/// What a finished build replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildKind {
+    /// Promote building segment `segment_id` to sealed.
+    Seal,
+    /// Replace the sealed segment at `base_id`, which held `len` nodes when
+    /// its vectors were read. A segment that no longer holds `len` nodes
+    /// (compaction renumbered it) refuses the result.
+    Rebuild { base_id: u32, len: usize },
+}
+
+/// Request to build an HNSW index (sent to the builder thread).
+///
+/// `vectors` holds one vector per local node id, soft-deleted nodes
+/// included, so the built graph keeps every id. The owning core applies
+/// the tombstones when it installs the result.
 pub struct BuildRequest {
     pub key: String,
     pub segment_id: u32,
+    pub kind: BuildKind,
     pub vectors: Vec<Vec<f32>>,
     pub dim: usize,
     pub params: HnswParams,
@@ -26,7 +42,10 @@ pub struct BuildRequest {
 pub struct BuildComplete {
     pub key: String,
     pub segment_id: u32,
-    pub index: HnswIndex,
+    pub kind: BuildKind,
+    /// The built index, or the error that stopped the build. A failed build
+    /// leaves the segment as it was.
+    pub result: Result<HnswIndex, crate::error::VectorError>,
 }
 
 /// A sealed segment whose HNSW index is being built in background.

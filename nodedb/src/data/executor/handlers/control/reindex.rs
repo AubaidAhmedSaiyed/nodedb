@@ -2,9 +2,11 @@
 
 //! Concurrent index rebuild (REINDEX CONCURRENTLY) for HNSW, FTS LSM, and graph CSR.
 //!
-//! Design: the Data Plane dispatches a `RebuildIndex` op.  For the concurrent
-//! path a background OS thread performs the heavy build work while the owning
-//! core continues to serve reads from the live index.  On each subsequent tick
+//! Design: the Data Plane dispatches a `RebuildIndex` op. HNSW segments are
+//! rebuilt on the core's HNSW builder thread, the same path every graph build
+//! takes (`handlers::vector_build`). For FTS and CSR a background OS thread
+//! performs the heavy build work while the owning core continues to serve
+//! reads from the live index.  On each subsequent tick
 //! the core polls `pending_reindex` for completion via `try_recv`; when the
 //! build succeeds the core performs an in-memory swap and returns the ACK.
 //!
@@ -24,8 +26,7 @@ use std::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::reindex_apply::{
-    FtsRebuild, RebuildOutput, apply_csr, apply_fts, apply_hnsw, rebuild_csr_thread,
-    rebuild_fts_thread, rebuild_hnsw_thread,
+    FtsRebuild, RebuildOutput, apply_csr, apply_fts, rebuild_csr_thread, rebuild_fts_thread,
 };
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -86,9 +87,10 @@ impl CoreLoop {
             .map(|n| n.eq_ignore_ascii_case("csr"))
             .unwrap_or(true);
 
-        // Start the first applicable background rebuild (priority: HNSW > FTS > CSR).
+        // Start the first applicable rebuild (priority: HNSW > FTS > CSR).
         let start_result = if rebuild_hnsw {
-            self.start_hnsw_rebuild(task, tenant_id, &collection_key)
+            self.start_hnsw_rebuild(task, tenant_id, &collection_key);
+            Ok(())
         } else if rebuild_fts {
             self.start_fts_rebuild(task, tenant_id, &collection_key)
         } else if rebuild_csr {
@@ -97,12 +99,7 @@ impl CoreLoop {
             Ok(())
         };
         if let Err(e) = start_result {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            );
+            return self.response_error(task, e);
         }
 
         self.response_ok(task)
@@ -160,9 +157,6 @@ impl CoreLoop {
                     output,
                 } => {
                     match output {
-                        RebuildOutput::Hnsw { bytes } => {
-                            apply_hnsw(self, &database_id, &tenant_id, &collection_key, bytes);
-                        }
                         RebuildOutput::Csr { bytes } => {
                             apply_csr(self, &database_id, &tenant_id, &collection_key, bytes);
                         }
@@ -228,82 +222,44 @@ impl CoreLoop {
 
     // ── Background-thread starters ────────────────────────────────────────────
 
+    /// Queue a rebuild of every sealed HNSW segment of the collection's
+    /// vector indexes on this core's builder thread. Each segment is rebuilt
+    /// from its own vectors with its node ids kept, quantized again under the
+    /// collection's config, and swapped in on this core; search reads the old
+    /// graph until then. The growing and building segments are left alone.
     fn start_hnsw_rebuild(
         &mut self,
         task: &ExecutionTask,
         tenant_id: TenantId,
         collection_key: &str,
-    ) -> crate::Result<()> {
+    ) {
         // Vector collections are stored under two key forms depending on how
         // they were inserted:
         //   - Bare:             (db, tenant, "coll")             — BatchInsert / native
         //   - Field-qualified:  (db, tenant, "coll:field_name")  — SQL INSERT, DirectUpsert
-        //
-        // Collect all matching keys so field-indexed collections (the common
-        // case from SQL DDL) are rebuilt correctly.
         let db = task.request.database_id;
         let field_prefix = format!("{collection_key}:");
-
         let matching_keys: Vec<(nodedb_types::DatabaseId, TenantId, String)> = self
             .vector_collections
-            .keys()
-            .filter(|(d, t, k)| {
+            .iter()
+            .filter(|((d, t, k), coll)| {
                 *d == db
                     && *t == tenant_id
                     && (k.as_str() == collection_key || k.starts_with(&field_prefix))
+                    // An IVF-PQ collection keeps no HNSW segments to rebuild.
+                    && !coll.is_ivf()
             })
-            .cloned()
+            .map(|(key, _)| key.clone())
             .collect();
-
-        if matching_keys.is_empty() {
-            return Ok(()); // no vector index for this collection; nothing to rebuild
-        }
-
         for key in matching_keys {
-            let coll = match self.vector_collections.get(&key) {
-                Some(c) => c,
-                None => continue,
-            };
-            // An IVF-PQ collection keeps no HNSW segments to rebuild.
-            if coll.is_ivf() {
-                continue;
-            }
-
-            let dim = coll.dim();
-            let params = coll.hnsw_params();
-
-            // Extract all live vectors from sealed segments.
-            let mut vectors: Vec<Vec<f32>> = Vec::new();
-            for sealed in coll.sealed_segments() {
-                for id in 0..sealed.index.len() as u32 {
-                    if !sealed.index.is_deleted(id)
-                        && let Some(v) = sealed.index.get_vector(id)
-                    {
-                        vectors.push(v.to_vec());
-                    }
-                }
-            }
-            // Also include live vectors from the growing flat index.
-            let growing = coll.growing_flat();
-            for id in 0..growing.len() as u32 {
-                if let Some(v) = growing.get_vector(id) {
-                    vectors.push(v.to_vec());
-                }
-            }
-
-            let (tx, rx) = mpsc::sync_channel::<crate::Result<RebuildOutput>>(1);
-            std::thread::spawn(move || {
-                let _ = tx.send(rebuild_hnsw_thread(vectors, dim, params));
-            });
-
-            self.maintenance.pending_reindex.push(PendingReindex {
-                database_id: db,
-                tenant_id,
-                collection_key: key.2,
-                rx,
-            });
+            let queued = self.queue_vector_rebuild(&key);
+            info!(
+                core = self.core_id,
+                collection = %key.2,
+                queued,
+                "HNSW rebuild queued"
+            );
         }
-        Ok(())
     }
 
     fn start_fts_rebuild(

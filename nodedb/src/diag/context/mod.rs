@@ -16,6 +16,7 @@ mod raft_apply;
 mod recovery;
 mod retention;
 mod vector;
+mod vector_build;
 mod write_path;
 
 pub(in crate::diag) use catalog::{
@@ -39,6 +40,7 @@ pub(in crate::diag) use raft_apply::{RaftEntryReapplied, ReplicatedWriteParked};
 pub(in crate::diag) use recovery::{ReplayRecordUnapplied, WalArchivalFailedTruncationHeld};
 pub(in crate::diag) use retention::RetentionAutowireOrphaned;
 pub(in crate::diag) use vector::VectorIndexNotApplied;
+pub(in crate::diag) use vector_build::{VectorBuildNotInstalled, VectorBuilderUnavailable};
 pub(in crate::diag) use write_path::{
     BatchInsertWithoutSurrogates, FtsIndexUpdateFailed, OrphanedIndexEntryAfterDelete,
     StrictRowUndecodable, WriteAckedWithoutDurability,

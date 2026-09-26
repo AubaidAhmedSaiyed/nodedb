@@ -4,14 +4,14 @@
 //!
 //! Every vector index, whatever its type, is one `VectorCollection` built
 //! from the index configuration `CREATE VECTOR INDEX` set. After a write the
-//! collection settles: a full growing segment seals and its HNSW build request
-//! goes to `build_tx`, and an IVF-PQ collection that holds its training
+//! collection settles: a full growing segment seals and its HNSW build goes
+//! to the core's builder queue, and an IVF-PQ collection that holds its training
 //! threshold trains and moves its buffered vectors into the IVF-PQ index.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::vector_direct_row::VectorIndexKey;
@@ -72,13 +72,19 @@ impl CoreLoop {
                 let config =
                     vector_index_config_for(&self.index_configs, &self.vector_params, config_key);
                 check_ivf_dim(&config, dim)?;
-                Ok(entry.insert(VectorCollection::with_index_config(dim, config)))
+                Ok(
+                    entry.insert(VectorCollection::with_seal_threshold_and_config(
+                        dim,
+                        config,
+                        self.vector_tuning.seal_threshold.max(1),
+                    )),
+                )
             }
         }
     }
 
     /// Settle the collection under `key` after a write: seal a full growing
-    /// segment and send its HNSW build, or train an IVF-PQ collection that
+    /// segment and queue its HNSW build, or train an IVF-PQ collection that
     /// holds its training threshold.
     pub(in crate::data::executor) fn settle_vector_collection(&mut self, key: &VectorIndexKey) {
         let seal_key = CoreLoop::vector_build_key(key);
@@ -87,10 +93,8 @@ impl CoreLoop {
         };
         if coll.needs_seal()
             && let Some(req) = coll.seal(&seal_key)
-            && let Some(tx) = &self.build_tx
-            && let Err(e) = tx.send(req)
         {
-            warn!(core = self.core_id, error = %e, "failed to send HNSW build request");
+            self.queue_sealed_build(key, req);
         }
         self.train_ivf_if_ready(key);
     }
@@ -107,20 +111,18 @@ impl CoreLoop {
         }
     }
 
-    /// Train every IVF-PQ collection that holds its training threshold. Boot
-    /// runs it once WAL replay and the store rebuild have restored the
-    /// buffers, so a collection that crossed its threshold before a restart
-    /// searches through IVF-PQ again without waiting for a write.
-    pub fn train_ready_ivf_collections(&mut self) {
-        let ready: Vec<VectorIndexKey> = self
-            .vector_collections
-            .iter()
-            .filter(|(_, coll)| coll.needs_ivf_training())
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in ready {
-            self.train_vector_collection_ivf(&key);
+    /// Settle every collection once boot has restored it: seal a growing
+    /// segment replay filled, train an IVF-PQ collection that holds its
+    /// threshold, and queue a build for every segment sealed but not yet
+    /// built — including segments a checkpoint restored as building. Boot
+    /// runs it after WAL replay and the store rebuild, so search uses the
+    /// built graphs and IVF-PQ again without waiting for a write.
+    pub fn settle_vector_collections_after_boot(&mut self) {
+        let keys: Vec<VectorIndexKey> = self.vector_collections.keys().cloned().collect();
+        for key in &keys {
+            self.settle_vector_collection(key);
         }
+        self.queue_unbuilt_segments();
     }
 
     /// Train the IVF-PQ index of the collection under `key`.

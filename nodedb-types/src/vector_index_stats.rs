@@ -128,6 +128,12 @@ pub struct VectorIndexStats {
     pub arena_bytes: Option<u64>,
     /// IVF-PQ training state. `None` unless the index type is `ivf_pq`.
     pub ivf: Option<VectorIvfStats>,
+    /// HNSW builds of this index waiting for or running on the builder.
+    pub builds_queued: usize,
+    /// HNSW builds of this index installed since the core opened it.
+    pub builds_completed: u64,
+    /// HNSW builds of this index that failed since the core opened it.
+    pub builds_failed: u64,
 }
 
 /// Training state of an IVF-PQ vector index.
@@ -198,6 +204,9 @@ mod tests {
                 cells: 16,
                 nprobe: 4,
             }),
+            builds_queued: 1,
+            builds_completed: 2,
+            builds_failed: 0,
         };
         let bytes = zerompk::to_msgpack_vec(&stats).unwrap();
         let restored: VectorIndexStats = zerompk::from_msgpack(&bytes).unwrap();
@@ -206,5 +215,6 @@ mod tests {
         assert_eq!(restored.quantization, VectorIndexQuantization::Sq8);
         assert_eq!(restored.index_type, VectorIndexType::Hnsw);
         assert_eq!(restored.ivf, stats.ivf);
+        assert_eq!(restored.builds_completed, 2);
     }
 }

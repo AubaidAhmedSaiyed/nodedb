@@ -111,6 +111,10 @@ impl VectorCollection {
                 cells: self.ivf.as_ref().map_or(0, |ivf| ivf.n_cells()),
                 nprobe: self.index_config.ivf_nprobe,
             }),
+            // The owning core fills this from its build queue.
+            builds_queued: 0,
+            builds_completed: self.builds_completed,
+            builds_failed: self.builds_failed,
         }
     }
 }

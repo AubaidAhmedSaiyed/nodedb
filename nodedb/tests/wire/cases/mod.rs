@@ -323,6 +323,7 @@ mod truncate_engine_conformance_columnar_family;
 mod txn_ddl_commit_registry_sync;
 mod user_transaction;
 mod vector_dimension_errors;
+mod vector_hnsw_build;
 mod vector_index_bulk_delete_reindex;
 mod vector_index_bulk_update_reindex;
 mod vector_index_merge_reindex;

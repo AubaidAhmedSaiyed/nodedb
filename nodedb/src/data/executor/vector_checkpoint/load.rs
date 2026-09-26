@@ -59,7 +59,8 @@ impl CoreLoop {
 
         let loaded = decoded.len();
         let mut vectors = 0usize;
-        for (key, collection) in decoded {
+        for (key, mut collection) in decoded {
+            collection.set_seal_threshold(self.vector_tuning.seal_threshold);
             vectors += collection.len();
             self.vector_collections.insert(key, collection);
         }
