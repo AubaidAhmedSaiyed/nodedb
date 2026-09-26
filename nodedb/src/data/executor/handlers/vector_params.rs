@@ -170,6 +170,11 @@ impl CoreLoop {
             declared_dim: resolved_dim,
         };
 
+        if resolved_dim > 0
+            && let Err(e) = super::vector_settle::check_ivf_dim(&config, resolved_dim)
+        {
+            return self.response_error(task, e);
+        }
         if resolved_dim > 0 {
             self.declared_dims.insert(index_key.clone(), resolved_dim);
         }

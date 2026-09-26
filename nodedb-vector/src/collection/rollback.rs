@@ -10,9 +10,10 @@
 //! would have taken without the write. Then it puts every binding and every
 //! tombstone back.
 //!
-//! The inserted nodes must still sit in the growing segment: a seal between
-//! the mark and the rollback moves them out, and the rollback then reports
-//! that it cannot restore the mark.
+//! The inserted nodes must still sit in the growing segment or the IVF-PQ
+//! index: a seal or an IVF-PQ training between the mark and the rollback
+//! moves them out, and the rollback then reports that it cannot restore the
+//! mark.
 
 use nodedb_types::Surrogate;
 
@@ -36,6 +37,11 @@ impl VectorCollection {
     /// Whether node `id` exists and is not soft-deleted, whichever segment
     /// holds it.
     pub fn is_live(&self, id: u32) -> bool {
+        if let Some(ivf) = &self.ivf
+            && ivf.contains(id)
+        {
+            return !ivf.is_deleted(id);
+        }
         if id >= self.growing_base_id {
             let local = id - self.growing_base_id;
             if (local as usize) < self.growing.len() {
@@ -99,8 +105,8 @@ impl VectorCollection {
     }
 
     /// Put the collection back to `mark`. Returns `false`, changing nothing,
-    /// when a seal moved the nodes inserted since the mark out of the growing
-    /// segment.
+    /// when a seal or an IVF-PQ training moved the nodes inserted since the
+    /// mark out of the growing segment.
     pub fn roll_back_to(&mut self, mark: VectorWriteMark) -> bool {
         if self.growing_base_id != mark.growing_base_id || mark.next_id < self.growing_base_id {
             return false;
@@ -114,6 +120,9 @@ impl VectorCollection {
         }
         self.growing
             .truncate((mark.next_id - self.growing_base_id) as usize);
+        if let Some(ivf) = &mut self.ivf {
+            ivf.roll_back_to(mark.next_id);
+        }
         self.next_id = mark.next_id;
 
         for (surrogate, prior) in mark.bindings {

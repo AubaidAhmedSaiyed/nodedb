@@ -82,21 +82,12 @@ impl CoreLoop {
                             floats.len(),
                         ));
                     }
-                    let params = self
-                        .vector_params
-                        .get(&index_key)
-                        .cloned()
-                        .unwrap_or_default();
                     // Skip a record the restored vector checkpoint holds. Its
                     // stamp names only records applied before the checkpoint,
                     // all of them replayed before the core serves a request,
                     // so a live write is never named.
                     let skip = wal_lsn != 0 && self.vector_replay_skips(wal_lsn);
-                    self.vector_collections
-                        .entry(index_key.clone())
-                        .or_insert_with(|| {
-                            nodedb_vector::VectorCollection::new(*dim as usize, params)
-                        });
+                    self.ensure_vector_collection(&index_key, &index_key, *dim as usize)?;
                     if skip {
                         continue;
                     }
@@ -159,11 +150,6 @@ impl CoreLoop {
                         },
                         None => continue,
                     };
-                    let params = self
-                        .vector_params
-                        .get(params_key)
-                        .cloned()
-                        .unwrap_or_default();
                     // Use field-qualified key so search can find it.
                     let store_key =
                         Self::vector_index_key(database_id, tid, collection, field_name);
@@ -171,9 +157,7 @@ impl CoreLoop {
                     let dim = floats.len();
                     // Same stamp gate as the strict arm above.
                     let skip = wal_lsn != 0 && self.vector_replay_skips(wal_lsn);
-                    self.vector_collections
-                        .entry(store_key.clone())
-                        .or_insert_with(|| nodedb_vector::VectorCollection::new(dim, params));
+                    self.ensure_vector_collection(&store_key, params_key, dim)?;
                     if skip {
                         continue;
                     }
@@ -194,6 +178,13 @@ impl CoreLoop {
             }
         }
 
+        // A committed-redo install trains once the whole record landed, so a
+        // rollback finds its inserts in the growing segment.
+        if !self.recording_redo_undo() {
+            for delta in &inserts {
+                self.train_ivf_if_ready(&delta.index_key);
+            }
+        }
         Ok(inserts)
     }
 

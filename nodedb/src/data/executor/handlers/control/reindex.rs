@@ -264,6 +264,10 @@ impl CoreLoop {
                 Some(c) => c,
                 None => continue,
             };
+            // An IVF-PQ collection keeps no HNSW segments to rebuild.
+            if coll.is_ivf() {
+                continue;
+            }
 
             let dim = coll.dim();
             let params = coll.hnsw_params();

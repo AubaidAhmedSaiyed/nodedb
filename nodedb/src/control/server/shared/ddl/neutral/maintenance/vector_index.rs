@@ -73,7 +73,7 @@ pub async fn handle_show_vector_index(
 
     let columns = vec!["property".to_string(), "value".to_string()];
 
-    let pairs: Vec<(&str, String)> = vec![
+    let mut pairs: Vec<(&str, String)> = vec![
         ("dimensions", stats.dimensions.to_string()),
         ("metric", stats.metric.clone()),
         ("index_type", stats.index_type.to_string()),
@@ -103,6 +103,17 @@ pub async fn handle_show_vector_index(
         ("seal_threshold", stats.seal_threshold.to_string()),
         ("mmap_segments", stats.mmap_segment_count.to_string()),
     ];
+    if let Some(ivf) = &stats.ivf {
+        pairs.extend([
+            ("ivf_training_threshold", ivf.training_threshold.to_string()),
+            ("ivf_trained", ivf.trained.to_string()),
+            ("ivf_trained_on", ivf.trained_on.to_string()),
+            ("ivf_trained_at_ms", ivf.trained_at_ms.to_string()),
+            ("ivf_indexed_vectors", ivf.indexed_vectors.to_string()),
+            ("ivf_cells", ivf.cells.to_string()),
+            ("ivf_nprobe", ivf.nprobe.to_string()),
+        ]);
+    }
 
     let rows: Vec<Map<String, JsonValue>> = pairs
         .into_iter()

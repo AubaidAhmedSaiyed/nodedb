@@ -96,7 +96,7 @@ pub mod vector_params;
 pub mod vector_search;
 mod vector_search_ann;
 mod vector_search_exec;
-mod vector_search_ivf;
+pub mod vector_settle;
 pub mod vector_sparse;
 pub mod vector_upsert;
 pub mod vector_write;

@@ -111,7 +111,6 @@ impl CoreLoop {
             self.vector_collections.retain(|(_, t, _), _| *t != tid_key);
             self.vector_params.retain(|(_, t, _), _| *t != tid_key);
             self.index_configs.retain(|(_, t, _), _| *t != tid_key);
-            self.ivf_indexes.retain(|(_, t, _), _| *t != tid_key);
             before - self.vector_collections.len()
         };
 

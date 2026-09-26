@@ -62,7 +62,7 @@ impl CoreLoop {
     ) -> Result<(), ErrorCode> {
         self.finalize_timeseries_truncates(&scope.undo);
         self.finalize_vector_truncates(&mut scope.undo);
-        self.seal_full_vector_collections();
+        self.settle_filled_vector_collections();
         for key in std::mem::take(&mut scope.columnar_written) {
             let collection = key.2.clone();
             self.flush_columnar_memtable_if_needed(task, &key, &collection)
@@ -87,28 +87,17 @@ impl CoreLoop {
         Ok(())
     }
 
-    /// Seal every vector collection whose growing segment filled while the
-    /// install held its seals back.
-    fn seal_full_vector_collections(&mut self) {
+    /// Settle every vector collection the install filled while it held its
+    /// seals and IVF-PQ trainings back.
+    fn settle_filled_vector_collections(&mut self) {
         let full: Vec<_> = self
             .vector_collections
             .iter()
-            .filter(|(_, coll)| coll.needs_seal())
+            .filter(|(_, coll)| coll.needs_seal() || coll.needs_ivf_training())
             .map(|(key, _)| key.clone())
             .collect();
         for key in full {
-            let seal_key = CoreLoop::vector_build_key(&key);
-            if let Some(coll) = self.vector_collections.get_mut(&key)
-                && let Some(req) = coll.seal(&seal_key)
-                && let Some(tx) = &self.build_tx
-                && let Err(e) = tx.send(req)
-            {
-                tracing::warn!(
-                    core = self.core_id,
-                    error = %e,
-                    "failed to send HNSW build request"
-                );
-            }
+            self.settle_vector_collection(&key);
         }
     }
 

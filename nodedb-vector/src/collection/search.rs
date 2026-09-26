@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! VectorCollection search: multi-segment merging with SQ8 reranking.
+//! VectorCollection search: multi-segment merging with SQ8 reranking. A
+//! trained IVF-PQ index answers beside the segments under global ids.
 //!
 //! The `search_with_payload_filter` method wires payload bitmap pre-filtering
 //! into the search path. When all referenced fields in the predicate are
@@ -12,6 +13,7 @@
 use crate::distance::{DistanceMetric, distance};
 use crate::error::{VectorError, check_dim};
 use crate::hnsw::SearchResult;
+use crate::hnsw::search::decode_filter_bitmap;
 
 use super::lifecycle::VectorCollection;
 use super::payload_index::FilterPredicate;
@@ -194,6 +196,9 @@ impl VectorCollection {
                 push_shifted(&mut all, results, seg.base_id);
             }
         }
+        if let Some(ivf) = &self.ivf {
+            all.extend(ivf.search(query, top_k)?);
+        }
 
         push_shifted(
             &mut all,
@@ -239,6 +244,9 @@ impl VectorCollection {
                 push_shifted(&mut all, results, seg.base_id);
             }
         }
+        if let Some(ivf) = &self.ivf {
+            all.extend(ivf.search_with(query, top_k, metric, None)?);
+        }
 
         push_shifted(
             &mut all,
@@ -270,6 +278,10 @@ impl VectorCollection {
         check_dim(self.dim, query.len())?;
         let mut all: Vec<SearchResult> = Vec::new();
 
+        if let Some(ivf) = &self.ivf {
+            let filter = decode_filter_bitmap(bitmap)?;
+            all.extend(ivf.search_with(query, top_k, metric, Some(&filter))?);
+        }
         push_shifted(
             &mut all,
             self.growing.search_filtered_offset_with_metric(
@@ -325,6 +337,10 @@ impl VectorCollection {
         check_dim(self.dim, query.len())?;
         let mut all: Vec<SearchResult> = Vec::new();
 
+        if let Some(ivf) = &self.ivf {
+            let filter = decode_filter_bitmap(bitmap)?;
+            all.extend(ivf.search_with(query, top_k, self.params.metric, Some(&filter))?);
+        }
         push_shifted(
             &mut all,
             self.growing

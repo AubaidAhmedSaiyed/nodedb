@@ -30,6 +30,7 @@ use crate::distance::DistanceMetric;
 use crate::error::VectorError;
 use crate::flat::FlatIndex;
 use crate::hnsw::{HnswIndex, HnswParams};
+use crate::ivf::IvfPqIndex;
 use crate::quantize::pq::PqCodec;
 use crate::quantize::sq8::Sq8Codec;
 
@@ -98,6 +99,12 @@ pub(crate) struct CollectionSnapshot {
     /// nothing and replay everything, exactly as before.
     #[serde(default)]
     pub checkpoint_wal_lsn: u64,
+    /// Index type and PQ/IVF parameters. Its HNSW parameters are the
+    /// `params_*` fields above.
+    pub index_config: crate::index_config::IndexConfig,
+    /// Encoded trained IVF-PQ index. `None` for a non-IVF collection or one
+    /// still buffering toward its training threshold.
+    pub ivf_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack)]
@@ -225,6 +232,8 @@ impl VectorCollection {
                 }
             },
             checkpoint_wal_lsn: self.checkpoint_wal_lsn.max(self.applied_wal_lsn),
+            index_config: self.index_config.clone(),
+            ivf_bytes: self.ivf.as_ref().map(IvfPqIndex::to_bytes).transpose()?,
         };
         let msgpack = match zerompk::to_msgpack_vec(&snapshot) {
             Ok(bytes) => bytes,
@@ -399,8 +408,13 @@ impl VectorCollection {
 
         let index_config = crate::index_config::IndexConfig {
             hnsw: params.clone(),
-            ..crate::index_config::IndexConfig::default()
+            ..snap.index_config
         };
+        let ivf = snap
+            .ivf_bytes
+            .as_deref()
+            .map(|bytes| IvfPqIndex::from_bytes(bytes, memory.clone()))
+            .transpose()?;
         Ok(Self {
             growing,
             growing_base_id: snap.growing_base_id,
@@ -432,6 +446,7 @@ impl VectorCollection {
             seal_threshold: DEFAULT_SEAL_THRESHOLD,
             index_config,
             codec_dispatch: None,
+            ivf,
             quantization: quantization_from_tag(snap.quantization_tag),
             payload: if snap.payload_index_bytes.is_empty() {
                 super::payload_index::PayloadIndexSet::default()

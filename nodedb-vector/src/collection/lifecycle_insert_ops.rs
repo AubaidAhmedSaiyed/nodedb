@@ -8,14 +8,21 @@ use super::lifecycle::VectorCollection;
 use crate::error::{VectorError, check_dim};
 
 impl VectorCollection {
-    /// Insert a vector. Returns the global vector ID.
+    /// Insert a vector. Returns the global vector ID. A trained IVF-PQ
+    /// collection inserts into its IVF index, every other collection into
+    /// the growing segment.
     ///
     /// A vector without the collection dimension fails with
     /// [`VectorError::DimensionMismatch`] and changes nothing.
     pub fn insert(&mut self, vector: Vec<f32>) -> Result<u32, VectorError> {
         check_dim(self.dim, vector.len())?;
         let id = self.next_id;
-        self.growing.insert(vector)?;
+        match &mut self.ivf {
+            Some(ivf) => ivf.insert_with_id(id, vector)?,
+            None => {
+                self.growing.insert(vector)?;
+            }
+        }
         self.next_id += 1;
         Ok(id)
     }
@@ -139,6 +146,11 @@ impl VectorCollection {
     }
 
     pub(super) fn delete_inner(&mut self, id: u32) -> bool {
+        if let Some(ivf) = &mut self.ivf
+            && ivf.contains(id)
+        {
+            return ivf.delete(id);
+        }
         if id >= self.growing_base_id {
             let local = id - self.growing_base_id;
             if (local as usize) < self.growing.len() {
@@ -167,6 +179,11 @@ impl VectorCollection {
     /// The live FP32 vector stored under global `id`, whichever segment
     /// holds it. `None` for an unknown or soft-deleted id.
     pub fn vector_for_id(&self, id: u32) -> Option<Vec<f32>> {
+        if let Some(ivf) = &self.ivf
+            && ivf.contains(id)
+        {
+            return ivf.get_vector(id).map(<[f32]>::to_vec);
+        }
         if id >= self.growing_base_id {
             let local = id - self.growing_base_id;
             if (local as usize) < self.growing.len() {
@@ -211,13 +228,16 @@ impl VectorCollection {
 
     /// Un-delete a previously soft-deleted vector (for transaction rollback).
     ///
-    /// Symmetric to [`Self::delete_inner`]: the vector may live in the growing
-    /// segment (the common case for a just-inserted vector), a sealed HNSW
-    /// segment, or an in-flight building segment — reverse the tombstone
-    /// wherever it landed. Only clearing sealed tombstones (the prior behavior)
-    /// silently failed to restore growing/building vectors, leaving a
-    /// rolled-back delete permanently unsearchable.
+    /// Symmetric to [`Self::delete_inner`]: the vector may live in the IVF
+    /// index, the growing segment (the common case for a just-inserted
+    /// vector), a sealed HNSW segment, or an in-flight building segment. The
+    /// tombstone is reversed wherever it landed.
     pub fn undelete(&mut self, id: u32) -> bool {
+        if let Some(ivf) = &mut self.ivf
+            && ivf.contains(id)
+        {
+            return ivf.undelete(id);
+        }
         if id >= self.growing_base_id {
             let local = id - self.growing_base_id;
             if (local as usize) < self.growing.len() {
@@ -247,7 +267,7 @@ impl VectorCollection {
 /// The FP32 vector at `local` in a sealed segment: the mmap tier when the
 /// segment lives there, else the HNSW node (decoded from a narrow dtype or
 /// fetched from the segment backing when the node holds no local copy).
-fn sealed_vector(seg: &super::segment::SealedSegment, local: u32) -> Option<Vec<f32>> {
+pub(super) fn sealed_vector(seg: &super::segment::SealedSegment, local: u32) -> Option<Vec<f32>> {
     if let Some(mmap) = &seg.mmap_vectors {
         return mmap.get_vector(local).map(<[f32]>::to_vec);
     }

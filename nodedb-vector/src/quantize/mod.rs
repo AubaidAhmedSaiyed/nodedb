@@ -5,6 +5,7 @@ pub mod binary_codec;
 
 pub mod pq;
 pub mod pq_decode;
+pub mod pq_kmeans;
 
 pub mod pq_codec;
 

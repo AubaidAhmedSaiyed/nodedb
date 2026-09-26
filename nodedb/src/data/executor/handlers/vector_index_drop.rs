@@ -38,7 +38,6 @@ impl CoreLoop {
         let (db, tenant, collection_key) = index_key.clone();
 
         let had_index = self.vector_collections.remove(&index_key).is_some();
-        self.ivf_indexes.remove(&index_key);
         self.vector_params.remove(&index_key);
         self.index_configs.remove(&index_key);
         self.declared_dims.remove(&index_key);

@@ -342,6 +342,7 @@ mod vector_index_txn_update_from_join;
 mod vector_index_txn_update_from_join_stmt_stage;
 mod vector_index_update_from_join_reindex;
 mod vector_index_update_reindex;
+mod vector_ivf_pq_training;
 mod vector_primary_dml;
 mod vector_primary_fast_path;
 mod vector_primary_write_rls_predicate;

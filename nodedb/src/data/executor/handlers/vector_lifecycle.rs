@@ -42,40 +42,6 @@ impl CoreLoop {
         );
 
         let Some(coll) = self.vector_collections.get(&index_key) else {
-            // Check IVF index as fallback.
-            if let Some(ivf) = self.ivf_indexes.get(&index_key) {
-                let stats = nodedb_types::VectorIndexStats {
-                    sealed_count: 0,
-                    building_count: 0,
-                    growing_vectors: ivf.len(),
-                    sealed_vectors: 0,
-                    live_count: ivf.len(),
-                    tombstone_count: 0,
-                    tombstone_ratio: 0.0,
-                    quantization: nodedb_types::VectorIndexQuantization::Pq,
-                    memory_bytes: 0,
-                    disk_bytes: 0,
-                    build_in_progress: false,
-                    index_type: nodedb_types::VectorIndexType::IvfPq,
-                    hnsw_m: 0,
-                    hnsw_m0: 0,
-                    hnsw_ef_construction: 0,
-                    metric: "l2".into(),
-                    dimensions: ivf.dim(),
-                    seal_threshold: 0,
-                    mmap_segment_count: 0,
-                    arena_bytes: None,
-                };
-                return match zerompk::to_msgpack_vec(&stats) {
-                    Ok(bytes) => self.response_with_payload(task, bytes),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("serialize stats: {e}"),
-                        },
-                    ),
-                };
-            }
             return self.response_error(task, ErrorCode::NotFound);
         };
 

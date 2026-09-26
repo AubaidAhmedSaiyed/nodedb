@@ -10,7 +10,6 @@ use super::vector_search::{
     surrogate_bitmap_to_global_ids,
 };
 use super::vector_search_ann::{ResolvedAnnOptions, apply_ann_options, quantization_matches};
-use super::vector_search_ivf::SearchIvfParams;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
@@ -22,7 +21,8 @@ impl CoreLoop {
     /// the slow-path SELECT (the Control Plane response translator flattens
     /// the body's fields into the hit JSON so payload columns surface to
     /// the client). When `attach == false`, or the hit carries no surrogate
-    /// binding, the hit is returned unchanged.
+    /// binding, the hit is returned unchanged. A storage read error fails
+    /// the call: a hit without its body would skip the RLS predicate check.
     ///
     /// The bytes are normalized to a standard msgpack map through the shared
     /// sparse-body normalizer, resolved from the collection's registered kind.
@@ -38,14 +38,14 @@ impl CoreLoop {
         collection: &str,
         attach: bool,
         mut hit: super::super::response_codec::VectorSearchHit,
-    ) -> super::super::response_codec::VectorSearchHit {
+    ) -> crate::Result<super::super::response_codec::VectorSearchHit> {
         if !attach {
-            return hit;
+            return Ok(hit);
         }
         let Some(key) = hit.id.storage_key() else {
-            return hit;
+            return Ok(hit);
         };
-        if let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, &key) {
+        if let Some(bytes) = self.sparse.get(database_id, tid, collection, &key)? {
             let format = self.sparse_body_format(
                 crate::types::DatabaseId::new(database_id),
                 crate::types::TenantId::new(tid),
@@ -61,7 +61,7 @@ impl CoreLoop {
                 .into_owned(),
             );
         }
-        hit
+        Ok(hit)
     }
 
     pub(in crate::data::executor) fn execute_vector_search(
@@ -132,22 +132,8 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
-        // Check for IVF-PQ index first.
-        if let Some(ivf) = self.ivf_indexes.get(&index_key) {
-            return self.search_ivf(SearchIvfParams {
-                task,
-                tid,
-                collection,
-                index_key: &index_key,
-                ivf,
-                query_vector,
-                top_k,
-                filter_bitmap,
-                rls_filters,
-            });
-        }
-
-        // Default: HNSW collection.
+        // Every index type is one `VectorCollection`: an IVF-PQ collection
+        // answers from its exact buffer or its trained IVF-PQ index.
         // If the specific field-named index does not exist, fall back to the
         // empty-field index. This handles data synced from NodeDB-Lite (which
         // uses collection-level storage, not named-field storage) being
@@ -363,7 +349,7 @@ impl CoreLoop {
         // OR when RLS filters need them; the CP response translator flattens
         // the bytes' fields into the hit JSON for client column projection.
         let attach = !skip_payload_fetch || !rls_filters.is_empty();
-        let mut hits: Vec<_> = results
+        let hits: crate::Result<Vec<_>> = results
             .iter()
             .map(|r| build_search_hit(Some(collection_ref), r.id, r.distance))
             .map(|hit| {
@@ -376,6 +362,10 @@ impl CoreLoop {
                 )
             })
             .collect();
+        let mut hits = match hits {
+            Ok(hits) => hits,
+            Err(e) => return self.response_error(task, e),
+        };
         let truncate_to = if rls_filters.is_empty() {
             top_k
         } else {

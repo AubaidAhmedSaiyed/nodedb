@@ -126,6 +126,40 @@ pub struct VectorIndexStats {
     /// bytes. `None` when the collection has no dedicated arena (e.g., it is
     /// not vector-primary, or the runtime does not support per-arena stats).
     pub arena_bytes: Option<u64>,
+    /// IVF-PQ training state. `None` unless the index type is `ivf_pq`.
+    pub ivf: Option<VectorIvfStats>,
+}
+
+/// Training state of an IVF-PQ vector index.
+///
+/// An IVF-PQ index buffers vectors, searched exactly, until it holds
+/// `training_threshold` live vectors. It then trains its cells and PQ
+/// codebooks on them and searches through IVF-PQ from then on.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct VectorIvfStats {
+    /// Live vectors the index needs before it trains: `max(ivf_cells, pq_k)`.
+    pub training_threshold: usize,
+    /// Whether training has run.
+    pub trained: bool,
+    /// Vectors the training read. `0` before training.
+    pub trained_on: usize,
+    /// Unix milliseconds of the training. `0` before training.
+    pub trained_at_ms: u64,
+    /// Vectors held by the trained index, live or soft-deleted.
+    pub indexed_vectors: usize,
+    /// Voronoi cells of the trained index. `0` before training.
+    pub cells: usize,
+    /// Cells probed per query.
+    pub nprobe: usize,
 }
 
 #[cfg(test)]
@@ -155,6 +189,15 @@ mod tests {
             seal_threshold: 65_536,
             mmap_segment_count: 1,
             arena_bytes: Some(4 * 1024 * 1024),
+            ivf: Some(VectorIvfStats {
+                training_threshold: 256,
+                trained: true,
+                trained_on: 300,
+                trained_at_ms: 1_700_000_000_000,
+                indexed_vectors: 310,
+                cells: 16,
+                nprobe: 4,
+            }),
         };
         let bytes = zerompk::to_msgpack_vec(&stats).unwrap();
         let restored: VectorIndexStats = zerompk::from_msgpack(&bytes).unwrap();
@@ -162,5 +205,6 @@ mod tests {
         assert_eq!(restored.live_count, 183_000);
         assert_eq!(restored.quantization, VectorIndexQuantization::Sq8);
         assert_eq!(restored.index_type, VectorIndexType::Hnsw);
+        assert_eq!(restored.ivf, stats.ivf);
     }
 }

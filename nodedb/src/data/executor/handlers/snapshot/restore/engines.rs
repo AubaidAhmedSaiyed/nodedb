@@ -55,29 +55,20 @@ impl CoreLoop {
             crate::types::TenantId::new(tenant_id),
             coll_key.to_string(),
         );
-        let params = self
-            .vector_params
-            .get(&map_key)
-            .cloned()
-            .unwrap_or_default();
         // Raft InstallSnapshot apply (`replace_mode`) must REPLACE the local
         // collection so the snapshot's vectors are not appended on top of stale
         // entries. User RESTORE (`!replace_mode`) keeps the prior insert-into-
         // existing-or-create behavior.
         if replace_mode {
-            self.vector_collections.insert(
-                map_key.clone(),
-                crate::engine::vector::collection::VectorCollection::new(dim, params.clone()),
-            );
+            self.vector_collections.remove(&map_key);
         }
-        let coll = self.vector_collections.entry(map_key).or_insert_with(|| {
-            crate::engine::vector::collection::VectorCollection::new(dim, params)
-        });
+        let coll = self.ensure_vector_collection(&map_key, &map_key, dim)?;
         let (data, surrogates): (Vec<Vec<f32>>, Vec<nodedb_types::Surrogate>) = vectors
             .into_iter()
             .map(|(_, data, surrogate)| (data, surrogate.unwrap_or(nodedb_types::Surrogate::ZERO)))
             .unzip();
         coll.insert_batch_with_surrogates(&data, &surrogates)?;
+        self.train_ivf_if_ready(&map_key);
         Ok(())
     }
 

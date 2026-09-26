@@ -21,8 +21,24 @@ impl VectorCollection {
     /// no matching entry in `building` and is ignored, and an mmap file name
     /// is never reused. The mmap file of each dropped sealed segment is
     /// removed from disk.
+    ///
+    /// An `IvfPq` collection drops its trained index too and buffers again:
+    /// its next training reads the vectors inserted after the truncate.
     pub fn truncate(&mut self) -> usize {
         let dropped = self.live_count();
+        self.clear_segments();
+        self.ivf = None;
+        self.surrogate_map.clear();
+        self.surrogate_to_local.clear();
+        self.multi_doc_map.clear();
+        self.payload.clear_rows();
+        dropped
+    }
+
+    /// Empty the growing segment and drop every sealed segment, in-flight
+    /// build and codec-dispatch index. The next insert keeps the id counter.
+    /// The mmap file of each dropped sealed segment is removed from disk.
+    pub(super) fn clear_segments(&mut self) {
         self.growing = FlatIndex::new(self.dim, self.params.metric);
         self.growing_base_id = self.next_id;
         for seg in self.sealed.drain(..) {
@@ -41,21 +57,17 @@ impl VectorCollection {
         }
         self.building.clear();
         self.mmap_segment_count = 0;
-        self.surrogate_map.clear();
-        self.surrogate_to_local.clear();
-        self.multi_doc_map.clear();
         self.codec_dispatch = None;
-        self.payload.clear_rows();
-        dropped
     }
 
-    /// Compact sealed segments by removing tombstoned nodes.
+    /// Compact sealed segments and the IVF-PQ index by removing tombstoned
+    /// nodes.
     ///
     /// Rewrites `surrogate_map` and `multi_doc_map` for every sealed
     /// segment so that global ids continue to resolve to the correct
-    /// surrogate after local-id renumbering.
+    /// surrogate after local-id renumbering. IVF-PQ entries keep their ids.
     pub fn compact(&mut self) -> usize {
-        let mut total_removed = 0;
+        let mut total_removed = self.ivf.as_mut().map_or(0, |ivf| ivf.compact());
         for seg in &mut self.sealed {
             let base_id = seg.base_id;
             let (removed, id_map) = seg.index.compact_with_map();
@@ -124,6 +136,13 @@ impl VectorCollection {
     /// zeroed those vectors would restore an index with missing data.
     pub fn export_snapshot(&self) -> Result<Vec<ExportedVector>, crate::error::VectorError> {
         let mut result = Vec::new();
+
+        if let Some(ivf) = &self.ivf {
+            for (vid, data) in ivf.live_vectors() {
+                let surrogate = self.surrogate_map.get(&vid).copied();
+                result.push((vid, data, surrogate));
+            }
+        }
 
         for i in 0..self.growing.len() as u32 {
             let vid = self.growing_base_id + i;

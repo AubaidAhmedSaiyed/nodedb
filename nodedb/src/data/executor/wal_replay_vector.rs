@@ -23,8 +23,6 @@ impl CoreLoop {
         num_cores: usize,
         tombstones: &nodedb_wal::TombstoneSet,
     ) {
-        use crate::engine::vector::collection::VectorCollection;
-        use crate::engine::vector::hnsw::HnswParams;
         use nodedb_wal::record::RecordType;
 
         let mut inserted = 0usize;
@@ -259,22 +257,18 @@ impl CoreLoop {
                         &collection,
                         &field_name,
                     );
-                    let params = self
-                        .vector_params
-                        .get(&index_key)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            tracing::debug!(
-                                core = self.core_id,
-                                %collection,
-                                "no VectorParams found during WAL replay; using defaults"
+                    let index = match self.ensure_vector_collection(&index_key, &index_key, dim) {
+                        Ok(index) => index,
+                        Err(e) => {
+                            self.replay_record_rejected(
+                                "vector",
+                                record_lsn,
+                                None,
+                                &format!("vector record for '{collection}': {e}"),
                             );
-                            HnswParams::default()
-                        });
-                    let index = self
-                        .vector_collections
-                        .entry(index_key)
-                        .or_insert_with(|| VectorCollection::new(dim, params));
+                            continue;
+                        }
+                    };
                     // Unlike the record-internal check above, this compares the
                     // record against a LIVE index whose width the collection
                     // may legitimately have changed since the record was
@@ -344,22 +338,18 @@ impl CoreLoop {
                     }
                     let index_key =
                         CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
-                    let params = self
-                        .vector_params
-                        .get(&index_key)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            tracing::debug!(
-                                core = self.core_id,
-                                %collection,
-                                "no VectorParams found during WAL replay; using defaults"
+                    let index = match self.ensure_vector_collection(&index_key, &index_key, dim) {
+                        Ok(index) => index,
+                        Err(e) => {
+                            self.replay_record_rejected(
+                                "vector",
+                                record_lsn,
+                                None,
+                                &format!("vector record for '{collection}': {e}"),
                             );
-                            HnswParams::default()
-                        });
-                    let index = self
-                        .vector_collections
-                        .entry(index_key)
-                        .or_insert_with(|| VectorCollection::new(dim, params));
+                            continue;
+                        }
+                    };
                     // Unlike the record-internal check above, this compares the
                     // record against a LIVE index whose width the collection
                     // may legitimately have changed since the record was
@@ -415,22 +405,18 @@ impl CoreLoop {
                         skipped += 1;
                         continue;
                     }
-                    let params = self
-                        .vector_params
-                        .get(&index_key)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            tracing::debug!(
-                                core = self.core_id,
-                                %collection,
-                                "no VectorParams found for batch replay; using defaults"
+                    let index = match self.ensure_vector_collection(&index_key, &index_key, dim) {
+                        Ok(index) => index,
+                        Err(e) => {
+                            self.replay_record_rejected(
+                                "vector",
+                                record_lsn,
+                                None,
+                                &format!("vector batch record for '{collection}': {e}"),
                             );
-                            HnswParams::default()
-                        });
-                    let index = self
-                        .vector_collections
-                        .entry(index_key)
-                        .or_insert_with(|| VectorCollection::new(dim, params));
+                            continue;
+                        }
+                    };
                     // Checked as a whole before any vector lands, so a record
                     // holding one vector of another width applies nothing.
                     if let Err(e) = index.insert_batch_with_surrogates(&vectors, &[]) {

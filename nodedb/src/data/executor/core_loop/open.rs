@@ -130,7 +130,6 @@ impl CoreLoop {
             aggregate_cache: HashMap::new(),
             maintenance: super::maintenance_state::MaintenanceState::new(),
             index_configs: HashMap::new(),
-            ivf_indexes: HashMap::new(),
             sparse_vector_indexes: HashMap::new(),
             doc_cache: DocCache::new(
                 nodedb_types::config::tuning::QueryTuning::default().doc_cache_entries,

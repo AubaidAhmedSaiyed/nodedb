@@ -4,6 +4,7 @@ pub mod budget;
 pub mod checkpoint;
 pub mod codec_build;
 pub mod codec_dispatch;
+pub mod ivf_mode;
 pub mod lifecycle;
 pub mod lifecycle_compact;
 pub mod lifecycle_insert_ops;

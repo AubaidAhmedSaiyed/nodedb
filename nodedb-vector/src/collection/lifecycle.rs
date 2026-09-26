@@ -22,6 +22,7 @@ use nodedb_types::{Surrogate, VectorQuantization};
 use crate::flat::FlatIndex;
 use crate::hnsw::{HnswIndex, HnswParams};
 use crate::index_config::{IndexConfig, IndexType};
+use crate::ivf::IvfPqIndex;
 
 use super::codec_dispatch::CollectionCodec;
 use super::payload_index::PayloadIndexSet;
@@ -71,6 +72,12 @@ pub struct VectorCollection {
     /// Coexists with sealed segments — for codec-dispatched collections the
     /// per-segment Sq8 builder is skipped and this index is used instead.
     pub codec_dispatch: Option<CollectionCodec>,
+    /// Trained IVF-PQ index of an `IvfPq` collection. `None` until the
+    /// collection holds the training threshold of vectors: until then its
+    /// vectors wait in the growing segment, searched exactly. Training moves
+    /// every vector into this index under its global id, and later inserts
+    /// land here.
+    pub(crate) ivf: Option<IvfPqIndex>,
     /// Quantization mode requested at collection-creation time.
     ///
     /// When `!= None && != Sq8`, each call to `complete_build` additionally
@@ -159,6 +166,7 @@ impl VectorCollection {
             seal_threshold,
             index_config: config,
             codec_dispatch: None,
+            ivf: None,
             quantization: VectorQuantization::default(),
             payload: PayloadIndexSet::default(),
             arena_index: None,
@@ -203,14 +211,16 @@ impl VectorCollection {
         Self::with_seal_threshold(dim, params, DEFAULT_SEAL_THRESHOLD)
     }
 
-    /// Check if the growing segment should be sealed.
+    /// Check if the growing segment should be sealed. An `IvfPq` collection
+    /// never seals: its growing segment is the buffer IVF-PQ training reads.
     pub fn needs_seal(&self) -> bool {
-        self.growing.len() >= self.seal_threshold
+        !self.is_ivf() && self.growing.len() >= self.seal_threshold
     }
 
-    /// Seal the growing segment and return a build request.
+    /// Seal the growing segment and return a build request. `None` for an
+    /// empty growing segment or an `IvfPq` collection.
     pub fn seal(&mut self, key: &str) -> Option<BuildRequest> {
-        if self.growing.is_empty() {
+        if self.growing.is_empty() || self.is_ivf() {
             return None;
         }
 
@@ -317,7 +327,7 @@ impl VectorCollection {
     }
 
     pub fn len(&self) -> usize {
-        let mut total = self.growing.len();
+        let mut total = self.growing.len() + self.ivf.as_ref().map_or(0, IvfPqIndex::len);
         for seg in &self.sealed {
             total += seg.index.len();
         }
@@ -328,7 +338,8 @@ impl VectorCollection {
     }
 
     pub fn live_count(&self) -> usize {
-        let mut total = self.growing.live_count();
+        let mut total =
+            self.growing.live_count() + self.ivf.as_ref().map_or(0, IvfPqIndex::live_count);
         for seg in &self.sealed {
             total += seg.index.live_count();
         }

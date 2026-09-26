@@ -144,6 +144,8 @@ pub use value::{NotScalar, Value, scalar_to_raw_bytes};
 pub use vector_ann::{VectorAnnOptions, VectorQuantization};
 pub use vector_dtype::VectorStorageDtype;
 pub use vector_index_params::StoredVectorIndexParams;
-pub use vector_index_stats::{VectorIndexQuantization, VectorIndexStats, VectorIndexType};
+pub use vector_index_stats::{
+    VectorIndexQuantization, VectorIndexStats, VectorIndexType, VectorIvfStats,
+};
 pub use vector_model::{VectorModelEntry, VectorModelMetadata};
 pub use volatility::Volatility;

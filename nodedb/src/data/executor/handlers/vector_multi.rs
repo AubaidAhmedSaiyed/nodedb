@@ -87,33 +87,13 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
-        // Validate dimension compatibility before taking mutable reference.
-        if let Some(existing) = self.vector_collections.get(&index_key)
-            && existing.dim() != dim
-        {
-            return self
-                .response_error(task, super::vector::dimension_mismatch(existing.dim(), dim));
-        }
-
-        // Get or create the vector collection.
-        let core_id = self.core_id;
-        let params = self
-            .vector_params
-            .get(&index_key)
-            .cloned()
-            .unwrap_or_default();
         // A committed-redo install seals once the whole record landed.
         let defer_seal = self.recording_redo_undo();
-        let coll = self
-            .vector_collections
-            .entry(index_key.clone())
-            .or_insert_with(|| {
-                debug!(
-                    core = core_id,
-                    dim, "creating vector collection for multi-vector"
-                );
-                crate::engine::vector::collection::VectorCollection::new(dim, params)
-            });
+        let coll =
+            match self.get_or_create_vector_index(database_id, tid, collection, dim, field_name) {
+                Ok(coll) => coll,
+                Err(err) => return self.response_error(task, err),
+            };
 
         // Build vector slices from flat data.
         let vector_slices: Vec<&[f32]> = (0..count)
@@ -129,15 +109,8 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, crate::Error::from(e)),
         };
 
-        // Auto-seal if needed.
-        let seal_key = CoreLoop::vector_build_key(&index_key);
-        if !defer_seal
-            && coll.needs_seal()
-            && let Some(req) = coll.seal(&seal_key)
-            && let Some(tx) = &self.build_tx
-            && let Err(e) = tx.send(req)
-        {
-            warn!(core = self.core_id, error = %e, "failed to send HNSW build after multi-vector insert");
+        if !defer_seal {
+            self.settle_vector_collection(&index_key);
         }
 
         self.checkpoint_coordinator.mark_dirty("vector", ids.len());

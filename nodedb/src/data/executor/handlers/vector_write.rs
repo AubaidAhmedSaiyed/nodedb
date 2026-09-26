@@ -5,7 +5,7 @@
 //! Extracted from `vector.rs` to keep file sizes within the 500-line limit.
 
 use nodedb_types::Surrogate;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -40,14 +40,8 @@ impl CoreLoop {
                 if let Err(e) = collection_ref.insert_batch_with_surrogates(vectors, surrogates) {
                     return self.response_error(task, crate::Error::from(e));
                 }
-                let seal_key = CoreLoop::vector_build_key(&index_key);
-                if !defer_seal
-                    && collection_ref.needs_seal()
-                    && let Some(req) = collection_ref.seal(&seal_key)
-                    && let Some(tx) = &self.build_tx
-                    && let Err(e) = tx.send(req)
-                {
-                    warn!(core = self.core_id, error = %e, "failed to send HNSW build request");
+                if !defer_seal {
+                    self.settle_vector_collection(&index_key);
                 }
                 self.checkpoint_coordinator
                     .mark_dirty("vector", vectors.len());

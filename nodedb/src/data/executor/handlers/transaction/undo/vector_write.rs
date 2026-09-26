@@ -5,9 +5,9 @@
 //! vector-primary row write.
 //!
 //! The pre-image is taken before the write: the collection's write mark
-//! (`VectorCollection::write_mark`), the IVF-PQ add counter, and for a
-//! vector-primary collection the sidecar row and payload bitmap entries of
-//! every named row. The undo withdraws every node the write inserted, puts
+//! (`VectorCollection::write_mark`, which covers a trained IVF-PQ index too),
+//! and for a vector-primary collection the sidecar row and payload bitmap
+//! entries of every named row. The undo withdraws every node the write inserted, puts
 //! every binding and tombstone back, and restores the sidecars and bitmap
 //! entries. A collection the write created is removed again.
 
@@ -21,13 +21,6 @@ use crate::engine::vector::collection::VectorWriteMark;
 
 use super::UndoEntry;
 
-/// The IVF-PQ state of a collection before a write.
-pub(in crate::data::executor) struct IvfMark {
-    /// Vectors the index held.
-    pub count: u32,
-    pub trained: bool,
-}
-
 /// The pre-image of one vector write.
 pub(in crate::data::executor) struct VectorWriteUndo {
     pub index_key: VectorIndexKey,
@@ -38,8 +31,6 @@ pub(in crate::data::executor) struct VectorWriteUndo {
     pub mark: Option<VectorWriteMark>,
     /// Whether the write found no `vector_params` entry for the key.
     pub params_absent: bool,
-    /// `None` when the collection had no IVF-PQ index.
-    pub ivf: Option<IvfMark>,
     /// Sidecar bytes of every named surrogate, `None` when absent. Empty for
     /// a write that stores no sidecar.
     pub sidecars: Vec<(Surrogate, Option<Vec<u8>>)>,
@@ -114,10 +105,6 @@ impl CoreLoop {
             collection: collection.to_string(),
             mark: coll.map(|coll| coll.write_mark(surrogates, ids)),
             params_absent: !self.vector_params.contains_key(index_key),
-            ivf: self.ivf_indexes.get(index_key).map(|ivf| IvfMark {
-                count: ivf.len() as u32,
-                trained: ivf.is_trained(),
-            }),
             sidecars: sidecar_rows,
             payload_rows,
         })))
@@ -135,7 +122,6 @@ impl CoreLoop {
             collection,
             mark,
             params_absent,
-            ivf,
             sidecars,
             payload_rows,
         } = undo;
@@ -177,7 +163,8 @@ impl CoreLoop {
                 };
                 if !coll.roll_back_to(mark) {
                     return Err(fail(format!(
-                        "vector index {:?} sealed the nodes a rolled-back write inserted",
+                        "vector index {:?} sealed or trained away the nodes a rolled-back \
+                         write inserted",
                         index_key
                     )));
                 }
@@ -191,16 +178,6 @@ impl CoreLoop {
         }
         if params_absent {
             self.vector_params.remove(&index_key);
-        }
-        match ivf {
-            Some(IvfMark { count, trained }) => {
-                if let Some(index) = self.ivf_indexes.get_mut(&index_key) {
-                    index.roll_back_to(count, trained);
-                }
-            }
-            None => {
-                self.ivf_indexes.remove(&index_key);
-            }
         }
 
         for (surrogate, prior) in sidecars {
@@ -227,54 +204,49 @@ impl CoreLoop {
 mod tests {
     use super::*;
     use crate::data::executor::core_loop::tests::make_core_with_dir;
-    use crate::engine::vector::ivf::{IvfPqIndex, IvfPqParams};
+    use crate::engine::vector::collection::VectorCollection;
+    use crate::engine::vector::index_config::{IndexConfig, IndexType};
     use crate::types::{DatabaseId, TenantId};
 
     const TID: u64 = 1;
+    const DIM: usize = 4;
 
-    fn params() -> IvfPqParams {
-        IvfPqParams {
-            n_cells: 2,
-            pq_m: 2,
-            pq_k: 4,
-            nprobe: 2,
-            metric: nodedb_vector::DistanceMetric::L2,
-        }
+    /// Distinct per `i`: the first component is `i + 1`.
+    fn vector(i: usize) -> Vec<f32> {
+        vec![
+            (i + 1) as f32,
+            (i % 7 + 1) as f32,
+            (i % 11 + 1) as f32,
+            (i % 13 + 1) as f32,
+        ]
     }
 
-    fn vectors() -> Vec<Vec<f32>> {
-        (0..8)
-            .map(|i| vec![i as f32, (i * 2) as f32, 1.0, 0.5])
-            .collect()
+    fn ivf_collection() -> VectorCollection {
+        VectorCollection::with_index_config(
+            DIM,
+            IndexConfig {
+                index_type: IndexType::IvfPq,
+                pq_m: 2,
+                ivf_cells: 2,
+                ivf_nprobe: 2,
+                ..IndexConfig::default()
+            },
+        )
     }
 
-    /// The IVF-PQ adds of a rolled-back write leave the index: it holds the
-    /// vectors and the training it held before the write.
-    #[test]
-    fn a_rolled_back_write_withdraws_its_ivf_adds() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
-        let key: VectorIndexKey = (DatabaseId::DEFAULT, TenantId::new(TID), "docs:".into());
-        let vecs = vectors();
-        let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let mut index = IvfPqIndex::new(4, params());
-        index
-            .train(
-                &refs,
-                nodedb_mem::ScopedMemory::new(
-                    crate::data::executor::core_loop::test_governor(),
-                    DatabaseId::DEFAULT,
-                    TenantId::new(TID),
-                    nodedb_mem::EngineId::Vector,
-                ),
-            )
-            .unwrap();
-        index.add_batch(&refs[..4]).unwrap();
-        core.ivf_indexes.insert(key.clone(), index);
+    fn memory() -> nodedb_mem::ScopedMemory {
+        nodedb_mem::ScopedMemory::new(
+            crate::data::executor::core_loop::test_governor(),
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            nodedb_mem::EngineId::Vector,
+        )
+    }
 
+    fn capture(core: &CoreLoop, key: &VectorIndexKey) -> VectorWriteUndo {
         let undo = core
             .capture_vector_write_undo(VectorWriteTarget {
-                index_key: &key,
+                index_key: key,
                 tid: TID,
                 collection: "docs",
                 surrogates: &[],
@@ -282,49 +254,69 @@ mod tests {
                 sidecars: false,
             })
             .expect("capture undo");
-        if let Some(index) = core.ivf_indexes.get_mut(&key) {
-            index.add_batch(&refs[4..]).unwrap();
-        }
         let UndoEntry::VectorWrite(undo) = undo else {
             panic!("a vector write captures a VectorWrite undo");
         };
-        core.apply_undo_vector_write(0, *undo)
+        *undo
+    }
+
+    /// The inserts of a rolled-back write leave a trained IVF-PQ index: it
+    /// holds the vectors and the training it held before the write.
+    #[test]
+    fn a_rolled_back_write_withdraws_its_ivf_inserts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let key: VectorIndexKey = (DatabaseId::DEFAULT, TenantId::new(TID), "docs:".into());
+        let mut coll = ivf_collection();
+        for i in 0..256 {
+            coll.insert(vector(i)).unwrap();
+        }
+        coll.train_ivf(memory(), 1).unwrap();
+        core.vector_collections.insert(key.clone(), coll);
+
+        let undo = capture(&core, &key);
+        if let Some(coll) = core.vector_collections.get_mut(&key) {
+            for i in 256..260 {
+                coll.insert(vector(i)).unwrap();
+            }
+        }
+        core.apply_undo_vector_write(0, undo)
             .expect("undo vector write");
 
-        let index = core.ivf_indexes.get(&key).expect("index stays");
-        assert_eq!(index.len(), 4);
-        assert!(index.is_trained());
+        let coll = core
+            .vector_collections
+            .get_mut(&key)
+            .expect("collection stays");
+        assert_eq!(coll.live_count(), 256);
+        assert!(coll.ivf_index().is_some_and(|ivf| ivf.is_trained()));
         assert!(
-            index.search(&vecs[6], 8).unwrap().iter().all(|r| r.id < 4),
-            "no vector the write added is found"
+            coll.search(&vector(258), 300, 64)
+                .unwrap()
+                .iter()
+                .all(|r| r.id < 256),
+            "no vector the write inserted is found"
+        );
+        assert_eq!(
+            coll.insert(vector(300)).unwrap(),
+            256,
+            "the id counter is back"
         );
     }
 
-    /// An IVF-PQ index the rolled-back write created is removed.
+    /// An IVF-PQ collection the rolled-back write created is removed.
     #[test]
-    fn a_rolled_back_write_removes_the_ivf_index_it_created() {
+    fn a_rolled_back_write_removes_the_ivf_collection_it_created() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
         let key: VectorIndexKey = (DatabaseId::DEFAULT, TenantId::new(TID), "docs:".into());
 
-        let undo = core
-            .capture_vector_write_undo(VectorWriteTarget {
-                index_key: &key,
-                tid: TID,
-                collection: "docs",
-                surrogates: &[],
-                ids: &[],
-                sidecars: false,
-            })
-            .expect("capture undo");
-        core.ivf_indexes
-            .insert(key.clone(), IvfPqIndex::new(4, params()));
-        let UndoEntry::VectorWrite(undo) = undo else {
-            panic!("a vector write captures a VectorWrite undo");
-        };
-        core.apply_undo_vector_write(0, *undo)
+        let undo = capture(&core, &key);
+        let mut coll = ivf_collection();
+        coll.insert(vector(0)).unwrap();
+        core.vector_collections.insert(key.clone(), coll);
+        core.apply_undo_vector_write(0, undo)
             .expect("undo vector write");
 
-        assert!(!core.ivf_indexes.contains_key(&key));
+        assert!(!core.vector_collections.contains_key(&key));
     }
 }

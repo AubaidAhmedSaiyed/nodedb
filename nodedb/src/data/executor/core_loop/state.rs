@@ -215,11 +215,6 @@ pub struct CoreLoop {
     pub(in crate::data::executor) index_configs:
         HashMap<(DatabaseId, TenantId, String), crate::engine::vector::index_config::IndexConfig>,
 
-    /// IVF-PQ indexes for collections configured with `index_type = "ivf_pq"`.
-    /// Key: `(DatabaseId, TenantId, collection_key)` — same shape as `vector_collections`.
-    pub(in crate::data::executor) ivf_indexes:
-        HashMap<(DatabaseId, TenantId, String), crate::engine::vector::ivf::IvfPqIndex>,
-
     /// Per-collection sparse vector inverted indexes, keyed by
     /// (DatabaseId, TenantId, collection, field).
     /// The field is `"_sparse"` when no named field is specified.

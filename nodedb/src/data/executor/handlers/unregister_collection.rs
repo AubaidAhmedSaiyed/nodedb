@@ -261,8 +261,6 @@ impl CoreLoop {
                 .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
             self.index_configs
                 .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
-            self.ivf_indexes
-                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
             removed
         };
 

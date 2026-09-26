@@ -264,8 +264,8 @@ impl CoreLoop {
         Ok(())
     }
 
-    /// Bookkeeping every completed direct write runs once: seal the growing
-    /// segment when it is full, mark the checkpoint dirty, and record each
+    /// Bookkeeping every completed direct write runs once: seal a full growing
+    /// segment or train an IVF-PQ collection at its threshold, mark the checkpoint dirty, and record each
     /// touched surrogate's write version for cross-shard OCC validation.
     pub(in crate::data::executor) fn finish_vector_direct_write(
         &mut self,
@@ -275,21 +275,10 @@ impl CoreLoop {
         collection: &str,
         surrogates: &[Surrogate],
     ) {
-        let seal_key = CoreLoop::vector_build_key(index_key);
         // A committed-redo install seals once the whole record landed, so a
         // rollback finds its inserts in the growing segment.
-        if !self.recording_redo_undo()
-            && let Some(coll) = self.vector_collections.get_mut(index_key)
-            && coll.needs_seal()
-            && let Some(req) = coll.seal(&seal_key)
-            && let Some(tx) = &self.build_tx
-            && let Err(e) = tx.send(req)
-        {
-            tracing::warn!(
-                core = self.core_id,
-                error = %e,
-                "failed to send HNSW build request"
-            );
+        if !self.recording_redo_undo() {
+            self.settle_vector_collection(index_key);
         }
         self.checkpoint_coordinator.mark_dirty("vector", 1);
         for surrogate in surrogates {
