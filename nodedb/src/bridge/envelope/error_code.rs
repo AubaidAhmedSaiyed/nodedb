@@ -150,6 +150,14 @@ pub enum ErrorCode {
     /// special-cases `NotFound`) and reaches the client as SQLSTATE `22012`
     /// rather than the generic `XX000` every `Internal` maps to.
     DivisionByZero,
+    /// Expression evaluation called a function no evaluator implements.
+    /// Surfaces as SQLSTATE `42883` (`undefined_function`), never as a
+    /// silent `NULL`.
+    UndefinedFunction { name: String },
+    /// A function received an argument it cannot compute on: vectors of
+    /// different dimensions, an argument of the wrong type, a malformed
+    /// JSONPath. Surfaces as SQLSTATE `22000` (`data_exception`).
+    DataException { detail: String },
     /// The bridge dispatcher refused the request at a capacity limit, so
     /// nothing was enqueued or applied. Transient: the same request succeeds
     /// once capacity frees. `reason` names the limit and its counts.
@@ -159,6 +167,24 @@ pub enum ErrorCode {
     /// answers for a task it stopped part way. Surfaces as the same
     /// query-cancelled error.
     ExpiredBeforeExecution,
+}
+
+/// An expression evaluation failure, as the Data Plane reports it.
+///
+/// Exhaustive, so a new evaluator error picks its own code rather than
+/// defaulting to one.
+impl From<nodedb_query::EvalError> for ErrorCode {
+    fn from(e: nodedb_query::EvalError) -> Self {
+        match e {
+            nodedb_query::EvalError::DivisionByZero => Self::DivisionByZero,
+            nodedb_query::EvalError::UnknownFunction { name } => Self::UndefinedFunction { name },
+            e @ (nodedb_query::EvalError::VectorDimensionMismatch { .. }
+            | nodedb_query::EvalError::ArgumentType { .. }
+            | nodedb_query::EvalError::InvalidJsonPath { .. }) => Self::DataException {
+                detail: e.to_string(),
+            },
+        }
+    }
 }
 
 impl From<crate::Error> for ErrorCode {
@@ -253,6 +279,8 @@ impl From<crate::Error> for ErrorCode {
                 Self::TxnOverlayMemoryExceeded { limit }
             }
             crate::Error::DivisionByZero => Self::DivisionByZero,
+            crate::Error::UndefinedFunction { name } => Self::UndefinedFunction { name },
+            crate::Error::DataException { detail } => Self::DataException { detail },
             crate::Error::UndefinedColumn { column } => Self::UndefinedColumn { column },
             // Same condition an undefined column reports at plan time, raised
             // here by the strict encoder for a transport the planner never

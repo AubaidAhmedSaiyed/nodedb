@@ -49,6 +49,11 @@ pub const CANNOT_DROP_DEFAULT_DATABASE: AmbiguousSqlstate = AmbiguousSqlstate("0
 
 // ── Class 22 — Data Exception ────────────────────────────────────────────────
 
+/// `22000` — `data_exception` (a function received a value it cannot compute
+/// on: a vector of the wrong dimension, an argument of the wrong shape, a
+/// malformed JSONPath)
+pub const DATA_EXCEPTION: &str = "22000";
+
 /// `22003` — `numeric_value_out_of_range`
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
@@ -351,6 +356,7 @@ mod tests {
             WARNING,
             NO_DATA,
             FEATURE_NOT_SUPPORTED,
+            DATA_EXCEPTION,
             NUMERIC_VALUE_OUT_OF_RANGE,
             DIVISION_BY_ZERO,
             INVALID_LIMIT_VALUE,

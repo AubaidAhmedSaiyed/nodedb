@@ -67,6 +67,9 @@ impl ErrorCode {
     pub const UNDEFINED_COLUMN: Self = Self(1206);
     /// A bare column name resolves against more than one relation in scope.
     pub const AMBIGUOUS_COLUMN: Self = Self(1207);
+    /// A function received a value it cannot compute on: a vector of the
+    /// wrong dimension, an argument of the wrong shape, a malformed path.
+    pub const DATA_EXCEPTION: Self = Self(1208);
 
     // Engine ops (1300–1399)
     pub const ARRAY: Self = Self(1300);

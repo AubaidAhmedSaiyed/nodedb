@@ -191,6 +191,7 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         sqlstate::UNDEFINED_FUNCTION => ErrorCode::UNDEFINED_FUNCTION,
         sqlstate::UNDEFINED_COLUMN => ErrorCode::UNDEFINED_COLUMN,
         sqlstate::AMBIGUOUS_COLUMN => ErrorCode::AMBIGUOUS_COLUMN,
+        sqlstate::DATA_EXCEPTION => ErrorCode::DATA_EXCEPTION,
         // A malformed request and a plan that cannot be built both render as
         // `42601`; both are non-retriable client errors, so one code covers
         // both without losing anything a client acts on.

@@ -23,7 +23,7 @@ pub enum ValidationOutcome {
     EvalError {
         /// The CHECK constraint whose predicate failed to evaluate.
         constraint_name: String,
-        /// The underlying evaluation error (currently only `DivisionByZero`).
+        /// The underlying evaluation error.
         error: nodedb_query::EvalError,
     },
 }

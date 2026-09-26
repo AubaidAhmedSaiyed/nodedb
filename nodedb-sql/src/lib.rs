@@ -182,6 +182,9 @@ fn plan_statements(
         }
     }
 
+    for plan in &plans {
+        planner::search_scope::refuse_row_scoped_search_functions(plan, &functions)?;
+    }
     Ok(plans)
 }
 

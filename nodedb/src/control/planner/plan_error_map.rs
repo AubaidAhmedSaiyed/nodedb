@@ -35,9 +35,11 @@ pub(crate) fn map_plan_error(
         nodedb_sql::SqlError::UndefinedFunction { name } => {
             crate::Error::UndefinedFunction { name }
         }
-        // A per-row sequence accessor is a refusal, not a syntax error, so it
-        // keeps SQLSTATE `0A000` rather than the `42601` the fallback gives.
-        nodedb_sql::SqlError::SequencePerRowUnsupported { .. } => {
+        // A per-row sequence accessor and a search function outside its
+        // search plan are refusals, not syntax errors, so they keep SQLSTATE
+        // `0A000` rather than the `42601` the fallback gives.
+        nodedb_sql::SqlError::SequencePerRowUnsupported { .. }
+        | nodedb_sql::SqlError::SearchFunctionOutsideSearch { .. } => {
             crate::Error::FeatureNotSupported {
                 detail: error.to_string(),
             }
@@ -51,6 +53,7 @@ pub(crate) fn map_plan_error(
         // A constant expression that divides by zero is the same condition the
         // row-scope evaluator raises, so it carries the same code.
         nodedb_sql::SqlError::DivisionByZero => crate::Error::DivisionByZero,
+        nodedb_sql::SqlError::DataException { detail } => crate::Error::DataException { detail },
         nodedb_sql::SqlError::InvalidLimitValue { clause, value } => {
             crate::Error::InvalidLimitValue { clause, value }
         }

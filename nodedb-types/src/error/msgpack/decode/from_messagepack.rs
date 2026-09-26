@@ -155,6 +155,10 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::DivisionByZero)
             }
+            TAG_DATA_EXCEPTION => {
+                let (detail,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::DataException { detail })
+            }
             TAG_INVALID_LIMIT_VALUE => {
                 let (clause, value) = read2_str(reader, field_count)?;
                 Ok(ErrorDetails::InvalidLimitValue { clause, value })
@@ -496,6 +500,14 @@ mod tests {
         let v = ErrorDetails::PlanError {
             phase: "logical".into(),
             detail: "ambiguous column reference".into(),
+        };
+        assert_eq!(roundtrip(&v), v);
+    }
+
+    #[test]
+    fn data_exception_roundtrip() {
+        let v = ErrorDetails::DataException {
+            detail: "vector_distance(): vector dimension mismatch: expected 3, got 2".into(),
         };
         assert_eq!(roundtrip(&v), v);
     }

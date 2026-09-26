@@ -33,6 +33,7 @@ pub(super) fn shape_error_to_api(e: NodeDbError) -> ApiError {
             | ErrorCode::OBJECT_NOT_READY
             | ErrorCode::PLAN_ERROR
             | ErrorCode::DIVISION_BY_ZERO
+            | ErrorCode::DATA_EXCEPTION
             | ErrorCode::BAD_REQUEST
     ) {
         StatusCode::BAD_REQUEST

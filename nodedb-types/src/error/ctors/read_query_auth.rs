@@ -199,6 +199,19 @@ impl NodeDbError {
         }
     }
 
+    /// A function received a value it cannot compute on: a vector of the
+    /// wrong dimension, an argument of the wrong shape, a malformed path.
+    /// SQLSTATE `22000` (`data_exception`). `detail` is the full message.
+    pub fn data_exception(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            code: ErrorCode::DATA_EXCEPTION,
+            message: detail.clone(),
+            details: ErrorDetails::DataException { detail },
+            cause: None,
+        }
+    }
+
     /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
     /// Distinct from `plan_error` so clients match the code, SQLSTATE
     /// `2201W`, instead of parsing the message.

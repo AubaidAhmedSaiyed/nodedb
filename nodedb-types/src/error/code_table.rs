@@ -95,6 +95,7 @@ error_code_table! {
     UNDEFINED_COLUMN => UndefinedColumn { column: String::new() },
     AMBIGUOUS_COLUMN => AmbiguousColumn { column: String::new() },
     DIVISION_BY_ZERO => DivisionByZero,
+    DATA_EXCEPTION => DataException { detail: message.to_owned() },
     INVALID_LIMIT_VALUE => InvalidLimitValue { clause: "remote".into(), value: message.to_owned() },
 
     // Auth / tenant quota.

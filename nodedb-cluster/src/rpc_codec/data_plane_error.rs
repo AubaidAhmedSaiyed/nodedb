@@ -113,6 +113,15 @@ pub enum DataPlaneErrorCode {
         limit: u64,
     },
     DivisionByZero,
+    /// Expression evaluation called a function no evaluator implements.
+    UndefinedFunction {
+        name: String,
+    },
+    /// A function received an argument it cannot compute on (SQLSTATE
+    /// `22000`). `detail` names the function and the value.
+    DataException {
+        detail: String,
+    },
     /// A period-lock reference row exists but does not carry the
     /// configured `status_column` — a misconfigured column name, not a
     /// locked period.

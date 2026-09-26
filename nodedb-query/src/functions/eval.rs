@@ -6,19 +6,25 @@ use nodedb_types::Value;
 
 use crate::expr::EvalError;
 
-use super::{array, conditional, datetime, fts, id, json, math, string, system, types};
+use super::{
+    array, conditional, datetime, fts, id, json, math, string, system, text_chunk, types, vector,
+};
 
 /// Evaluate a scalar function call.
 ///
-/// Every function returns `Ok(Value::Null)` on invalid/missing arguments
-/// (SQL NULL propagation semantics) — the sole exception is `mod`'s
-/// zero-modulus arm (`math::try_eval`), which returns
-/// `Err(EvalError::DivisionByZero)`. Every other
-/// sibling module here stays `Option<Value>`-shaped internally; only the
-/// `math` arm is threaded as `Option<Result<Value, EvalError>>` and the
-/// rest are wrapped in `Ok` at this dispatch boundary, so a single
-/// fallible arm doesn't force every scalar-function module to carry a
-/// `Result` it can never actually produce.
+/// A `NULL` argument gives `Ok(Value::Null)` (SQL NULL propagation). These
+/// calls fail instead:
+/// - `mod`'s zero-modulus arm (`math::try_eval`) returns
+///   `Err(EvalError::DivisionByZero)`;
+/// - a vector distance over operands of different dimensions or over a
+///   non-vector operand (`vector::try_eval`);
+/// - a document function given a malformed JSONPath (`json::try_eval`);
+/// - a name no family module implements returns
+///   `Err(EvalError::UnknownFunction)`, never a silent `NULL`.
+///
+/// The fallible families (`math`, `vector`, `json`) return
+/// `Option<Result<Value, EvalError>>`. The rest stay `Option<Value>`-shaped
+/// and are wrapped in `Ok` at this dispatch boundary.
 pub fn eval_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     if let Some(v) = string::try_eval(name, args) {
         return Ok(v);
@@ -35,8 +41,8 @@ pub fn eval_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     if let Some(v) = datetime::try_eval(name, args) {
         return Ok(v);
     }
-    if let Some(v) = json::try_eval(name, args) {
-        return Ok(v);
+    if let Some(r) = json::try_eval(name, args) {
+        return r;
     }
     if let Some(v) = types::try_eval(name, args) {
         return Ok(v);
@@ -50,8 +56,16 @@ pub fn eval_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     if let Some(v) = system::try_eval(name, args) {
         return Ok(v);
     }
+    if let Some(r) = vector::try_eval(name, args) {
+        return r;
+    }
+    if let Some(v) = text_chunk::try_eval(name, args) {
+        return Ok(v);
+    }
     // Geo / Spatial functions — delegated to geo_functions module.
-    Ok(crate::geo_functions::eval_geo_function(name, args).unwrap_or(Value::Null))
+    crate::geo_functions::eval_geo_function(name, args).ok_or_else(|| EvalError::UnknownFunction {
+        name: name.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -67,6 +81,147 @@ mod tests {
     fn mod_by_zero_errors() {
         let err = eval_function("mod", &[Value::Integer(5), Value::Integer(0)]).unwrap_err();
         assert_eq!(err, EvalError::DivisionByZero);
+    }
+
+    #[test]
+    fn an_unknown_function_is_an_error_not_null() {
+        let err = eval_function("no_such_function", &[Value::Integer(1)]).unwrap_err();
+        assert_eq!(
+            err,
+            EvalError::UnknownFunction {
+                name: "no_such_function".into()
+            }
+        );
+    }
+
+    /// Registered SQL scalars with a per-row meaning dispatch to a real
+    /// evaluator, never to the unknown-function error.
+    #[test]
+    fn registered_row_scalars_have_evaluators() {
+        let doc = Value::Object(
+            [(
+                "tags".to_string(),
+                Value::Array(vec![Value::String("a".into())]),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let path = Value::String("$.tags[0]".into());
+        let vector = Value::Array(vec![Value::Float(1.0), Value::Float(0.0)]);
+        let calls: [(&str, Vec<Value>); 8] = [
+            ("doc_get", vec![doc.clone(), path.clone()]),
+            ("doc_exists", vec![doc.clone(), path.clone()]),
+            (
+                "doc_array_contains",
+                vec![
+                    doc.clone(),
+                    Value::String("$.tags".into()),
+                    Value::String("a".into()),
+                ],
+            ),
+            ("nav", vec![doc, path]),
+            ("vector_distance", vec![vector.clone(), vector.clone()]),
+            (
+                "vector_cosine_distance",
+                vec![vector.clone(), vector.clone()],
+            ),
+            ("vector_neg_inner_product", vec![vector.clone(), vector]),
+            (
+                "ndb_chunk_text",
+                vec![Value::String("abc".into()), Value::Integer(2)],
+            ),
+        ];
+        for (name, args) in calls {
+            let value = eval_function(name, &args)
+                .unwrap_or_else(|e| panic!("{name}() must evaluate, got {e}"));
+            assert_ne!(value, Value::Null, "{name}() gave NULL");
+        }
+    }
+
+    fn text(s: &str) -> Value {
+        Value::String(s.into())
+    }
+
+    #[test]
+    fn like_matches_percent_and_underscore() {
+        assert_eq!(
+            eval_fn("like", vec![text("alice"), text("a%")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("like", vec![text("alice"), text("a_ice")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("like", vec![text("alice"), text("b%")]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_fn("like", vec![text("Alice"), text("a%")]),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn like_honours_the_escape_character() {
+        assert_eq!(
+            eval_fn("like", vec![text("50%"), text("50\\%")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("like", vec![text("500"), text("50\\%")]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_fn("like", vec![text("50%"), text("50!%"), text("!")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("like", vec![text("a\\b"), text("a\\b"), text("")]),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn like_with_a_null_operand_is_null() {
+        assert_eq!(eval_fn("like", vec![Value::Null, text("a%")]), Value::Null);
+        assert_eq!(eval_fn("ilike", vec![text("a"), Value::Null]), Value::Null);
+    }
+
+    #[test]
+    fn ilike_folds_unicode_case() {
+        assert_eq!(
+            eval_fn("ilike", vec![text("ÉCOLE"), text("éc%")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("ilike", vec![text("Straße"), text("STRA%")]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("like", vec![text("ÉCOLE"), text("éc%")]),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn not_like_negates_the_call() {
+        let expr = SqlExpr::Negate(Box::new(SqlExpr::Function {
+            name: "like".into(),
+            args: vec![SqlExpr::Literal(text("bob")), SqlExpr::Literal(text("a%"))],
+        }));
+        assert_eq!(expr.eval(&Value::Null).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn make_array_keeps_every_evaluated_element() {
+        assert_eq!(
+            eval_fn(
+                "make_array",
+                vec![Value::Integer(5), Value::Null, text("x")]
+            ),
+            Value::Array(vec![Value::Integer(5), Value::Null, text("x")])
+        );
     }
 
     #[test]

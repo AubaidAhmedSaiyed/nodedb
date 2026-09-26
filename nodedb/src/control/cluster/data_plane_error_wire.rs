@@ -176,6 +176,8 @@ impl From<ErrorCode> for DataPlaneErrorCode {
                 limit: to_wire_count(limit),
             },
             ErrorCode::DivisionByZero => Self::DivisionByZero,
+            ErrorCode::UndefinedFunction { name } => Self::UndefinedFunction { name },
+            ErrorCode::DataException { detail } => Self::DataException { detail },
             ErrorCode::DispatchCapacity { reason } => Self::DispatchCapacity { reason },
             ErrorCode::ExpiredBeforeExecution => Self::ExpiredBeforeExecution,
         }
@@ -303,6 +305,8 @@ impl From<DataPlaneErrorCode> for ErrorCode {
                 }
             }
             DataPlaneErrorCode::DivisionByZero => Self::DivisionByZero,
+            DataPlaneErrorCode::UndefinedFunction { name } => Self::UndefinedFunction { name },
+            DataPlaneErrorCode::DataException { detail } => Self::DataException { detail },
             DataPlaneErrorCode::DispatchCapacity { reason } => Self::DispatchCapacity { reason },
             DataPlaneErrorCode::ExpiredBeforeExecution => Self::ExpiredBeforeExecution,
         }

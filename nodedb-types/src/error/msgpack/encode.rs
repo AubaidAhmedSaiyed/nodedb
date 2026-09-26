@@ -178,6 +178,7 @@ impl ToMessagePack for ErrorDetails {
                 write1(writer, TAG_AMBIGUOUS_COLUMN, column)
             }
             ErrorDetails::DivisionByZero => write_unit(writer, TAG_DIVISION_BY_ZERO),
+            ErrorDetails::DataException { detail } => write1(writer, TAG_DATA_EXCEPTION, detail),
             ErrorDetails::InvalidLimitValue { clause, value } => {
                 write2(writer, TAG_INVALID_LIMIT_VALUE, clause, value)
             }

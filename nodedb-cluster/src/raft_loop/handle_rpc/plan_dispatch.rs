@@ -149,6 +149,9 @@ mod tests {
         let resp = propose_forwarded(&mut mr, sequencer_request());
 
         assert!(!resp.success);
-        assert_eq!(resp.error_message, "not leader");
+        assert_eq!(
+            resp.refusal,
+            Some(crate::rpc_codec::ForwardedProposeRefusal::NotLeader)
+        );
     }
 }

@@ -105,6 +105,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             ("ERROR", sqlstate::UNDEFINED_COLUMN, err.to_string())
         }
         crate::Error::DivisionByZero => ("ERROR", sqlstate::DIVISION_BY_ZERO, err.to_string()),
+        crate::Error::DataException { detail } => {
+            ("ERROR", sqlstate::DATA_EXCEPTION, detail.clone())
+        }
         crate::Error::InvalidLimitValue { .. } => {
             ("ERROR", sqlstate::INVALID_LIMIT_VALUE, err.to_string())
         }
@@ -279,6 +282,8 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::AMBIGUOUS_COLUMN => sqlstate::AMBIGUOUS_COLUMN,
         // Mirrors the `DivisionByZero` arm.
         Ec::DIVISION_BY_ZERO => sqlstate::DIVISION_BY_ZERO,
+        // Mirrors the `DataException` arm.
+        Ec::DATA_EXCEPTION => sqlstate::DATA_EXCEPTION,
         // Mirrors the `InvalidLimitValue` arm.
         Ec::INVALID_LIMIT_VALUE => sqlstate::INVALID_LIMIT_VALUE,
         // Mirrors the `FanOutExceeded` arm.

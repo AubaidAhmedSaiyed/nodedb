@@ -16,14 +16,19 @@ impl From<nodedb_query::expr_parse::ExprParseError> for Error {
     }
 }
 
-/// `EvalError` has exactly one variant today (`DivisionByZero`); the
-/// `match` is exhaustive rather than a `_ =>` fallback so
-/// a future evaluator error is forced to pick its own `crate::Error`
-/// mapping instead of silently inheriting this one.
+/// The `match` is exhaustive rather than a `_ =>` fallback, so a new
+/// evaluator error picks its own `crate::Error` mapping instead of silently
+/// inheriting one.
 impl From<nodedb_query::EvalError> for Error {
     fn from(e: nodedb_query::EvalError) -> Self {
         match e {
             nodedb_query::EvalError::DivisionByZero => Self::DivisionByZero,
+            nodedb_query::EvalError::UnknownFunction { name } => Self::UndefinedFunction { name },
+            e @ (nodedb_query::EvalError::VectorDimensionMismatch { .. }
+            | nodedb_query::EvalError::ArgumentType { .. }
+            | nodedb_query::EvalError::InvalidJsonPath { .. }) => Self::DataException {
+                detail: e.to_string(),
+            },
         }
     }
 }

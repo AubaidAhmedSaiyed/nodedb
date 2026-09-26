@@ -46,7 +46,7 @@ pub(in crate::data::executor) fn vector_sidecar_matches(
         return Ok(true);
     }
     let (_id, mp) = sparse_row_to_doc(key, sidecar, SparseBodyFormatRef::VectorSidecar);
-    ScanFilter::all_match_binary(filters, &mp).map_err(|_| ErrorCode::DivisionByZero)
+    ScanFilter::all_match_binary(filters, &mp).map_err(ErrorCode::from)
 }
 
 impl CoreLoop {

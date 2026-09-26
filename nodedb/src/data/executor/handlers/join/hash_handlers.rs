@@ -465,9 +465,9 @@ impl CoreLoop {
             emit_unmatched_right: true,
         }) {
             Ok(r) => r,
-            // Div/modulo-by-zero in a residual ON predicate surfaces to the
-            // client as SQLSTATE 22012.
-            Err(_e) => return self.response_error(join.task, ErrorCode::DivisionByZero),
+            // An evaluation error in a residual ON predicate reaches the
+            // client under its own SQLSTATE.
+            Err(e) => return self.response_error(join.task, ErrorCode::from(e)),
         };
 
         if enforce_output_budget && results.len() >= probe_limit {

@@ -110,6 +110,8 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         | ErrorCode::TxnOverlayMemoryExceeded { .. }
         // Expression evaluation failed before producing a value to write.
         | ErrorCode::DivisionByZero
+        | ErrorCode::UndefinedFunction { .. }
+        | ErrorCode::DataException { .. }
         | ErrorCode::UndefinedColumn { .. } => true,
 
         // NOT established — every one of these can be reported by a request

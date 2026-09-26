@@ -524,6 +524,28 @@ async fn a_sparse_where_trigger_refuses_the_distance_cell() {
     );
 }
 
+/// The same WHERE `sparse_score(...)` comparison without the outer column
+/// reference stays in a row filter. `sparse_score` reads the sparse index
+/// and has no per-row value, so the planner refuses the statement with
+/// `0A000` naming the function, whether or not the collection holds rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sparse_where_comparison_is_refused_at_plan_time() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE TABLE sp_sparse_refuse (id TEXT PRIMARY KEY, terms SPARSEVECTOR)")
+        .await
+        .unwrap();
+
+    let error = server
+        .query_text("SELECT id FROM sp_sparse_refuse WHERE sparse_score(terms, '{3: 1.0}') > 0.1")
+        .await
+        .expect_err("sparse_score has no per-row value in a row filter");
+    assert!(
+        error.contains("0A000") && error.contains("sparse_score"),
+        "expected 0A000 naming sparse_score, got: {error}"
+    );
+}
+
 /// A one-argument `vector_distance` does not route to a search
 /// (`order_by/triggers.rs` returns `Ok(None)` below two arguments), so no
 /// cell is declared and `s.distance` must refuse `42703`.

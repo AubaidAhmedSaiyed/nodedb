@@ -343,6 +343,13 @@ pub enum Error {
     #[error("division by zero")]
     DivisionByZero,
 
+    /// A function received an argument it cannot compute on: vectors of
+    /// different dimensions, an argument of the wrong type, a malformed
+    /// JSONPath. `detail` names the function and the value. Rendered as
+    /// SQLSTATE `22000` (data_exception) at the pgwire layer.
+    #[error("{detail}")]
+    DataException { detail: String },
+
     /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
     /// The pgwire layer renders it as SQLSTATE `2201W`.
     #[error("invalid {clause} value: {value}")]

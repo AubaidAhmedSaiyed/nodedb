@@ -151,8 +151,8 @@ impl CoreLoop {
             match ScanFilter::all_match_binary(&base_preds, &mp) {
                 Ok(true) => {}
                 Ok(false) => continue,
-                Err(_e) => {
-                    return self.response_error(task, ErrorCode::DivisionByZero);
+                Err(e) => {
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             }
             let key = if distinct {
@@ -205,8 +205,8 @@ impl CoreLoop {
                     match ScanFilter::all_match_binary(&recursive_preds, &mp) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => {
-                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        Err(e) => {
+                            return self.response_error(task, ErrorCode::from(e));
                         }
                     }
 
@@ -261,8 +261,8 @@ impl CoreLoop {
                     match ScanFilter::all_match_binary(&recursive_preds, &mp) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => {
-                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        Err(e) => {
+                            return self.response_error(task, ErrorCode::from(e));
                         }
                     }
                     let key = if distinct {

@@ -209,8 +209,8 @@ impl CoreLoop {
                     UpdateValue::Expr(expr) => {
                         let result: nodedb_types::Value = match expr.eval(&eval_doc) {
                             Ok(v) => v,
-                            // Division/modulo by zero fails the statement.
-                            Err(_e) => return Err(ErrorCode::DivisionByZero),
+                            // An evaluation error fails the statement.
+                            Err(e) => return Err(ErrorCode::from(e)),
                         };
                         let json: serde_json::Value = result.into();
                         json

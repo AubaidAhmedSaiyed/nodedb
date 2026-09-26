@@ -66,9 +66,9 @@ impl CoreLoop {
             if batch.is_empty() {
                 return Ok(());
             }
-            // A residual-ON-predicate div/modulo-by-zero propagates out of the
-            // flush closure; the caller's `?` converts it to
-            // `crate::Error::DivisionByZero` (SQLSTATE 22012).
+            // A residual-ON-predicate evaluation error propagates out of the
+            // flush closure; the caller's `?` converts it to its typed
+            // `crate::Error`.
             probe_rows_into(
                 &ProbeParams {
                     probe_docs: batch,

@@ -30,10 +30,7 @@ pub fn evaluate_generated_columns(
         // A generated column's expression is write-path-shaped: a
         // division/modulo-by-zero fails the write instead of silently
         // materializing NULL into the stored column.
-        let result = spec
-            .expr
-            .eval(&doc_val)
-            .map_err(|_e| ErrorCode::DivisionByZero)?;
+        let result = spec.expr.eval(&doc_val).map_err(ErrorCode::from)?;
         let computed = serde_json::Value::from(result);
         if let Some(obj) = doc.as_object_mut() {
             obj.insert(spec.name.clone(), computed);

@@ -123,6 +123,10 @@ pub enum ErrorDetails {
     /// Expression evaluation divided or took a modulus by zero.
     #[serde(rename = "division_by_zero")]
     DivisionByZero,
+    /// A function received a value it cannot compute on. `detail` names
+    /// the function and the offending value.
+    #[serde(rename = "data_exception")]
+    DataException { detail: String },
     /// A LIMIT/OFFSET/FETCH bound resolved outside `[0, usize::MAX]`.
     #[serde(rename = "invalid_limit_value")]
     InvalidLimitValue { clause: String, value: String },

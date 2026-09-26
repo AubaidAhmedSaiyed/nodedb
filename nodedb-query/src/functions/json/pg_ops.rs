@@ -17,7 +17,7 @@ use nodedb_types::Value;
 ///
 /// This is a cheap path: non-string values pass through a single `matches!`
 /// check; strings that are not valid JSON also return quickly from the parser.
-fn coerce_json_string(v: &Value) -> std::borrow::Cow<'_, Value> {
+pub(super) fn coerce_json_string(v: &Value) -> std::borrow::Cow<'_, Value> {
     if let Value::String(s) = v
         && let Ok(parsed) = sonic_rs::from_str::<serde_json::Value>(s)
     {

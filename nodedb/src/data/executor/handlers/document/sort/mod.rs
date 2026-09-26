@@ -6,4 +6,4 @@ pub(in crate::data::executor) mod compare;
 pub(in crate::data::executor) mod external;
 pub(in crate::data::executor) mod in_memory;
 
-pub(in crate::data::executor) use in_memory::sort_rows;
+pub(in crate::data::executor) use in_memory::{sort_decoded_rows, sort_rows};

@@ -322,20 +322,18 @@ impl CoreLoop {
                     match row_matches_filters(&row, &schema, &filter_predicates) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => {
-                            return Err(self.response_error(task, ErrorCode::DivisionByZero));
+                        Err(e) => {
+                            return Err(self.response_error(task, ErrorCode::from(e)));
                         }
                     }
                 }
                 // No computed columns on this path (`&[]` below), so this
-                // can never actually raise `DivisionByZero` today — handled
-                // uniformly with every other `row_to_projected_value` caller
-                // instead of assuming that invariant with an `unwrap`.
+                // cannot raise an evaluation error today. It is handled like
+                // every other `row_to_projected_value` caller instead of
+                // assuming that invariant with an `unwrap`.
                 let obj = match row_to_projected_value(&row, &schema, &[], &[], false) {
                     Ok(v) => v,
-                    Err(_e) => {
-                        return Err(self.response_error(task, ErrorCode::DivisionByZero));
-                    }
+                    Err(e) => return Err(self.response_error(task, e)),
                 };
                 matched.push((surrogate, row, obj));
             }

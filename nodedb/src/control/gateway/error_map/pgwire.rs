@@ -106,6 +106,9 @@ mod tests {
                 column: "x".into(),
             },
             Error::DivisionByZero,
+            Error::DataException {
+                detail: "vector_distance(): vector dimension mismatch: expected 3, got 2".into(),
+            },
             Error::InvalidLimitValue {
                 clause: "LIMIT",
                 value: "-1".into(),
