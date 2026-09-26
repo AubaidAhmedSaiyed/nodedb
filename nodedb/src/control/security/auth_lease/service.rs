@@ -17,6 +17,11 @@
 //! leadership against a quorum, taken after the decision. A leader deposed
 //! meanwhile answers `NotLeader`, so no lease it grants and no barrier it
 //! releases outlives its term unseen.
+//!
+//! A leader that is the only voter of the metadata group pins its own lease
+//! (see [`super::table`]). No other node can lead the group then, so every
+//! barrier releases here, and each one waits for this node's coverage.
+//! Planning on this node then needs no lease that expires on the clock.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, Weak};
@@ -36,7 +41,7 @@ use crate::control::security::auth_fence::cluster::{
 use crate::control::security::auth_fence::view::apply_committed_tree_defs;
 use crate::control::state::SharedState;
 
-use super::leadership::{leader_hint, leading_term};
+use super::leadership::{leader_hint, leading_term, sole_voter_term};
 use super::table::{BarrierState, LeaseTable, RenewDecision};
 use super::timing::LeaseTiming;
 use super::withheld_warn::WithheldWarnings;
@@ -78,6 +83,24 @@ impl LeaderLeaseService {
 
     fn table(&self) -> std::sync::MutexGuard<'_, Option<LeaseTable>> {
         self.table.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether the table of `term` pins the lease of `node_id`.
+    ///
+    /// The caller passes the term in which it read that this node is the
+    /// only voter of the metadata group.
+    pub fn holds_pinned_lease(&self, term: u64, node_id: u64) -> bool {
+        self.table()
+            .as_ref()
+            .is_some_and(|table| table.term() == term && table.is_pinned(node_id))
+    }
+
+    /// Run `edit` on the current table, creating one for `term` first.
+    #[cfg(test)]
+    pub(crate) fn edit_table(&self, term: u64, now: Instant, edit: impl FnOnce(&mut LeaseTable)) {
+        let mut table = self.table();
+        let table = table.get_or_insert_with(|| LeaseTable::new(term, now));
+        edit(table);
     }
 
     /// Make the table of `term` current and load its floors.
@@ -184,16 +207,24 @@ impl LeaderLeaseService {
                 outcome: AuthLeaseRenewOutcome::Withheld,
             };
         }
+        let sole_voter = sole_voter_term(&state) == Some(term);
         let (decision, shortfall) = {
             let mut table = self.table();
             match table.as_mut().filter(|t| t.term() == term) {
                 Some(table) => {
+                    table.observe_sole_voter(sole_voter);
                     let decision = table.renew(
                         req.node_id,
                         &req.coverage,
                         Instant::now(),
                         self.timing.lease,
                     );
+                    if decision == RenewDecision::Granted
+                        && sole_voter
+                        && req.node_id == state.node_id
+                    {
+                        table.pin(req.node_id);
+                    }
                     let shortfall = match decision {
                         RenewDecision::Withheld => table.shortfall(&req.coverage),
                         RenewDecision::Granted => Vec::new(),
@@ -257,6 +288,7 @@ impl LeaderLeaseService {
                 tokio::time::sleep(self.timing.renew_every).await;
                 continue;
             }
+            let sole_voter = sole_voter_term(&state) == Some(term);
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -264,6 +296,7 @@ impl LeaderLeaseService {
                 let mut table = self.table();
                 match table.as_mut().filter(|t| t.term() == term) {
                     Some(table) => {
+                        table.observe_sole_voter(sole_voter);
                         table.raise_floors(&req.targets);
                         table.barrier(&req.targets, Instant::now(), self.timing.lease)
                     }
@@ -282,6 +315,10 @@ impl LeaderLeaseService {
                 }
                 BarrierState::NotReady => tokio::time::sleep(self.timing.renew_every).await,
                 BarrierState::Waiting { until } => {
+                    // A pinned holder releases the barrier by renewing, which
+                    // wakes `notified`. A check every renewal interval also
+                    // sees the pin end when a second voter joins.
+                    let until = until.unwrap_or_else(|| Instant::now() + self.timing.renew_every);
                     let wake = tokio::time::Instant::from_std(until.min(deadline));
                     drop(state);
                     tokio::select! {

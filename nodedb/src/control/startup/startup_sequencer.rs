@@ -147,7 +147,7 @@ impl SequencerState {
             if self.failed.is_some() {
                 return;
             }
-            if self.current == StartupPhase::GatewayEnable {
+            if self.current == StartupPhase::Serving {
                 return;
             }
             let Some(next) = self.current.next() else {
@@ -330,7 +330,7 @@ mod tests {
     /// that `current_phase()` advances in lock-step.
     ///
     /// Without the sentinel gate the sequencer would advance all the way to
-    /// `GatewayEnable` after the last registered gate fires, because no
+    /// `Serving` after the last registered gate fires, because no
     /// pending gates block the remaining phases. The sentinel makes the
     /// stopping point explicit and deterministic.
     #[tokio::test]
@@ -502,7 +502,7 @@ mod tests {
     // ── 6. Matchstick: StartupPhase::next() is exhaustive ───────────────────
 
     /// Every non-terminal phase must return `Some(_)` from `next()`, and
-    /// the chain must terminate exactly at `GatewayEnable`. If a new
+    /// the chain must terminate exactly at `Serving`. If a new
     /// variant is added without a branch in `next()`, the compiler rejects
     /// the match — catching the omission at compile time.
     #[test]
@@ -523,8 +523,8 @@ mod tests {
         }
         assert_eq!(
             cur,
-            StartupPhase::GatewayEnable,
-            "chain must terminate at GatewayEnable"
+            StartupPhase::Serving,
+            "chain must terminate at Serving"
         );
 
         // Exhaustive match — compile error if a variant is added without
@@ -541,6 +541,7 @@ mod tests {
             StartupPhase::WarmPeers => StartupPhase::WarmPeers.next(),
             StartupPhase::HealthLoopStart => StartupPhase::HealthLoopStart.next(),
             StartupPhase::GatewayEnable => StartupPhase::GatewayEnable.next(),
+            StartupPhase::Serving => StartupPhase::Serving.next(),
             StartupPhase::Failed => StartupPhase::Failed.next(),
         };
     }

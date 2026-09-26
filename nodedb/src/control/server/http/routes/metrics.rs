@@ -276,10 +276,7 @@ pub async fn metrics(
 
     // Authorization lease validity. A node without a valid lease refuses
     // permission-checked statements.
-    crate::control::security::auth_lease::status::render_prometheus(
-        &state.shared.authorization_fence,
-        &mut output,
-    );
+    crate::control::security::auth_lease::status::render_prometheus(&state.shared, &mut output);
 
     // Metering capacity: dropped-entry counters, so a refused (i.e. never
     // billed) usage record is observable without reading server logs.

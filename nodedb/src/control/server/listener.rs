@@ -48,7 +48,11 @@ pub struct ListenerRunParams {
 impl Listener {
     /// Bind to the given address.
     pub async fn bind(addr: SocketAddr) -> crate::Result<Self> {
-        let tcp = TcpListener::bind(addr).await?;
+        Self::from_listener(TcpListener::bind(addr).await?)
+    }
+
+    /// Serve on a socket that already listens.
+    pub fn from_listener(tcp: TcpListener) -> crate::Result<Self> {
         let local_addr = tcp.local_addr()?;
         info!(%local_addr, "control plane listener bound");
         Ok(Self {

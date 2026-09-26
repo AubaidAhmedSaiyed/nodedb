@@ -211,11 +211,12 @@ pub async fn await_cluster_ready(
     // opens once the first lease is granted, so the first statements are
     // not refused.
     if let Some(timing) = shared.authorization_fence.timing()
-        && let Err(error) = shared
-            .authorization_fence
-            .holder()
-            .await_valid(RAFT_READY_STALL_TIMEOUT, timing.renew_every)
-            .await
+        && let Err(error) = crate::control::security::auth_lease::await_planning_admitted(
+            shared,
+            RAFT_READY_STALL_TIMEOUT,
+            timing.renew_every,
+        )
+        .await
     {
         gateway_enable_gate.fail(format!("authorization lease not granted: {error}"));
         return Err(anyhow::anyhow!(

@@ -15,7 +15,9 @@
 //! 4. In a cluster, the node must hold a valid authorization lease. A writer
 //!    acknowledges an authorization change only after every lease holder
 //!    covered it or its lease expired, so a valid lease means the state read
-//!    here holds every change acknowledged before this point.
+//!    here holds every change acknowledged before this point. A node that
+//!    leads the metadata group as its only voter holds a pinned lease, which
+//!    never expires: every barrier waits for its coverage instead.
 //!
 //! The lease is checked after the cache guard is taken. The guard fixes the
 //! cache for the whole plan, and a change acknowledged after the check was
@@ -25,6 +27,7 @@ use std::time::Instant;
 
 use tokio::sync::RwLockReadGuard;
 
+use crate::control::security::auth_lease::lease_status;
 use crate::control::security::permission_tree::{PermissionCache, reload};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, VShardId};
@@ -58,12 +61,7 @@ pub async fn permission_view(
             }
         }
     }
-    if state.authorization_fence.timing().is_some()
-        && !state
-            .authorization_fence
-            .holder()
-            .is_valid_at(Instant::now())
-    {
+    if !lease_status(state, Instant::now()).admits_planning() {
         return Err(behind(
             "this node holds no valid authorization lease; it has not confirmed the latest \
              authorization changes",

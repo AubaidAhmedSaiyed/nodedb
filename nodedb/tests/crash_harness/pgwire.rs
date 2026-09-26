@@ -152,7 +152,7 @@ impl CrashHarness {
     /// reports ready.
     ///
     /// `/healthz` is a one-shot boot-phase latch (`control/startup/health.rs`)
-    /// that flips to OK at `GatewayEnable`; the Calvin sequencer is
+    /// that flips to OK at `Serving`; the Calvin sequencer is
     /// deliberately not a data group in that readiness gate, so a write can
     /// still hit `calvin-submit: no sequencer leader elected yet; cannot
     /// submit cross-shard transaction` after `/healthz` is already green.

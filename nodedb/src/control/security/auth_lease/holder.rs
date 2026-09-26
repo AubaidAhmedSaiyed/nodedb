@@ -6,6 +6,9 @@
 //! lease is valid. The lease ends on this node's clock before it ends on the
 //! leader's (see [`super::timing`]), so once the leader treats it as expired
 //! no statement here can still plan under it.
+//!
+//! A node that leads the metadata group as its only voter also plans under a
+//! pinned lease, which has no expiry (see [`super::status`]).
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -37,25 +40,6 @@ impl LeaseHolder {
     /// When the lease ends, if one was granted.
     pub fn valid_until(&self) -> Option<Instant> {
         *self.valid_until.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Wait until a lease is valid, polling every `poll`, or refuse once
-    /// `timeout` passes.
-    pub async fn await_valid(
-        &self,
-        timeout: std::time::Duration,
-        poll: std::time::Duration,
-    ) -> crate::Result<()> {
-        let deadline = Instant::now() + timeout;
-        while !self.is_valid_at(Instant::now()) {
-            if Instant::now() >= deadline {
-                return Err(crate::Error::AuthorizationStateBehind {
-                    detail: format!("no authorization lease was granted within {timeout:?}"),
-                });
-            }
-            tokio::time::sleep(poll).await;
-        }
-        Ok(())
     }
 }
 

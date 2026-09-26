@@ -3,11 +3,14 @@
 //! HTTP API server using axum + axum-server (for TLS).
 //!
 //! Probe routes (unversioned, always reachable):
-//! - GET  /healthz      — k8s readiness/liveness (always reachable; 503 until GatewayEnable)
+//! - GET  /healthz      — k8s readiness (always reachable; 503 until the `Serving` phase)
 //! - GET  /health/live  — unconditional liveness probe
-//! - GET  /health/ready — readiness (WAL recovered)
+//! - GET  /health/ready — readiness (WAL recovered and the `Serving` phase reached)
 //! - POST /health/drain — trigger graceful drain
-//! - GET  /metrics      — Prometheus-format metrics (requires monitor role)
+//! - GET  /metrics      — Prometheus-format metrics (requires monitor role; always reachable)
+//!
+//! Every other route returns 503 until the `Serving` startup phase (see
+//! [`super::startup_gate`]).
 //!
 //! All other routes are versioned under `/v1/`.
 //!
@@ -40,9 +43,8 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::extract::DefaultBodyLimit;
+use axum::middleware;
 use axum::routing::{get, post, put};
 use tracing::info;
 
@@ -64,7 +66,7 @@ use super::routes;
 /// SSE and WebSocket routes are kept on a separate sub-router that does NOT
 /// carry the `map_response` layer — those handlers set their own
 /// `Content-Type` (text/event-stream, or the WS upgrade response).
-fn build_router(state: AppState) -> Router {
+pub(super) fn build_router(state: AppState) -> Router {
     // ── Streaming / non-JSON routes (no Content-Type stamp) ──────────────────
     let streaming_routes = Router::new()
         // WebSocket RPC — upgrade response, not JSON.
@@ -172,48 +174,9 @@ fn build_router(state: AppState) -> Router {
         .merge(streaming_routes)
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            startup_gate_middleware,
+            super::startup_gate::startup_gate_middleware,
         ))
         .with_state(state)
-}
-
-/// Axum middleware that gates non-health routes on [`StartupPhase::GatewayEnable`].
-///
-/// All `/health*` paths (liveness, readiness, drain) are always let through so
-/// k8s probes can observe startup progress. All other routes receive a
-/// `503 Service Unavailable` until the node reaches `GatewayEnable`.
-async fn startup_gate_middleware(
-    State(app_state): State<AppState>,
-    req: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-
-    let path = req.uri().path();
-    // Health-probe paths bypass the gate — these must be reachable during startup.
-    let is_health_path = path == "/healthz" || path.starts_with("/health/");
-
-    if !is_health_path {
-        let gate = &app_state.shared.startup;
-        let snap = gate.current_phase();
-        if let Some(err) = gate.is_failed() {
-            let body = serde_json::json!({
-                "status": "failed",
-                "error": err.to_string(),
-            });
-            return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-        }
-        if snap < crate::control::startup::StartupPhase::GatewayEnable {
-            let body = serde_json::json!({
-                "status": "starting",
-                "phase": snap.name(),
-            });
-            return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-        }
-    }
-
-    next.run(req).await
 }
 
 /// Start the HTTP API server from an already-bound [`tokio::net::TcpListener`].

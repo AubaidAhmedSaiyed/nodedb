@@ -88,9 +88,8 @@ async fn start_http(auth_mode: AuthMode) -> TestServer {
         .ok();
     });
 
-    // Wait for the gate (startup phase must reach GatewayEnable).
-    // For testing purposes the Trust-mode server starts in Trust mode which
-    // also fires the gate because startup is bypassed in test builds.
+    // The test state's pre-fired startup gate starts at `Serving`, the final
+    // phase, so every route answers at once. Give the server time to start.
     tokio::time::sleep(Duration::from_millis(40)).await;
 
     TestServer {

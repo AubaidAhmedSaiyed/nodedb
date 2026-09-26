@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Integration test: native protocol STATUS command returns "OK" after
-//! GatewayEnable fires and returns "Starting" before it fires.
+//! Integration test: native protocol STATUS command returns "OK" once the
+//! sequencer reaches `Serving`, the final phase.
 //!
 //! The native protocol is a simple framing format:
 //!   [4-byte big-endian payload_len][payload]
@@ -35,13 +35,16 @@ fn make_gated_state() -> (
     let mut shared = SharedState::new(dispatcher, wal).unwrap();
 
     let (seq, gate) = StartupSequencer::new();
-    let gw_gate = seq.register_gate(StartupPhase::GatewayEnable, "gateway-enable-native-test");
+    // No gate holds the phases before Serving. Firing this gate passes
+    // GatewayEnable, which opens the accept loop, and enters Serving, where
+    // STATUS reports ready.
+    let serving_gate = seq.register_gate(StartupPhase::Serving, "serving-native-test");
 
     Arc::get_mut(&mut shared)
         .expect("SharedState not yet cloned")
         .startup = Arc::clone(&gate);
 
-    (shared, seq, gw_gate, dir)
+    (shared, seq, serving_gate, dir)
 }
 
 /// Encode a JSON payload as a native protocol frame (4-byte length prefix).
@@ -70,8 +73,8 @@ async fn read_json_frame(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_status_returns_ok_after_gateway_enable() {
-    let (shared, _seq, gw_gate, _dir) = make_gated_state();
+async fn native_status_returns_ok_once_serving() {
+    let (shared, _seq, serving_gate, _dir) = make_gated_state();
     let startup_gate = Arc::clone(&shared.startup);
 
     // Bind the native protocol listener on an ephemeral port.
@@ -100,8 +103,8 @@ async fn native_status_returns_ok_after_gateway_enable() {
             .await;
     });
 
-    // Fire the gate so the listener starts accepting.
-    gw_gate.fire();
+    // Enter Serving so STATUS reports ready.
+    serving_gate.fire();
 
     // Give the listener time to reach the accept loop.
     tokio::time::sleep(Duration::from_millis(30)).await;

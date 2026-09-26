@@ -43,10 +43,16 @@ pub async fn wire_state(
         array_catalog,
         maintenance_budget,
     } = components;
-    // Install startup gate.
-    if let Some(state) = Arc::get_mut(shared) {
-        state.startup = Arc::clone(startup_gate);
-    }
+    // Install startup gate. `/healthz` and the HTTP startup gate read it, so
+    // a state left on the test helpers' pre-fired gate would report ready
+    // and open every route during boot.
+    Arc::get_mut(shared)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "startup gate: SharedState is already shared before the gate was installed"
+            )
+        })?
+        .startup = Arc::clone(startup_gate);
 
     // Replay surrogate WAL records.
     // Note: wal_records are not passed here — caller must handle surrogate replay

@@ -10,10 +10,6 @@ use nodedb::ServerConfig;
 use nodedb::bootstrap;
 use nodedb::bootstrap::tls::build_tls_acceptor;
 use nodedb::control::cluster::ClusterHandle;
-use nodedb::control::server::ilp_listener::IlpListener;
-use nodedb::control::server::listener::Listener;
-use nodedb::control::server::pgwire::listener::PgListener;
-use nodedb::control::server::resp::RespListener;
 use nodedb::control::shutdown::ShutdownBus;
 use nodedb::control::state::SharedState;
 
@@ -23,12 +19,9 @@ use nodedb::control::state::SharedState;
 pub(crate) struct ListenerSetup {
     pub(crate) conn_semaphore: Arc<tokio::sync::Semaphore>,
     pub(crate) admission_registry: Arc<nodedb::control::server::admission::AdmissionRegistry>,
-    pub(crate) listener: Listener,
-    pub(crate) pg_listener: PgListener,
-    pub(crate) http_listener: tokio::net::TcpListener,
-    pub(crate) sync_listener: tokio::net::TcpListener,
-    pub(crate) ilp_listener: Option<IlpListener>,
-    pub(crate) resp_listener: Option<RespListener>,
+    /// Every protocol socket. HTTP listens at once. The client protocols
+    /// listen only once the node is ready.
+    pub(crate) bound: bootstrap::listeners::BoundListeners,
     pub(crate) base_acceptor: Option<tokio_rustls::TlsAcceptor>,
     pub(crate) native_tls_enabled: bool,
 }
@@ -57,15 +50,9 @@ pub(crate) async fn setup(
 
     // Bind all listeners — every protocol, including HTTP and sync — before
     // starting any accept loop, so a port conflict fails boot here rather
-    // than after the node is already serving other protocols.
-    let bootstrap::listeners::BoundListeners {
-        native: listener,
-        pgwire: pg_listener,
-        http: http_listener,
-        sync: sync_listener,
-        ilp: ilp_listener,
-        resp: resp_listener,
-    } = bootstrap::listeners::bind_listeners(config).await?;
+    // than after the node is already serving other protocols. Only HTTP
+    // listens now. The client protocols listen once the node is ready.
+    let bound = bootstrap::listeners::bind_listeners(config)?;
 
     // Startup banner (and trust-mode warning if applicable).
     bootstrap::credentials::print_startup_banner(config, cluster_mode_str);
@@ -106,12 +93,7 @@ pub(crate) async fn setup(
     Ok(ListenerSetup {
         conn_semaphore,
         admission_registry,
-        listener,
-        pg_listener,
-        http_listener,
-        sync_listener,
-        ilp_listener,
-        resp_listener,
+        bound,
         base_acceptor,
         native_tls_enabled,
     })

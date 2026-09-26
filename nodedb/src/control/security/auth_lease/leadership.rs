@@ -27,6 +27,23 @@ pub(crate) fn leading_term(state: &SharedState) -> Option<u64> {
         .map(|(_, term)| term)
 }
 
+/// The term this node leads the metadata group in, when it is also the
+/// group's only voter.
+///
+/// A single-voter group commits a configuration change inside the propose
+/// call and applies it at once. A second voter therefore ends this before it
+/// can vote. No other node can lead the group while this returns a term.
+pub(crate) fn sole_voter_term(state: &SharedState) -> Option<u64> {
+    let status = state.raft_status_fn.get()?;
+    status()
+        .into_iter()
+        .find(|group| group.group_id == METADATA_GROUP_ID)
+        .filter(|group| {
+            group.role == "Leader" && group.leader_id == state.node_id && group.member_count == 1
+        })
+        .map(|group| group.term)
+}
+
 /// The leader hint to send back with a refusal.
 pub(crate) fn leader_hint(state: &SharedState) -> Option<u64> {
     metadata_leader(state)

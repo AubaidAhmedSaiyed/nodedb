@@ -163,6 +163,7 @@ async fn server_main() -> anyhow::Result<()> {
         warm_peers_gate,
         health_loop_gate,
         gateway_enable_gate,
+        serving_gate,
     } = gates::register_startup_gates(&startup_seq);
 
     let data_plane::DataPlaneBootstrap {
@@ -237,12 +238,7 @@ async fn server_main() -> anyhow::Result<()> {
     let listeners::ListenerSetup {
         conn_semaphore,
         admission_registry,
-        listener,
-        pg_listener,
-        http_listener,
-        sync_listener,
-        ilp_listener,
-        resp_listener,
+        bound,
         base_acceptor,
         native_tls_enabled,
     } = listeners::setup(
@@ -253,6 +249,22 @@ async fn server_main() -> anyhow::Result<()> {
         cluster_handle.clone(),
     )
     .await?;
+
+    let nodedb::bootstrap::listeners::BoundListeners {
+        http: http_listener,
+        clients: client_sockets,
+    } = bound;
+
+    // Serve HTTP from here on, so orchestrator probes can watch the rest of
+    // boot. Only `/healthz`, `/health/*` and `/metrics` answer until the
+    // `Serving` phase below. Every other route returns 503, so no request can
+    // bypass a quota before `replay_quotas` runs.
+    nodedb::bootstrap::listeners::spawn_http_listener(
+        http_listener,
+        Arc::clone(&shared),
+        &config,
+        shutdown_bus.clone(),
+    );
 
     // Per-protocol TLS: returns the acceptor only if the protocol flag is true.
     let tls_for = |enabled: bool| -> Option<tokio_rustls::TlsAcceptor> {
@@ -281,11 +293,22 @@ async fn server_main() -> anyhow::Result<()> {
     // listener has accepted a connection that could bypass a cap.
     nodedb::bootstrap::quota_replay::replay_quotas(&shared);
 
+    // Listen on the client protocols only now, and enter `Serving`. Until here
+    // every client socket was bound but not listening, so a client
+    // connecting during boot was refused at once instead of waiting in the
+    // kernel's accept queue for the node to become ready.
+    let nodedb::bootstrap::listeners::OpenListeners {
+        native: listener,
+        pgwire: pg_listener,
+        sync: sync_listener,
+        ilp: ilp_listener,
+        resp: resp_listener,
+    } = nodedb::bootstrap::listeners::open_listeners(client_sockets, serving_gate)?;
+
     // Spawn all non-native protocol listeners.
     nodedb::bootstrap::listeners::spawn_protocol_listeners(
         nodedb::bootstrap::listeners::ProtocolListeners {
             pg_listener,
-            http_listener,
             sync_listener,
             ilp_listener,
             resp_listener,

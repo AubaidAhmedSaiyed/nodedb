@@ -39,6 +39,11 @@ impl RespListener {
             .map_err(|e| crate::Error::Config {
                 detail: format!("failed to bind RESP listener on {addr}: {e}"),
             })?;
+        Self::from_listener(tcp)
+    }
+
+    /// Serve on a socket that already listens.
+    pub fn from_listener(tcp: TcpListener) -> crate::Result<Self> {
         let local_addr = tcp.local_addr().map_err(|e| crate::Error::Config {
             detail: format!("failed to get RESP local address: {e}"),
         })?;

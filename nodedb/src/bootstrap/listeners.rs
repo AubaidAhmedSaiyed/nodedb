@@ -13,18 +13,19 @@ use crate::control::cluster::ClusterHandle;
 use crate::control::server::ilp_listener::IlpListener;
 use crate::control::server::listener::Listener;
 use crate::control::server::pgwire::listener::PgListener;
+use crate::control::server::reserved_socket::ReservedSocket;
 use crate::control::server::resp::RespListener;
 use crate::control::shutdown::ShutdownBus;
-use crate::control::startup::StartupGate;
+use crate::control::startup::{ReadyGate, StartupGate};
 use crate::control::state::SharedState;
 
-/// The pre-bound protocol listeners passed to [`spawn_protocol_listeners`].
+/// The listening client-protocol sockets passed to
+/// [`spawn_protocol_listeners`].
 ///
-/// Every socket here is already bound by [`bind_listeners`], so spawning
-/// cannot fail on a port conflict.
+/// Every socket here was bound by [`bind_listeners`] and opened by
+/// [`open_listeners`], so spawning cannot fail on a port conflict.
 pub struct ProtocolListeners {
     pub pg_listener: PgListener,
-    pub http_listener: TcpListener,
     pub sync_listener: TcpListener,
     pub ilp_listener: Option<IlpListener>,
     pub resp_listener: Option<RespListener>,
@@ -37,14 +38,16 @@ pub struct ListenerInfra {
     pub shutdown_bus: ShutdownBus,
 }
 
-/// Spawn all non-native protocol listeners as background tasks.
+/// Spawn all non-native client-protocol listeners as background tasks.
 ///
 /// The native listener is not spawned here — it is run on the main task
-/// by the caller after this returns.
+/// by the caller after this returns. The HTTP server is spawned earlier by
+/// [`spawn_http_listener`].
 ///
 /// Infallible by construction: every socket was bound by [`bind_listeners`]
-/// before this point, so a port conflict has already aborted boot while
-/// nothing was exposed. Nothing here may silently swallow a bind failure.
+/// and opened by [`open_listeners`] before this point, so a port conflict
+/// has already aborted boot. Nothing here may silently swallow a bind
+/// failure.
 pub async fn spawn_protocol_listeners(
     listeners: ProtocolListeners,
     shared: Arc<SharedState>,
@@ -55,7 +58,6 @@ pub async fn spawn_protocol_listeners(
 ) {
     let ProtocolListeners {
         pg_listener,
-        http_listener,
         sync_listener,
         ilp_listener,
         resp_listener,
@@ -70,7 +72,6 @@ pub async fn spawn_protocol_listeners(
     };
     let tls_flags = config.server.tls.as_ref();
     let pgwire_tls_enabled = tls_flags.is_some_and(|t| t.pgwire);
-    let http_tls_enabled = tls_flags.is_some_and(|t| t.http);
     let resp_tls_enabled = tls_flags.is_some_and(|t| t.resp);
     let ilp_tls_enabled = tls_flags.is_some_and(|t| t.ilp);
 
@@ -94,29 +95,6 @@ pub async fn spawn_protocol_listeners(
             .await
         {
             tracing::error!(error = %e, "pgwire listener failed");
-        }
-    });
-
-    // HTTP API server (on the socket bound by `bind_listeners`).
-    let shared_http = Arc::clone(&shared);
-    let http_auth_mode = config.auth.mode.clone();
-    let http_tls = if http_tls_enabled {
-        config.server.tls.clone()
-    } else {
-        None
-    };
-    let bus_http = shutdown_bus.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::control::server::http::server::run(
-            http_listener,
-            shared_http,
-            http_auth_mode,
-            http_tls.as_ref(),
-            bus_http,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "HTTP API server failed");
         }
     });
 
@@ -194,11 +172,61 @@ pub async fn spawn_protocol_listeners(
     nodedb_cluster::readiness::notify_ready();
 }
 
-/// Every protocol socket, bound before any accept loop starts.
+/// Spawn the HTTP API server on `http_listener`.
+///
+/// Boot calls this before it waits for the node to become ready, so
+/// orchestrator probes can watch startup. Until the `Serving` phase only the
+/// probe and metrics routes answer (see
+/// `control::server::http::startup_gate`).
+pub fn spawn_http_listener(
+    http_listener: TcpListener,
+    shared: Arc<SharedState>,
+    config: &ServerConfig,
+    shutdown_bus: ShutdownBus,
+) {
+    let http_auth_mode = config.auth.mode.clone();
+    let http_tls = config.server.tls.as_ref().filter(|tls| tls.http).cloned();
+    tokio::spawn(async move {
+        if let Err(e) = crate::control::server::http::server::run(
+            http_listener,
+            shared,
+            http_auth_mode,
+            http_tls.as_ref(),
+            shutdown_bus,
+        )
+        .await
+        {
+            tracing::error!(error = %e, "HTTP API server failed");
+        }
+    });
+}
+
+/// Every protocol socket, bound before the node waits to become ready.
+///
+/// The HTTP socket listens from the start, so probes answer during boot. The
+/// client-protocol sockets are bound but not listening.
 pub struct BoundListeners {
+    pub http: TcpListener,
+    pub clients: ClientSockets,
+}
+
+/// The client-protocol sockets, bound but not yet listening.
+///
+/// A bound socket that does not listen refuses each connection attempt at
+/// once. Boot listens through [`open_listeners`] only once the node can
+/// serve, so no client waits in a kernel accept queue through boot.
+pub struct ClientSockets {
+    pub native: ReservedSocket,
+    pub pgwire: ReservedSocket,
+    pub sync: ReservedSocket,
+    pub ilp: Option<ReservedSocket>,
+    pub resp: Option<ReservedSocket>,
+}
+
+/// Every client-protocol socket, listening.
+pub struct OpenListeners {
     pub native: Listener,
     pub pgwire: PgListener,
-    pub http: TcpListener,
     pub sync: TcpListener,
     pub ilp: Option<IlpListener>,
     pub resp: Option<RespListener>,
@@ -209,35 +237,82 @@ pub struct BoundListeners {
 /// This is the single fail-fast point for listener setup: it runs before the
 /// node waits on cluster readiness and before any accept loop is spawned, so
 /// a port conflict on *any* protocol — including HTTP and sync, which serve
-/// from detached tasks — aborts boot while nothing is exposed yet. Never
-/// move a bind out of here into a spawned task; that is how a server ends up
-/// running for days missing a listener behind one warning line.
-pub async fn bind_listeners(config: &ServerConfig) -> anyhow::Result<BoundListeners> {
-    let native = crate::control::server::listener::Listener::bind(config.native_addr()).await?;
-    let pgwire =
-        crate::control::server::pgwire::listener::PgListener::bind(config.pgwire_addr()).await?;
-    let http = TcpListener::bind(config.http_addr())
-        .await
-        .with_context(|| format!("bind HTTP API listener to {}", config.http_addr()))?;
-    let sync = crate::control::server::sync::listener::bind_sync_listener(config.sync_addr())
-        .await
+/// from detached tasks — aborts boot early. Never move a bind out of here
+/// into a spawned task; that is how a server ends up running for days
+/// missing a listener behind one warning line.
+pub fn bind_listeners(config: &ServerConfig) -> anyhow::Result<BoundListeners> {
+    let reserve = |name: &str, addr: std::net::SocketAddr| {
+        ReservedSocket::bind(addr).with_context(|| format!("bind {name} listener to {addr}"))
+    };
+    let http = reserve("HTTP API", config.http_addr())?
+        .listen()
+        .context("listen on the HTTP API address")?;
+    let native = reserve("native protocol", config.native_addr())?;
+    let pgwire = reserve("pgwire", config.pgwire_addr())?;
+    let sync = crate::control::server::sync::listener::reserve_sync_listener(config.sync_addr())
         .context("sync listener failed to bind")?;
-    let ilp = if let Some(ilp_addr) = config.ilp_addr() {
-        Some(crate::control::server::ilp_listener::IlpListener::bind(ilp_addr).await?)
-    } else {
-        None
-    };
-    let resp = if let Some(resp_addr) = config.resp_addr() {
-        Some(crate::control::server::resp::RespListener::bind(resp_addr).await?)
-    } else {
-        None
-    };
+    let ilp = config
+        .ilp_addr()
+        .map(|addr| reserve("ILP", addr))
+        .transpose()?;
+    let resp = config
+        .resp_addr()
+        .map(|addr| reserve("RESP", addr))
+        .transpose()?;
     Ok(BoundListeners {
+        http,
+        clients: ClientSockets {
+            native,
+            pgwire,
+            sync,
+            ilp,
+            resp,
+        },
+    })
+}
+
+/// Start listening on every client-protocol socket, then fire
+/// `serving_gate`.
+///
+/// Boot calls this once the node can serve and before any accept loop is
+/// spawned. The gate advances the startup sequencer to
+/// [`StartupPhase::Serving`](crate::control::startup::StartupPhase::Serving),
+/// which opens every HTTP route and lets `/healthz` report `ok`, at the same
+/// point the client protocols start listening. A socket that cannot listen
+/// fails the gate and aborts boot: another process started listening on its
+/// address after the bind.
+pub fn open_listeners(
+    clients: ClientSockets,
+    serving_gate: ReadyGate,
+) -> anyhow::Result<OpenListeners> {
+    let ClientSockets {
         native,
         pgwire,
-        http,
         sync,
         ilp,
         resp,
-    })
+    } = clients;
+    let open = || -> crate::Result<OpenListeners> {
+        Ok(OpenListeners {
+            native: Listener::from_listener(native.listen()?)?,
+            pgwire: PgListener::from_listener(pgwire.listen()?)?,
+            sync: sync.listen()?,
+            ilp: ilp
+                .map(|socket| IlpListener::from_listener(socket.listen()?))
+                .transpose()?,
+            resp: resp
+                .map(|socket| RespListener::from_listener(socket.listen()?))
+                .transpose()?,
+        })
+    };
+    match open() {
+        Ok(open) => {
+            serving_gate.fire();
+            Ok(open)
+        }
+        Err(error) => {
+            serving_gate.fail(error.to_string());
+            Err(error.into())
+        }
+    }
 }

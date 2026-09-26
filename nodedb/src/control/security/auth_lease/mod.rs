@@ -18,5 +18,5 @@ pub use barrier::{
 pub use calvin_acks::CalvinAckCoverage;
 pub use holder::LeaseHolder;
 pub use service::LeaderLeaseService;
-pub use status::{LeaseStatus, lease_status};
+pub use status::{LeaseStatus, await_planning_admitted, lease_status};
 pub use timing::LeaseTiming;

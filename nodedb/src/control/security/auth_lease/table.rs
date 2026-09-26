@@ -13,6 +13,12 @@
 //! in the table. They end within one lease duration of this leader taking
 //! over, so a barrier also waits until then.
 //!
+//! A leader that is the only voter of the metadata group can pin its own
+//! lease. A pinned lease has no expiry: every barrier waits for the pinned
+//! node's coverage, however late its renewal runs. The caller reports on
+//! every renewal and barrier whether the leader is still the only voter. The
+//! first report that it is not removes the pin.
+//!
 //! The table is pure: callers pass the clock, so every rule is testable.
 
 use std::collections::HashMap;
@@ -50,8 +56,10 @@ pub enum BarrierState {
     /// No node can plan against state older than the targets.
     Released,
     /// Waiting for a report or an expiry. Nothing changes on its own before
-    /// the instant named, except a renewal.
-    Waiting { until: Instant },
+    /// `until`, except a renewal. `until` is `None` while the pinned holder
+    /// has not covered the targets: only its renewal, or the end of the pin,
+    /// can release the barrier then.
+    Waiting { until: Option<Instant> },
     /// The floors of this term are not loaded yet.
     NotReady,
 }
@@ -64,6 +72,9 @@ pub struct LeaseTable {
     floors_ready: bool,
     floors: HashMap<u64, u64>,
     holders: HashMap<u64, HolderRecord>,
+    /// The holder whose lease has no expiry while the leader stays the only
+    /// voter of the metadata group.
+    pinned: Option<u64>,
 }
 
 impl LeaseTable {
@@ -75,6 +86,7 @@ impl LeaseTable {
             floors_ready: false,
             floors: HashMap::new(),
             holders: HashMap::new(),
+            pinned: None,
         }
     }
 
@@ -125,6 +137,25 @@ impl LeaseTable {
         RenewDecision::Granted
     }
 
+    /// Record whether the leader is still the only voter of the metadata
+    /// group. A leader that is not removes the pin.
+    pub fn observe_sole_voter(&mut self, sole_voter: bool) {
+        if !sole_voter {
+            self.pinned = None;
+        }
+    }
+
+    /// Pin the lease of `node_id`, which a renewal just granted while the
+    /// leader was the only voter.
+    pub fn pin(&mut self, node_id: u64) {
+        self.pinned = Some(node_id);
+    }
+
+    /// Whether the lease of `node_id` is pinned.
+    pub fn is_pinned(&self, node_id: u64) -> bool {
+        self.pinned == Some(node_id)
+    }
+
     /// Every group whose floor `coverage` does not reach, as
     /// `(group_id, floor, reported)`. `reported` is `None` for a group the
     /// report omits.
@@ -159,23 +190,33 @@ impl LeaseTable {
         let mut wait_for = |instant: Instant| {
             until = Some(until.map_or(instant, |current: Instant| current.min(instant)));
         };
+        let mut wait_for_pinned = false;
         let earlier_leases_end = self.leader_since + lease;
         if now < earlier_leases_end {
             wait_for(earlier_leases_end);
         }
-        for record in self.holders.values() {
-            let Some(expires_at) = record.expires_at.filter(|end| *end > now) else {
+        for (node_id, record) in &self.holders {
+            let pinned = self.pinned == Some(*node_id);
+            let live_until = record.expires_at.filter(|end| *end > now);
+            if !pinned && live_until.is_none() {
                 continue;
-            };
+            }
             let covered = targets
                 .iter()
                 .all(|target| record.covers(target.group_id, target.through));
-            if !covered {
-                wait_for(expires_at);
+            if covered {
+                continue;
+            }
+            match live_until {
+                Some(expires_at) if !pinned => wait_for(expires_at),
+                _ => wait_for_pinned = true,
             }
         }
+        if wait_for_pinned {
+            return BarrierState::Waiting { until: None };
+        }
         match until {
-            Some(until) => BarrierState::Waiting { until },
+            Some(until) => BarrierState::Waiting { until: Some(until) },
             None => BarrierState::Released,
         }
     }
@@ -248,7 +289,7 @@ mod tests {
         assert_eq!(
             table.barrier(&[cover(0, 5)], start, LEASE),
             BarrierState::Waiting {
-                until: start + LEASE
+                until: Some(start + LEASE)
             }
         );
         assert_eq!(
@@ -271,7 +312,9 @@ mod tests {
         // Node 2 holds a lease and has not covered index 12.
         assert_eq!(
             table.barrier(&target, now, LEASE),
-            BarrierState::Waiting { until: now + LEASE }
+            BarrierState::Waiting {
+                until: Some(now + LEASE)
+            }
         );
         // Its renewal below the new floor is withheld, and its lease is not
         // extended.
@@ -291,7 +334,9 @@ mod tests {
         table.raise_floors(&later);
         assert_eq!(
             table.barrier(&later, now, LEASE),
-            BarrierState::Waiting { until: now + LEASE }
+            BarrierState::Waiting {
+                until: Some(now + LEASE)
+            }
         );
         assert_eq!(
             table.barrier(&later, now + LEASE, LEASE),
@@ -301,6 +346,67 @@ mod tests {
         assert_eq!(
             table.renew(2, &[cover(0, 12)], now + LEASE, LEASE),
             RenewDecision::Withheld
+        );
+    }
+
+    /// A pinned lease holds a barrier past its bounded expiry. Its renewal
+    /// can run arbitrarily late without any barrier releasing behind it.
+    #[test]
+    fn a_pinned_lease_holds_a_barrier_past_its_expiry() {
+        let start = Instant::now();
+        let mut table = settled_table(start);
+        let now = start + LEASE;
+        table.observe_sole_voter(true);
+        assert_eq!(
+            table.renew(1, &[cover(0, 10)], now, LEASE),
+            RenewDecision::Granted
+        );
+        table.pin(1);
+        let target = [cover(0, 12)];
+        table.raise_floors(&target);
+
+        // Ten lease durations pass with no renewal. The bounded lease ended
+        // long ago, but the barrier still waits for node 1.
+        let starved = now + LEASE * 10;
+        table.observe_sole_voter(true);
+        assert_eq!(
+            table.barrier(&target, starved, LEASE),
+            BarrierState::Waiting { until: None }
+        );
+
+        // A late renewal that covers the target releases it.
+        assert_eq!(
+            table.renew(1, &[cover(0, 12)], starved, LEASE),
+            RenewDecision::Granted
+        );
+        assert_eq!(
+            table.barrier(&target, starved, LEASE),
+            BarrierState::Released
+        );
+    }
+
+    /// Once the leader is not the only voter, the pin ends and the lease
+    /// expires on the clock again.
+    #[test]
+    fn a_second_voter_ends_the_pin() {
+        let start = Instant::now();
+        let mut table = settled_table(start);
+        let now = start + LEASE;
+        assert_eq!(
+            table.renew(1, &[cover(0, 10)], now, LEASE),
+            RenewDecision::Granted
+        );
+        table.pin(1);
+        assert!(table.is_pinned(1));
+        let target = [cover(0, 12)];
+        table.raise_floors(&target);
+
+        let starved = now + LEASE * 10;
+        table.observe_sole_voter(false);
+        assert!(!table.is_pinned(1));
+        assert_eq!(
+            table.barrier(&target, starved, LEASE),
+            BarrierState::Released
         );
     }
 }

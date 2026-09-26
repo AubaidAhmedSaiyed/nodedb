@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
+use crate::control::server::reserved_socket::ReservedSocket;
 use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection_future};
 use crate::control::shutdown::{ShutdownBus, ShutdownPhase};
 use crate::control::state::SharedState;
@@ -250,13 +251,13 @@ async fn run_accepted_session<T>(
     isolate_connection_future(future).await
 }
 
-/// Bind the sync WebSocket listener socket.
+/// Bind the sync listener address without listening.
 ///
-/// Separate from [`serve_sync_listener`] so boot can bind every protocol
-/// socket up front — before any accept loop is spawned and before the node
-/// joins the cluster — and fail loudly on a port conflict while nothing is
-/// yet exposed. See `bootstrap::listeners::bind_listeners`.
-pub async fn bind_sync_listener(addr: SocketAddr) -> crate::Result<TcpListener> {
+/// Boot reserves every protocol socket up front, before the node joins the
+/// cluster, and fails loudly on a port conflict while nothing is exposed.
+/// It listens only once the node can serve. See
+/// `bootstrap::listeners::bind_listeners`.
+pub fn reserve_sync_listener(addr: SocketAddr) -> crate::Result<ReservedSocket> {
     // Plaintext `ws://` sync must terminate TLS at a loopback proxy: reject any
     // public bind here so both the fail-fast boot path (`bind_listeners`) and
     // the convenience `start_sync_listener` path are covered by one guard.
@@ -277,16 +278,17 @@ pub async fn bind_sync_listener(addr: SocketAddr) -> crate::Result<TcpListener> 
             ),
         });
     }
-    TcpListener::bind(&addr)
-        .await
-        .map_err(|e| crate::Error::Config {
-            detail: format!("bind sync listener to {addr}: {e}"),
-        })
+    ReservedSocket::bind(addr)
+}
+
+/// Bind the sync listener address and listen at once.
+pub async fn bind_sync_listener(addr: SocketAddr) -> crate::Result<TcpListener> {
+    reserve_sync_listener(addr)?.listen()
 }
 
 /// Start the sync WebSocket listener with full security context.
 ///
-/// Binds and serves in one step. Boot uses [`bind_sync_listener`] +
+/// Binds and serves in one step. Boot uses [`reserve_sync_listener`] +
 /// [`serve_sync_listener`] instead so the bind is fail-fast; this is the
 /// convenience path for callers that own the whole lifecycle (tests, tools)
 /// and can provide that lifecycle's canonical shutdown bus.

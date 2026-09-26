@@ -6,7 +6,7 @@
 //! |-------------------|--------|-----------------------------|---------------|
 //! | `/healthz`        | GET    | Ready to serve traffic      | readiness     |
 //! | `/health/live`    | GET    | Process alive (always 200)  | liveness      |
-//! | `/health/ready`   | GET    | WAL recovered               | readiness alt |
+//! | `/health/ready`   | GET    | WAL recovered, serving      | readiness alt |
 //! | `/health/drain`   | POST   | Trigger graceful drain      | preStop hook  |
 
 use std::sync::atomic::Ordering;
@@ -34,13 +34,13 @@ pub async fn live() -> impl IntoResponse {
 
 /// GET /healthz — k8s-style readiness probe.
 ///
-/// Returns `200 OK` when the node has reached `GatewayEnable`, is
+/// Returns `200 OK` when the node has reached `Serving`, is
 /// serving traffic, is NOT draining/decommissioned, and — on a node that
 /// runs a Calvin sequencer — can actually sequence a cross-shard write.
 /// Returns `503 Service Unavailable` otherwise.
 ///
 /// Every condition is evaluated live on each call, not latched: sequencer
-/// leadership and the epoch seed can both be lost long after `GatewayEnable`.
+/// leadership and the epoch seed can both be lost long after `Serving`.
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     // The coordinator signals this canonical watch before progressing drain
     // phases, so readiness must fail immediately even before lifecycle state
@@ -192,13 +192,14 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     (status, axum::Json(body))
 }
 
-/// The lease state `/healthz` reports: `valid`, `invalid`, or `not_required`
-/// on a single node without a cluster.
+/// The lease state `/healthz` reports: `valid`, `invalid`, `sole_voter` for
+/// a pinned lease, or `not_required` on a single node without a cluster.
 fn lease_label(state: &AppState) -> &'static str {
     use crate::control::security::auth_lease::{LeaseStatus, lease_status};
-    match lease_status(&state.shared.authorization_fence, std::time::Instant::now()) {
+    match lease_status(&state.shared, std::time::Instant::now()) {
         LeaseStatus::NotRequired => "not_required",
         LeaseStatus::Valid { .. } => "valid",
+        LeaseStatus::SoleVoter => "sole_voter",
         LeaseStatus::Invalid { .. } => "invalid",
     }
 }
@@ -207,8 +208,8 @@ fn lease_label(state: &AppState) -> &'static str {
 /// `None` when it holds one or needs none.
 fn lease_invalid_body(state: &AppState) -> Option<serde_json::Value> {
     use crate::control::security::auth_lease::{LeaseStatus, lease_status};
-    match lease_status(&state.shared.authorization_fence, std::time::Instant::now()) {
-        LeaseStatus::NotRequired | LeaseStatus::Valid { .. } => None,
+    match lease_status(&state.shared, std::time::Instant::now()) {
+        LeaseStatus::NotRequired | LeaseStatus::Valid { .. } | LeaseStatus::SoleVoter => None,
         LeaseStatus::Invalid { expired_for } => Some(json!({
             "status": "degraded",
             "reason": "authorization_lease_invalid",
@@ -302,16 +303,23 @@ fn sequencer_not_servable(
     None
 }
 
-/// GET /health/ready — readiness check (WAL recovered, cores initialized).
+/// GET /health/ready — readiness check: WAL recovered and the `Serving` phase reached.
+///
+/// Boot recovers the WAL long before it listens on the client protocols, so
+/// the WAL alone never makes the node ready.
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let wal_ready = state.shared.wal.next_lsn().as_u64() > 0;
-    let status = if wal_ready {
+    let serving = matches!(
+        crate::control::startup::health::observe(&state.shared.startup),
+        crate::control::startup::health::HealthState::Ok
+    );
+    let ready = serving && state.shared.wal.next_lsn().as_u64() > 0;
+    let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
     let body = json!({
-        "status": if wal_ready { "ready" } else { "not_ready" },
+        "status": if ready { "ready" } else { "not_ready" },
         "wal_lsn": state.shared.wal.next_lsn().as_u64(),
         "node_id": state.shared.node_id,
     });

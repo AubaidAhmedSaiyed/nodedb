@@ -34,7 +34,9 @@ use super::leadership::{metadata_leader, send_to_leader};
 /// holder reports its coverage only with its next renewal. This covers every
 /// DDL that bears authorization, `CREATE COLLECTION` included. A holder that
 /// cannot renew adds up to one lease duration (the election timeout), until
-/// its lease expires. On a single node the wait is the permission step's
+/// its lease expires. A pinned holder, the leader that is the only voter of
+/// the metadata group, has no expiry: the barrier waits for its next renewal
+/// however late it runs. On a single node the wait is the permission step's
 /// lag only.
 pub async fn authorization_barrier(
     state: &SharedState,
