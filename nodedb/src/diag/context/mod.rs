@@ -11,6 +11,7 @@ mod crdt;
 mod data_plane;
 mod index_rebuild;
 mod ingest;
+mod lease;
 mod outcome_floor;
 mod quota;
 mod raft_apply;
@@ -32,6 +33,7 @@ pub(in crate::diag) use data_plane::{
 pub(in crate::diag) use index_rebuild::IndexRebuildNotInstalled;
 pub(in crate::diag) use ingest::IlpAcceptedLinesDropped;
 pub use ingest::IlpFlushOutcome;
+pub(in crate::diag) use lease::DescriptorLeaseNotRenewed;
 pub(in crate::diag) use outcome_floor::{WriteWindowHeld, WriteWindowLeaked};
 pub use quota::{DATABASE_SCOPE, TENANT_SCOPE};
 pub(in crate::diag) use quota::{
