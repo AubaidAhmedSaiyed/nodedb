@@ -159,6 +159,10 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 let (detail,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::DataException { detail })
             }
+            TAG_PROGRAM_LIMIT_EXCEEDED => {
+                let (detail,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::ProgramLimitExceeded { detail })
+            }
             TAG_INVALID_LIMIT_VALUE => {
                 let (clause, value) = read2_str(reader, field_count)?;
                 Ok(ErrorDetails::InvalidLimitValue { clause, value })
@@ -508,6 +512,14 @@ mod tests {
     fn data_exception_roundtrip() {
         let v = ErrorDetails::DataException {
             detail: "vector_distance(): vector dimension mismatch: expected 3, got 2".into(),
+        };
+        assert_eq!(roundtrip(&v), v);
+    }
+
+    #[test]
+    fn program_limit_exceeded_roundtrip() {
+        let v = ErrorDetails::ProgramLimitExceeded {
+            detail: "WITH RECURSIVE CTE 'walk' exceeded max recursion depth 100".into(),
         };
         assert_eq!(roundtrip(&v), v);
     }

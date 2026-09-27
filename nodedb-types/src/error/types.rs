@@ -103,6 +103,7 @@ impl NodeDbError {
                 | ErrorDetails::AmbiguousColumn { .. }
                 | ErrorDetails::DivisionByZero
                 | ErrorDetails::DataException { .. }
+                | ErrorDetails::ProgramLimitExceeded { .. }
                 | ErrorDetails::InvalidLimitValue { .. }
                 | ErrorDetails::BackupTenantMismatch { .. }
                 | ErrorDetails::BackupKeyMismatch

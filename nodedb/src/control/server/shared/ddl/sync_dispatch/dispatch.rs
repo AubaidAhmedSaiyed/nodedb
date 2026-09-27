@@ -5,11 +5,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
+use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response};
 use crate::control::server::dispatch_utils::{
     Collect, MintedRecords, OwnedResponse, OwnedWait, RecordOwner, await_response_owned,
 };
 use crate::control::server::shared::clone_write::CloneCheckedTask;
+use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::server::shared::session::statement_deadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
@@ -20,6 +21,11 @@ use super::system_task::SystemTask;
 ///
 /// This is async — it yields the Tokio thread while waiting, so the response
 /// poller can deliver the result without deadlocking.
+///
+/// A Data-Plane refusal returns `crate::Error::DataPlane` with the response's
+/// own [`crate::bridge::envelope::ErrorCode`]. Each protocol renders that code
+/// through its SQLSTATE or status table. Only a refusal with no code is
+/// `crate::Error::Internal`.
 pub(crate) async fn dispatch_system(
     state: &SharedState,
     task: SystemTask<'_>,
@@ -28,34 +34,21 @@ pub(crate) async fn dispatch_system(
     let event_source = task.reason.event_source();
     let resp = dispatch_system_response_with_source(state, task, timeout, event_source).await?;
 
-    if resp.status != Status::Ok {
-        // DDL/DSL callers receive the flattened message form. Callers that need
-        // to classify the Data-Plane rejection by type use
-        // `dispatch_system_response_with_source` and inspect `resp.error_code`.
-        let detail = resp
-            .error_code
-            .as_ref()
-            .map(|c| format!("{c:?}"))
-            .unwrap_or_else(|| String::from_utf8_lossy(&resp.payload).into_owned());
-        return Err(crate::Error::Internal { detail });
-    }
-
     // A system task never advances the tenant's observed write-HLC. Its
     // `SystemReason` states that no client asked for the work, and RESTORE's
     // staleness gate counts only user data writes.
-    Ok(resp.payload.to_vec())
+    payload_or_typed_error(resp)
 }
 
 /// Send system-initiated work and await the full [`Response`], preserving the
 /// typed [`crate::bridge::envelope::ErrorCode`] on a non-`Ok` status instead of
 /// flattening it to a string.
 ///
-/// Infrastructure failures (dispatch, timeout, channel close) still surface as
-/// typed `Error` variants. Callers that must classify a Data-Plane rejection by
-/// type (e.g. the CRDT sync delta path) use this and inspect `resp.error_code`;
-/// [`dispatch_system`] wraps this and flattens the code to a message
-/// for DDL/DSL callers. This function does **not** advance the tenant write-HLC
-/// — the caller does that on its own success path.
+/// Infrastructure failures (dispatch, timeout, channel close) surface as typed
+/// `Error` variants. Callers that inspect the whole response (the CRDT sync
+/// delta path, CONVERT) use this. [`dispatch_system`] wraps it and returns the
+/// payload or the typed refusal. This function does **not** advance the
+/// tenant write-HLC — the caller does that on its own success path.
 pub(crate) async fn dispatch_system_response_with_source(
     state: &SharedState,
     task: SystemTask<'_>,
@@ -85,6 +78,9 @@ pub(crate) async fn dispatch_system_response_with_source(
 
 /// Send clone-checked, already-authorized work to the Data Plane and await its
 /// payload.
+///
+/// A Data-Plane refusal returns `crate::Error::DataPlane` with its own code,
+/// the same shape [`dispatch_system`] returns.
 ///
 /// The capability is consumed here: the plan that reaches storage is the plan
 /// authorization approved, so a caller cannot authorize one shape and dispatch
@@ -119,16 +115,7 @@ pub(crate) async fn dispatch_authorized(
     )
     .await?;
 
-    if resp.status != Status::Ok {
-        let detail = resp
-            .error_code
-            .as_ref()
-            .map(|c| format!("{c:?}"))
-            .unwrap_or_else(|| String::from_utf8_lossy(&resp.payload).into_owned());
-        return Err(crate::Error::Internal { detail });
-    }
-
-    Ok(resp.payload.to_vec())
+    payload_or_typed_error(resp)
 }
 
 /// What [`dispatch_plan`] sends, and where.

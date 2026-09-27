@@ -127,6 +127,10 @@ pub enum ErrorDetails {
     /// the function and the offending value.
     #[serde(rename = "data_exception")]
     DataException { detail: String },
+    /// A statement exceeded a server limit on its own size or depth.
+    /// `detail` names the limit.
+    #[serde(rename = "program_limit_exceeded")]
+    ProgramLimitExceeded { detail: String },
     /// A LIMIT/OFFSET/FETCH bound resolved outside `[0, usize::MAX]`.
     #[serde(rename = "invalid_limit_value")]
     InvalidLimitValue { clause: String, value: String },

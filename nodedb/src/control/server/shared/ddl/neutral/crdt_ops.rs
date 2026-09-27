@@ -96,7 +96,7 @@ pub async fn crdt_state(
         },
     )
     .await
-    .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     let columns = vec!["crdt_state".to_string()];
 
@@ -219,14 +219,14 @@ pub async fn crdt_apply(
         state,
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
             authorized,
-            collection,
+            collection: &qualified_collection,
             timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,
             policy: &policy,
         },
     )
     .await
-    .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     let columns = vec!["result".to_string()];
     let mut row = Map::new();

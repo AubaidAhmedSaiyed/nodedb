@@ -129,7 +129,7 @@ pub async fn rate_check(
                 // Read TTL to compute retry_after_ms.
                 let ttl_remaining = read_ttl_ms(state, tenant_id, vshard, &rate_key).await;
                 Err(ddl_err(
-                    "54001",
+                    "53300",
                     format!(
                         "rate limit exceeded for {gate_name}:{key}, retry after {ttl_remaining}ms (current={current}, max={max_count})"
                     ),

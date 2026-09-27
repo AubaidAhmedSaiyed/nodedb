@@ -14,8 +14,8 @@ use crate::bridge::envelope::{Response, Status};
 /// the detail.
 ///
 /// Shared by every door that returns bytes rather than a `Response`: the
-/// replicated sync write, the user DDL/DSL dispatch, and the version-history
-/// read. One copy so a response a clone hook served and a response the Data
+/// replicated sync write, the user DDL/DSL dispatch, the system dispatch, and
+/// the version-history read. One copy so a response a clone hook served and a response the Data
 /// Plane returned cannot be reported differently.
 pub(crate) fn payload_or_typed_error(response: Response) -> crate::Result<Vec<u8>> {
     if response.status != Status::Ok {

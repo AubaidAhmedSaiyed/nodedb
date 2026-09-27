@@ -31,6 +31,9 @@ const FRONTIER_RETRY_LIMIT: usize = 8;
 
 pub struct AuthorizedCrdtApplyAdmissionRequest<'a> {
     pub authorized: AuthorizedTask,
+    /// The db-qualified collection (`QualifiedCollection::as_str`), the same
+    /// string the plan's `CrdtOp::Apply` carries. The preview and the apply
+    /// address the Data Plane by it, and the catalog lookup de-qualifies it.
     pub collection: &'a str,
     pub timeout: Duration,
     pub event_source: EventSource,
@@ -40,6 +43,8 @@ pub struct AuthorizedCrdtApplyAdmissionRequest<'a> {
 pub struct CrdtApplyAdmissionRequest<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
+    /// The db-qualified collection, equal to the plan's `CrdtOp::Apply`
+    /// collection.
     pub collection: &'a str,
     pub plan: PhysicalPlan,
     pub timeout: Duration,
@@ -70,6 +75,7 @@ impl CrdtAdmissionOutcome {
 pub struct CrdtRestoreAdmissionRequest<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
+    /// The db-qualified collection the generated restore ops address.
     pub collection: &'a str,
     pub document_id: &'a str,
     pub target_version_json: &'a str,
@@ -147,31 +153,35 @@ pub async fn dispatch_authorized_crdt_apply_admitted_outcome(
     .await
 }
 
+/// `collection` is db-qualified. The catalog keys collections by the bare
+/// name, so the lookup de-qualifies it first.
 fn enforce_external_signing_policy(
     state: &SharedState,
     authorized: &AuthorizedTask,
     collection: &str,
 ) -> crate::Result<()> {
+    let bare = crate::control::target_identity::naming::bare_collection_name(
+        authorized.database_id(),
+        collection,
+    );
     let stored = state
         .credentials
         .catalog()
         .get_collection(
             authorized.database_id(),
             authorized.tenant_id().as_u64(),
-            collection,
+            &bare,
         )?
         .ok_or_else(|| crate::Error::CollectionNotFound {
             tenant_id: authorized.tenant_id(),
-            collection: collection.to_owned(),
+            collection: bare.clone(),
         })?;
     if stored.crdt_signing_required
         && matches!(authorized.plan(), PhysicalPlan::Crdt(CrdtOp::Apply { .. }))
     {
         return Err(crate::Error::RejectedAuthz {
             tenant_id: authorized.tenant_id(),
-            resource: format!(
-                "collection:{collection}:unsigned_crdt_delta_requires_authenticated_sync"
-            ),
+            resource: format!("collection:{bare}:unsigned_crdt_delta_requires_authenticated_sync"),
         });
     }
     Ok(())

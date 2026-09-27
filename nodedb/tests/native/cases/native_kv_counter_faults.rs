@@ -5,8 +5,8 @@
 //! `KV_INCR` on a raw value that is not a decimal integer, or past the i64
 //! range, is refused by the Data Plane with the collection it ran on. The
 //! native frame carries the data-exception SQLSTATE pgwire sends, the same
-//! message text, the numeric code, and structured details that name the
-//! collection.
+//! message text, a numeric code of the same data-exception class, and
+//! structured details that name the collection.
 
 use nodedb_test_support::native_harness::{do_handshake, send_sql};
 use nodedb_test_support::pgwire_harness::TestServer;
@@ -71,14 +71,10 @@ async fn native_counter_parse_fault_names_the_collection() {
     )
     .await;
     assert_eq!(err.code, sqlstate::INVALID_TEXT_REPRESENTATION);
-    assert_eq!(err.ndb_code, ErrorCode::TYPE_MISMATCH.0);
-    assert_eq!(
-        err.message,
-        format!("value is not an integer or out of range on {COLLECTION}")
-    );
-    let expected = ErrorDetails::TypeMismatch {
-        collection: COLLECTION.into(),
-    };
+    assert_eq!(err.ndb_code, ErrorCode::DATA_EXCEPTION.0);
+    let message = format!("value is not an integer or out of range on {COLLECTION}");
+    assert_eq!(err.message, message);
+    let expected = ErrorDetails::DataException { detail: message };
     assert_eq!(err.details.as_ref(), Some(&expected));
 
     let typed = NodeDbError::from_wire_with_details(

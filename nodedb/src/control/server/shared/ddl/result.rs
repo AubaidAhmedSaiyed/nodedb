@@ -45,6 +45,9 @@ pub struct DdlError {
     /// The structured details of a typed verdict: the collection, gate, or
     /// document it names. `None` for an error built from a SQLSTATE alone.
     pub details: Option<Box<ErrorDetails>>,
+    /// The typed error that caused this one, such as the Data-Plane refusal
+    /// behind a MOVE TENANT phase failure. `None` when there is none.
+    pub cause: Option<Box<nodedb_types::NodeDbError>>,
 }
 
 impl DdlError {
@@ -59,6 +62,7 @@ impl DdlError {
             code,
             message: message.into(),
             details: None,
+            cause: None,
         }
     }
 
@@ -74,6 +78,7 @@ impl DdlError {
             code: public.code(),
             message: message.into(),
             details: Some(Box::new(public.details().clone())),
+            cause: None,
         }
     }
 
@@ -86,6 +91,23 @@ impl DdlError {
         Self::from_public(sqlstate, message, &public)
     }
 
+    /// Build a `DdlError` from an internal error, with `context` before its
+    /// message. The SQLSTATE, code and details stay the error's own, so a
+    /// typed Data-Plane refusal keeps its class under the prefix.
+    pub fn from_error_in_context(context: &str, error: &crate::Error) -> Self {
+        let (_, sqlstate, message) =
+            crate::control::server::pgwire::types::error_to_sqlstate(error);
+        let public = crate::error_classify::classify(error);
+        Self::from_public(sqlstate, format!("{context}: {message}"), &public)
+    }
+
+    /// Carry `error`'s cause, when it has one, as this error's cause. The
+    /// phase code stays this error's own, and the cause keeps its own class.
+    pub fn with_cause_of(mut self, error: &nodedb_types::NodeDbError) -> Self {
+        self.cause = error.cause().map(|cause| Box::new(cause.clone()));
+        self
+    }
+
     /// Build a `DdlError` with an explicit code, bypassing derivation.
     /// Used by the named constructors below for ambiguous SQLSTATEs.
     fn with_code(sqlstate: &'static str, code: ErrorCode, message: impl Into<String>) -> Self {
@@ -94,6 +116,7 @@ impl DdlError {
             code,
             message: message.into(),
             details: None,
+            cause: None,
         }
     }
 

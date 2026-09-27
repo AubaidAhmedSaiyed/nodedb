@@ -70,6 +70,9 @@ impl ErrorCode {
     /// A function received a value it cannot compute on: a vector of the
     /// wrong dimension, an argument of the wrong shape, a malformed path.
     pub const DATA_EXCEPTION: Self = Self(1208);
+    /// A statement exceeded a server limit on its own size or depth: a
+    /// recursion depth, a per-transaction staging budget.
+    pub const PROGRAM_LIMIT_EXCEEDED: Self = Self(1209);
 
     // Engine ops (1300–1399)
     pub const ARRAY: Self = Self(1300);

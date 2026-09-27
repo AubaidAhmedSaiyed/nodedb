@@ -13,6 +13,15 @@ use crate::control::server::response_shape::types::{
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::ddl::{DdlError, DdlResult};
 
+/// The SQLSTATE, message and numeric code a native error frame carries for
+/// one Control-Plane error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeErrorFields {
+    pub(crate) sqlstate: &'static str,
+    pub(crate) message: String,
+    pub(crate) code: nodedb_types::error::ErrorCode,
+}
+
 /// Convert a Control-Plane error into a native error frame.
 ///
 /// The stable numeric NodeDB code travels alongside the SQLSTATE, taken from
@@ -24,7 +33,14 @@ use crate::control::server::shared::ddl::{DdlError, DdlResult};
 /// The SQLSTATE is chosen here because it is a protocol-level rendering, while
 /// the numeric code is the classification itself.
 pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
-    let (code, message) = match e {
+    let fields = native_error_fields(e);
+    NativeResponse::error_with_code(seq, fields.sqlstate, fields.message, fields.code.0)
+}
+
+/// The fields [`error_to_native`] puts on the frame. The one native mapping:
+/// every native rendering of an `Error` reads it.
+pub(crate) fn native_error_fields(e: &crate::Error) -> NativeErrorFields {
+    let (sqlstate, message) = match e {
         crate::Error::BadRequest { detail } => ("42601", detail.clone()),
         crate::Error::RejectedAuthz { resource, .. } => ("42501", resource.clone()),
         crate::Error::RateExceeded { .. } => (
@@ -76,8 +92,11 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
             (sqlstate, message)
         }
     };
-    let ndb_code = crate::error_classify::classify(e).code().0;
-    NativeResponse::error_with_code(seq, code, message, ndb_code)
+    NativeErrorFields {
+        sqlstate,
+        message,
+        code: crate::error_classify::classify(e).code(),
+    }
 }
 
 /// Convert a Control-Plane error into a native error frame under a SQLSTATE
@@ -183,10 +202,17 @@ pub(crate) fn ddl_result_to_native(
             code,
             message,
             details,
+            cause,
         }) => {
             let frame = NativeResponse::error_with_code(seq, sqlstate, message, code.0);
-            match details {
+            let frame = match details {
                 Some(details) => frame.with_error_details(*details),
+                None => frame,
+            };
+            match cause {
+                Some(cause) => frame.with_error_cause(
+                    nodedb_types::protocol::ErrorCausePayload::from(cause.as_ref()),
+                ),
                 None => frame,
             }
         }
@@ -470,6 +496,32 @@ mod tests {
         assert_eq!(
             client_err.code(),
             nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND
+        );
+    }
+
+    /// A phase failure keeps its own code, and the typed Data-Plane cause
+    /// rides beside it with its own code, so a client sees both.
+    #[test]
+    fn ddl_phase_failure_carries_its_typed_cause() {
+        let phase = nodedb_types::NodeDbError::move_tenant_snapshot_failed("7", "dispatch")
+            .with_cause(nodedb_types::NodeDbError::division_by_zero());
+        let response = ddl_result_to_native(
+            1,
+            Err(DdlError::move_tenant_snapshot_failed(phase.message()).with_cause_of(&phase)),
+        );
+
+        let bytes = zerompk::to_msgpack_vec(&response).expect("encode native response");
+        let decoded: NativeResponse =
+            zerompk::from_msgpack(&bytes).expect("decode native response");
+        let error = decoded.error.expect("error responses carry a payload");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::MOVE_TENANT_SNAPSHOT_FAILED.0
+        );
+        let cause = error.cause.expect("the typed cause survives the wire");
+        assert_eq!(
+            cause.to_error().code(),
+            nodedb_types::error::ErrorCode::DIVISION_BY_ZERO
         );
     }
 

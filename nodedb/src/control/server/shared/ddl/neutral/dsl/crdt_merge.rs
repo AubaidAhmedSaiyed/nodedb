@@ -87,7 +87,7 @@ pub async fn crdt_merge(
         },
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
     if source_bytes.is_empty() {
         return Err(ddl_err(
             "02000",
@@ -138,9 +138,9 @@ pub async fn crdt_merge(
     //
     // RLS write policies are stored keyed by `db_qualified(database_id,
     // collection)`, so the policy is handed that same key or it silently
-    // misses a policy on a non-default database. `collection` itself stays
-    // bare: it also feeds vShard routing and the admission request's equality
-    // check against this same (unqualified) plan.
+    // misses a policy on a non-default database. The admission request takes
+    // the same qualified name: it must equal the plan's `CrdtOp::Apply`
+    // collection, and the preview addresses the Data Plane by it.
     let qualified_collection =
         crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, collection);
     let policy = ExternalCrdtPostImagePolicy::from_identity(
@@ -156,14 +156,14 @@ pub async fn crdt_merge(
         state,
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
             authorized,
-            collection,
+            collection: &qualified_collection,
             timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,
             policy: &policy,
         },
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

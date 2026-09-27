@@ -195,7 +195,6 @@ pub async fn create_vector_index(
             database_id,
             collection,
             &field_name,
-            "42P16",
             CONTEXT,
         )
         .await?;
@@ -206,7 +205,6 @@ pub async fn create_vector_index(
             database_id,
             collection,
             set_params_plan,
-            "42P16",
             CONTEXT,
         )
         .await?;

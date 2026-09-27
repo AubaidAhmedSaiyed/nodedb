@@ -70,12 +70,12 @@ pub(super) async fn dispatch_authorized_read(
         // answer itself; the payload is flattened the same way the Data Plane's
         // own response is, so the two are indistinguishable to the caller.
         CloneCheckedOutcome::Handled(response) => {
-            payload_or_typed_error(response).map_err(|e| DdlError::new("XX000", format!("{e}")))
+            payload_or_typed_error(response).map_err(|e| DdlError::from_error(&e))
         }
         CloneCheckedOutcome::Proceed(checked) => {
             dispatch_authorized(state, checked, collection, timeout)
                 .await
-                .map_err(|e| DdlError::new("XX000", format!("dispatch: {e}")))
+                .map_err(|e| DdlError::from_error_in_context("dispatch", &e))
         }
     }
 }

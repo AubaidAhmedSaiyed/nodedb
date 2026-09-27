@@ -212,6 +212,19 @@ impl NodeDbError {
         }
     }
 
+    /// A statement exceeded a server limit on its own size or depth: a
+    /// recursion depth, a per-transaction staging budget. SQLSTATE `54000`
+    /// (`program_limit_exceeded`). `detail` is the full message.
+    pub fn program_limit_exceeded(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            code: ErrorCode::PROGRAM_LIMIT_EXCEEDED,
+            message: detail.clone(),
+            details: ErrorDetails::ProgramLimitExceeded { detail },
+            cause: None,
+        }
+    }
+
     /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
     /// Distinct from `plan_error` so clients match the code, SQLSTATE
     /// `2201W`, instead of parsing the message.

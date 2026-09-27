@@ -51,7 +51,7 @@ pub async fn query_last_values(
         },
     )
     .await
-    .map_err(|e| ddl_err("XX000", format!("dispatch failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("dispatch failed", &e))?;
 
     // `meta_query_last_values` encodes with `response_codec::encode`, which is
     // MessagePack — `decode_payload` is its counterpart. A JSON parser on those
@@ -120,7 +120,7 @@ pub async fn query_last_value(
         },
     )
     .await
-    .map_err(|e| ddl_err("XX000", format!("dispatch failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("dispatch failed", &e))?;
 
     // MessagePack, as in `query_last_values` above — an absent series is
     // encoded as a null (decoding to `None`), which is a different fact from a

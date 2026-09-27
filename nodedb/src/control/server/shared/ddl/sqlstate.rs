@@ -175,12 +175,14 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             sqlstate::CHECK_VIOLATION,
             format!("insufficient balance on {collection}: {detail}"),
         ),
+        // The transient, retryable class, the same SQLSTATE the Control
+        // Plane gives `crate::Error::RateExceeded`.
         ErrorCode::RateExceeded {
             gate,
             retry_after_ms,
         } => (
             "ERROR",
-            sqlstate::STATEMENT_TOO_COMPLEX,
+            sqlstate::TOO_MANY_CONNECTIONS,
             format!("rate limit exceeded for {gate}, retry after {retry_after_ms}ms"),
         ),
         ErrorCode::CollectionDraining { collection } => (

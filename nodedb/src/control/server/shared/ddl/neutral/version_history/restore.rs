@@ -70,9 +70,8 @@ pub async fn restore_version(
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     // RLS write policies are stored keyed by `db_qualified(database_id,
     // collection)`, so the policy is handed that same key or it silently
-    // misses a policy on a non-default database. `collection` itself stays
-    // bare: it feeds vShard routing and the restore-op collection field the
-    // admission workflow builds internally, which must stay self-consistent.
+    // misses a policy on a non-default database. The admission workflow
+    // addresses the Data Plane by the same qualified name.
     let qualified_collection =
         crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, &collection);
     let policy = ExternalCrdtPostImagePolicy::from_identity(
@@ -89,7 +88,7 @@ pub async fn restore_version(
         crate::control::crdt_admission::CrdtRestoreAdmissionRequest {
             tenant_id,
             database_id,
-            collection: &collection,
+            collection: &qualified_collection,
             document_id: &doc_id,
             target_version_json: &vv_json,
             surrogate,
@@ -100,7 +99,7 @@ pub async fn restore_version(
         },
     )
     .await
-    .map_err(|e| err("XX000", format!("restore dispatch: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("restore dispatch", &e))?;
 
     state
         .audit
@@ -152,8 +151,9 @@ async fn persist_restore_delta(
         peer_id,
         delta,
     } = params;
+    let qualified = nodedb_types::QualifiedCollection::new(database_id, collection);
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
+        collection: qualified.clone(),
         document_id: document_id.to_string(),
         delta,
         peer_id,
@@ -169,7 +169,7 @@ async fn persist_restore_delta(
         crate::control::crdt_admission::CrdtApplyAdmissionRequest {
             tenant_id,
             database_id,
-            collection,
+            collection: qualified.as_str(),
             plan,
             timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,

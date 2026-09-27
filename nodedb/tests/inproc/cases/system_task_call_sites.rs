@@ -83,8 +83,85 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every `SystemTask::new` in the tree is in a file that named itself as
-/// system-initiated work.
+/// The file that declares the module `file` holds, and that module's name.
+///
+/// `a/b.rs` and `a/b/mod.rs` are both module `b`, declared in `a/mod.rs`,
+/// `a.rs`, or the crate root (`lib.rs`, `main.rs`) when `a` is `src`.
+fn declaring_file(root: &Path, file: &Path) -> Option<(PathBuf, String)> {
+    let stem = file.file_stem()?.to_str()?;
+    let (name, dir) = if stem == "mod" {
+        let dir = file.parent()?;
+        (dir.file_name()?.to_str()?.to_owned(), dir.parent()?)
+    } else {
+        (stem.to_owned(), file.parent()?)
+    };
+    if dir == root {
+        return ["lib.rs", "main.rs"]
+            .iter()
+            .map(|f| root.join(f))
+            .find(|p| std::fs::read_to_string(p).is_ok_and(|b| declared_attrs(&b, &name).is_some()))
+            .map(|p| (p, name));
+    }
+    [dir.join("mod.rs"), dir.with_extension("rs")]
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| (p, name))
+}
+
+/// The attribute lines directly above `mod <name>;` in `body`, or `None`
+/// when `body` does not declare that module.
+fn declared_attrs(body: &str, name: &str) -> Option<Vec<String>> {
+    let lines: Vec<&str> = body.lines().collect();
+    let target = format!("mod {name};");
+    let index = lines.iter().position(|line| {
+        let line = line.trim();
+        line == target || (line.starts_with("pub") && line.ends_with(&format!(" {target}")))
+    })?;
+    let attrs = lines[..index]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .take_while(|line| line.starts_with("#[") || line.starts_with("//"))
+        .filter(|line| line.starts_with("#["))
+        .map(str::to_owned)
+        .collect();
+    Some(attrs)
+}
+
+/// Whether `file` compiles only under `cfg(test)`: the file opens with
+/// `#![cfg(test)]`, its `mod` declaration carries `#[cfg(test)]`, or its
+/// parent module does. Such a file never reaches a production build, so a
+/// `SystemTask` it builds is a test fixture, not a dispatch door.
+fn is_test_only(root: &Path, file: &Path) -> bool {
+    let Ok(body) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    if body.lines().any(|line| line.trim() == "#![cfg(test)]") {
+        return true;
+    }
+    let Some((parent, name)) = declaring_file(root, file) else {
+        return false;
+    };
+    let Ok(parent_body) = std::fs::read_to_string(&parent) else {
+        return false;
+    };
+    match declared_attrs(&parent_body, &name) {
+        Some(attrs) if attrs.iter().any(|a| a == "#[cfg(test)]") => true,
+        Some(_) => {
+            parent.as_path() != file && !is_crate_root(root, &parent) && is_test_only(root, &parent)
+        }
+        None => false,
+    }
+}
+
+fn is_crate_root(root: &Path, file: &Path) -> bool {
+    file == root.join("lib.rs") || file == root.join("main.rs")
+}
+
+/// Every `SystemTask::new` in a production build is in a file that named
+/// itself as system-initiated work. Test-only files are skipped: they never
+/// compile into the server, and a fixture that drives the system door must
+/// not need a production allowlist entry.
 #[test]
 fn system_task_is_constructed_only_by_system_initiated_code() {
     let root = src_root();
@@ -100,7 +177,7 @@ fn system_task_is_constructed_only_by_system_initiated_code() {
     for file in &files {
         let body = std::fs::read_to_string(file)
             .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        if !body.contains("SystemTask::new") {
+        if !body.contains("SystemTask::new") || is_test_only(&root, file) {
             continue;
         }
         let relative = file
@@ -139,5 +216,23 @@ fn every_allowlisted_file_still_constructs_a_system_task() {
     assert!(
         stale.is_empty(),
         "the SystemTask allowlist has stale entries; remove them: {stale:#?}"
+    );
+}
+
+/// The test-only skip can never hide a production caller: no allowlisted
+/// file reads as test-only, and a file declared under `#[cfg(test)]` does.
+#[test]
+fn test_only_detection_matches_the_module_tree() {
+    let root = src_root();
+    for entry in ALLOWED {
+        assert!(
+            !is_test_only(&root, &root.join(entry)),
+            "{entry} is production code but reads as test-only"
+        );
+    }
+    let fixture = root.join("control/gateway/error_map/test_fixtures.rs");
+    assert!(
+        is_test_only(&root, &fixture),
+        "a `#[cfg(test)] mod` file must read as test-only"
     );
 }

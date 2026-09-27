@@ -179,6 +179,9 @@ impl ToMessagePack for ErrorDetails {
             }
             ErrorDetails::DivisionByZero => write_unit(writer, TAG_DIVISION_BY_ZERO),
             ErrorDetails::DataException { detail } => write1(writer, TAG_DATA_EXCEPTION, detail),
+            ErrorDetails::ProgramLimitExceeded { detail } => {
+                write1(writer, TAG_PROGRAM_LIMIT_EXCEEDED, detail)
+            }
             ErrorDetails::InvalidLimitValue { clause, value } => {
                 write2(writer, TAG_INVALID_LIMIT_VALUE, clause, value)
             }

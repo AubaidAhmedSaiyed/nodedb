@@ -463,7 +463,8 @@ async fn native_not_leader_gateway_error_mapping() {
 
     assert_eq!(node.not_leader_retry_count(), 0);
 
-    // Error-mapping proof: GatewayErrorMap::to_native maps NotLeader to code 40.
+    // Error-mapping proof: GatewayErrorMap::to_native maps NotLeader to the
+    // public NOT_LEADER code.
     let not_leader = Error::NotLeader {
         vshard_id: VShardId::new(0),
         leader_node: 1,
@@ -471,8 +472,9 @@ async fn native_not_leader_gateway_error_mapping() {
     };
     let (native_code, _native_msg) = GatewayErrorMap::to_native(&not_leader);
     assert_eq!(
-        native_code, 10,
-        "NotLeader must map to native error code 10 (CODE_NOT_LEADER)"
+        native_code,
+        nodedb::ErrorCode::NOT_LEADER,
+        "NotLeader must map to the public NOT_LEADER code"
     );
 
     node.shutdown().await;

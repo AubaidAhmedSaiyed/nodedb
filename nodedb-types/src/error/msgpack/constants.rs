@@ -86,6 +86,7 @@
 // |  80 | AmbiguousColumn           |
 // |  81 | PeriodLockMisconfigured   |
 // |  82 | DataException             |
+// |  83 | ProgramLimitExceeded      |
 
 pub(super) const TAG_CONSTRAINT_VIOLATION: u16 = 1;
 pub(super) const TAG_WRITE_CONFLICT: u16 = 2;
@@ -169,3 +170,4 @@ pub(super) const TAG_UNDEFINED_COLUMN: u16 = 79;
 pub(super) const TAG_AMBIGUOUS_COLUMN: u16 = 80;
 pub(super) const TAG_PERIOD_LOCK_MISCONFIGURED: u16 = 81;
 pub(super) const TAG_DATA_EXCEPTION: u16 = 82;
+pub(super) const TAG_PROGRAM_LIMIT_EXCEEDED: u16 = 83;

@@ -40,11 +40,16 @@ fn error_frame_to_typed(
     if payload.ndb_code == 0 {
         return NodeDbError::internal(payload.message.clone());
     }
-    NodeDbError::from_wire_with_details(
+    let error = NodeDbError::from_wire_with_details(
         nodedb_types::error::ErrorCode(payload.ndb_code),
         payload.message.clone(),
         payload.details.clone(),
-    )
+    );
+    // The typed cause, when the server sent one, becomes the error's cause.
+    match &payload.cause {
+        Some(cause) => error.with_cause(cause.to_error()),
+        None => error,
+    }
 }
 
 pub(super) fn response_to_query_result(resp: NativeResponse) -> NodeDbResult<QueryResult> {

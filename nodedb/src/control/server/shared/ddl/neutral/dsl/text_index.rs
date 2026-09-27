@@ -192,7 +192,6 @@ async fn create_text_index(
             database_id,
             collection: collection.clone(),
             plan: set_config_plan.clone(),
-            sqlstate: "58000".to_string(),
             context: command.to_string(),
         });
         if !deferred {
@@ -202,7 +201,6 @@ async fn create_text_index(
                 database_id,
                 &collection,
                 set_config_plan,
-                "58000",
                 command,
             )
             .await?;

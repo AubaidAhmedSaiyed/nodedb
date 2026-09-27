@@ -207,8 +207,13 @@ impl NodeDbError {
     ///
     /// `fault` is the client text, e.g. `value is not an integer or out of
     /// range`. The message is `"{fault} on {collection}"`, the text the SQL
-    /// surfaces send. `out_of_range` picks the class: `OVERFLOW` for a result
-    /// out of range, `TYPE_MISMATCH` for a stored value that does not parse.
+    /// surfaces send. `out_of_range` picks the class, and both classes are
+    /// the data-exception class (`22`) the SQL surfaces send:
+    ///
+    /// - `OVERFLOW` for a result out of range (SQLSTATE `22003`).
+    /// - `DATA_EXCEPTION` for a stored value that does not parse (SQLSTATE
+    ///   `22P02`). `TYPE_MISMATCH` is the class for a key that holds the
+    ///   wrong kind of value (SQLSTATE `42846`), a different condition.
     pub fn kv_counter_fault(
         collection: impl Into<String>,
         fault: impl fmt::Display,
@@ -225,9 +230,9 @@ impl NodeDbError {
             }
         } else {
             Self {
-                code: ErrorCode::TYPE_MISMATCH,
-                message,
-                details: ErrorDetails::TypeMismatch { collection },
+                code: ErrorCode::DATA_EXCEPTION,
+                message: message.clone(),
+                details: ErrorDetails::DataException { detail: message },
                 cause: None,
             }
         }

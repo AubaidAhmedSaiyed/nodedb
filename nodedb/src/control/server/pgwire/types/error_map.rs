@@ -129,6 +129,47 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::TxnOverlayMemoryExceeded { .. } => {
             ("ERROR", sqlstate::PROGRAM_LIMIT_EXCEEDED, err.to_string())
         }
+        // Control-Plane twins of Data-Plane codes take the SQLSTATE their
+        // Data-Plane code has, so one condition answers one class wherever
+        // it is detected.
+        crate::Error::RejectedPrevalidation { .. } | crate::Error::InsufficientBalance { .. } => {
+            ("ERROR", sqlstate::CHECK_VIOLATION, err.to_string())
+        }
+        crate::Error::RetryableRefusal { .. } => {
+            ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
+        }
+        crate::Error::AppendOnlyViolation { .. } => {
+            ("ERROR", sqlstate::APPEND_ONLY_VIOLATION, err.to_string())
+        }
+        crate::Error::BalanceViolation { .. } => {
+            ("ERROR", sqlstate::BALANCE_VIOLATION, err.to_string())
+        }
+        crate::Error::PeriodLocked { .. } => ("ERROR", sqlstate::PERIOD_LOCKED, err.to_string()),
+        crate::Error::PeriodLockMisconfigured { .. } => (
+            "ERROR",
+            sqlstate::PERIOD_LOCK_MISCONFIGURED,
+            err.to_string(),
+        ),
+        crate::Error::RetentionViolation { .. } => {
+            ("ERROR", sqlstate::RETENTION_VIOLATION, err.to_string())
+        }
+        crate::Error::LegalHoldActive { .. } => {
+            ("ERROR", sqlstate::LEGAL_HOLD_ACTIVE, err.to_string())
+        }
+        crate::Error::StateTransitionViolation { .. } => (
+            "ERROR",
+            sqlstate::STATE_TRANSITION_VIOLATION,
+            err.to_string(),
+        ),
+        crate::Error::TransitionCheckViolation { .. } => (
+            "ERROR",
+            sqlstate::TRANSITION_CHECK_VIOLATION,
+            err.to_string(),
+        ),
+        crate::Error::TypeGuardViolation { .. } => {
+            ("ERROR", sqlstate::TYPE_GUARD_VIOLATION, err.to_string())
+        }
+        crate::Error::TypeMismatch { .. } => ("ERROR", sqlstate::CANNOT_COERCE, err.to_string()),
         crate::Error::DeadlineExceeded { .. } => {
             ("ERROR", sqlstate::QUERY_CANCELED, err.to_string())
         }
@@ -299,6 +340,25 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::NOT_LEADER => sqlstate::DATABASE_DROPPED,
         // Mirrors the `CloneWriteRequiresMaterialize` arm.
         Ec::CLONE_WRITE_REQUIRES_MATERIALIZE => sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE.0,
+        // The codes below mirror the Data-Plane code table
+        // (`error_code_to_sqlstate`) for the public code each Data-Plane code
+        // classifies to, so a verdict that crossed a node as a numeric code
+        // renders in the class it has locally.
+        Ec::PREVALIDATION_REJECTED | Ec::INSUFFICIENT_BALANCE => sqlstate::CHECK_VIOLATION,
+        Ec::APPEND_ONLY_VIOLATION => sqlstate::APPEND_ONLY_VIOLATION,
+        Ec::BALANCE_VIOLATION => sqlstate::BALANCE_VIOLATION,
+        Ec::PERIOD_LOCKED => sqlstate::PERIOD_LOCKED,
+        Ec::PERIOD_LOCK_MISCONFIGURED => sqlstate::PERIOD_LOCK_MISCONFIGURED,
+        Ec::STATE_TRANSITION_VIOLATION => sqlstate::STATE_TRANSITION_VIOLATION,
+        Ec::TRANSITION_CHECK_VIOLATION => sqlstate::TRANSITION_CHECK_VIOLATION,
+        Ec::RETENTION_VIOLATION => sqlstate::RETENTION_VIOLATION,
+        Ec::LEGAL_HOLD_ACTIVE => sqlstate::LEGAL_HOLD_ACTIVE,
+        Ec::TYPE_GUARD_VIOLATION => sqlstate::TYPE_GUARD_VIOLATION,
+        Ec::TYPE_MISMATCH => sqlstate::CANNOT_COERCE,
+        Ec::OVERFLOW => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+        Ec::COLLECTION_DRAINING => sqlstate::CANNOT_CONNECT_NOW,
+        Ec::SQL_NOT_ENABLED => sqlstate::FEATURE_NOT_SUPPORTED,
+        Ec::PROGRAM_LIMIT_EXCEEDED => sqlstate::PROGRAM_LIMIT_EXCEEDED,
         _ => sqlstate::INTERNAL_ERROR,
     }
 }

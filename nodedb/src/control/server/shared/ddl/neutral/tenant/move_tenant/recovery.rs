@@ -116,7 +116,7 @@ pub async fn resume_or_compensate(
                 Err(ref e) => {
                     drain::release(state, tenant_id, source_db_id);
                     journal::delete_journal_entry_logged(catalog, tenant_id);
-                    return Err(DdlError::move_tenant_snapshot_failed(e.message()));
+                    return Err(DdlError::move_tenant_snapshot_failed(e.message()).with_cause_of(e));
                 }
             };
 
@@ -136,7 +136,7 @@ pub async fn resume_or_compensate(
                     let _ = snapshot::delete_temp(state, key).await;
                 }
                 journal::delete_journal_entry_logged(catalog, tenant_id);
-                return Err(DdlError::move_tenant_cutover_failed(e.message()));
+                return Err(DdlError::move_tenant_cutover_failed(e.message()).with_cause_of(e));
             }
 
             if let Some(ref key) = entry.temp_snapshot_key {

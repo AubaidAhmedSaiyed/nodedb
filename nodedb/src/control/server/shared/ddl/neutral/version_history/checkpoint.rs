@@ -55,7 +55,7 @@ pub async fn create_checkpoint(
         timeout,
     )
     .await
-    .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("dispatch", &e))?;
 
     let vv_json = String::from_utf8(vv_bytes)
         .map_err(|e| err("XX000", format!("version vector decode: {e}")))?;

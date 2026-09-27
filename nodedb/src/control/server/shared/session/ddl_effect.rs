@@ -22,13 +22,13 @@ pub enum DeferredDdlEffect {
     /// `Ready`.
     SecondaryIndexBuild(SecondaryIndexBuild),
     /// Apply an index's engine configuration, such as a full-text analyzer
-    /// binding. A refusal fails the COMMIT with `sqlstate`.
+    /// binding. A refusal fails the COMMIT with the refusal's own SQLSTATE,
+    /// and `context` leads its message.
     EngineApply {
         tenant_id: TenantId,
         database_id: DatabaseId,
         collection: String,
         plan: PhysicalPlan,
-        sqlstate: String,
         context: String,
     },
     /// Remove a dropped index's engine state: a secondary index's entries,

@@ -53,7 +53,6 @@ async fn run_one(state: &SharedState, effect: DeferredDdlEffect) -> Result<(), D
             database_id,
             collection,
             plan,
-            sqlstate,
             context,
         } => {
             crate::control::server::shared::ddl::engine_apply::apply_in_engine(
@@ -62,7 +61,6 @@ async fn run_one(state: &SharedState, effect: DeferredDdlEffect) -> Result<(), D
                 database_id,
                 &collection,
                 plan,
-                &sqlstate,
                 &context,
             )
             .await

@@ -52,8 +52,14 @@ pub async fn run(
         timeout,
     )
     .await
+    // The phase code stays the statement's verdict, and the typed dispatch
+    // error rides as its cause with its own class.
     .map_err(|e| {
-        NodeDbError::move_tenant_snapshot_failed(tenant_id.as_u64().to_string(), format!("{e}"))
+        NodeDbError::move_tenant_snapshot_failed(
+            tenant_id.as_u64().to_string(),
+            "snapshot dispatch failed",
+        )
+        .with_cause(crate::error_classify::classify(&e))
     })?;
     Ok(Bytes::from(raw))
 }

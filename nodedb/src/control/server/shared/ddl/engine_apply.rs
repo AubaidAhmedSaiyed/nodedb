@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::bridge::envelope::PhysicalPlan;
+use crate::bridge::envelope::{ErrorCode, PhysicalPlan};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
@@ -17,14 +17,16 @@ use super::result::DdlError;
 use super::sync_dispatch::{SystemReason, SystemTask, dispatch_system};
 
 /// Dispatch `plan` for `collection` and translate any Data-Plane refusal into
-/// a [`DdlError`] carrying `sqlstate` and `context`.
+/// a [`DdlError`] with `context` before its message.
+///
+/// A typed refusal keeps its own SQLSTATE and code. A refusal with no code is
+/// an internal error.
 pub(crate) async fn apply_in_engine(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     collection: &str,
     plan: PhysicalPlan,
-    sqlstate: &str,
     context: &str,
 ) -> Result<(), DdlError> {
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
@@ -41,24 +43,25 @@ pub(crate) async fn apply_in_engine(
     )
     .await
     .map(|_| ())
-    .map_err(|e| DdlError::new(sqlstate, format!("{context}: {e}")))
+    .map_err(|e| DdlError::from_error_in_context(context, &e))
 }
 
 /// Refuse a vector index definition the engine would refuse, without
 /// changing engine state.
 ///
-/// `VectorOp::SetParams` refuses a core whose index already materialized.
-/// Inside an explicit transaction the parameters install at COMMIT, so the
-/// statement probes with the read-only `VectorOp::QueryStats` instead: an
-/// index that answers has materialized, and `NotFound` means the parameters
-/// will install.
+/// `VectorOp::SetParams` refuses a core whose index already materialized with
+/// `ErrorCode::Unsupported`. Inside an explicit transaction the parameters
+/// install at COMMIT, so the statement probes with the read-only
+/// `VectorOp::QueryStats` instead: an index that answers has materialized, and
+/// `NotFound` means the parameters will install. A materialized index gets the
+/// same `Unsupported` verdict the engine gives, so both paths answer one
+/// SQLSTATE.
 pub(crate) async fn refuse_materialized_vector_index(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     collection: &str,
     field_name: &str,
-    sqlstate: &str,
     context: &str,
 ) -> Result<(), DdlError> {
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
@@ -79,19 +82,24 @@ pub(crate) async fn refuse_materialized_vector_index(
         crate::event::EventSource::User,
     )
     .await
-    .map_err(|e| DdlError::new("XX000", format!("{context}: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context(context, &e))?;
     match (response.status, response.error_code.as_deref()) {
-        (crate::bridge::envelope::Status::Ok, _) => Err(DdlError::new(
-            sqlstate,
-            format!(
-                "{context}: cannot change index params after creation; drop and recreate \
-                 the collection"
-            ),
+        (crate::bridge::envelope::Status::Ok, _) => Err(DdlError::from_error_in_context(
+            context,
+            &crate::Error::DataPlane(ErrorCode::Unsupported {
+                detail: "changing vector index params after the index holds vectors is not \
+                         supported; drop and recreate the collection"
+                    .into(),
+            }),
         )),
-        (_, Some(crate::bridge::envelope::ErrorCode::NotFound)) => Ok(()),
-        (_, code) => Err(DdlError::new(
+        (_, Some(ErrorCode::NotFound)) => Ok(()),
+        (_, Some(code)) => Err(DdlError::from_error_in_context(
+            &format!("{context}: vector index probe"),
+            &crate::Error::DataPlane(code.clone()),
+        )),
+        (_, None) => Err(DdlError::new(
             "XX000",
-            format!("{context}: vector index probe failed: {code:?}"),
+            format!("{context}: vector index probe failed with no error code"),
         )),
     }
 }

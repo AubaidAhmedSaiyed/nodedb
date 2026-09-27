@@ -121,7 +121,7 @@ pub async fn drop_continuous_aggregate(
             Duration::from_secs(5),
         )
         .await
-        .map_err(|e| err("XX000", format!("dispatch failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("dispatch failed", &e))?;
     }
 
     tracing::info!(name, "continuous aggregate dropped");

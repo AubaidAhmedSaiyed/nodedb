@@ -22,13 +22,14 @@ pub(super) fn gateway_error(error: crate::Error) -> ApiError {
     ApiError::HttpStatus(status, msg)
 }
 
+/// Map a Data-Plane refusal to the HTTP error the client reads. A typed
+/// refusal takes the status its code maps to. Only a refusal with no code is
+/// an internal error.
 pub(super) fn response_error(response: &crate::bridge::envelope::Response) -> ApiError {
-    let detail = response
-        .error_code
-        .as_ref()
-        .map(|code| format!("{code:?}"))
-        .unwrap_or_else(|| "unknown error".into());
-    ApiError::Internal(detail)
+    match response.error_code.as_deref() {
+        Some(code) => gateway_error(crate::Error::DataPlane(code.clone())),
+        None => ApiError::Internal("data plane returned an error status with no error code".into()),
+    }
 }
 
 #[cfg(test)]

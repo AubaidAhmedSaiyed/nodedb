@@ -78,10 +78,11 @@ pub(crate) fn stream_response_channel(
                     Err(error) => error,
                     // `NotFound` is the one code that conversion reads as an
                     // empty observation rather than an error. This stream
-                    // declined to tolerate it, so it stops here.
-                    Ok(()) => crate::Error::Dispatch {
-                        detail: "data plane error: NotFound".to_string(),
-                    },
+                    // declined to tolerate it, so it stops here with the
+                    // code's own class.
+                    Ok(()) => crate::Error::DataPlane(
+                        crate::bridge::envelope::ErrorCode::NotFound,
+                    ),
                 };
                 Err(error)?;
                 return;
@@ -288,7 +289,7 @@ mod tests {
     }
 
     /// An untolerated `NotFound` still stops the stream rather than reading as
-    /// an empty success.
+    /// an empty success, and keeps its typed code.
     #[tokio::test]
     async fn untolerated_not_found_errors() {
         let (tx, rx) = mpsc::channel(8);
@@ -299,7 +300,10 @@ mod tests {
             1 << 20,
             false,
         );
-        assert!(materialize(stream).await.is_err());
+        match materialize(stream).await {
+            Err(crate::Error::DataPlane(ErrorCode::NotFound)) => {}
+            other => panic!("expected the typed NotFound refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

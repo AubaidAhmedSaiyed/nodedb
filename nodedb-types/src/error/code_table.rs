@@ -96,6 +96,7 @@ error_code_table! {
     AMBIGUOUS_COLUMN => AmbiguousColumn { column: String::new() },
     DIVISION_BY_ZERO => DivisionByZero,
     DATA_EXCEPTION => DataException { detail: message.to_owned() },
+    PROGRAM_LIMIT_EXCEEDED => ProgramLimitExceeded { detail: message.to_owned() },
     INVALID_LIMIT_VALUE => InvalidLimitValue { clause: "remote".into(), value: message.to_owned() },
 
     // Auth / tenant quota.
@@ -238,6 +239,7 @@ mod tests {
             ErrorCode::CANNOT_DROP_DEFAULT_DATABASE,
             ErrorCode::COLLECTION_DEACTIVATED,
             ErrorCode::ARRAY,
+            ErrorCode::PROGRAM_LIMIT_EXCEEDED,
             ErrorCode::QUOTA_OVERCOMMIT,
             ErrorCode::CLONE_DEPTH_EXCEEDED,
             ErrorCode::CLONE_WRITE_REQUIRES_MATERIALIZE,

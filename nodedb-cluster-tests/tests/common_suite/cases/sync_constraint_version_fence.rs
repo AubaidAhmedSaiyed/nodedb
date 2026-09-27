@@ -99,11 +99,11 @@ async fn read_crdt_doc(
             }
             // A missing document is terminal, not transient: the CRDT read path
             // answers `NotFound`, which the `crdt_state` scalar function surfaces
-            // as an internal error whose message carries "NotFound". That is
-            // exactly the "not imported" state the fence assertion expects.
+            // as SQLSTATE `02000` (no_data). That is exactly the "not imported"
+            // state the fence assertion expects.
             Err(e)
                 if e.as_db_error()
-                    .is_some_and(|d| d.message().contains("NotFound")) =>
+                    .is_some_and(|d| d.code() == &tokio_postgres::error::SqlState::NO_DATA) =>
             {
                 return Ok(None);
             }

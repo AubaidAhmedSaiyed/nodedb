@@ -16,11 +16,19 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             collection,
             constraint,
             detail,
-        } => NodeDbError::constraint_violation(collection.clone(), constraint.clone(), detail),
+        } => crate::error_from_data_plane::rejected_constraint_to_public(
+            collection.clone(),
+            constraint.clone(),
+            detail.clone(),
+        ),
         Error::RejectedAuthz { resource, .. } => {
             NodeDbError::authorization_denied(resource.clone())
         }
-        Error::TxnOverlayMemoryExceeded { .. } => NodeDbError::bad_request(e.to_string()),
+        // `54000` on the SQL surfaces, the class `TxnOverlayMemoryExceeded`
+        // has as a Data-Plane code.
+        Error::TxnOverlayMemoryExceeded { .. } => {
+            NodeDbError::program_limit_exceeded(e.to_string())
+        }
         Error::BackupTenantMismatch { expected, actual } => {
             NodeDbError::backup_tenant_mismatch(*expected, *actual)
         }
@@ -151,16 +159,23 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             shards_touched,
             limit,
         } => NodeDbError::fan_out_exceeded(*shards_touched, *limit),
-        Error::CrossCollectionNotColocated { .. } => NodeDbError::bad_request(e.to_string()),
+        // `0A000` on the SQL surfaces, the class `Unsupported` has as a
+        // Data-Plane code.
+        Error::CrossCollectionNotColocated { .. } => NodeDbError::from_wire(
+            nodedb_types::error::ErrorCode::SQL_NOT_ENABLED,
+            e.to_string(),
+        ),
 
         Error::BadRequest { detail } => NodeDbError::bad_request(detail),
         Error::QuotaOvercommit { field, detail } => {
             NodeDbError::quota_overcommit(field.clone(), detail)
         }
         Error::PlanError { detail } => NodeDbError::plan_error(detail),
-        // The native surface carries this as a plan error; the pgwire
-        // surface renders SQLSTATE `0A000`.
-        Error::FeatureNotSupported { detail } => NodeDbError::plan_error(detail),
+        // `0A000` on every surface, the class `Unsupported` has as a
+        // Data-Plane code.
+        Error::FeatureNotSupported { detail } => {
+            NodeDbError::from_wire(nodedb_types::error::ErrorCode::SQL_NOT_ENABLED, detail)
+        }
         Error::UndefinedFunction { name } => NodeDbError::undefined_function(name.clone()),
         Error::UndefinedObject { kind, name } => {
             NodeDbError::undefined_object(format!("{kind} \"{name}\""))

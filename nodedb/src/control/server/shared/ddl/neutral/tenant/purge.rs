@@ -96,6 +96,6 @@ pub async fn purge_tenant(
             );
             Ok(status("PURGE TENANT"))
         }
-        Err(e) => Err(ddl_err("XX000", format!("purge failed: {e}"))),
+        Err(e) => Err(DdlError::from_error_in_context("purge failed", &e)),
     }
 }

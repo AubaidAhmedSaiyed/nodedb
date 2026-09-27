@@ -13,6 +13,8 @@ impl GatewayErrorMap {
     /// - 400 Bad Request for client-side errors (bad SQL, not found)
     /// - 403 Forbidden for authz errors
     /// - 409 Conflict for write-conflict / constraint violations
+    /// - 429 Too Many Requests for a rate-gate refusal
+    /// - 501 Not Implemented for an unsupported feature
     /// - 503 Service Unavailable for routing/leader errors and dispatch overload
     /// - 504 Gateway Timeout for deadline exceeded
     /// - 500 Internal Server Error as the default fallback
@@ -31,13 +33,17 @@ impl GatewayErrorMap {
             Error::BadRequest { detail } => (400, detail.clone()),
             Error::PlanError { detail } => (400, detail.clone()),
             Error::RejectedConstraint { detail, .. } => (409, detail.clone()),
+            Error::RateExceeded { .. } => (429, err.to_string()),
             Error::NoLeader { .. } => (503, err.to_string()),
             Error::DispatchCapacity { .. } => (503, err.to_string()),
             Error::Serialization { .. } | Error::Codec { .. } => (500, err.to_string()),
             Error::Internal { .. } => (500, err.to_string()),
-            // 501 Not Implemented: a valid op refused because cross-core
-            // source-shipping is not yet supported (fail-closed safety floor).
-            Error::CrossCollectionNotColocated { .. } => (501, err.to_string()),
+            // 501 Not Implemented: a valid op this server does not support,
+            // such as a cross-collection write whose collections are not
+            // co-resident (fail-closed safety floor).
+            Error::CrossCollectionNotColocated { .. } | Error::FeatureNotSupported { .. } => {
+                (501, err.to_string())
+            }
             Error::RemoteTyped { code, message } => {
                 (remote_code_to_http_status(*code), message.clone())
             }

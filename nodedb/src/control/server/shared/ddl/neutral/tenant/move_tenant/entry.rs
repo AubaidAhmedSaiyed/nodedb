@@ -131,7 +131,7 @@ pub async fn handle_move_tenant(
             // Compensate: release drain, remove journal.
             drain::release(state, tenant_id, source_db_id);
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            return Err(DdlError::move_tenant_snapshot_failed(e.message()));
+            return Err(DdlError::move_tenant_snapshot_failed(e.message()).with_cause_of(e));
         }
     };
 
@@ -160,7 +160,7 @@ pub async fn handle_move_tenant(
         drain::release(state, tenant_id, source_db_id);
         let _ = snapshot::delete_temp(state, &temp_key).await;
         journal::delete_journal_entry_logged(catalog, tenant_id);
-        return Err(DdlError::move_tenant_cutover_failed(e.message()));
+        return Err(DdlError::move_tenant_cutover_failed(e.message()).with_cause_of(e));
     }
 
     // ── Phase 5: Resume ───────────────────────────────────────────────────────

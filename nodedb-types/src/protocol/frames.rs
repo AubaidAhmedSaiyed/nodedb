@@ -130,6 +130,12 @@ pub struct ErrorPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[msgpack(default)]
     pub details: Option<crate::error::ErrorDetails>,
+    /// The typed error that caused this one, when the server held one: the
+    /// Data-Plane refusal behind a phase failure, say. `None` when there is
+    /// no cause to report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[msgpack(default)]
+    pub cause: Option<super::error_cause::ErrorCausePayload>,
 }
 
 /// `skip_serializing_if` predicate for [`ErrorPayload::ndb_code`]: zero is the
@@ -202,6 +208,7 @@ impl NativeResponse {
                 message: message.into(),
                 ndb_code,
                 details: None,
+                cause: None,
             }),
             auth: None,
             warnings: Vec::new(),
@@ -213,6 +220,15 @@ impl NativeResponse {
     pub fn with_error_details(mut self, details: crate::error::ErrorDetails) -> Self {
         if let Some(payload) = self.error.as_mut() {
             payload.details = Some(details);
+        }
+        self
+    }
+
+    /// Attach the typed cause to an error response. A response with no error
+    /// payload is returned unchanged.
+    pub fn with_error_cause(mut self, cause: super::error_cause::ErrorCausePayload) -> Self {
+        if let Some(payload) = self.error.as_mut() {
+            payload.cause = Some(cause);
         }
         self
     }
@@ -357,6 +373,20 @@ mod tests {
         let decoded: NativeResponse = zerompk::from_msgpack(&bytes).expect("decode");
         let payload = decoded.error.expect("error payload survives the wire");
         assert_eq!(payload.details, Some(details));
+    }
+
+    #[test]
+    fn error_payload_round_trips_the_cause() {
+        let cause = super::super::error_cause::ErrorCausePayload::from(
+            &crate::error::NodeDbError::division_by_zero(),
+        );
+        let frame = NativeResponse::error_with_code(7, "XX000", "snapshot failed", 1602)
+            .with_error_cause(cause.clone());
+        let bytes = zerompk::to_msgpack_vec(&frame).expect("encode");
+        let decoded: NativeResponse = zerompk::from_msgpack(&bytes).expect("decode");
+        let payload = decoded.error.expect("error payload survives the wire");
+        assert_eq!(payload.ndb_code, 1602);
+        assert_eq!(payload.cause, Some(cause));
     }
 
     #[test]
