@@ -136,11 +136,8 @@ impl DatabaseMetricsRegistry {
     /// Negative or non-finite inputs are clamped to zero so accidental underflow
     /// in upstream timing arithmetic cannot subtract from the cumulative counter.
     ///
-    /// NOTE: Intentionally unfilled by `database_metrics_sampler`. Unlike the five
-    /// gauge metrics (connections, memory, storage, bridge queue depth, and WAL
-    /// latency P99) which represent point-in-time state, this is a cumulative
-    /// counter tracking task execution time. It remains wired for callers
-    /// pending a dedicated per-task maintenance completion accounting source.
+    /// Called from [`crate::control::maintenance::MaintenanceLease::drop`]
+    /// when a maintenance lease finishes and records elapsed wall-clock CPU time.
     pub fn add_maintenance_cpu_secs(&self, db_name: &str, secs: f64) {
 
         let us = if secs.is_finite() && secs > 0.0 {

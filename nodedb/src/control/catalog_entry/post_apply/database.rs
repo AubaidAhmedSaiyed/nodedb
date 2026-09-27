@@ -13,12 +13,19 @@ use nodedb_types::DatabaseId;
 use crate::control::security::catalog::database_types::DatabaseDescriptor;
 use crate::control::state::SharedState;
 
-/// Post-apply for `PutDatabase` — no in-memory cache to update.
-pub fn put(_descriptor: DatabaseDescriptor, _shared: Arc<SharedState>) {}
+/// Post-apply for `PutDatabase` — update in-memory maintenance budget name resolution.
+pub fn put(descriptor: DatabaseDescriptor, shared: Arc<SharedState>) {
+    shared
+        .maintenance_budget
+        .set_database_name(descriptor.id, &descriptor.name);
+}
 
 /// Post-apply for `DeleteDatabase` — release the quota caps of the dropped
-/// scope, its tenants' caps included.
+/// scope, its tenants' caps included, and unregister from maintenance budget.
 pub fn delete(db_id: u64, shared: Arc<SharedState>) {
+    shared
+        .maintenance_budget
+        .remove_database(DatabaseId::new(db_id));
     super::quota::release_database_scope(DatabaseId::new(db_id), &shared);
 }
 
