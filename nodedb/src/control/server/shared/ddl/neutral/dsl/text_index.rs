@@ -132,7 +132,9 @@ async fn create_text_index(
         .credentials
         .catalog()
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
-        .map_err(|e| ddl_err("XX000", format!("{command}: read index registry: {e}")))?
+        .map_err(|e| {
+            DdlError::from_error_in_context(&format!("{command}: read index registry"), &e)
+        })?
     {
         if stmt.header.if_not_exists && taken.kind == IndexKind::FullText {
             return Ok(vec![DdlResult::Status {

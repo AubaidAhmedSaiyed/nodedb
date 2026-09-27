@@ -52,7 +52,7 @@ pub async fn clone_database(
     // ── Resolve source database ───────────────────────────────────────────────
     let source_db_id = catalog
         .get_database_id_by_name(params.source_name)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| {
             ddl_err(
                 "42P01",
@@ -65,7 +65,7 @@ pub async fn clone_database(
 
     let source_descriptor = catalog
         .get_database(source_db_id)
-        .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read failed", &e))?
         .ok_or_else(|| {
             ddl_err(
                 "42P01",
@@ -92,7 +92,7 @@ pub async fn clone_database(
 
     // ── Enforce MAX_CLONE_DEPTH ────────────────────────────────────────────────
     let depth = clone_chain_depth(state, source_db_id)
-        .map_err(|e| ddl_err("XX000", format!("clone depth check failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("clone depth check failed", &e))?;
 
     if depth >= MAX_CLONE_DEPTH {
         return Err(ddl_err(
@@ -115,7 +115,7 @@ pub async fn clone_database(
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(ddl_err("XX000", format!("catalog lookup failed: {e}")));
+            return Err(DdlError::from_error_in_context("catalog lookup failed", &e));
         }
     }
 
@@ -129,7 +129,7 @@ pub async fn clone_database(
     // empty the WAL frontier is used as the best available approximation,
     // which is correct for recent timestamps (within the same server session).
     let now_ms =
-        current_wall_ms().map_err(|e| ddl_err("XX000", format!("clock read failed: {e}")))?;
+        current_wall_ms().map_err(|e| DdlError::from_error_in_context("clock read failed", &e))?;
     let (as_of_lsn, as_of_ms) = match params.as_of {
         CloneAsOf::Latest => (state.wal.next_lsn(), now_ms),
         CloneAsOf::SystemTimeMs(ms) => {
@@ -175,7 +175,7 @@ pub async fn clone_database(
     };
 
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
 
     // Single-node fast path (`LocalOnly` means "no Raft, apply directly").
     //
@@ -187,32 +187,34 @@ pub async fn clone_database(
     if outcome.needs_local_apply() {
         catalog
             .add_clone_child(source_db_id, target_db_id)
-            .map_err(|e| ddl_err("XX000", format!("lineage write failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("lineage write failed", &e))?;
 
         if let Err(put_err) = catalog.put_database(&target_descriptor) {
             // Compensate: remove the lineage edge we just wrote. A failure here
             // is fatal — surface both errors so on-call can repair the catalog.
             if let Err(rb_err) = catalog.remove_clone_child(source_db_id, target_db_id) {
-                return Err(ddl_err(
-                    "XX000",
-                    format!(
-                        "catalog write failed: {put_err}; \
-                         lineage rollback ALSO failed: {rb_err} — \
+                return Err(DdlError::from_error_in_context(
+                    &format!(
+                        "lineage rollback ALSO failed: {rb_err} — \
                          catalog left with orphan lineage edge \
-                         (source={source_db_id}, target={target_db_id})",
+                         (source={source_db_id}, target={target_db_id}); catalog write failed",
                     ),
+                    &put_err,
                 ));
             }
-            return Err(ddl_err("XX000", format!("catalog write failed: {put_err}")));
+            return Err(DdlError::from_error_in_context(
+                "catalog write failed",
+                &put_err,
+            ));
         }
 
         // Stamp every active source collection into the target database with
         // `cloned_from` set.  This lets the SQL planner resolve collection
         // names against the clone without knowing about clone indirection;
         // CoW delegation happens at dispatch time.
-        let source_colls = catalog
-            .load_all_collections(source_db_id)
-            .map_err(|e| ddl_err("XX000", format!("clone: enumerate source collections: {e}")))?;
+        let source_colls = catalog.load_all_collections(source_db_id).map_err(|e| {
+            DdlError::from_error_in_context("clone: enumerate source collections", &e)
+        })?;
         let kv_surrogate_ceiling = Some(state.surrogate_assigner.current_hwm());
         for mut coll in source_colls.into_iter().filter(|c| c.is_active) {
             coll.database_id = target_db_id;
@@ -231,12 +233,12 @@ pub async fn clone_database(
             // the failure is the only way the caller learns the clone is
             // incomplete.
             catalog.put_collection(target_db_id, &coll).map_err(|e| {
-                ddl_err(
-                    "XX000",
-                    format!(
-                        "clone: stamping shadow descriptor for collection '{}' failed: {e}",
+                DdlError::from_error_in_context(
+                    &format!(
+                        "clone: stamping shadow descriptor for collection '{}' failed",
                         coll.name
                     ),
+                    &e,
                 )
             })?;
 
@@ -251,12 +253,12 @@ pub async fn clone_database(
                 owner_username: coll.owner.clone(),
             };
             catalog.put_owner(&owner).map_err(|e| {
-                ddl_err(
-                    "XX000",
-                    format!(
-                        "clone: stamping owner for collection '{}' failed: {e}",
+                DdlError::from_error_in_context(
+                    &format!(
+                        "clone: stamping owner for collection '{}' failed",
                         coll.name
                     ),
+                    &e,
                 )
             })?;
         }
@@ -272,7 +274,7 @@ pub async fn clone_database(
         // answers queries the source answers differently, and nothing later
         // re-copies the row.
         copy_database_metadata(catalog, source_db_id, target_db_id)
-            .map_err(|e| ddl_err("XX000", format!("clone: copying catalog metadata: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("clone: copying catalog metadata", &e))?;
     }
 
     // Synonym groups and custom types travel as proposed entries, not as a
@@ -329,24 +331,14 @@ async fn copy_synonym_groups(
     let groups = catalog
         .load_synonym_groups_in_database(source.as_u64())
         .map_err(|e| {
-            ddl_err(
-                "XX000",
-                format!("clone: enumerate source synonym groups: {e}"),
-            )
+            DdlError::from_error_in_context("clone: enumerate source synonym groups", &e)
         })?;
 
     for mut group in groups {
         group.database_id = target.as_u64();
         let entry = CatalogEntry::PutSynonymGroup(Box::new(group.clone()));
-        let outcome = propose_and_apply(state, &entry).map_err(|e| {
-            ddl_err(
-                "XX000",
-                format!(
-                    "clone: copying synonym group '{}': {}",
-                    group.name, e.message
-                ),
-            )
-        })?;
+        let outcome = propose_and_apply(state, &entry)
+            .map_err(|e| e.in_context(&format!("clone: copying synonym group '{}'", group.name)))?;
         if outcome.needs_local_apply() {
             state.synonym_registry.register(group.clone());
             crate::control::catalog_entry::post_apply::install_synonym_group(group, state).await;
@@ -372,25 +364,17 @@ fn copy_custom_types(
     let catalog = state.credentials.catalog();
     let types = catalog
         .load_custom_types_in_database(source.as_u64())
-        .map_err(|e| {
-            ddl_err(
-                "XX000",
-                format!("clone: enumerate source custom types: {e}"),
-            )
-        })?;
+        .map_err(|e| DdlError::from_error_in_context("clone: enumerate source custom types", &e))?;
 
     for mut custom_type in types {
         custom_type.database_id = target.as_u64();
         custom_type.oid = UNASSIGNED_OID;
         let entry = CatalogEntry::PutCustomType(Box::new(custom_type.clone()));
         let outcome = propose_and_apply(state, &entry).map_err(|e| {
-            ddl_err(
-                "XX000",
-                format!(
-                    "clone: copying custom type '{}': {}",
-                    custom_type.name, e.message
-                ),
-            )
+            e.in_context(&format!(
+                "clone: copying custom type '{}'",
+                custom_type.name
+            ))
         })?;
         if outcome.needs_local_apply() {
             register_written(
@@ -430,12 +414,7 @@ fn clone_chain_depth(state: &SharedState, start_db_id: DatabaseId) -> crate::Res
         if depth > MAX_CLONE_DEPTH {
             return Ok(depth);
         }
-        let desc = catalog
-            .get_database(current)
-            .map_err(|e| crate::Error::Storage {
-                engine: "catalog".into(),
-                detail: format!("depth walk get_database failed: {e}"),
-            })?;
+        let desc = catalog.get_database(current)?;
         match desc.and_then(|d| d.parent_clone) {
             None => return Ok(depth),
             Some(parent) => {

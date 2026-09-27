@@ -364,10 +364,7 @@ fn crdt_apply_forbidden_in_transaction(txn_ctx: &DmlTxnCtx<'_>) -> bool {
 }
 
 fn crdt_transaction_error() -> DdlError {
-    DdlError::new(
-        "25001",
-        crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
-    )
+    DdlError::from_error(&crate::Error::CrdtApplyForbiddenInTransaction)
 }
 
 #[cfg(test)]
@@ -395,6 +392,10 @@ mod tests {
 
         let error = crdt_transaction_error();
         assert_eq!(error.sqlstate, "25001");
+        assert_eq!(
+            error.code,
+            nodedb_types::error::ErrorCode::ACTIVE_SQL_TRANSACTION
+        );
         assert_eq!(
             error.message,
             crate::Error::CrdtApplyForbiddenInTransaction.to_string()

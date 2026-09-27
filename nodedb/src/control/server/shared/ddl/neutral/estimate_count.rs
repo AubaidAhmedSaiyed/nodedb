@@ -83,7 +83,7 @@ pub async fn estimate_count(
                     ))]);
                 }
                 Err(e) => {
-                    return Err(DdlError::new("XX000", e.to_string()));
+                    return Err(DdlError::from_error(&e));
                 }
             }
         }

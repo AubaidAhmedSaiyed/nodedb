@@ -80,7 +80,7 @@ pub async fn transfer(
             identity.tenant_id,
             &source_bytes,
         )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     let credit_surrogate = state
         .surrogate_assigner
         .assign(
@@ -88,7 +88,7 @@ pub async fn transfer(
             identity.tenant_id,
             &dest_bytes,
         )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     let plan = PhysicalPlan::Kv(KvOp::Transfer {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         source_key: source_bytes,
@@ -167,7 +167,7 @@ pub async fn transfer_item(
             identity.tenant_id,
             &dest_bytes,
         )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // Dispatch to Data Plane — verify + delete + insert is atomic. Routed
     // through the same in-transaction staging gate as `TRANSFER` (see above).

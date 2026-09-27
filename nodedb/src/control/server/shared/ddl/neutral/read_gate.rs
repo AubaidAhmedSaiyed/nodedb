@@ -50,8 +50,6 @@ const INSUFFICIENT_PRIVILEGE: &str = "42501";
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
 /// SQLSTATE for a collection the catalog does not hold.
 const UNDEFINED_TABLE: &str = "42P01";
-/// SQLSTATE for a policy set that could not be compiled.
-const INTERNAL_ERROR: &str = "XX000";
 
 fn gate_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
@@ -192,7 +190,7 @@ impl<'a> CollectionReadGate<'a> {
                 self.tenant_id().as_u64(),
                 collection,
             )
-            .map_err(|e| gate_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         match stored {
             None => Err(gate_err(
                 UNDEFINED_TABLE,
@@ -222,7 +220,7 @@ impl<'a> CollectionReadGate<'a> {
                 collection,
                 self.scope.auth(),
             )
-            .map_err(|e| gate_err(INTERNAL_ERROR, format!("rls compile: {e}")))?
+            .map_err(|e| DdlError::from_error_in_context("rls compile", &e))?
             .is_some_and(|filters| filters.is_empty());
         if unrestricted {
             return Ok(());

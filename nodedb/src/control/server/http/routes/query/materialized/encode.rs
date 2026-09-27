@@ -115,11 +115,10 @@ mod tests {
         assert_eq!(json["cause"]["error"], "not on this engine");
     }
 
-    /// A plain `XX000` DDL error is a server fault, never a client error.
+    /// An internal DDL error is a server fault, never a client error.
     #[tokio::test]
     async fn xx000_ddl_error_is_500() {
-        let error =
-            crate::control::server::shared::ddl::DdlError::new("XX000", "catalog write failed");
+        let error = crate::control::server::shared::ddl::DdlError::internal("catalog write failed");
         let (status, _) = response_json(ddl_error_to_api(error)).await;
         assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }

@@ -60,14 +60,14 @@ pub async fn alter_set_on_conflict(
     let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(database_id, tenant_id, collection)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{collection}' not found")))?;
 
     // Step 1: read the durable policy, falling back to the same ephemeral
     // default the in-memory `PolicyRegistry` uses for an unregistered
     // collection.
     let mut policy: CollectionPolicy = match &coll.conflict_policy {
-        Some(json) => sonic_rs::from_str(json).map_err(|e| err("XX000", e.to_string()))?,
+        Some(json) => sonic_rs::from_str(json).map_err(|e| DdlError::internal(e.to_string()))?,
         None => CollectionPolicy::ephemeral(),
     };
 
@@ -76,7 +76,8 @@ pub async fn alter_set_on_conflict(
     apply_conflict_policy(&mut policy, constraint_kind, new_conflict_policy);
 
     // Step 3: persist on the catalog record and re-broadcast.
-    let policy_json = sonic_rs::to_string(&policy).map_err(|e| err("XX000", e.to_string()))?;
+    let policy_json =
+        sonic_rs::to_string(&policy).map_err(|e| DdlError::internal(e.to_string()))?;
     coll.conflict_policy = Some(policy_json);
     let entry = CatalogEntry::PutCollection(Box::new(coll));
     propose_and_apply(state, &entry)?;
@@ -105,14 +106,14 @@ pub async fn show_conflict_policy(
     let catalog = state.credentials.catalog();
     let coll = catalog
         .get_collection(database_id, tenant_id, collection)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{collection}' not found")))?;
 
     let policy: CollectionPolicy = match &coll.conflict_policy {
-        Some(json) => sonic_rs::from_str(json).map_err(|e| err("XX000", e.to_string()))?,
+        Some(json) => sonic_rs::from_str(json).map_err(|e| DdlError::internal(e.to_string()))?,
         None => CollectionPolicy::ephemeral(),
     };
-    let text = sonic_rs::to_string(&policy).map_err(|e| err("XX000", e.to_string()))?;
+    let text = sonic_rs::to_string(&policy).map_err(|e| DdlError::internal(e.to_string()))?;
 
     let mut row = Map::new();
     row.insert("policy".to_string(), JsonValue::String(text));

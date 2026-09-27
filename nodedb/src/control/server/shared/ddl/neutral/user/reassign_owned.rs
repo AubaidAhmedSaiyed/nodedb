@@ -30,70 +30,12 @@
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::propose_outcome::ProposeOutcome;
-use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::{StoredOwner, SystemCatalog};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
 use super::super::super::result::DdlError;
-
-/// Every catalog object kind that carries an owner reference. The nine
-/// parent-replicated kinds each own a primary `Stored*` record with an
-/// in-band `owner` field; `Index` is the standalone path (a bare
-/// `StoredOwner` row with no parent record).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum OwnerKind {
-    Collection,
-    Function,
-    Procedure,
-    Trigger,
-    MaterializedView,
-    StreamingMaterializedView,
-    Sequence,
-    Schedule,
-    ChangeStream,
-    ContinuousAggregate,
-    Index,
-}
-
-impl OwnerKind {
-    /// Map a persisted `StoredOwner.object_type` to its kind. `None`
-    /// means the writer of that owner row introduced a kind this module
-    /// does not yet handle — the caller turns that into a hard error so
-    /// the drop fails closed instead of leaking a dangling reference.
-    pub(super) fn from_object_type(s: &str) -> Option<Self> {
-        Some(match s {
-            object_type::COLLECTION => Self::Collection,
-            object_type::FUNCTION => Self::Function,
-            object_type::PROCEDURE => Self::Procedure,
-            object_type::TRIGGER => Self::Trigger,
-            object_type::MATERIALIZED_VIEW => Self::MaterializedView,
-            object_type::STREAMING_MATERIALIZED_VIEW => Self::StreamingMaterializedView,
-            object_type::SEQUENCE => Self::Sequence,
-            object_type::SCHEDULE => Self::Schedule,
-            object_type::CHANGE_STREAM => Self::ChangeStream,
-            object_type::CONTINUOUS_AGGREGATE => Self::ContinuousAggregate,
-            object_type::INDEX => Self::Index,
-            _ => return None,
-        })
-    }
-
-    fn as_object_type(&self) -> &'static str {
-        match self {
-            Self::Collection => object_type::COLLECTION,
-            Self::Function => object_type::FUNCTION,
-            Self::Procedure => object_type::PROCEDURE,
-            Self::Trigger => object_type::TRIGGER,
-            Self::MaterializedView => object_type::MATERIALIZED_VIEW,
-            Self::StreamingMaterializedView => object_type::STREAMING_MATERIALIZED_VIEW,
-            Self::Sequence => object_type::SEQUENCE,
-            Self::Schedule => object_type::SCHEDULE,
-            Self::ChangeStream => object_type::CHANGE_STREAM,
-            Self::ContinuousAggregate => object_type::CONTINUOUS_AGGREGATE,
-            Self::Index => object_type::INDEX,
-        }
-    }
-}
+use super::owner_kind::OwnerKind;
 
 /// Reassign every object owned by `username` (within `user_tenant`) to the
 /// tenant's validated ownership fallback, then revoke every grant made to the
@@ -108,14 +50,14 @@ pub(super) fn reassign_owned_and_sweep_grants(
 
     let owned = catalog
         .owners_for_user(username, user_tenant.as_u64())
-        .map_err(|e| ddl_err(format!("load owner rows: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("load owner rows", &e))?;
     if owned.is_empty() {
         sweep_grants(state, catalog, username)?;
         return Ok(None);
     }
     let admin_name = catalog
         .resolve_ownership_fallback(user_tenant.as_u64(), username)
-        .map_err(|e| ddl_err(format!("resolve ownership fallback: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("resolve ownership fallback", &e))?
         .ok_or_else(|| {
             DdlError::new(
                 "55000",
@@ -128,7 +70,7 @@ pub(super) fn reassign_owned_and_sweep_grants(
         })?;
     for owner in &owned {
         let kind = OwnerKind::from_object_type(&owner.object_type).ok_or_else(|| {
-            ddl_err(format!(
+            DdlError::internal(format!(
                 "cannot reassign object of unknown owner type '{}' ('{}') owned by \
                  '{username}' — refusing to drop user to avoid a dangling owner reference",
                 owner.object_type, owner.object_name
@@ -170,14 +112,14 @@ fn reassign_one(
             let database_id = nodedb_types::DatabaseId::new(database_id);
             let mut stored = catalog
                 .get_collection(database_id, tenant_id, name)
-                .map_err(|e| ddl_err(format!("get collection '{name}': {e}")))?
+                .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             stored.owner = admin_name.to_string();
             let entry = CatalogEntry::PutCollection(Box::new(stored.clone()));
             if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_collection(database_id, &stored)
-                    .map_err(|e| ddl_err(format!("put collection '{name}': {e}")))?;
+                    .map_err(object_error("put", object_type, name))?;
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -196,14 +138,14 @@ fn reassign_one(
                     tenant_id,
                     name,
                 )
-                .map_err(|e| ddl_err(format!("get function '{name}': {e}")))?
+                .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutFunction(Box::new(s.clone()));
             if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_function(&s)
-                    .map_err(|e| ddl_err(format!("put function '{name}': {e}")))?;
+                    .map_err(object_error("put", object_type, name))?;
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -222,14 +164,14 @@ fn reassign_one(
                     tenant_id,
                     name,
                 )
-                .map_err(|e| ddl_err(format!("get procedure '{name}': {e}")))?
+                .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutProcedure(Box::new(s.clone()));
             if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_procedure(&s)
-                    .map_err(|e| ddl_err(format!("put procedure '{name}': {e}")))?;
+                    .map_err(object_error("put", object_type, name))?;
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -248,14 +190,14 @@ fn reassign_one(
                     tenant_id,
                     name,
                 )
-                .map_err(|e| ddl_err(format!("get trigger '{name}': {e}")))?
+                .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutTrigger(Box::new(s.clone()));
             if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_trigger(&s)
-                    .map_err(|e| ddl_err(format!("put trigger '{name}': {e}")))?;
+                    .map_err(object_error("put", object_type, name))?;
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -270,14 +212,16 @@ fn reassign_one(
         OwnerKind::MaterializedView => {
             let mut s = catalog
                 .get_materialized_view(database_id, tenant_id, name)
-                .map_err(|e| ddl_err(format!("get materialized_view '{name}': {e}")))?
+                .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutMaterializedView(Box::new(s.clone()));
             if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_materialized_view(&s)
-                    .map_err(|e| ddl_err(format!("put materialized_view '{name}': {e}")))?;
+                catalog.put_materialized_view(&s).map_err(object_error(
+                    "put",
+                    object_type,
+                    name,
+                ))?;
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -292,7 +236,9 @@ fn reassign_one(
         OwnerKind::StreamingMaterializedView => {
             let mut s = catalog
                 .load_all_streaming_mvs()
-                .map_err(|e| ddl_err(format!("load streaming materialized views: {e}")))?
+                .map_err(|e| {
+                    DdlError::from_error_in_context("load streaming materialized views", &e)
+                })?
                 .into_iter()
                 .find(|mv| {
                     mv.database_id.as_u64() == database_id
@@ -304,7 +250,7 @@ fn reassign_one(
             let entry = CatalogEntry::PutStreamingMaterializedView(Box::new(s.clone()));
             if propose(state, &entry)?.needs_local_apply() {
                 crate::control::catalog_entry::apply::apply_to(&entry, catalog)
-                    .map_err(|e| ddl_err(format!("catalog apply: {e}")))?;
+                    .map_err(|e| DdlError::from_error_in_context("catalog apply", &e))?;
                 state.mv_registry.register(s);
                 persist_owner_local_in_database(
                     state,
@@ -320,14 +266,14 @@ fn reassign_one(
         OwnerKind::Sequence => {
             let mut s = catalog
                 .get_sequence(database_id, tenant_id, name)
-                .map_err(|e| ddl_err(format!("get sequence '{name}': {e}")))?
+                .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutSequence(Box::new(s.clone()));
             if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_sequence(&s)
-                    .map_err(|e| ddl_err(format!("put sequence '{name}': {e}")))?;
+                    .map_err(object_error("put", object_type, name))?;
                 persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
             }
         }
@@ -335,7 +281,7 @@ fn reassign_one(
             // Schedules have no single-key getter; find within the tenant.
             let mut s = catalog
                 .load_all_schedules()
-                .map_err(|e| ddl_err(format!("load schedules: {e}")))?
+                .map_err(|e| DdlError::from_error_in_context("load schedules", &e))?
                 .into_iter()
                 .find(|d| {
                     d.database_id == database_id && d.tenant_id == tenant_id && d.name == name
@@ -346,7 +292,7 @@ fn reassign_one(
             if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_schedule(&s)
-                    .map_err(|e| ddl_err(format!("put schedule '{name}': {e}")))?;
+                    .map_err(object_error("put", object_type, name))?;
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -361,14 +307,14 @@ fn reassign_one(
         OwnerKind::ChangeStream => {
             let mut s = catalog
                 .get_change_stream(crate::types::DatabaseId::new(database_id), tenant_id, name)
-                .map_err(|e| ddl_err(format!("get change_stream '{name}': {e}")))?
+                .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutChangeStream(Box::new(s.clone()));
             if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_change_stream(&s)
-                    .map_err(|e| ddl_err(format!("put change_stream '{name}': {e}")))?;
+                    .map_err(object_error("put", object_type, name))?;
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -383,14 +329,14 @@ fn reassign_one(
         OwnerKind::ContinuousAggregate => {
             let mut stored = catalog
                 .get_continuous_aggregate(database_id, tenant_id, name)
-                .map_err(|e| ddl_err(format!("get continuous_aggregate '{name}': {e}")))?
+                .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             stored.owner = admin_name.to_string();
             let entry = CatalogEntry::PutContinuousAggregate(Box::new(stored.clone()));
             if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_continuous_aggregate(&stored)
-                    .map_err(|e| ddl_err(format!("put continuous_aggregate '{name}': {e}")))?;
+                    .map_err(object_error("put", object_type, name))?;
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -439,7 +385,7 @@ pub(super) fn sweep_grants(
     let grantee = format!("user:{username}");
     let grants = catalog
         .load_all_permissions()
-        .map_err(|e| ddl_err(format!("load permissions: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("load permissions", &e))?;
     for grant in grants.into_iter().filter(|grant| grant.grantee == grantee) {
         let entry = CatalogEntry::DeletePermission {
             target: grant.target.clone(),
@@ -449,7 +395,12 @@ pub(super) fn sweep_grants(
         if propose(state, &entry)?.needs_local_apply() {
             catalog
                 .delete_permission(&grant.target, &grantee, &grant.permission)
-                .map_err(|e| ddl_err(format!("delete permission on '{}': {e}", grant.target)))?;
+                .map_err(|e| {
+                    DdlError::from_error_in_context(
+                        &format!("delete permission on '{}'", grant.target),
+                        &e,
+                    )
+                })?;
             state
                 .permissions
                 .install_replicated_revoke(&grant.target, &grantee, &grant.permission);
@@ -483,7 +434,12 @@ fn persist_owner_local_in_database(
 ) -> Result<(), DdlError> {
     catalog
         .rewrite_object_owner(object_type, database_id, tenant_id, name, admin_name)
-        .map_err(|e| ddl_err(format!("rewrite owner for {object_type} '{name}': {e}")))?;
+        .map_err(|e| {
+            DdlError::from_error_in_context(
+                &format!("rewrite owner for {object_type} '{name}'"),
+                &e,
+            )
+        })?;
     state.permissions.install_replicated_owner(&StoredOwner {
         database_id,
         object_type: object_type.to_string(),
@@ -498,16 +454,23 @@ pub(super) fn propose(
     state: &SharedState,
     entry: &CatalogEntry,
 ) -> Result<ProposeOutcome, DdlError> {
-    propose_catalog_entry(state, entry).map_err(|e| ddl_err(format!("metadata propose: {e}")))
+    propose_catalog_entry(state, entry)
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))
+}
+
+/// The error for a failed catalog read or write of one owned object. It keeps
+/// the SQLSTATE of the typed error and names the object before its message.
+fn object_error<'a>(
+    op: &'a str,
+    object_type: &'a str,
+    name: &'a str,
+) -> impl FnOnce(crate::Error) -> DdlError + 'a {
+    move |error| DdlError::from_error_in_context(&format!("{op} {object_type} '{name}'"), &error)
 }
 
 fn missing(object_type: &str, name: &str) -> DdlError {
-    ddl_err(format!(
+    DdlError::internal(format!(
         "owned {object_type} '{name}' has an owner row but no primary record — \
          cannot reassign; refusing to drop user"
     ))
-}
-
-pub(super) fn ddl_err(message: String) -> DdlError {
-    DdlError::new("XX000", message)
 }

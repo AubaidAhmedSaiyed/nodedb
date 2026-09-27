@@ -20,6 +20,13 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         // `SourceFrozen` / `RetryableSchemaChanged` arms, and `OllpExhausted`
         // when it exhausted on drift.
         Ec::WRITE_CONFLICT => sqlstate::SERIALIZATION_FAILURE,
+        // Mirrors the `CalvinParticipantError` arm.
+        Ec::TRANSACTION_ROLLBACK => sqlstate::TRANSACTION_ROLLBACK,
+        // Mirrors the `NotInTransactionBlock` / `CrdtApplyForbiddenInTransaction`
+        // / `CrossShardInExplicitTransaction` arms.
+        Ec::ACTIVE_SQL_TRANSACTION => sqlstate::ACTIVE_SQL_TRANSACTION,
+        // Mirrors the `DependentObjectsExist` arm.
+        Ec::DEPENDENT_OBJECTS_EXIST => sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
         // Mirrors the `DeadlineExceeded` arm.
         Ec::DEADLINE_EXCEEDED => sqlstate::QUERY_CANCELED,
         // Mirrors the `CollectionNotFound` / `CollectionDeactivated` arms.

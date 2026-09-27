@@ -260,7 +260,7 @@ pub fn alter_raft_group(
     };
     let data = change
         .to_entry_data()
-        .map_err(|e| ddl_err("XX000", format!("conf_change encode: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("conf_change encode: {e}")))?;
 
     // Find a vShard that maps to this group to propose through Raft.
     let routing = match &state.cluster_routing {
@@ -286,6 +286,6 @@ pub fn alter_raft_group(
             command: "ALTER RAFT GROUP".to_string(),
             rows_affected: None,
         }]),
-        Err(e) => Err(ddl_err("XX000", format!("propose failed: {e}"))),
+        Err(e) => Err(DdlError::from_error_in_context("propose failed", &e)),
     }
 }

@@ -126,7 +126,7 @@ pub fn define_field(
                     database_id,
                     &coll,
                 ) {
-                    return Err(err("XX000", &format!("save collection: {e}")));
+                    return Err(DdlError::from_error_in_context("save collection", &e));
                 }
             }
             _ => {
@@ -229,7 +229,7 @@ pub fn define_event(
                     database_id,
                     &coll,
                 ) {
-                    return Err(err("XX000", &format!("save collection: {e}")));
+                    return Err(DdlError::from_error_in_context("save collection", &e));
                 }
             }
             _ => {
@@ -301,7 +301,7 @@ pub fn remove_event(
                 &format!("collection '{collection}' does not exist"),
             ));
         }
-        Err(e) => return Err(err("XX000", &format!("read collection: {e}"))),
+        Err(e) => return Err(DdlError::from_error_in_context("read collection", &e)),
     };
     let before = coll.event_defs.len();
     coll.event_defs.retain(|e| e.name != event_name);
@@ -312,7 +312,7 @@ pub fn remove_event(
         ));
     }
     crate::control::catalog_entry::persist_collection_replicated(state, database_id, &coll)
-        .map_err(|e| err("XX000", &format!("save collection: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("save collection", &e))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

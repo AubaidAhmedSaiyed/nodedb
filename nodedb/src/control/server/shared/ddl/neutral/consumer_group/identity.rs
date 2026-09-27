@@ -71,7 +71,7 @@ pub fn migrate_legacy_topic_group(
             canonical_stream,
             group,
         )
-        .map_err(|error| DdlError::new("XX000", format!("consumer-group migration: {error}")))?;
+        .map_err(|error| DdlError::from_error_in_context("consumer-group migration", &error))?;
     super::replicate::propose_migrate(state, &def, legacy_stream)?;
     Ok(true)
 }

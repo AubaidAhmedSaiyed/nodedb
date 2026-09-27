@@ -101,9 +101,10 @@ pub async fn insert_document(
                         fields.insert(field_def.name.clone(), typed_val);
                     }
                     Err(e) => {
-                        return Some(Err(ddl_err(
-                            "XX000",
-                            format!("sequence '{seq_name}' error: {e}"),
+                        return Some(Err(DdlError::from_error(
+                            &crate::control::sequence::error_map::sequence_error_to_error(
+                                seq_name, e,
+                            ),
                         )));
                     }
                 }
@@ -225,9 +226,9 @@ pub async fn insert_document(
                 &pending.fields,
             )
         {
-            return Some(Err(ddl_err(
-                "XX000",
-                format!("record inferred schema fields: {e}"),
+            return Some(Err(DdlError::from_error_in_context(
+                "record inferred schema fields",
+                &e,
             )));
         }
     }
@@ -298,7 +299,7 @@ pub async fn insert_document(
         ) {
             Ok(s) => s,
             Err(e) => {
-                return Some(Err(ddl_err("XX000", format!("surrogate assign: {e}"))));
+                return Some(Err(DdlError::from_error_in_context("surrogate assign", &e)));
             }
         };
         let vec_plan = crate::bridge::envelope::PhysicalPlan::Vector(VectorOp::Insert {

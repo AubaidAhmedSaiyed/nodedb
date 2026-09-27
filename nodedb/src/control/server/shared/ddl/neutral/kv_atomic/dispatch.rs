@@ -118,21 +118,17 @@ pub(crate) async fn dispatch_and_respond(
         // durable apply, and a buffered route has no value to answer with, so
         // either one is a classification break, never an answer.
         Ok(InTxnRoute::Read(_)) => {
-            return Err(ddl_err(
-                "XX000",
-                format!("{func_name}: the staging gate classified this write as a read"),
-            ));
+            return Err(DdlError::internal(format!(
+                "{func_name}: the staging gate classified this write as a read"
+            )));
         }
         Ok(InTxnRoute::Buffered) => {
-            return Err(ddl_err(
-                "XX000",
-                format!(
-                    "{func_name}: the staging gate buffered this write, so it has no value to \
-                     return at the statement"
-                ),
-            ));
+            return Err(DdlError::internal(format!(
+                "{func_name}: the staging gate buffered this write, so it has no value to \
+                 return at the statement"
+            )));
         }
-        Err(StagingGateError::Dispatch(e)) => return Err(ddl_err("XX000", e.to_string())),
+        Err(StagingGateError::Dispatch(e)) => return Err(DdlError::from_error(&e)),
         Err(StagingGateError::Rejected { code }) => return Err(data_plane_error(code)),
     };
 
@@ -217,7 +213,7 @@ fn error_to_ddl(error: &crate::Error) -> DdlError {
 /// silently downgraded to success.
 fn data_plane_error(code: Option<crate::bridge::envelope::ErrorCode>) -> DdlError {
     let Some(code) = code else {
-        return ddl_err("XX000", "unknown data plane error");
+        return DdlError::internal("unknown data plane error");
     };
     let (_, sqlstate, message) =
         crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code);

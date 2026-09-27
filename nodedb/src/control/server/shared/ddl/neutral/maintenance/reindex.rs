@@ -78,7 +78,7 @@ pub async fn handle_reindex(
         trace_id,
     )
     .await
-    .map_err(|e| ddl_err("XX000", format!("REINDEX failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("REINDEX failed", &e))?;
 
     tracing::info!(%collection, concurrent, "REINDEX acknowledged by all cores");
 

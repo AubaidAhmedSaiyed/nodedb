@@ -39,7 +39,7 @@ pub fn create_timeseries(
             ));
         }
         Ok(None) => {}
-        Err(error) => return Err(ddl_err("XX000", error.to_string())),
+        Err(error) => return Err(DdlError::from_error(&error)),
     }
 
     let config_json = parse_with_clause(parts);
@@ -106,7 +106,7 @@ pub fn create_timeseries(
     };
 
     crate::control::catalog_entry::persist_collection_replicated(state, database_id, &coll)
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // Initialize partition registry for this timeseries collection.
     if let Some(registries) = state.timeseries_registries() {

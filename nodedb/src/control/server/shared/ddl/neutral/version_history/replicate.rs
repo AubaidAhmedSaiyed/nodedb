@@ -24,7 +24,7 @@ pub(super) fn propose_put(state: &SharedState, record: &CheckpointRecord) -> Res
     let entry = CatalogEntry::PutCheckpoint(Box::new(record.clone()));
     propose_and_apply(state, &entry, || {
         apply::put(record, state.credentials.catalog())
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))
     })
 }
 
@@ -46,7 +46,7 @@ pub(super) fn propose_delete(
     };
     propose_and_apply(state, &entry, || {
         apply::delete(doc, checkpoint_name, state.credentials.catalog())
-            .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))
+            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))
     })
 }
 
@@ -76,6 +76,6 @@ pub(super) fn propose_compact_history(
     };
     propose_and_apply_outcome(state, &entry, || {
         apply::delete_before(doc, before_timestamp, state.credentials.catalog())
-            .map_err(|e| DdlError::new("XX000", format!("catalog range delete: {e}")))
+            .map_err(|e| DdlError::from_error_in_context("catalog range delete", &e))
     })
 }

@@ -58,7 +58,7 @@ pub fn alter_user(
             let stored = state
                 .credentials
                 .prepare_user_update_from(base, Some(password.as_str()), None)
-                .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+                .map_err(|e| DdlError::from_error(&e))?;
             // Password change — no role/access change; no invalidation.
             propose_and_install(state, stored, None)?;
 
@@ -87,7 +87,7 @@ pub fn alter_user(
             let stored = state
                 .credentials
                 .prepare_user_update_from(base, None, Some(new_roles.clone()))
-                .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+                .map_err(|e| DdlError::from_error(&e))?;
             let replicated = propose_and_install(
                 state,
                 stored,
@@ -207,7 +207,7 @@ pub fn alter_user(
             let catalog = state.credentials.catalog();
             let db_id = catalog
                 .get_database_id_by_name(db_name)
-                .map_err(|e| DdlError::new("XX000", format!("catalog lookup: {e}")))?
+                .map_err(|e| DdlError::from_error_in_context("catalog lookup", &e))?
                 .ok_or_else(|| {
                     DdlError::new("42704", format!("database '{db_name}' does not exist"))
                 })?;
@@ -241,13 +241,13 @@ fn propose_and_install(
 ) -> Result<bool, DdlError> {
     let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .put_user(&stored)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state
             .credentials

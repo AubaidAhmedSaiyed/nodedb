@@ -96,6 +96,14 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 let (gate,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::RateExceeded { gate })
             }
+            TAG_TRANSACTION_ROLLBACK => {
+                let (detail,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::TransactionRollback { detail })
+            }
+            TAG_ACTIVE_SQL_TRANSACTION => {
+                let (detail,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::ActiveSqlTransaction { detail })
+            }
             TAG_COLLECTION_NOT_FOUND => {
                 let (collection,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::CollectionNotFound { collection })
@@ -395,6 +403,10 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 let (detail,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::NotFound { detail })
             }
+            TAG_DEPENDENT_OBJECTS_EXIST => {
+                let (object,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::DependentObjectsExist { object })
+            }
             TAG_CANNOT_DROP_DEFAULT_DATABASE => {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::CannotDropDefaultDatabase)
@@ -522,6 +534,46 @@ mod tests {
             detail: "WITH RECURSIVE CTE 'walk' exceeded max recursion depth 100".into(),
         };
         assert_eq!(roundtrip(&v), v);
+    }
+
+    #[test]
+    fn transaction_rollback_roundtrip() {
+        let v = ErrorDetails::TransactionRollback {
+            detail: "a participant vShard returned an error".into(),
+        };
+        assert_eq!(roundtrip(&v), v);
+    }
+
+    #[test]
+    fn active_sql_transaction_roundtrip() {
+        let v = ErrorDetails::ActiveSqlTransaction {
+            detail: "VACUUM cannot run inside a transaction block".into(),
+        };
+        assert_eq!(roundtrip(&v), v);
+    }
+
+    #[test]
+    fn dependent_objects_exist_roundtrip() {
+        let v = ErrorDetails::DependentObjectsExist {
+            object: "role \"auditor\"".into(),
+        };
+        assert_eq!(roundtrip(&v), v);
+    }
+
+    /// The details of each transaction and dependency code decode to the
+    /// same variant, which answers the same numeric code.
+    #[test]
+    fn transaction_and_dependency_details_keep_their_code() {
+        use crate::error::NodeDbError;
+        for e in [
+            NodeDbError::transaction_rollback("participant failed"),
+            NodeDbError::active_sql_transaction("VACUUM"),
+            NodeDbError::dependent_objects_exist("role \"r\"", "held by users: alice"),
+        ] {
+            let back = roundtrip(e.details());
+            assert_eq!(&back, e.details());
+            assert_eq!(back.code(), e.code());
+        }
     }
 
     #[test]

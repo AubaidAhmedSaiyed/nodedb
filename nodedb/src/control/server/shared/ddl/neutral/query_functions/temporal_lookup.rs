@@ -72,7 +72,7 @@ pub async fn temporal_lookup(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| err("XX000", &format!("scan failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("scan failed", &e))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);

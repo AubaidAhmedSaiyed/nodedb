@@ -62,6 +62,14 @@ pub enum ErrorDetails {
     InsufficientBalance { collection: String },
     #[serde(rename = "rate_exceeded")]
     RateExceeded { gate: String },
+    /// A transaction rolled back for a reason other than a serialization
+    /// conflict. `detail` names the reason. The client retries it.
+    #[serde(rename = "transaction_rollback")]
+    TransactionRollback { detail: String },
+    /// The statement cannot run inside an explicit transaction block.
+    /// `detail` names the statement or the refused operation.
+    #[serde(rename = "active_sql_transaction")]
+    ActiveSqlTransaction { detail: String },
 
     // Read path
     #[serde(rename = "collection_not_found")]
@@ -89,6 +97,10 @@ pub enum ErrorDetails {
     /// collection/document shape of `DocumentNotFound`.
     #[serde(rename = "not_found")]
     NotFound { detail: String },
+    /// A drop or revoke refused because other objects still depend on
+    /// `object`. The message lists the dependents.
+    #[serde(rename = "dependent_objects_exist")]
+    DependentObjectsExist { object: String },
     #[serde(rename = "collection_draining")]
     CollectionDraining { collection: String },
     #[serde(rename = "collection_deactivated")]

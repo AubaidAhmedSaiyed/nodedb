@@ -41,7 +41,7 @@ pub async fn convert_collection(
 
     let mut coll = catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{collection}' does not exist")))?;
 
     // Build columns before dispatch — needed for both Data Plane and catalog.
@@ -63,7 +63,8 @@ pub async fn convert_collection(
     };
 
     let schema_json_for_dp = if let Some(ref cols) = columns {
-        sonic_rs::to_string(cols).map_err(|e| err("XX000", format!("schema serialization: {e}")))?
+        sonic_rs::to_string(cols)
+            .map_err(|e| DdlError::internal(format!("schema serialization: {e}")))?
     } else {
         String::new()
     };
@@ -181,7 +182,7 @@ pub async fn convert_collection(
     }
 
     persist_collection_replicated(state, database_id, &coll)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // Refresh this node's Data Plane `doc_configs` entry to the NEW storage
     // mode. Without this, every later read of the collection resolves its
@@ -190,7 +191,7 @@ pub async fn convert_collection(
         state, &coll,
     )
     .await
-    .map_err(|e| err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     tracing::info!(
         %collection,

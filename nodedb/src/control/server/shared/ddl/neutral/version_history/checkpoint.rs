@@ -57,7 +57,7 @@ pub async fn create_checkpoint(
     .map_err(|e| DdlError::from_error_in_context("dispatch", &e))?;
 
     let vv_json = String::from_utf8(vv_bytes)
-        .map_err(|e| err("XX000", format!("version vector decode: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("version vector decode: {e}")))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -86,7 +86,7 @@ pub async fn create_checkpoint(
     );
     if catalog
         .get_checkpoint(doc, &checkpoint_name)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .is_some()
     {
         return Err(err(
@@ -134,7 +134,7 @@ pub fn drop_checkpoint(
     );
     if catalog
         .get_checkpoint(doc, &checkpoint_name)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .is_none()
     {
         return Err(err(

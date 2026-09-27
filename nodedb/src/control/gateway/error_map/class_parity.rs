@@ -377,7 +377,7 @@ fn expired_session_token_is_invalid_authorization_everywhere() {
 }
 
 /// The number of `crate::Error` variants [`error_variant_index`] numbers.
-const ERROR_VARIANT_COUNT: usize = 108;
+const ERROR_VARIANT_COUNT: usize = 109;
 
 /// A dense index per `crate::Error` variant. Exhaustive, so a new variant
 /// fails to compile here until it gets an index, and
@@ -494,6 +494,7 @@ pub(crate) fn error_variant_index(err: &crate::Error) -> usize {
         E::OllpExhausted { .. } => 105,
         E::MirrorReadOnly { .. } => 106,
         E::StaleReadNotLeader { .. } => 107,
+        E::RoleInUse { .. } => 108,
     }
 }
 
@@ -829,6 +830,12 @@ pub(crate) fn error_samples() -> Vec<crate::Error> {
             source_cluster: "src".into(),
             detail: text(),
         },
+        E::RoleInUse {
+            role: "analyst".into(),
+            dependents: crate::control::security::role_assignment::RoleDependents::Users(vec![
+                "bob".into(),
+            ]),
+        },
     ]
 }
 
@@ -866,13 +873,6 @@ fn every_error_variant_has_the_http_status_of_its_sqlstate() {
     }
 }
 
-/// Variants whose pgwire SQLSTATE class has no public numeric code: `25`
-/// (`CrdtApplyForbiddenInTransaction`, `NotInTransactionBlock`,
-/// `CrossShardInExplicitTransaction`), `2B` (`DependentObjectsExist`), and
-/// `40000` (`CalvinParticipantError`, whose code is deliberately not a write
-/// conflict). The numeric wire form cannot carry their class.
-const NUMERIC_CLASS_GAPS: [usize; 5] = [7, 32, 33, 88, 90];
-
 /// Every `crate::Error` variant renders the SQLSTATE class it renders locally
 /// after it crosses a node hop, through both wire encoders and the decoder.
 #[test]
@@ -887,9 +887,6 @@ fn every_error_variant_keeps_its_class_across_a_node_hop() {
     ];
     for (name, encode) in encoders {
         for (err, twin) in error_samples().into_iter().zip(error_samples()) {
-            if NUMERIC_CLASS_GAPS.contains(&error_variant_index(&err)) {
-                continue;
-            }
             let (_, local, _) = error_to_sqlstate(&err);
             let rebuilt = crate::Error::from(encode(twin));
             let (_, remote, _) = error_to_sqlstate(&rebuilt);
@@ -935,6 +932,7 @@ fn classified_sqlstates() -> Vec<(usize, &'static str)> {
         (104, sqlstate::SYNTAX_ERROR),
         (106, sqlstate::READ_ONLY_SQL_TRANSACTION),
         (107, sqlstate::STALE_READ_NOT_LEADER),
+        (108, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
     ]
 }
 
@@ -980,4 +978,90 @@ fn dedicated_codes_render_the_class_of_their_variant() {
         numeric_code_to_sqlstate(Ec::STALE_READ_NOT_LEADER),
         sqlstate::STALE_READ_NOT_LEADER
     );
+    assert_eq!(
+        numeric_code_to_sqlstate(Ec::TRANSACTION_ROLLBACK),
+        sqlstate::TRANSACTION_ROLLBACK
+    );
+    assert_eq!(
+        numeric_code_to_sqlstate(Ec::ACTIVE_SQL_TRANSACTION),
+        sqlstate::ACTIVE_SQL_TRANSACTION
+    );
+    assert_eq!(
+        numeric_code_to_sqlstate(Ec::DEPENDENT_OBJECTS_EXIST),
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
+    );
+}
+
+/// The transaction-state and dependency variants render their exact
+/// SQLSTATE after a node hop through both encoders, and carry the public
+/// code of that class.
+#[test]
+fn transaction_and_dependency_variants_keep_their_sqlstate_across_a_hop() {
+    use nodedb_cluster::rpc_codec::TypedClusterError;
+    use nodedb_types::error::ErrorCode as Ec;
+
+    use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
+
+    let cases: [(fn() -> crate::Error, &str, Ec); 6] = [
+        (
+            || crate::Error::CalvinParticipantError,
+            sqlstate::TRANSACTION_ROLLBACK,
+            Ec::TRANSACTION_ROLLBACK,
+        ),
+        (
+            || crate::Error::NotInTransactionBlock {
+                statement: "VACUUM".into(),
+            },
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            Ec::ACTIVE_SQL_TRANSACTION,
+        ),
+        (
+            || crate::Error::CrdtApplyForbiddenInTransaction,
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            Ec::ACTIVE_SQL_TRANSACTION,
+        ),
+        (
+            || crate::Error::CrossShardInExplicitTransaction,
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            Ec::ACTIVE_SQL_TRANSACTION,
+        ),
+        (
+            || crate::Error::DependentObjectsExist {
+                tenant_id: 1,
+                root_kind: "collection",
+                root_name: "c".into(),
+                dependent_count: 1,
+                dependents: vec![("view".into(), "v".into())],
+            },
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            Ec::DEPENDENT_OBJECTS_EXIST,
+        ),
+        (
+            || crate::Error::RoleInUse {
+                role: "analyst".into(),
+                dependents: crate::control::security::role_assignment::RoleDependents::ChildRoles(
+                    vec!["junior".into()],
+                ),
+            },
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            Ec::DEPENDENT_OBJECTS_EXIST,
+        ),
+    ];
+    let encoders: [(&str, fn(crate::Error) -> TypedClusterError); 2] = [
+        ("execution_error_to_typed", execution_error_to_typed),
+        ("From<Error>", TypedClusterError::from),
+    ];
+    for (make, state, code) in cases {
+        let err = make();
+        assert_eq!(error_to_sqlstate(&err).1, state, "{err:?} locally");
+        assert_eq!(native_error_fields(&err).code, code, "{err:?} native code");
+        for (name, encode) in encoders {
+            let rebuilt = crate::Error::from(encode(make()));
+            assert_eq!(
+                error_to_sqlstate(&rebuilt).1,
+                state,
+                "{name}: {err:?} after the hop as {rebuilt:?}"
+            );
+        }
+    }
 }

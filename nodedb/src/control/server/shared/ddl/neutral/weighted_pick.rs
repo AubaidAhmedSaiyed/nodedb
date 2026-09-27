@@ -161,7 +161,7 @@ pub async fn weighted_pick(
                 .unwrap_or(0)
         );
         let audit_value = nodedb_types::json_to_msgpack(&audit_entry)
-            .map_err(|e| ddl_err("XX000", format!("WEIGHTED_PICK: audit entry encode: {e}")))?;
+            .map_err(|e| DdlError::internal(format!("WEIGHTED_PICK: audit entry encode: {e}")))?;
         let audit_key_bytes = audit_key.into_bytes();
         let audit_surrogate = state
             .surrogate_assigner
@@ -280,19 +280,17 @@ async fn scan_all_entries(
     // KV scan returns a flat msgpack array of entry maps.
     let payload_text = crate::data::executor::response_codec::decode_payload_to_json(&payload);
     let json: serde_json::Value = sonic_rs::from_str(&payload_text).map_err(|e| {
-        ddl_err(
-            "XX000",
-            format!("WEIGHTED_PICK: the scan of '{collection}' returned undecodable rows: {e}"),
-        )
+        DdlError::internal(format!(
+            "WEIGHTED_PICK: the scan of '{collection}' returned undecodable rows: {e}"
+        ))
     })?;
 
     let entries = match json {
         serde_json::Value::Array(arr) => arr,
         other => {
-            return Err(ddl_err(
-                "XX000",
-                format!("WEIGHTED_PICK: the scan of '{collection}' returned {other}, not rows"),
-            ));
+            return Err(DdlError::internal(format!(
+                "WEIGHTED_PICK: the scan of '{collection}' returned {other}, not rows"
+            )));
         }
     };
 
@@ -312,10 +310,9 @@ fn scan_row_key(row: &serde_json::Value, collection: &str) -> Result<String, Ddl
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .ok_or_else(|| {
-            ddl_err(
-                "XX000",
-                format!("WEIGHTED_PICK: a scan row of '{collection}' has no text 'key'"),
-            )
+            DdlError::internal(format!(
+                "WEIGHTED_PICK: a scan row of '{collection}' has no text 'key'"
+            ))
         })
 }
 

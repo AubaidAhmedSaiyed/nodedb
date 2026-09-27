@@ -154,22 +154,22 @@ pub(super) async fn stage_edge_write_in_txn(
         // transaction block the gate returns `Staged`. Any other route means
         // the caller's `InBlock` check and the gate disagree. A report of zero
         // rows drops the write silently, so the statement fails instead.
-        Ok(InTxnRoute::Read(_) | InTxnRoute::Autocommit(_) | InTxnRoute::Buffered) => Err(ddl_err(
-            "XX000",
-            "a graph edge write reached the transaction staging gate and was not staged",
-        )),
+        Ok(InTxnRoute::Read(_) | InTxnRoute::Autocommit(_) | InTxnRoute::Buffered) => {
+            Err(DdlError::internal(
+                "a graph edge write reached the transaction staging gate and was not staged",
+            ))
+        }
         Err(StagingGateError::Dispatch(e)) => {
             let (_, sqlstate, message) = error_to_sqlstate(&e);
             Err(ddl_err(sqlstate, message))
         }
-        Err(StagingGateError::Rejected { code }) => {
-            let (_, sqlstate, message) = match code {
-                Some(code) => {
-                    crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code)
-                }
-                None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-            };
-            Err(ddl_err(sqlstate, message))
-        }
+        Err(StagingGateError::Rejected { code }) => Err(match code {
+            Some(code) => {
+                let (_, sqlstate, message) =
+                    crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code);
+                ddl_err(sqlstate, message)
+            }
+            None => DdlError::internal("unknown data plane error"),
+        }),
     }
 }

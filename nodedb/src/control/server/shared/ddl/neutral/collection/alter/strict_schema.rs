@@ -49,7 +49,7 @@ pub(super) fn load_strict_collection(
         .timeseries_config
         .as_deref()
         .and_then(|s| sonic_rs::from_str(s).ok())
-        .ok_or_else(|| err("XX000", "strict schema missing or malformed"))?;
+        .ok_or_else(|| DdlError::internal("strict schema missing or malformed"))?;
 
     Ok((coll, schema))
 }
@@ -120,7 +120,7 @@ pub(super) async fn persist_schema_change(
 
     super::super::register::dispatch_register_from_stored(state, updated)
         .await
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     recompile_rls_policies(state, updated)?;
     state.schema_version.bump();
     Ok(())
@@ -144,5 +144,5 @@ pub(super) fn recompile_rls_policies(
             updated.tenant_id,
             &updated.name,
         )
-        .map_err(|e| err("XX000", format!("rls recompile: {e}")))
+        .map_err(|e| DdlError::from_error_in_context("rls recompile", &e))
 }

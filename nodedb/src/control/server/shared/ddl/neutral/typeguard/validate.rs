@@ -39,7 +39,7 @@ pub async fn validate_typeguard(
 
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &coll_name)
-        .map_err(|e| super::parse::err("XX000", &format!("catalog error: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog error", &e))?
         .ok_or_else(|| {
             super::parse::err("42P01", &format!("collection '{coll_name}' not found"))
         })?;
@@ -89,7 +89,7 @@ pub async fn validate_typeguard(
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| super::parse::err("XX000", &format!("scan dispatch failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("scan dispatch failed", &e))?;
 
         if !resp.payload.is_empty() {
             let json = crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);

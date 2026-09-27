@@ -101,7 +101,7 @@ pub async fn tree_sum(
         },
     )
     .await
-    .map_err(|e| ddl_err("XX000", format!("BFS failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("BFS failed", &e))?;
 
     // Parse BFS result as JSON array of node IDs.
     let bfs_json =
@@ -146,7 +146,7 @@ pub async fn tree_sum(
                     tenant_id,
                     &pk_bytes,
                 )
-                .map_err(|e| ddl_err("XX000", format!("surrogate lookup: {e}")))?
+                .map_err(|e| DdlError::from_error_in_context("surrogate lookup", &e))?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             let mut get_plan =
                 PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {

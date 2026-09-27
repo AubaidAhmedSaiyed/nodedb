@@ -35,7 +35,7 @@ pub fn backup_database(
             ));
         }
         Err(e) => {
-            return Err(ddl_err("XX000", format!("catalog lookup failed: {e}")));
+            return Err(DdlError::from_error_in_context("catalog lookup failed", &e));
         }
     };
     require_database_owner_or_higher(state, identity, db_id, &format!("BACKUP DATABASE {name}"))?;

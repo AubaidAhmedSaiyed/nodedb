@@ -34,7 +34,7 @@ pub async fn call_procedure(
 
     let proc = catalog
         .get_procedure_in_database(database_id, tenant_id.as_u64(), &name)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| DdlError::new("42883", format!("procedure '{name}' does not exist")))?;
 
     // Validate argument count matches IN parameters.

@@ -109,7 +109,7 @@ fn alter_org(
     let found = state
         .orgs
         .set_status(org_id, &status_val)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     if !found {
         return Err(err("42704", format!("org '{org_id}' not found")));
     }
@@ -141,7 +141,7 @@ fn drop_org(
     let found = state
         .orgs
         .drop_org(org_id)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     if !found {
         return Err(err("42704", format!("org '{org_id}' not found")));
     }

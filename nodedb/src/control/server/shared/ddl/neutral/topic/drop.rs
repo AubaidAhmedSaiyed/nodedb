@@ -66,10 +66,7 @@ pub async fn drop_topic(
     for group_name in catalog
         .topic_consumer_group_names(database_id, tenant_id, &name)
         .map_err(|error| {
-            DdlError::new(
-                "XX000",
-                format!("catalog enumerate topic consumer groups: {error}"),
-            )
+            DdlError::from_error_in_context("catalog enumerate topic consumer groups", &error)
         })?
     {
         group_names.insert(group_name);
@@ -105,9 +102,7 @@ pub async fn drop_topic(
     state
         .offset_store
         .delete_groups(database_id, tenant_id, &offset_groups)
-        .map_err(|error| {
-            DdlError::new("XX000", format!("durable topic offset cleanup: {error}"))
-        })?;
+        .map_err(|error| DdlError::from_error_in_context("durable topic offset cleanup", &error))?;
 
     // Definition, retained messages, and both consumer-group identities share
     // one catalog transaction, and the registry teardown rides the same entry

@@ -129,7 +129,7 @@ impl NodeDbPgHandler {
         {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
-                "XX000".to_owned(),
+                nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
                 "internal error: failed to retain descriptor leases for buffered transaction tasks"
                     .to_owned(),
             ))));
@@ -158,7 +158,11 @@ impl NodeDbPgHandler {
                     Some(code) => {
                         crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code)
                     }
-                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+                    None => (
+                        "ERROR",
+                        nodedb_types::error::sqlstate::INTERNAL_ERROR,
+                        "unknown data plane error".to_owned(),
+                    ),
                 };
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     severity.to_owned(),

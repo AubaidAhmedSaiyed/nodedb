@@ -79,7 +79,7 @@ pub fn create_database(
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(ddl_err("XX000", format!("catalog lookup failed: {e}")));
+            return Err(DdlError::from_error_in_context("catalog lookup failed", &e));
         }
     }
 
@@ -112,14 +112,14 @@ pub fn create_database(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
-    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
 
     // Direct write for single-node mode (`LocalOnly`) or as a fallback
     // when the cluster is in mixed-version compat mode.
     if outcome.needs_local_apply() {
         catalog
             .put_database(&descriptor)
-            .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))?;
     }
 
     // Flush the allocator hwm on the periodic threshold so restarts
@@ -150,4 +150,58 @@ pub fn create_database(
     );
 
     Ok(status("CREATE DATABASE"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nodedb_types::error::ErrorCode;
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::identity::{DatabaseSet, Role};
+    use crate::types::TenantId;
+    use crate::wal::WalManager;
+
+    fn test_state() -> (tempfile::TempDir, Arc<SharedState>) {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("create-database.wal"))
+                .expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        (dir, state)
+    }
+
+    fn admin() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_internal_service(
+            0,
+            "create_database_test",
+            TenantId::new(1),
+            vec![Role::Superuser],
+            true,
+            None,
+            DatabaseSet::All,
+        )
+    }
+
+    /// CREATE DATABASE of a name already taken is `duplicate_database`
+    /// (`42P04`) with the already-exists code, never an internal error.
+    #[test]
+    fn creating_an_existing_database_is_a_duplicate_database() {
+        let (_dir, state) = test_state();
+        let identity = admin();
+        create_database(&state, &identity, "orders", false, &[]).expect("first create succeeds");
+
+        let err = create_database(&state, &identity, "orders", false, &[])
+            .expect_err("a second create of the same name is refused");
+        assert_eq!(err.sqlstate, "42P04", "{err:?}");
+        assert_eq!(err.code, ErrorCode::ALREADY_EXISTS);
+
+        let existing = create_database(&state, &identity, "orders", true, &[])
+            .expect("IF NOT EXISTS on an existing name succeeds");
+        assert_eq!(existing.len(), 1);
+    }
 }

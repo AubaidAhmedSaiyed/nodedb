@@ -97,7 +97,7 @@ fn drop_user_inner(
         .credentials
         .catalog()
         .authoritative_tenant_admin(user_tenant.as_u64())
-        .map_err(|e| DdlError::new("XX000", format!("load tenant administrator: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("load tenant administrator", &e))?;
     if !tenant_teardown && authoritative_admin.as_deref() == Some(username) {
         return Err(DdlError::new(
             "55006",
@@ -136,13 +136,13 @@ fn drop_user_inner(
         username: username.to_string(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     let dropped = if outcome.needs_local_apply() {
         // Single-node fallback.
         state
             .credentials
             .drop_user(username)
-            .map_err(|e| DdlError::new("XX000", e.to_string()))?
+            .map_err(|e| DdlError::from_error(&e))?
     } else {
         // Cluster mode: the raft entry committed, so the
         // drop WILL be applied on every node. The

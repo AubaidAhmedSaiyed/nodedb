@@ -117,10 +117,9 @@ pub async fn rate_check(
     let current: i64 = sonic_rs::from_str::<serde_json::Value>(&payload_text)
         .ok()
         .and_then(|v| v.get("value")?.as_i64())
-        .ok_or(ddl_err(
-            "XX000",
-            format!("RATE_CHECK: counter '{rate_key}' increment answered no integer value"),
-        ))?;
+        .ok_or(DdlError::internal(format!(
+            "RATE_CHECK: counter '{rate_key}' increment answered no integer value"
+        )))?;
 
     if current > max_count {
         // Read TTL to compute retry_after_ms.
@@ -316,10 +315,9 @@ fn ttl_from(
     let ttl_ms = sonic_rs::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|v| v.get("ttl_ms")?.as_i64())
-        .ok_or(ddl_err(
-            "XX000",
-            format!("{context}: TTL read answered no integer ttl_ms: {text}"),
-        ))?;
+        .ok_or(DdlError::internal(format!(
+            "{context}: TTL read answered no integer ttl_ms: {text}"
+        )))?;
     Ok((ttl_ms != TTL_ABSENT).then_some(ttl_ms))
 }
 
@@ -337,7 +335,7 @@ fn counter_from(
             .ok()
             .and_then(|text| text.parse::<i64>().ok())
             .ok_or(ddl_err(
-                "XX000",
+                "22P02",
                 format!(
                     "RATE_REMAINING: counter '{rate_key}' does not hold decimal text; \
                      reset the gate with RATE_RESET"
@@ -572,6 +570,20 @@ mod tests {
             counter_from("_rate:g:k", Ok(answer(b"7".to_vec()))).expect("read succeeds"),
             7
         );
+    }
+
+    /// A counter that holds text other than a decimal is a stored value the
+    /// read cannot parse: `22P02`, never an internal error.
+    #[test]
+    fn a_non_decimal_counter_is_invalid_text() {
+        let err = counter_from("_rate:g:k", Ok(answer(b"abc".to_vec())))
+            .expect_err("a non-decimal counter fails the read");
+        assert_eq!(
+            err.sqlstate,
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "{err:?}"
+        );
+        assert_eq!(err.code, nodedb_types::error::ErrorCode::BAD_REQUEST);
     }
 
     /// The TTL read behind `retry after` propagates a dispatch error instead

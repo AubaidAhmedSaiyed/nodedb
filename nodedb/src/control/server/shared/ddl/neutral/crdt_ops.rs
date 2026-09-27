@@ -167,7 +167,7 @@ pub async fn crdt_apply(
             tenant_id,
             document_id.as_bytes(),
         )
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),
@@ -200,7 +200,7 @@ pub async fn crdt_apply(
     .into_tasks()
     .into_iter()
     .next()
-    .ok_or_else(|| DdlError::new("XX000", "authorization returned no capability"))?;
+    .ok_or_else(|| DdlError::internal("authorization returned no capability"))?;
 
     // Route through the Raft proposer gate so the delta is quorum-durable under
     // replication. A local-only dispatch would land the delta on the receiving

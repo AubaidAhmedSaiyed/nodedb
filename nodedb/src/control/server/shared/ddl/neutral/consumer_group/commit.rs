@@ -246,7 +246,7 @@ pub async fn commit_offset(
                         partition_id,
                         offset,
                     )
-                    .map_err(|e| DdlError::new("XX000", format!("offset commit: {e}")))?;
+                    .map_err(|e| DdlError::from_error_in_context("offset commit", &e))?;
             }
         }
 

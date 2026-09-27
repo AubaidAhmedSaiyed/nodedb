@@ -336,7 +336,7 @@ pub(crate) async fn handle_direct_op(
                 None => {
                     return sqlstate_error(
                         seq,
-                        "XX000",
+                        nodedb_types::error::sqlstate::INTERNAL_ERROR,
                         "authorization returned no task capability",
                     );
                 }

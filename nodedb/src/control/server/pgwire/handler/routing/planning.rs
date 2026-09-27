@@ -38,7 +38,7 @@ impl NodeDbPgHandler {
                 .ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "FATAL".to_owned(),
-                        "XX000".to_owned(),
+                        nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
                         "connection session metadata is unavailable".to_owned(),
                     )))
                 })?,
@@ -89,7 +89,7 @@ impl NodeDbPgHandler {
                 .ok_or_else(|| {
                     StatementSetupError::protocol(
                         "FATAL",
-                        "XX000",
+                        nodedb_types::error::sqlstate::INTERNAL_ERROR,
                         "connection session metadata is unavailable",
                     )
                 })?,

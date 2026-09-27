@@ -57,17 +57,16 @@ pub fn create_wasm_aggregate(
         .map_err(|e| DdlError::new("42601", e.to_string()))?;
 
     // Validate aggregate exports (init, accumulate, merge, finalize).
-    let runtime =
-        wasm::runtime::WasmRuntime::new().map_err(|e| DdlError::new("XX000", e.to_string()))?;
+    let runtime = wasm::runtime::WasmRuntime::new().map_err(|e| DdlError::from_error(&e))?;
     let module = runtime
         .get_or_compile(&wasm_bytes)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     wasm::wit::validate_aggregate_exports(&module)
         .map_err(|e| DdlError::new("42601", e.to_string()))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError::new("XX000", "system clock"))?
+        .map_err(|_| DdlError::internal("system clock"))?
         .as_secs();
 
     // Store as a function with language=WASM. The "aggregate" nature is

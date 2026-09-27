@@ -193,10 +193,16 @@ impl RoleStore {
         let mut roles = self.roles.write();
 
         // Check no other role inherits from this one.
-        let has_children = roles.values().any(|r| r.parent.as_deref() == Some(name));
-        if has_children {
-            return Err(crate::Error::BadRequest {
-                detail: format!("cannot drop role '{name}': other roles inherit from it"),
+        let mut children: Vec<String> = roles
+            .values()
+            .filter(|r| r.parent.as_deref() == Some(name))
+            .map(|r| r.name.clone())
+            .collect();
+        if !children.is_empty() {
+            children.sort();
+            return Err(crate::Error::RoleInUse {
+                role: name.to_string(),
+                dependents: super::role_assignment::RoleDependents::ChildRoles(children),
             });
         }
 

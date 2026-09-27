@@ -125,12 +125,12 @@ pub fn create_api_key(
             });
     let entry = crate::control::catalog_entry::CatalogEntry::PutApiKey(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         catalog
             .put_api_key(&stored)
-            .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         state.api_keys.install_replicated_key(&stored);
     }
 

@@ -149,7 +149,7 @@ pub async fn create_index(
     // loudly — only a genuine name collision is absorbed by `IF NOT EXISTS`.
     if let Some(existing) = catalog
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
     {
         if if_not_exists {
             return Ok(create_index_ok());

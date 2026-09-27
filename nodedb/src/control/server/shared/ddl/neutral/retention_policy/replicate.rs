@@ -14,10 +14,6 @@ use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
 use super::super::super::result::DdlError;
 use super::super::replicate::propose_and_apply;
 
-fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError::new(sqlstate, message)
-}
-
 /// Propose the full policy record. CREATE and ALTER both re-put the row.
 ///
 /// The leader validates before proposing, so apply never rejects.
@@ -28,7 +24,7 @@ pub(super) fn propose_put(state: &SharedState, def: &RetentionPolicyDef) -> Resu
             .credentials
             .catalog()
             .put_retention_policy(def)
-            .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         post_apply::put(def, state);
         Ok(())
     })
@@ -50,7 +46,7 @@ pub(super) fn propose_delete(
             .credentials
             .catalog()
             .delete_retention_policy(def.database_id, def.tenant_id, &def.name)
-            .map_err(|e| err("XX000", format!("catalog delete: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
         post_apply::delete(def.database_id, def.tenant_id, &def.name, state);
         Ok(())
     })

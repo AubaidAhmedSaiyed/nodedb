@@ -229,17 +229,17 @@ pub fn create_rls_policy(
     };
 
     let stored = StoredRlsPolicy::from_runtime(&policy, database_id, predicate_raw)
-        .map_err(|e| DdlError::new("XX000", format!("rls serialize: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("rls serialize", &e))?;
 
     let entry = CatalogEntry::PutRlsPolicy(Box::new(stored.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .put_rls_policy(&stored)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state.rls.install_replicated_policy(policy);
     }
@@ -290,13 +290,13 @@ pub fn drop_rls_policy(
         name: name.to_string(),
     };
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .delete_rls_policy(tenant_id, &qualified_collection, name)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state
             .rls

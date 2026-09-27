@@ -60,7 +60,7 @@ pub async fn balance_as_of(
             tenant_id,
             &pk_bytes,
         )
-        .map_err(|e| err("XX000", &format!("surrogate lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("surrogate lookup failed", &e))?
         .unwrap_or(nodedb_types::Surrogate::ZERO);
     let mut get_plan =
         PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
@@ -83,7 +83,7 @@ pub async fn balance_as_of(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| err("XX000", &format!("point get failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("point get failed", &e))?;
 
     let doc_json = crate::data::executor::response_codec::decode_payload_to_json(&get_resp.payload);
     let doc: serde_json::Value = sonic_rs::from_str(&doc_json).unwrap_or(serde_json::Value::Null);
@@ -97,7 +97,7 @@ pub async fn balance_as_of(
     let catalog = state.credentials.catalog();
     let coll = catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)
-        .map_err(|e| err("XX000", &e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{collection}' not found")))?;
 
     let Some(mat_def) = coll
@@ -149,7 +149,7 @@ pub async fn balance_as_of(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| err("XX000", &format!("source scan failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("source scan failed", &e))?;
 
     let source_json =
         crate::data::executor::response_codec::decode_payload_to_json(&source_resp.payload);
@@ -170,7 +170,7 @@ pub async fn balance_as_of(
         let src_doc = serde_json::Value::Object(obj.clone());
         let created_at = crate::data::executor::enforcement::retention::extract_created_at_secs(
             &sonic_rs::to_vec(&src_doc)
-                .map_err(|e| err("XX000", &format!("serialization failed: {e}")))?,
+                .map_err(|e| DdlError::internal(format!("serialization failed: {e}")))?,
         );
         if let Some(ts) = created_at {
             if ts <= as_of_secs {

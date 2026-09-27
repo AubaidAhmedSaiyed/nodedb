@@ -125,6 +125,7 @@ impl GatewayErrorMap {
             | Error::CatalogIntegrityViolation { .. }
             | Error::Promql(_)
             | Error::DependentObjectsExist { .. }
+            | Error::RoleInUse { .. }
             | Error::CascadeCycle { .. }
             | Error::CrossShardInExplicitTransaction
             | Error::SequencerUnavailable

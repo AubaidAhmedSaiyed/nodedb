@@ -533,6 +533,14 @@ pub enum Error {
         dependents: Vec<(String, String)>,
     },
 
+    /// A DROP ROLE refused: users still hold the custom role, or other
+    /// roles inherit from it.
+    #[error("role \"{role}\" cannot be dropped because {dependents}")]
+    RoleInUse {
+        role: String,
+        dependents: crate::control::security::role_assignment::RoleDependents,
+    },
+
     /// Cascade graph cycle or depth cap blocks mutation.
     #[error(
         "cascade cycle or depth limit ({depth}) exceeded while enumerating \

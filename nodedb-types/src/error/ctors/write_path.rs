@@ -257,4 +257,30 @@ impl NodeDbError {
             cause: None,
         }
     }
+
+    /// A transaction rolled back for a reason other than a serialization
+    /// conflict. SQLSTATE `40000` (`transaction_rollback`). The client
+    /// retries it. `detail` is the full message.
+    pub fn transaction_rollback(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            code: ErrorCode::TRANSACTION_ROLLBACK,
+            message: detail.clone(),
+            details: ErrorDetails::TransactionRollback { detail },
+            cause: None,
+        }
+    }
+
+    /// The statement cannot run inside an explicit transaction block.
+    /// SQLSTATE `25001` (`active_sql_transaction`). `detail` is the full
+    /// message.
+    pub fn active_sql_transaction(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            code: ErrorCode::ACTIVE_SQL_TRANSACTION,
+            message: detail.clone(),
+            details: ErrorDetails::ActiveSqlTransaction { detail },
+            cause: None,
+        }
+    }
 }

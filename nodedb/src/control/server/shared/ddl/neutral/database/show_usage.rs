@@ -36,12 +36,12 @@ pub fn show_database_usage(
 
     let db_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     let record = catalog
         .get_database_quota(db_id)
-        .map_err(|e| ddl_err("XX000", format!("quota read failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("quota read failed", &e))?
         .unwrap_or(QuotaRecord::DEFAULT);
 
     // Pull live gauges from the system metrics registry. Dimensions without a

@@ -185,11 +185,11 @@ pub fn drop_type(
         name: name.to_string(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", &format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         catalog
             .delete_custom_type(database_id_u64, tenant_id, name)
-            .map_err(|e| err("XX000", &format!("catalog delete: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
     }
 
     state
@@ -289,11 +289,11 @@ fn persist_and_register(state: &SharedState, stored: StoredCustomType) -> Result
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutCustomType(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", &format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         let written = catalog
             .put_custom_type_assigning_oid(&stored)
-            .map_err(|e| err("XX000", &format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         state.custom_type_registry.register(written);
     }
 
@@ -332,7 +332,7 @@ fn current_epoch_secs() -> Result<u64, DdlError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|_| err("XX000", "system clock error"))
+        .map_err(|_| DdlError::internal("system clock error"))
 }
 
 fn type_summary(def: &CustomTypeDef) -> (String, String) {

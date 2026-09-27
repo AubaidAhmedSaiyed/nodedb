@@ -63,9 +63,8 @@ pub(super) async fn try_string(
     }
     if upper.starts_with("RESTORE ") && upper.contains("SET VERSION") {
         if restore_forbidden_in_transaction(txn_ctx) {
-            return Some(Err(DdlError::new(
-                "25001",
-                crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
+            return Some(Err(DdlError::from_error(
+                &crate::Error::CrdtApplyForbiddenInTransaction,
             )));
         }
         return Some(

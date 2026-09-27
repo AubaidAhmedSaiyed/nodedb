@@ -31,7 +31,7 @@ fn resolve_tenant_selector(
             let catalog = state.credentials.catalog();
             let stored = catalog
                 .find_tenant_by_name(name)
-                .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
+                .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
                 .ok_or_else(|| DdlError::new("42704", format!("tenant '{name}' not found")))?;
             Ok(TenantId::new(stored.tenant_id))
         }
@@ -103,7 +103,7 @@ pub fn create_user(
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         // Single-node / no-cluster fallback: install into the
         // in-memory cache so subsequent reads see the user.
@@ -116,7 +116,7 @@ pub fn create_user(
             let catalog = state.credentials.catalog();
             catalog
                 .put_user(&stored)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         // CREATE USER: no open sessions exist for a brand-new user.
         state.credentials.install_replicated_user(&stored, None);

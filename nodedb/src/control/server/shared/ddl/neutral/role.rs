@@ -68,12 +68,12 @@ pub fn create_role(
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         catalog
             .put_role(&stored)
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         state.roles.install_replicated_role(&stored);
     } else if outcome.is_replicated() {
         super::role_checks::confirm_role(state, name, parent)?;
@@ -131,13 +131,13 @@ pub fn drop_role(
         name: name.to_string(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     let dropped = if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         state
             .roles
             .drop_role(name, Some(catalog))
-            .map_err(|e| DdlError::new("2BP01", e.to_string()))?
+            .map_err(|e| DdlError::from_error(&e))?
     } else if outcome.is_replicated() {
         // The synchronous post-apply removed the role from this node's
         // cache before the applied index advanced. A role still present
@@ -287,12 +287,12 @@ pub fn set_role_parent(
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         catalog
             .put_role(&stored)
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         state.roles.install_replicated_role(&stored);
     } else if outcome.is_replicated() {
         super::role_checks::confirm_role(state, role_name, parent)?;

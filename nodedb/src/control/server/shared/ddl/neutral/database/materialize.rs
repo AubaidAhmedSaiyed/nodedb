@@ -33,7 +33,7 @@ pub fn alter_database_materialize(
 
     let db_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     require_database_owner_or_higher(

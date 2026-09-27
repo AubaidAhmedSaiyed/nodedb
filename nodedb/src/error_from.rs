@@ -405,6 +405,7 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::CatalogIntegrityViolation { .. }
             | Error::Promql(_)
             | Error::DependentObjectsExist { .. }
+            | Error::RoleInUse { .. }
             | Error::CascadeCycle { .. }
             | Error::CrossShardInExplicitTransaction
             | Error::SequencerUnavailable

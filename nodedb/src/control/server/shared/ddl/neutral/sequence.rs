@@ -12,6 +12,8 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::catalog::sequence_types::StoredSequence;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::sequence::SequenceError;
+use crate::control::sequence::error_map::sequence_error_to_error;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
@@ -132,15 +134,34 @@ pub fn create_sequence(
     let entry = crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(def.clone()));
     let outcome = propose_and_apply(state, &entry)?;
     if outcome.needs_local_apply() {
+        let name = def.name.clone();
         state
             .sequence_registry
             .create(def)
-            .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+            .map_err(|e| create_refusal(&name, e))?;
     }
 
     state.schema_version.bump();
 
     Ok(status("CREATE SEQUENCE"))
+}
+
+/// The DDL error for a registry refusal of a new sequence. A name taken since
+/// the existence check is a duplicate object. Every other refusal keeps the
+/// SQLSTATE the sequence error map gives it.
+fn create_refusal(name: &str, error: SequenceError) -> DdlError {
+    match error {
+        SequenceError::AlreadyExists { .. } => DdlError::new("42P07", error.to_string()),
+        other @ (SequenceError::Exhausted { .. }
+        | SequenceError::NotYetCalled { .. }
+        | SequenceError::OutOfRange { .. }
+        | SequenceError::NotFound { .. }
+        | SequenceError::InvalidDefinition { .. }
+        | SequenceError::FormatParse { .. }
+        | SequenceError::InvalidResetScope { .. }) => {
+            DdlError::from_error(&sequence_error_to_error(name, other))
+        }
+    }
 }
 
 /// Handle `ALTER SEQUENCE <name> RESTART [WITH <value>] | FORMAT '<template>'`.
@@ -211,7 +232,7 @@ fn alter_restart(
     };
     let entry = crate::control::catalog_entry::CatalogEntry::PutSequenceState(Box::new(new_state));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     if outcome.needs_local_apply() {
         state
             .sequence_registry
@@ -292,7 +313,7 @@ pub fn drop_sequence(
         name: name.to_string(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     if outcome.needs_local_apply() {
         // Single-node / no-cluster fallback.
         {
@@ -403,4 +424,48 @@ pub fn describe_sequence(
     }
 
     Ok(vec![DdlResult::Rows(ShapedRows::text_rows(columns, rows))])
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::error::ErrorCode;
+
+    use super::*;
+
+    /// A name taken between the existence check and the registry insert is a
+    /// duplicate object, `42P07`, never an internal error.
+    #[test]
+    fn a_racing_duplicate_is_a_duplicate_object() {
+        let err = create_refusal(
+            "orders_seq",
+            SequenceError::AlreadyExists {
+                name: "orders_seq".into(),
+            },
+        );
+        assert_eq!(err.sqlstate, "42P07");
+        assert_eq!(err.code, ErrorCode::ALREADY_EXISTS);
+    }
+
+    /// Every other registry refusal keeps the SQLSTATE the sequence error map
+    /// gives it.
+    #[test]
+    fn other_refusals_keep_the_sequence_error_class() {
+        let err = create_refusal(
+            "orders_seq",
+            SequenceError::NotFound {
+                name: "orders_seq".into(),
+            },
+        );
+        assert_eq!(err.sqlstate, "42704");
+        assert_eq!(err.code, ErrorCode::UNDEFINED_OBJECT);
+
+        let err = create_refusal(
+            "orders_seq",
+            SequenceError::InvalidDefinition {
+                detail: "increment is zero".into(),
+            },
+        );
+        assert_eq!(err.sqlstate, "55000");
+        assert_eq!(err.code, ErrorCode::OBJECT_NOT_READY);
+    }
 }

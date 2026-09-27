@@ -47,7 +47,7 @@ pub fn drop_database(
 
     let db_id = match catalog
         .get_database_id_by_name(name)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
     {
         Some(id) => id,
         None => {
@@ -92,7 +92,7 @@ pub fn drop_database(
     {
         let descriptor_for_mirror = catalog
             .get_database(db_id)
-            .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog read failed", &e))?;
         if let Some(descriptor) = descriptor_for_mirror
             && let Some(origin) = descriptor.mirror_origin.as_ref()
             // Promoted mirrors are now standalone writable databases — the
@@ -131,7 +131,7 @@ pub fn drop_database(
     // before proceeding.
     let dependent_ids = catalog
         .get_clone_children(db_id)
-        .map_err(|e| ddl_err("XX000", format!("lineage check failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("lineage check failed", &e))?;
 
     if !dependent_ids.is_empty() {
         if !cascade {
@@ -181,7 +181,7 @@ pub fn drop_database(
     // ── Cascade: drop all collections ────────────────────────────────────────
     let collections = catalog
         .load_all_collections(db_id)
-        .map_err(|e| ddl_err("XX000", format!("catalog scan failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog scan failed", &e))?;
 
     if !cascade && !collections.is_empty() {
         return Err(ddl_err(
@@ -216,16 +216,16 @@ pub fn drop_database(
             db_id: db_id.as_u64(),
         },
     )
-    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
 
     if outcome.needs_local_apply() {
         catalog
             .delete_database(db_id)
-            .map_err(|e| ddl_err("XX000", format!("catalog delete failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog delete failed", &e))?;
         // Single-node path: no applier runs, so this branch owns both the
         // quota row deletion and the live cap release.
         crate::control::catalog_entry::apply::quota::purge_database_scope(db_id.as_u64(), catalog)
-            .map_err(|e| ddl_err("XX000", format!("quota purge failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("quota purge failed", &e))?;
         crate::control::catalog_entry::post_apply::quota::release_database_scope(db_id, state);
     }
 
@@ -260,13 +260,13 @@ fn drop_all_collections_in_database(
         catalog
             .delete_collection(db_id, coll.tenant_id, &coll.name)
             .map_err(|e| {
-                ddl_err(
-                    "XX000",
-                    format!(
-                        "CASCADE DROP DATABASE {}: failed to delete collection '{}': {e}",
+                DdlError::from_error_in_context(
+                    &format!(
+                        "CASCADE DROP DATABASE {}: failed to delete collection '{}'",
                         db_id.as_u64(),
                         coll.name
                     ),
+                    &e,
                 )
             })?;
     }

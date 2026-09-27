@@ -102,7 +102,7 @@ pub async fn crdt_merge(
             tenant_id,
             target_id.as_bytes(),
         )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let apply_plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),
@@ -135,7 +135,7 @@ pub async fn crdt_merge(
     .into_tasks()
     .into_iter()
     .next()
-    .ok_or_else(|| ddl_err("XX000", "authorization returned no capability"))?;
+    .ok_or_else(|| DdlError::internal("authorization returned no capability"))?;
 
     // Route the merge result through the Raft proposer gate so the applied delta
     // is quorum-durable under replication, not lost to followers on failover.

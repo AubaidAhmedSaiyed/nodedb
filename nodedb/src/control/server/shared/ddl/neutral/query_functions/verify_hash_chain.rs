@@ -70,7 +70,7 @@ pub async fn verify_hash_chain(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| err("XX000", &format!("scan failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("scan failed", &e))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
@@ -118,7 +118,7 @@ pub async fn verify_hash_chain(
             obj.remove("_chain_hash");
         }
         let doc_bytes = sonic_rs::to_vec(&doc_for_hash)
-            .map_err(|e| err("XX000", &format!("failed to serialize document: {e}")))?;
+            .map_err(|e| DdlError::internal(format!("failed to serialize document: {e}")))?;
 
         let expected = crate::data::executor::enforcement::hash_chain::compute_chain_hash(
             &prev_hash, &doc_id, &doc_bytes,

@@ -90,7 +90,7 @@ pub(super) async fn add_materialized_sum(
 
     let existing_bindings: Vec<MaterializedSumDef> = catalog
         .load_collections_for_tenant(database_id, tenant_id)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .into_iter()
         .flat_map(|c| c.materialized_sums)
         .collect();
@@ -107,7 +107,7 @@ pub(super) async fn add_materialized_sum(
     // maintenance write is still rejected on an unknown field.
     super::super::register::dispatch_register_from_stored(state, &coll)
         .await
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // The SOURCE has to be re-registered too, and it is the half that decides
     // whether anything is folded at all: the binding is stored here on the
@@ -117,7 +117,7 @@ pub(super) async fn add_materialized_sum(
     // nothing and the total silently stays where it was.
     super::super::register::dispatch_register_for_sum_sources(state, &coll)
         .await
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
 
@@ -153,13 +153,13 @@ fn declare_target_column(
     }
 
     let config_json = coll.timeseries_config.as_deref().ok_or_else(|| {
-        err(
-            "XX000",
-            format!("strict collection '{}' has no stored schema", coll.name),
-        )
+        DdlError::internal(format!(
+            "strict collection '{}' has no stored schema",
+            coll.name
+        ))
     })?;
     let mut schema: StrictSchema = sonic_rs::from_str(config_json)
-        .map_err(|e| err("XX000", format!("strict schema decode: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("strict schema decode: {e}")))?;
 
     if schema.columns.iter().any(|c| c.name == column) {
         return Err(err(

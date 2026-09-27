@@ -146,6 +146,7 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::DataPlane(_)
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
         | crate::Error::CascadeCycle { .. }
         | crate::Error::CrossShardInExplicitTransaction
         | crate::Error::SequencerUnavailable

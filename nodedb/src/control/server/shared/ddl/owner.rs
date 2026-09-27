@@ -25,10 +25,6 @@ use crate::types::TenantId;
 
 use super::result::DdlError;
 
-fn owner_err(sqlstate: &str, message: String) -> DdlError {
-    DdlError::new(sqlstate, message)
-}
-
 /// Propose `PutOwner` through raft, falling back to a direct redb
 /// write + in-memory install on single-node mode.
 ///
@@ -51,13 +47,13 @@ pub fn propose_owner(
     );
     let entry = CatalogEntry::PutOwner(Box::new(stored.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| owner_err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .put_owner(&stored)
-                .map_err(|e| owner_err("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state.permissions.install_replicated_owner(&stored);
     }
@@ -82,13 +78,13 @@ pub fn propose_delete_owner(
         object_name: object_name.to_string(),
     };
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| owner_err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .delete_owner(object_type, database_id, tenant_id.as_u64(), object_name)
-                .map_err(|e| owner_err("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state.permissions.install_replicated_remove_owner(
             object_type,

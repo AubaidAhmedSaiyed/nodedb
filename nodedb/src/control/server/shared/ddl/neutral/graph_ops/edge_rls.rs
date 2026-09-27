@@ -22,7 +22,6 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::super::result::DdlError;
-use super::support::ddl_err;
 
 /// Resolve the collection's write policy against a hand-built edge write.
 ///
@@ -39,9 +38,8 @@ pub(super) fn resolve_edge_write_rls(
     CollectionReadGate::for_request(state, identity, database_id).inject_rls(&mut plan)?;
     match plan {
         PhysicalPlan::Graph(op) => Ok(op),
-        other => Err(ddl_err(
-            "XX000",
-            format!("edge write plan changed shape during RLS resolution: {other:?}"),
-        )),
+        other => Err(DdlError::internal(format!(
+            "edge write plan changed shape during RLS resolution: {other:?}"
+        ))),
     }
 }

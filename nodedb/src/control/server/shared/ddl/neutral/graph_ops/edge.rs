@@ -23,14 +23,11 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::edge_parse::{properties_to_json, validate_edge_label};
 use super::support::{data_plane_verdict, ddl_err};
 
-/// Read the affected count off a Data-Plane response, mapping a missing count
-/// to a [`DdlError`] via `ddl_err` — never a default.
+/// Read the affected count off a Data-Plane response. A missing count is an
+/// error, never a default.
 fn response_affected(response: &crate::bridge::envelope::Response) -> Result<u64, DdlError> {
     require_affected_count(response.payload.as_bytes()).map_err(|e| {
-        ddl_err(
-            "XX000",
-            format!("edge write response is missing its affected count: {e}"),
-        )
+        DdlError::from_error_in_context("edge write response is missing its affected count", &e)
     })
 }
 
@@ -73,7 +70,7 @@ pub async fn insert_edge(
         &collection,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     // Dual-home: a cross-shard edge must be written on the home vShard of both src
     // and dst, or reverse/IN traversal never finds it.
@@ -84,11 +81,11 @@ pub async fn insert_edge(
     let src_surrogate =
         assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), TraceId::ZERO)
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
     let dst_surrogate =
         assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), TraceId::ZERO)
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
 
     // Write policy decides the `PROPERTIES` image before staging: this handler
     // dispatches as trusted internal work, so nothing downstream resolves a policy.
@@ -149,7 +146,7 @@ pub async fn insert_edge(
                 crate::event::EventSource::User,
             )
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         data_plane_verdict(&response)?;
         response_affected(&response)?
     } else {
@@ -163,11 +160,11 @@ pub async fn insert_edge(
             post_set_op: PostSetOp::None,
             txn_id: None,
         };
-        let tx_class = build_static_tx_class(&[task], tenant_id, &[])
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        let tx_class =
+            build_static_tx_class(&[task], tenant_id, &[]).map_err(|e| DdlError::from_error(&e))?;
         let response = submit_calvin_routed(state, tx_class)
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         match response {
             Some(response) => {
                 data_plane_verdict(&response)?;
@@ -179,8 +176,7 @@ pub async fn insert_edge(
             // participant's applied response. A missing deposit here is a
             // scheduler invariant violation, never a value to guess.
             None => {
-                return Err(ddl_err(
-                    "XX000",
+                return Err(DdlError::internal(
                     "cross-shard edge insert completed with no applied response to read \
                      its affected count from",
                 ));
@@ -247,11 +243,11 @@ pub async fn delete_edge(
     let src_surrogate =
         assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), TraceId::ZERO)
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
     let dst_surrogate =
         assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), TraceId::ZERO)
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
 
     // A delete carries no image, so the policy compiles into the plan's write-gate
     // slot and is decided in the Data Plane against the edge's stored properties.
@@ -310,7 +306,7 @@ pub async fn delete_edge(
         };
         let response = crate::control::write_resolve::run_write_resolve(state, ctx, &*resolver)
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         return Ok(vec![DdlResult::Status {
             command: "DELETE EDGE".to_string(),
             rows_affected: Some(response_affected(&response)?),
@@ -331,7 +327,7 @@ pub async fn delete_edge(
                 crate::event::EventSource::User,
             )
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         data_plane_verdict(&response)?;
         response_affected(&response)?
     } else {
@@ -345,11 +341,11 @@ pub async fn delete_edge(
             post_set_op: PostSetOp::None,
             txn_id: None,
         };
-        let tx_class = build_static_tx_class(&[task], tenant_id, &[])
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        let tx_class =
+            build_static_tx_class(&[task], tenant_id, &[]).map_err(|e| DdlError::from_error(&e))?;
         let response = submit_calvin_routed(state, tx_class)
             .await
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         match response {
             Some(response) => {
                 data_plane_verdict(&response)?;
@@ -363,8 +359,7 @@ pub async fn delete_edge(
             // absent), so a missing deposit here is a scheduler invariant
             // violation, never a value to guess.
             None => {
-                return Err(ddl_err(
-                    "XX000",
+                return Err(DdlError::internal(
                     "cross-shard edge delete completed with no applied response to read \
                      its affected count from",
                 ));
@@ -427,8 +422,8 @@ pub async fn set_node_labels(
         minted
             .cancel(&state.wal, owner, 0)
             .await
-            .map_err(|c| ddl_err("XX000", c.to_string()))?;
-        return Err(ddl_err("XX000", e.to_string()));
+            .map_err(|c| DdlError::from_error(&c))?;
+        return Err(DdlError::from_error(&e));
     }
 
     let response =
@@ -440,7 +435,7 @@ pub async fn set_node_labels(
             minted,
         )
         .await
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     data_plane_verdict(&response)?;
 
     let tag = if remove { "UNLABEL" } else { "LABEL" };

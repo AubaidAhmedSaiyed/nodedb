@@ -3,7 +3,7 @@
 //! `DECLARE CURSOR` materialisation: plan a SELECT, dispatch it to the
 //! Data Plane, and collect JSON-encoded rows for cursor storage.
 
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::error::{PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::retry::retry_on_schema_change;
@@ -112,13 +112,7 @@ impl NodeDbPgHandler {
                     TraceId::ZERO,
                 )
                 .await
-                .map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        e.to_string(),
-                    )))
-                })?;
+                .map_err(|e| super::super::types::error_to_pg(&e))?;
 
             if !resp.payload.is_empty() {
                 let json =

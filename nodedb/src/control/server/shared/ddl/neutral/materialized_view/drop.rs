@@ -70,7 +70,7 @@ pub fn drop_materialized_view(
             name: name.clone(),
         };
         let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-            .map_err(|error| err("XX000", format!("metadata propose: {error}")))?;
+            .map_err(|error| DdlError::from_error_in_context("metadata propose", &error))?;
         crate::control::catalog_entry::apply::local::apply_locally_if_needed(
             state, &entry, outcome,
         );
@@ -136,14 +136,14 @@ pub fn drop_materialized_view(
         None
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|error| err("XX000", format!("metadata propose: {error}")))?;
+        .map_err(|error| DdlError::from_error_in_context("metadata propose", &error))?;
     if outcome.needs_local_apply() {
         // No metadata Raft is active, so apply the same compound catalog
         // deletion locally and synchronously reclaim the implementation-owned
         // target collection. A reclaim failure after catalog deletion is
         // fatal: continuing would permit a same-name CREATE over stale rows.
         crate::control::catalog_entry::apply::apply_to(&entry, state.credentials.catalog())
-            .map_err(|e| err("XX000", format!("catalog apply: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog apply", &e))?;
         let purge_lsn = state.wal.next_lsn().as_u64();
         let purge_result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {

@@ -34,7 +34,7 @@ pub fn show_database_mirror_status(
 
     let all_databases = catalog
         .list_databases()
-        .map_err(|e| ddl_err("XX000", format!("catalog list failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog list failed", &e))?;
 
     let columns = vec![
         "name".to_string(),

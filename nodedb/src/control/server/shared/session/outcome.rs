@@ -53,7 +53,7 @@ pub enum AbortReason {
     /// transaction is retryable as a whole. → `40001`.
     SchemaChanged { detail: String },
     /// Proposing the buffered DDL batch to the metadata Raft group failed.
-    /// → `XX000`.
+    /// Adapters render the carried error with its own SQLSTATE.
     DdlPropose(crate::Error),
 }
 

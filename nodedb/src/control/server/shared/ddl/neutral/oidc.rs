@@ -141,7 +141,7 @@ pub fn create_oidc_provider(
 
     let tenant_exists = catalog
         .load_all_tenants()
-        .map_err(|e| DdlError::new("XX000", format!("tenant lookup: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("tenant lookup", &e))?
         .iter()
         .any(|tenant| tenant.tenant_id == tenant_id);
     if !tenant_exists {
@@ -162,7 +162,7 @@ pub fn create_oidc_provider(
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(DdlError::new("XX000", format!("catalog read: {e}")));
+            return Err(DdlError::from_error_in_context("catalog read", &e));
         }
     }
 
@@ -182,7 +182,7 @@ pub fn create_oidc_provider(
             }
         }
         Err(e) => {
-            return Err(DdlError::new("XX000", format!("catalog list: {e}")));
+            return Err(DdlError::from_error_in_context("catalog list", &e));
         }
     }
 
@@ -209,11 +209,11 @@ pub fn create_oidc_provider(
 
     let entry = CatalogEntry::PutOidcProvider(Box::new(provider.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         catalog
             .put_oidc_provider(&provider)
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
     }
 
     state.audit_record(
@@ -241,7 +241,7 @@ pub fn alter_oidc_provider_claim_mapping(
 
     let mut provider = catalog
         .get_oidc_provider(name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .ok_or_else(|| DdlError::new("42704", format!("OIDC provider '{name}' does not exist")))?;
     validate_claim_mapping_roles(state, claim_mappings, provider.tenant_id)?;
 
@@ -260,11 +260,11 @@ pub fn alter_oidc_provider_claim_mapping(
 
     let entry = CatalogEntry::PutOidcProvider(Box::new(provider.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         catalog
             .put_oidc_provider(&provider)
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
     }
 
     state.audit_record(
@@ -293,7 +293,7 @@ pub fn drop_oidc_provider(
 
     if catalog
         .get_oidc_provider(name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .is_none()
     {
         if if_exists {
@@ -309,11 +309,11 @@ pub fn drop_oidc_provider(
         name: name.to_string(),
     };
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         catalog
             .delete_oidc_provider(name)
-            .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
     }
 
     state.audit_record(
@@ -337,7 +337,7 @@ pub fn show_oidc_providers(
 
     let providers = catalog
         .list_oidc_providers()
-        .map_err(|e| DdlError::new("XX000", format!("catalog list: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog list", &e))?;
 
     let columns = vec![
         "name".to_string(),

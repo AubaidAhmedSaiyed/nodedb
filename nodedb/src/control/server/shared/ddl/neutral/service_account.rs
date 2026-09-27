@@ -186,13 +186,13 @@ pub fn create_service_account(
         .map_err(|e| DdlError::new("42710", e.to_string()))?;
     let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()
             .put_user(&stored)
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         // A new account has no open sessions to invalidate.
         state.credentials.install_replicated_user(&stored, None);
     } else if outcome.is_replicated() {
@@ -325,7 +325,7 @@ pub fn alter_service_account_set_databases(
     for db_name in raw_names {
         let resolved: Option<nodedb_types::id::DatabaseId> = catalog
             .get_database_id_by_name(db_name)
-            .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         match resolved {
             Some(id) => db_ids.push(id),
             None => {
@@ -340,16 +340,16 @@ pub fn alter_service_account_set_databases(
     let stored = state
         .credentials
         .prepare_service_account_databases_from(user, db_ids)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()
             .put_user(&stored)
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         state.credentials.install_replicated_user(
             &stored,
             Some(crate::control::security::buses::SessionInvalidationReason::RoleAltered),
@@ -374,6 +374,6 @@ fn resolve_database(
     let catalog = state.credentials.catalog();
     let resolved: Option<nodedb_types::id::DatabaseId> = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     resolved.ok_or_else(|| DdlError::new("42704", format!("database '{name}' not found")))
 }

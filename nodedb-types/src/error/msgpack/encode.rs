@@ -136,6 +136,12 @@ impl ToMessagePack for ErrorDetails {
                 write1(writer, TAG_INSUFFICIENT_BALANCE, collection)
             }
             ErrorDetails::RateExceeded { gate } => write1(writer, TAG_RATE_EXCEEDED, gate),
+            ErrorDetails::TransactionRollback { detail } => {
+                write1(writer, TAG_TRANSACTION_ROLLBACK, detail)
+            }
+            ErrorDetails::ActiveSqlTransaction { detail } => {
+                write1(writer, TAG_ACTIVE_SQL_TRANSACTION, detail)
+            }
             ErrorDetails::CollectionNotFound { collection } => {
                 write1(writer, TAG_COLLECTION_NOT_FOUND, collection)
             }
@@ -329,6 +335,9 @@ impl ToMessagePack for ErrorDetails {
             ErrorDetails::AlreadyExists { object } => write1(writer, TAG_ALREADY_EXISTS, object),
             ErrorDetails::ObjectNotReady { object } => write1(writer, TAG_OBJECT_NOT_READY, object),
             ErrorDetails::NotFound { detail } => write1(writer, TAG_NOT_FOUND, detail),
+            ErrorDetails::DependentObjectsExist { object } => {
+                write1(writer, TAG_DEPENDENT_OBJECTS_EXIST, object)
+            }
             ErrorDetails::CannotDropDefaultDatabase => {
                 write_unit(writer, TAG_CANNOT_DROP_DEFAULT_DATABASE)
             }

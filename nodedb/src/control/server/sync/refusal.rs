@@ -154,6 +154,7 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
         | crate::Error::CascadeCycle { .. }
         | crate::Error::CrossShardInExplicitTransaction
         | crate::Error::SequencerUnavailable
@@ -288,6 +289,7 @@ fn is_indeterminate(error: &crate::Error) -> bool {
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
         | crate::Error::CascadeCycle { .. }
         | crate::Error::CrossShardInExplicitTransaction
         | crate::Error::SessionCapExceeded { .. }

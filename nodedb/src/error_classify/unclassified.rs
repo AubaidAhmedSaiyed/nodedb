@@ -101,6 +101,7 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::DataPlane(_)
         | Error::Promql(_)
         | Error::DependentObjectsExist { .. }
+        | Error::RoleInUse { .. }
         | Error::CrossShardInExplicitTransaction
         | Error::SequencerUnavailable
         | Error::SessionCapExceeded { .. }

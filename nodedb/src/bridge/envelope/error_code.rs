@@ -359,6 +359,7 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::ObjectNotInPrerequisiteState { .. }
             | crate::Error::MirrorReadOnly { .. }
             | crate::Error::DependentObjectsExist { .. }
+            | crate::Error::RoleInUse { .. }
             | crate::Error::UndefinedObject { .. }
             | crate::Error::AmbiguousColumn { .. }
             | crate::Error::ExecutionLimitExceeded { .. }

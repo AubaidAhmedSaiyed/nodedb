@@ -130,7 +130,7 @@ pub fn create_change_stream(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError::new("XX000", "system clock before UNIX epoch"))?
+        .map_err(|_| DdlError::internal("system clock before UNIX epoch"))?
         .as_secs();
 
     // Capture the creating principal's roles onto the subscription record.

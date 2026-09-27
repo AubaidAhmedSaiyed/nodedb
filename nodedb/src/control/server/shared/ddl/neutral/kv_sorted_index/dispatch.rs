@@ -74,8 +74,8 @@ fn refusal(target: &SortedIndexTarget<'_>, resp: &Response) -> Option<DdlError> 
                 target.collection
             ),
         ),
-        Some(other) => ddl_err("XX000", format!("{other:?}")),
-        None => ddl_err("XX000", String::from_utf8_lossy(&resp.payload).into_owned()),
+        Some(other) => DdlError::from_error(&crate::Error::DataPlane(other.clone())),
+        None => DdlError::internal(String::from_utf8_lossy(&resp.payload)),
     })
 }
 
@@ -98,7 +98,7 @@ pub(super) async fn dispatch_read(
         read.txn_id,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     match refusal(target, &resp) {
         Some(error) => Err(error),
@@ -141,7 +141,7 @@ async fn dispatch_durable(
     match dispatched {
         Ok(resp) => Ok(resp),
         Err(crate::Error::DataPlane(code)) => Ok(verdict_response(code)),
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
+        Err(e) => Err(DdlError::from_error(&e)),
     }
 }
 
@@ -170,7 +170,7 @@ fn verdict_response(code: ErrorCode) -> Response {
 /// report an empty leaderboard for every query, whatever the index held.
 fn decode_rows(payload: &[u8]) -> Result<Vec<serde_json::Value>, DdlError> {
     crate::data::executor::response_codec::decode_payload(payload)
-        .map_err(|e| ddl_err("XX000", format!("sorted index reply: {e}")))
+        .map_err(|e| DdlError::from_error_in_context("sorted index reply", &e))
 }
 
 /// Build the index's tree on the core that owns its collection's rows, and

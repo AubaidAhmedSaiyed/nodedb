@@ -51,13 +51,13 @@ fn propose_user_with_roles(
         .map_err(|e| DdlError::new("42704", e.to_string()))?;
     let entry = CatalogEntry::PutUser(Box::new(stored.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .put_user(&stored)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state
             .credentials

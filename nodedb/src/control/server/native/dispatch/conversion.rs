@@ -100,6 +100,22 @@ pub(crate) fn native_error_fields(e: &crate::Error) -> NativeErrorFields {
     }
 }
 
+/// Convert a Control-Plane error into a native error frame with `context`
+/// before its message. The SQLSTATE and code stay the error's own.
+pub(crate) fn error_to_native_in_context(
+    seq: u64,
+    context: &str,
+    e: &crate::Error,
+) -> NativeResponse {
+    let fields = native_error_fields(e);
+    NativeResponse::error_with_code(
+        seq,
+        fields.sqlstate,
+        format!("{context}: {}", fields.message),
+        fields.code.0,
+    )
+}
+
 /// Convert a Control-Plane error into a native error frame under a SQLSTATE
 /// the call site chooses.
 ///
@@ -126,18 +142,26 @@ pub(crate) fn error_to_native_with_sqlstate(
 /// Convert a `NodeDbError` produced while shaping a response into a
 /// NativeResponse error frame.
 ///
-/// The numeric code travels alongside the SQLSTATE: the error is already
-/// classified here, and rendering only `XX000` would make the client rebuild
-/// it as a generic internal failure.
+/// The numeric code travels alongside the SQLSTATE its code maps to, the same
+/// SQLSTATE pgwire's `shape_error_to_pg` renders.
 pub(crate) fn shape_error_to_native(seq: u64, e: &nodedb_types::NodeDbError) -> NativeResponse {
-    NativeResponse::error_with_code(seq, "XX000", e.message().to_string(), e.code().0)
+    NativeResponse::error_with_code(
+        seq,
+        crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(e.code()),
+        e.message().to_string(),
+        e.code().0,
+    )
 }
 
 /// Render a statement-tag fold refusal as a native error frame. Two tasks of
 /// one statement disagreeing on their verb is a planner bug, so it is an
 /// internal error, the same class pgwire's `dml_fold_error_to_pg` renders.
 pub(crate) fn dml_fold_error_to_native(seq: u64, e: &DmlFoldError) -> NativeResponse {
-    sqlstate_error(seq, "XX000", e.to_string())
+    sqlstate_error(
+        seq,
+        nodedb_types::error::sqlstate::INTERNAL_ERROR,
+        e.to_string(),
+    )
 }
 
 /// Render an error [`Response`] from the Data Plane as a native error frame.
@@ -170,7 +194,11 @@ pub(crate) fn error_code_to_native(
     code: Option<&crate::bridge::envelope::ErrorCode>,
 ) -> NativeResponse {
     let Some(code) = code else {
-        return sqlstate_error(seq, "XX000", "unknown data plane error");
+        return sqlstate_error(
+            seq,
+            nodedb_types::error::sqlstate::INTERNAL_ERROR,
+            "unknown data plane error",
+        );
     };
     let (_, sqlstate, message) = error_code_to_sqlstate(code);
     let public = nodedb_types::NodeDbError::from(crate::Error::DataPlane(code.clone()));
@@ -392,6 +420,42 @@ mod tests {
             .error
             .expect("error responses must carry a payload");
         assert_eq!(error.code, "28000");
+    }
+
+    /// A shaping error answers the SQLSTATE its code maps to, the one pgwire
+    /// renders, never a bare internal error.
+    #[test]
+    fn a_shaping_error_keeps_its_sqlstate() {
+        let shaped = shape_error_to_native(1, &nodedb_types::NodeDbError::division_by_zero());
+        let error = shaped.error.expect("error responses carry a payload");
+        assert_eq!(error.code, "22012");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::DIVISION_BY_ZERO.0
+        );
+    }
+
+    /// A typed error behind a context prefix keeps its SQLSTATE and code.
+    #[test]
+    fn an_error_in_context_keeps_its_class() {
+        let missing = crate::Error::CollectionNotFound {
+            tenant_id: crate::types::TenantId::new(1),
+            collection: "orders".into(),
+        };
+        let response = error_to_native_in_context(1, "database catalog lookup failed", &missing);
+        let error = response.error.expect("error responses carry a payload");
+        assert_eq!(error.code, "42P01");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND.0
+        );
+        assert!(
+            error
+                .message
+                .starts_with("database catalog lookup failed: "),
+            "{}",
+            error.message
+        );
     }
 
     /// One statement running out of time answers ONE SQLSTATE, whichever half

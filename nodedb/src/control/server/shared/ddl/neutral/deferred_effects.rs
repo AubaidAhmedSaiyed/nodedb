@@ -137,7 +137,7 @@ mod tests {
             error,
             crate::Error::RejectedConstraint { ref constraint, .. } if constraint == "unique"
         ));
-        let other = effect_error("users", DdlError::new("XX000", "core gone"));
+        let other = effect_error("users", DdlError::internal("core gone"));
         assert!(matches!(other, crate::Error::Internal { .. }));
     }
 }

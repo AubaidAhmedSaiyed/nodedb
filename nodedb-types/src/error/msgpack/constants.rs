@@ -87,6 +87,9 @@
 // |  81 | PeriodLockMisconfigured   |
 // |  82 | DataException             |
 // |  83 | ProgramLimitExceeded      |
+// |  84 | TransactionRollback       |
+// |  85 | ActiveSqlTransaction      |
+// |  86 | DependentObjectsExist     |
 
 pub(super) const TAG_CONSTRAINT_VIOLATION: u16 = 1;
 pub(super) const TAG_WRITE_CONFLICT: u16 = 2;
@@ -171,3 +174,6 @@ pub(super) const TAG_AMBIGUOUS_COLUMN: u16 = 80;
 pub(super) const TAG_PERIOD_LOCK_MISCONFIGURED: u16 = 81;
 pub(super) const TAG_DATA_EXCEPTION: u16 = 82;
 pub(super) const TAG_PROGRAM_LIMIT_EXCEEDED: u16 = 83;
+pub(super) const TAG_TRANSACTION_ROLLBACK: u16 = 84;
+pub(super) const TAG_ACTIVE_SQL_TRANSACTION: u16 = 85;
+pub(super) const TAG_DEPENDENT_OBJECTS_EXIST: u16 = 86;

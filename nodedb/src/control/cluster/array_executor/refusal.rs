@@ -142,6 +142,7 @@ pub(super) fn execution_error(context: &str, error: crate::Error) -> ClusterErro
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
         | crate::Error::CascadeCycle { .. }
         | crate::Error::CrossShardInExplicitTransaction
         | crate::Error::SequencerUnavailable

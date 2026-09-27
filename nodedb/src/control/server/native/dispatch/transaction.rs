@@ -123,9 +123,9 @@ pub(crate) async fn handle_rollback(ctx: &DispatchCtx<'_>, seq: u64) -> NativeRe
     NativeResponse::status_row(seq, "ROLLBACK")
 }
 
-/// Map a neutral commit abort reason to the native error frame native emitted
-/// before extraction (batch/dispatch failures collapse to `40001`, batch
-/// rejections carry the Data-Plane SQLSTATE).
+/// Map a neutral commit abort reason to the native error frame. A batch
+/// rejection carries the Data-Plane SQLSTATE. A dispatch or DDL-propose error
+/// keeps the SQLSTATE and code of its typed error, as on pgwire.
 fn commit_abort_to_native(seq: u64, reason: &AbortReason) -> NativeResponse {
     // The numeric NodeDB code rides alongside the SQLSTATE wherever the abort
     // was classified: a UNIQUE violation that only surfaces at COMMIT is the
@@ -170,16 +170,64 @@ fn commit_abort_to_native(seq: u64, reason: &AbortReason) -> NativeResponse {
             format!("could not serialize access due to concurrent schema change: {detail}"),
             nodedb_types::error::ErrorCode::WRITE_CONFLICT.0,
         ),
-        AbortReason::Dispatch(e) => (
-            "40001",
-            format!("transaction commit failed: {e}"),
-            nodedb_types::error::ErrorCode::WRITE_CONFLICT.0,
-        ),
-        AbortReason::DdlPropose(e) => (
-            "XX000",
-            format!("{e}"),
-            nodedb_types::error::ErrorCode::INTERNAL.0,
-        ),
+        AbortReason::Dispatch(e) => {
+            let fields = super::native_error_fields(e);
+            (
+                fields.sqlstate,
+                format!("transaction commit failed: {}", fields.message),
+                fields.code.0,
+            )
+        }
+        AbortReason::DdlPropose(e) => {
+            let fields = super::native_error_fields(e);
+            (fields.sqlstate, fields.message, fields.code.0)
+        }
     };
     NativeResponse::error_with_code(seq, code, message, ndb_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::error::ErrorCode as PublicCode;
+
+    use super::*;
+
+    fn frame(reason: &AbortReason) -> (String, String, u16) {
+        let payload = commit_abort_to_native(1, reason)
+            .error
+            .expect("an aborted commit answers an error frame");
+        (payload.code, payload.message, payload.ndb_code)
+    }
+
+    /// A buffered DDL refused at COMMIT keeps the class of its typed error,
+    /// the same SQLSTATE pgwire renders for it.
+    #[test]
+    fn a_ddl_propose_abort_keeps_its_class() {
+        let in_use = crate::Error::RoleInUse {
+            role: "analyst".into(),
+            dependents: crate::control::security::role_assignment::RoleDependents::Users(vec![
+                "bob".into(),
+            ]),
+        };
+        let (code, _, ndb_code) = frame(&AbortReason::DdlPropose(in_use));
+        assert_eq!(code, "2BP01");
+        assert_eq!(ndb_code, PublicCode::DEPENDENT_OBJECTS_EXIST.0);
+    }
+
+    /// A commit dispatch error keeps its class instead of reading as a
+    /// serialization failure.
+    #[test]
+    fn a_dispatch_abort_keeps_its_class() {
+        let missing = crate::Error::CollectionNotFound {
+            tenant_id: crate::types::TenantId::new(1),
+            collection: "orders".into(),
+        };
+        let (code, message, ndb_code) = frame(&AbortReason::Dispatch(missing));
+        assert_eq!(code, "42P01");
+        assert_eq!(ndb_code, PublicCode::COLLECTION_NOT_FOUND.0);
+        assert!(
+            message.starts_with("transaction commit failed: "),
+            "{message}"
+        );
+    }
 }

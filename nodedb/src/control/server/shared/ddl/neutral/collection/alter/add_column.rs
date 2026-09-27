@@ -126,7 +126,7 @@ pub(super) async fn alter_table_add_column(
     if let Some(ref coll) = updated {
         super::super::register::dispatch_register_from_stored(state, coll)
             .await
-            .map_err(|e| err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         super::strict_schema::recompile_rls_policies(state, coll)?;
     }
 

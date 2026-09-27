@@ -147,6 +147,20 @@ impl NodeDbError {
         }
     }
 
+    /// A drop or revoke refused because other objects still depend on
+    /// `object`. SQLSTATE `2BP01` (`dependent_objects_still_exist`).
+    /// `message` is the full message and names the dependents.
+    pub fn dependent_objects_exist(object: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::DEPENDENT_OBJECTS_EXIST,
+            message: message.into(),
+            details: ErrorDetails::DependentObjectsExist {
+                object: object.into(),
+            },
+            cause: None,
+        }
+    }
+
     /// An object exists but a prerequisite step has not run, such as `currval`
     /// before this session called `nextval`. Renders as SQLSTATE `55000`
     /// (`object_not_in_prerequisite_state`).

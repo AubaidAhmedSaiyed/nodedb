@@ -99,7 +99,7 @@ pub fn drop_scope(
     let found = state
         .scope_defs
         .drop_scope(name)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     if !found {
         return Err(err("42704", format!("scope '{name}' not found")));
     }

@@ -60,7 +60,7 @@ pub async fn handle_alter_vector_index_set(
             &collection,
             &field_name,
         )
-        .map_err(|e| ddl_err("XX000", format!("read vector index params: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("read vector index params", &e))?
         .ok_or_else(|| {
             ddl_err(
                 "42704",
@@ -81,7 +81,7 @@ pub async fn handle_alter_vector_index_set(
     if outcome.needs_local_apply() {
         let shared = state
             .self_arc()
-            .map_err(|e| ddl_err("XX000", format!("install vector index params: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("install vector index params", &e))?;
         crate::control::catalog_entry::post_apply::install_vector_index_params(merged, shared)
             .await;
     }

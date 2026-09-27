@@ -68,6 +68,7 @@ impl NodeDbError {
         matches!(
             self.details,
             ErrorDetails::WriteConflict { .. }
+                | ErrorDetails::TransactionRollback { .. }
                 | ErrorDetails::DeadlineExceeded
                 | ErrorDetails::NoLeader
                 | ErrorDetails::NotLeader { .. }
@@ -104,6 +105,8 @@ impl NodeDbError {
                 | ErrorDetails::DivisionByZero
                 | ErrorDetails::DataException { .. }
                 | ErrorDetails::ProgramLimitExceeded { .. }
+                | ErrorDetails::ActiveSqlTransaction { .. }
+                | ErrorDetails::DependentObjectsExist { .. }
                 | ErrorDetails::InvalidLimitValue { .. }
                 | ErrorDetails::BackupTenantMismatch { .. }
                 | ErrorDetails::BackupKeyMismatch
@@ -234,6 +237,26 @@ mod tests {
     fn client_errors() {
         assert!(NodeDbError::bad_request("bad").is_client_error());
         assert!(!NodeDbError::internal("oops").is_client_error());
+    }
+
+    /// A participant rollback is retriable. A statement refused inside a
+    /// transaction block and a drop refused by dependents are client errors.
+    #[test]
+    fn transaction_and_dependency_codes_classify() {
+        let rollback = NodeDbError::transaction_rollback("participant failed");
+        assert!(rollback.is_retriable());
+        assert!(!rollback.is_client_error());
+        assert_eq!(rollback.code(), ErrorCode::TRANSACTION_ROLLBACK);
+
+        let in_block = NodeDbError::active_sql_transaction("VACUUM");
+        assert!(in_block.is_client_error());
+        assert!(!in_block.is_retriable());
+        assert_eq!(in_block.code(), ErrorCode::ACTIVE_SQL_TRANSACTION);
+
+        let dependents = NodeDbError::dependent_objects_exist("role \"r\"", "held by users");
+        assert!(dependents.is_client_error());
+        assert!(!dependents.is_retriable());
+        assert_eq!(dependents.code(), ErrorCode::DEPENDENT_OBJECTS_EXIST);
     }
 
     #[test]

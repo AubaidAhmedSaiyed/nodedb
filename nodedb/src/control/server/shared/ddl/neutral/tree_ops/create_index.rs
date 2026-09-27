@@ -10,8 +10,8 @@
 //! 1. **Atomic-ish**: the whole edge set is dispatched in a single
 //!    `EdgePutBatch` per vshard. Any `Err` from the Data Plane causes
 //!    the DDL to attempt a best-effort rollback via `EdgeDeleteBatch`
-//!    on the shards that already succeeded, then surfaces SQLSTATE
-//!    `XX000` to the client.
+//!    on the shards that already succeeded, then surfaces the dispatch
+//!    error with its own SQLSTATE to the client.
 //! 2. **Loud on partial failure**: no `tracing::warn!` + continue. The
 //!    reported `edges_created` count either matches the number of
 //!    valid parent→child relations in the collection or the DDL fails.
@@ -85,7 +85,7 @@ pub async fn create_graph_index(
     let catalog = state.credentials.catalog();
     let stored = catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)
-        .map_err(|e| ddl_err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| ddl_err("42P01", format!("collection '{collection}' not found")))?;
     if !stored.collection_type.is_document() {
         return Err(ddl_err(
@@ -121,7 +121,7 @@ pub async fn create_graph_index(
     if state
         .rls
         .combined_read_predicate_with_auth(tenant_id.as_u64(), &collection, scope.auth())
-        .map_err(|e| ddl_err("XX000", format!("rls compile: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("rls compile", &e))?
         .is_none_or(|filters| !filters.is_empty())
     {
         return Err(ddl_err(
@@ -149,7 +149,7 @@ pub async fn create_graph_index(
     });
     let scan_resp = broadcast_to_all_cores(state, tenant_id, database_id, scan_plan, TraceId::ZERO)
         .await
-        .map_err(|e| ddl_err("XX000", format!("scan failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("scan failed", &e))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
@@ -172,12 +172,9 @@ pub async fn create_graph_index(
             continue;
         };
         let Some(obj) = obj_outer.get("data").and_then(|v| v.as_object()) else {
-            return Err(ddl_err(
-                "XX000",
-                format!(
-                    "CREATE GRAPH INDEX: document scan returned a row without a `data` field: {doc}"
-                ),
-            ));
+            return Err(DdlError::internal(format!(
+                "CREATE GRAPH INDEX: document scan returned a row without a `data` field: {doc}"
+            )));
         };
 
         let doc_id = obj
@@ -215,7 +212,7 @@ pub async fn create_graph_index(
                         tenant_id,
                         parent.as_bytes(),
                     )
-                    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+                    .map_err(|e| DdlError::from_error(&e))?;
                 let dst_surrogate = state
                     .surrogate_assigner
                     .assign(
@@ -223,7 +220,7 @@ pub async fn create_graph_index(
                         tenant_id,
                         child.as_bytes(),
                     )
-                    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+                    .map_err(|e| DdlError::from_error(&e))?;
                 edges_by_shard.entry(shard).or_default().push(BatchEdge {
                     collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
                     src_id: parent.to_string(),
@@ -251,7 +248,7 @@ pub async fn create_graph_index(
         // cancels this one.
         let minted = append_edge_batch(state, tenant_id, shard, &plan)
             .await
-            .map_err(|e| ddl_err("XX000", format!("edge-insert WAL append failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("edge-insert WAL append failed", &e))?;
 
         match crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_minted_sync_response(
             state,
@@ -268,7 +265,8 @@ pub async fn create_graph_index(
                     state,
                     tenant_id,
                     &committed_shards,
-                    format!("edge-insert dispatch failed on shard {shard:?}: {e}"),
+                    &format!("edge-insert dispatch failed on shard {shard:?}"),
+                    &e,
                 )
                 .await;
             }
@@ -331,8 +329,8 @@ fn edge_batch_owner(
 /// Surface a build-time failure.
 ///
 /// Runs rollback in parallel across all committed shards. If **every**
-/// shard's `EdgeDeleteBatch` succeeds, returns a clean
-/// `XX000 CREATE GRAPH INDEX failed: <reason>; reverted N shards`.
+/// shard's `EdgeDeleteBatch` succeeds, returns `cause` with its own SQLSTATE,
+/// prefixed `CREATE GRAPH INDEX failed: <context>; reverted N shards`.
 ///
 /// If **any** shard's rollback itself fails, the CSR is now in an
 /// inconsistent state across shards — some have the partial index,
@@ -345,7 +343,8 @@ async fn surface_failure(
     state: &SharedState,
     tenant_id: TenantId,
     committed: &[(VShardId, Vec<BatchEdge>)],
-    cause: String,
+    context: &str,
+    cause: &crate::Error,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let committed_count = committed.len();
     let rollback_futures = committed.iter().map(|(shard, edges)| {
@@ -382,11 +381,11 @@ async fn surface_failure(
         .collect();
 
     if failed.is_empty() {
-        Err(ddl_err(
-            "XX000",
-            format!(
-                "CREATE GRAPH INDEX failed: {cause}; reverted {committed_count} committed shards"
+        Err(DdlError::from_error_in_context(
+            &format!(
+                "CREATE GRAPH INDEX failed: {context}; reverted {committed_count} committed shards"
             ),
+            cause,
         ))
     } else {
         // Distinct SQLSTATE so clients / operators can distinguish
@@ -394,7 +393,7 @@ async fn surface_failure(
         Err(ddl_err(
             "XX001",
             format!(
-                "CREATE GRAPH INDEX failed: {cause}; rollback also failed on {}/{} shards \
+                "CREATE GRAPH INDEX failed: {context}: {cause}; rollback also failed on {}/{} shards \
                  ({:?}); GRAPH INDEX LEFT IN INCONSISTENT STATE — operator intervention required",
                 failed.len(),
                 committed_count,

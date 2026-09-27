@@ -151,6 +151,7 @@ impl RetryableSchemaChange for Error {
             | Error::DataPlane(_)
             | Error::Promql(_)
             | Error::DependentObjectsExist { .. }
+            | Error::RoleInUse { .. }
             | Error::CascadeCycle { .. }
             | Error::CrossShardInExplicitTransaction
             | Error::SequencerUnavailable

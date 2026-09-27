@@ -138,6 +138,7 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
         | crate::Error::CascadeCycle { .. }
         | crate::Error::CrossShardInExplicitTransaction
         | crate::Error::SequencerUnavailable

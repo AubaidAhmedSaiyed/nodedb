@@ -57,7 +57,7 @@ pub(super) fn properties_to_json(properties: GraphProperties) -> Result<String, 
             // persisting an edge whose properties silently lost a clause.
             match nodedb_sql::parser::object_literal::parse_object_literal_complete(&obj_str) {
                 Some(Ok(fields)) => sonic_rs::to_string(&nodedb_types::Value::Object(fields))
-                    .map_err(|e| ddl_err("XX000", format!("PROPERTIES serialize error: {e}"))),
+                    .map_err(|e| DdlError::internal(format!("PROPERTIES serialize error: {e}"))),
                 Some(Err(msg)) => Err(ddl_err(
                     "42601",
                     format!("PROPERTIES object literal error: {msg}"),

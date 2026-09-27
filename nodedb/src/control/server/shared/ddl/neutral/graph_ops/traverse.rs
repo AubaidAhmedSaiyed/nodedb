@@ -168,7 +168,7 @@ pub async fn traverse(
     .await
     {
         Ok(resp) => Ok(payload_to_rows(&resp.payload)),
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
+        Err(e) => Err(DdlError::from_error(&e)),
     }
 }
 
@@ -229,7 +229,7 @@ pub async fn neighbors(
     .await
     {
         Ok(resp) => Ok(payload_to_rows(&resp.payload)),
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
+        Err(e) => Err(DdlError::from_error(&e)),
     }
 }
 
@@ -287,7 +287,7 @@ pub async fn shortest_path(
     .await
     {
         Ok(resp) => Ok(payload_to_rows(&resp.payload)),
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
+        Err(e) => Err(DdlError::from_error(&e)),
     }
 }
 

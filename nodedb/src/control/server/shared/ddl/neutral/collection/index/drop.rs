@@ -68,7 +68,7 @@ pub async fn drop_index(
         .credentials
         .catalog()
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), index_name)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         // An index whose collection is soft-deleted is not listed and cannot
         // be dropped on its own: the collection owns its lifecycle, and
         // UNDROP must bring it back intact.

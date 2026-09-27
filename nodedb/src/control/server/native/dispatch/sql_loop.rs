@@ -191,7 +191,7 @@ pub(super) async fn run_dispatch_loop(
         {
             return resp(sqlstate_error(
                 seq,
-                "XX000",
+                nodedb_types::error::sqlstate::INTERNAL_ERROR,
                 "internal error: failed to retain descriptor leases for buffered transaction tasks",
             ));
         }

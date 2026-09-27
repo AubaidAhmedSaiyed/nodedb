@@ -162,9 +162,9 @@ fn check_engine_support(
         Ok(Some(c)) => c,
         Ok(None) => return Ok(()), // Collection doesn't exist yet — will fail at INSERT.
         Err(e) => {
-            return Err(ddl_err(
-                "XX000",
-                format!("COPY: catalog lookup failed: {e}"),
+            return Err(DdlError::from_error_in_context(
+                "COPY: catalog lookup failed",
+                &e,
             ));
         }
     };

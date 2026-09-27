@@ -70,7 +70,7 @@ impl NodeDbPgHandler {
                 .ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "FATAL".to_owned(),
-                        "XX000".to_owned(),
+                        nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
                         "connection session metadata is unavailable".to_owned(),
                     )))
                 })?,
@@ -127,10 +127,10 @@ impl NodeDbPgHandler {
                 // byte. The charge below is on the success path and so can
                 // never be where a cap blocks anything.
                 admit_backup_restore_quota(&self.state, request.scope(), tenant_id)
-                    .map_err(internal)?;
+                    .map_err(typed)?;
                 let bytes = backup::backup_tenant(&self.state, tenant_id)
                     .await
-                    .map_err(internal)?;
+                    .map_err(typed)?;
                 // Metered here, on the success path, before the response is
                 // built below — there is no `PhysicalPlan` for a whole-tenant
                 // backup, so the collection dimension is a synthetic
@@ -290,7 +290,7 @@ impl CopyHandler for NodeDbCopyHandler {
             self.state.auth_stores(),
             database_id,
         );
-        admit_backup_restore_quota(&self.state, &scope, pending.tenant_id).map_err(internal)?;
+        admit_backup_restore_quota(&self.state, &scope, pending.tenant_id).map_err(typed)?;
 
         let stats = backup::restore_tenant(
             &self.state,
@@ -300,7 +300,7 @@ impl CopyHandler for NodeDbCopyHandler {
             pending.force,
         )
         .await
-        .map_err(internal)?;
+        .map_err(typed)?;
         // pgwire does not auto-send CommandComplete after `on_copy_done`
         // returns Ok — the trait contract leaves message construction to
         // the handler. Send a `RESTORE TENANT N <op-count>` tag so the
@@ -343,11 +343,11 @@ fn sqlstate(code: &str, message: &str) -> PgWireError {
     )))
 }
 
-fn internal(e: crate::Error) -> PgWireError {
-    // Surface error string but never echo deserializer context — the
-    // restore orchestrator already scrubs envelope errors. We pass
-    // through everything else (RPC failures, dispatch errors).
-    sqlstate(ss::INTERNAL_ERROR, &e.to_string())
+/// Render a backup or restore error with its own SQLSTATE: a spent quota,
+/// a tenant mismatch or a wrong key keeps its class. The restore
+/// orchestrator already scrubs envelope errors before they reach here.
+fn typed(e: crate::Error) -> PgWireError {
+    super::super::types::error_to_pg(&e)
 }
 
 #[cfg(test)]

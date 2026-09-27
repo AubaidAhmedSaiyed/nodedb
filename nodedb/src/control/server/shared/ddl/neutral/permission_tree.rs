@@ -79,7 +79,7 @@ pub async fn set_permission_tree(
     let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{collection}' does not exist")))?;
 
     if !coll.is_active {
@@ -91,10 +91,10 @@ pub async fn set_permission_tree(
 
     // Serialize and persist.
     let def_json = sonic_rs::to_string(&def)
-        .map_err(|e| err("XX000", format!("serialize PERMISSION_TREE: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("serialize PERMISSION_TREE: {e}")))?;
     coll.permission_tree_def = Some(def_json);
     persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let sources = [collection.clone(), def.permission_table.clone()];
 
@@ -168,12 +168,12 @@ pub async fn drop_permission_tree(
     let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{collection}' does not exist")))?;
 
     coll.permission_tree_def = None;
     persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // Update in-memory cache.
     state

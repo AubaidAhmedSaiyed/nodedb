@@ -144,7 +144,7 @@ pub async fn create_continuous_aggregate(
     // fields — the def is decoded on register dispatch in
     // `post_apply::async_dispatch::continuous_aggregate::put_async`.
     let def_bytes = zerompk::to_msgpack_vec(&def)
-        .map_err(|e| err("XX000", format!("serialize continuous aggregate def: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("serialize continuous aggregate def: {e}")))?;
 
     let stored = StoredContinuousAggregate {
         database_id: database_id.as_u64(),
@@ -226,7 +226,7 @@ pub async fn create_continuous_aggregate(
         propose_and_apply(state, &coll_entry)?;
         collection::dispatch_register_from_stored(state, &target)
             .await
-            .map_err(|e| err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
     }
 
     // Single-node / no-applier path: the async post-apply dispatcher

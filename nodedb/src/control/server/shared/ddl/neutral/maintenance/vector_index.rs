@@ -59,7 +59,7 @@ pub async fn handle_show_vector_index(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     if resp.payload.is_empty() {
         return Err(ddl_err(
@@ -69,7 +69,7 @@ pub async fn handle_show_vector_index(
     }
 
     let stats: nodedb_types::VectorIndexStats = zerompk::from_msgpack(&resp.payload)
-        .map_err(|e| ddl_err("XX000", format!("decode vector stats: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("decode vector stats: {e}")))?;
 
     let columns = vec!["property".to_string(), "value".to_string()];
 
@@ -156,7 +156,7 @@ pub async fn handle_alter_vector_index_seal(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     Ok(vec![DdlResult::Status {
         command: "SEAL".to_string(),
@@ -189,7 +189,7 @@ pub async fn handle_alter_vector_index_compact(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     Ok(vec![DdlResult::Status {
         command: "COMPACT".to_string(),

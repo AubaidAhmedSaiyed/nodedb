@@ -95,9 +95,8 @@ pub(crate) async fn refuse_materialized_vector_index(
             &format!("{context}: vector index probe"),
             &crate::Error::DataPlane(code.clone()),
         )),
-        (_, None) => Err(DdlError::new(
-            "XX000",
-            format!("{context}: vector index probe failed with no error code"),
-        )),
+        (_, None) => Err(DdlError::internal(format!(
+            "{context}: vector index probe failed with no error code"
+        ))),
     }
 }

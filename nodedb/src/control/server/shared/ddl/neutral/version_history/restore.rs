@@ -69,7 +69,7 @@ pub async fn restore_version(
             tenant_id,
             doc_id.as_bytes(),
         )
-        .map_err(|e| err("XX000", format!("surrogate assign: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("surrogate assign", &e))?;
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     // RLS write policies are stored keyed by `db_qualified(database_id,

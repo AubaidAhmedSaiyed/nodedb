@@ -24,7 +24,7 @@ pub fn sqlstate_error(code: &str, message: &str) -> PgWireError {
 /// Two tasks of one statement disagreeing on their verb is a planner bug,
 /// so it surfaces as an internal error.
 pub fn dml_fold_error_to_pg(e: &DmlFoldError) -> PgWireError {
-    sqlstate_error("XX000", &e.to_string())
+    sqlstate_error(sqlstate::INTERNAL_ERROR, &e.to_string())
 }
 
 /// Map a NodeDB `Error` to the pgwire error the client reads, through the
@@ -35,6 +35,17 @@ pub fn error_to_pg(err: &crate::Error) -> PgWireError {
         severity.to_owned(),
         code.to_owned(),
         message,
+    )))
+}
+
+/// Map a NodeDB `Error` to the pgwire error the client reads, with `context`
+/// before its message. The SQLSTATE stays the error's own.
+pub fn error_to_pg_in_context(context: &str, err: &crate::Error) -> PgWireError {
+    let (severity, code, message) = error_to_sqlstate(err);
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        severity.to_owned(),
+        code.to_owned(),
+        format!("{context}: {message}"),
     )))
 }
 
@@ -336,7 +347,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         | crate::Error::RoleInheritanceDepthExceeded { .. } => {
             ("ERROR", sqlstate::SYNTAX_ERROR, err.to_string())
         }
-        crate::Error::DependentObjectsExist { .. } => (
+        crate::Error::DependentObjectsExist { .. } | crate::Error::RoleInUse { .. } => (
             "ERROR",
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             err.to_string(),
@@ -403,8 +414,37 @@ pub fn response_status_to_sqlstate(
             if let Some(code) = error_code {
                 Some(crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(code))
             } else {
-                Some(("ERROR", "XX000", "unknown data plane error".into()))
+                Some((
+                    "ERROR",
+                    sqlstate::INTERNAL_ERROR,
+                    "unknown data plane error".into(),
+                ))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A typed error behind a context prefix keeps its own SQLSTATE.
+    #[test]
+    fn an_error_in_context_keeps_its_sqlstate() {
+        let missing = crate::Error::CollectionNotFound {
+            tenant_id: crate::types::TenantId::new(1),
+            collection: "orders".into(),
+        };
+        match error_to_pg_in_context("catalog read", &missing) {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, sqlstate::UNDEFINED_TABLE);
+                assert!(
+                    info.message.starts_with("catalog read: "),
+                    "{}",
+                    info.message
+                );
+            }
+            other => panic!("expected a user error, got {other:?}"),
         }
     }
 }

@@ -387,7 +387,7 @@ async fn execute_planned(
                 let Some(scope) = lease_scope.take() else {
                     return resp(sqlstate_error(
                         seq,
-                        "XX000",
+                        nodedb_types::error::sqlstate::INTERNAL_ERROR,
                         "internal error: query lease scope missing before SQL stream dispatch",
                     ));
                 };
@@ -408,7 +408,7 @@ async fn execute_planned(
     let Some(lease_scope) = lease_scope.take() else {
         return resp(sqlstate_error(
             seq,
-            "XX000",
+            nodedb_types::error::sqlstate::INTERNAL_ERROR,
             "internal error: query lease scope missing before materialized SQL dispatch",
         ));
     };
@@ -433,7 +433,7 @@ async fn execute_planned(
 // expects (a single, fully-resolved SQL string).
 //
 // Errors here surface as `42P02` (`undefined_parameter`) so the client
-// gets a typed SQLSTATE rather than a generic `XX000` opaque failure.
+// gets a typed SQLSTATE rather than an opaque internal error.
 
 /// Substitute `$N` placeholders in `sql` with canonical SQL literals.
 fn inline_params(sql: &str, params: &[Value]) -> String {

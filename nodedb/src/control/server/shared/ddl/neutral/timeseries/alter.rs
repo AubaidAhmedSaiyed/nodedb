@@ -32,7 +32,7 @@ pub fn alter_timeseries(
         let catalog = state.credentials.catalog();
         let mut coll = catalog
             .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
-            .map_err(|e| ddl_err("XX000", e.to_string()))?
+            .map_err(|e| DdlError::from_error(&e))?
             .ok_or_else(|| ddl_err("42P01", format!("collection '{name}' does not exist")))?;
 
         if !coll.collection_type.is_timeseries() {
@@ -63,7 +63,7 @@ pub fn alter_timeseries(
         }
 
         persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
     }
 
     tracing::info!(collection = name, "timeseries config updated");

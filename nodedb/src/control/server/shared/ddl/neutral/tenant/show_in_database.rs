@@ -205,12 +205,12 @@ fn resolve_tenant_quota(
 
     let db_id = catalog
         .get_database_id_by_name(database)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{database}' does not exist")))?;
 
     let tenants = catalog
         .load_all_tenants()
-        .map_err(|e| ddl_err("XX000", format!("tenant load failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("tenant load failed", &e))?;
     let tenant_id = tenants
         .iter()
         .find(|t| t.name == name)
@@ -219,7 +219,7 @@ fn resolve_tenant_quota(
 
     let record = catalog
         .get_tenant_quota(db_id, tenant_id)
-        .map_err(|e| ddl_err("XX000", format!("quota read failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("quota read failed", &e))?
         .unwrap_or(QuotaRecord::DEFAULT);
 
     Ok((db_id, tenant_id, record))

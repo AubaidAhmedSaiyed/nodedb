@@ -40,13 +40,13 @@ pub fn handle_alter_tenant_quota(
     // Resolve database name → id.
     let db_id = catalog
         .get_database_id_by_name(database)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{database}' does not exist")))?;
 
     // Resolve tenant name → id via a linear scan of stored tenants.
     let tenants = catalog
         .load_all_tenants()
-        .map_err(|e| ddl_err("XX000", format!("tenant load failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("tenant load failed", &e))?;
     let tenant_id = tenants
         .iter()
         .find(|t| t.name == name)
@@ -60,14 +60,14 @@ pub fn handle_alter_tenant_quota(
     // sum-of-tenant-quotas ≤ database-quota invariant on `check_tenant_quota`.
     let before = catalog
         .get_tenant_quota(db_id, tenant_id)
-        .map_err(|e| ddl_err("XX000", format!("quota read failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("quota read failed", &e))?
         .unwrap_or(QuotaRecord::DEFAULT);
     let mut record = before.clone();
     record.merge(spec);
 
     catalog
         .check_tenant_quota(db_id, tenant_id, &record)
-        .map_err(|e| ddl_err("53400", format!("{e}")))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // Replicated: every node writes the row and installs the quota in its live
     // enforcement components via post-apply.
@@ -81,7 +81,7 @@ pub fn handle_alter_tenant_quota(
         || {
             catalog
                 .write_tenant_quota(db_id, tenant_id, &record)
-                .map_err(|e| ddl_err("53400", format!("{e}")))?;
+                .map_err(|e| DdlError::from_error(&e))?;
             crate::control::catalog_entry::post_apply::quota::put_tenant(
                 db_id, tenant_id, &record, state,
             );

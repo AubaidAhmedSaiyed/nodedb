@@ -49,7 +49,7 @@ impl SqlOutcome {
             SqlOutcome::Response(r) => *r,
             SqlOutcome::Stream(s) => crate::control::server::native::sqlstate_code::sqlstate_error(
                 s.seq,
-                "XX000",
+                nodedb_types::error::sqlstate::INTERNAL_ERROR,
                 "internal error: SQL stream produced on a non-streaming path",
             ),
         }

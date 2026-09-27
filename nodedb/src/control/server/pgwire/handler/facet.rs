@@ -305,7 +305,7 @@ fn build_filter_bytes(filter_text: &str) -> PgWireResult<Vec<u8>> {
     zerompk::to_msgpack_vec(&filters).map_err(|e| {
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
-            "XX000".to_owned(),
+            nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
             format!("filter serialization failed: {e}"),
         )))
     })

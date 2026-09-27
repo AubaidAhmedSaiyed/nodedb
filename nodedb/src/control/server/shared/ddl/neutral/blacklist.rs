@@ -93,7 +93,7 @@ fn handle_blacklist_user(
     state
         .blacklist
         .blacklist_user(user_id, &reason, &identity.username, expires_at)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // WITH KILL SESSIONS — terminate active sessions immediately.
     let kill_sessions = parts.iter().any(|p| p.to_uppercase() == "KILL");
@@ -140,7 +140,7 @@ fn handle_blacklist_ip(
     state
         .blacklist
         .blacklist_ip(addr, &reason, &identity.username, expires_at)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -221,7 +221,7 @@ fn lift(
         &crate::control::security::blacklist::store::BlacklistStore,
     ) -> crate::Result<bool>,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let removed = remove(&state.blacklist).map_err(|e| err("XX000", e.to_string()))?;
+    let removed = remove(&state.blacklist).map_err(|e| DdlError::from_error(&e))?;
     if !removed {
         return Err(err(
             "42704",

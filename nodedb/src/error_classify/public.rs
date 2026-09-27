@@ -47,8 +47,9 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             "cross-shard",
             "global OCC verdict was abort (read-set validation failed)",
         ),
-        // Not a write conflict: no read-set was validated, a participant failed.
-        Error::CalvinParticipantError => NodeDbError::cluster(
+        // Not a write conflict: no read-set was validated, a participant
+        // failed. `40000` keeps the retryable class 40 across a node hop.
+        Error::CalvinParticipantError => NodeDbError::transaction_rollback(
             "cross-shard transaction aborted: a participant vShard returned an error before \
              any read-set was validated",
         ),
@@ -147,11 +148,15 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         }
         Error::CrdtAdmissionInvalidPlan { .. }
         | Error::CrdtAdmissionCallerFence
-        | Error::CrdtApplyRequiresAdmission
-        | Error::CrdtApplyForbiddenInTransaction => {
+        | Error::CrdtApplyRequiresAdmission => {
             NodeDbError::bad_request("invalid CRDT admission request".to_owned())
         }
-        Error::NotInTransactionBlock { .. } => NodeDbError::bad_request(e.to_string()),
+        // `25001`: the statement cannot run inside a transaction block.
+        Error::CrdtApplyForbiddenInTransaction
+        | Error::NotInTransactionBlock { .. }
+        | Error::CrossShardInExplicitTransaction => {
+            NodeDbError::active_sql_transaction(e.to_string())
+        }
         Error::CrdtAdmissionTimeout { .. } => NodeDbError::deadline_exceeded(),
         Error::NoLeader { vshard_id } => {
             NodeDbError::no_leader(format!("vshard {vshard_id} has no serving leader"))
@@ -259,10 +264,16 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             dependents,
         } => {
             let names: Vec<String> = dependents.iter().map(|(k, n)| format!("{k}:{n}")).collect();
-            NodeDbError::bad_request(format!(
-                "cannot drop {root_kind} '{root_name}': {dependent_count} dependent(s) exist ({})",
-                names.join(", ")
-            ))
+            NodeDbError::dependent_objects_exist(
+                format!("{root_kind} '{root_name}'"),
+                format!(
+                    "cannot drop {root_kind} '{root_name}': {dependent_count} dependent(s) exist ({})",
+                    names.join(", ")
+                ),
+            )
+        }
+        Error::RoleInUse { role, .. } => {
+            NodeDbError::dependent_objects_exist(format!("role \"{role}\""), e.to_string())
         }
         Error::CascadeCycle {
             tenant_id: _,
@@ -271,13 +282,6 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         } => NodeDbError::internal(format!(
             "cascade cycle / depth-limit ({depth}) exceeded on '{root}'"
         )),
-        Error::CrossShardInExplicitTransaction => NodeDbError::bad_request(
-            "cross-shard write inside explicit transaction block is not supported. \
-             Calvin cross-shard atomicity requires auto-commit (single-statement). \
-             Options: 1) Remove BEGIN/COMMIT to use auto-commit. \
-             2) SET cross_shard_txn = 'best_effort_non_atomic' for non-atomic dispatch."
-                .to_owned(),
-        ),
         Error::SequencerUnavailable => NodeDbError::bad_request(
             "cross-shard transactions require a cluster deployment with the Calvin sequencer; \
              this node is running in embedded/local mode"

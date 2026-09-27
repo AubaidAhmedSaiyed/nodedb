@@ -84,11 +84,13 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn dispat
         }
         // A refusal arrives as an error status inside an `Ok` response.
         Ok(response) if response.status == crate::bridge::envelope::Status::Error => {
-            let (_, sqlstate, message) = match response.error_code.as_deref() {
-                Some(code) => error_code_to_sqlstate(code),
-                None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-            };
-            Some(Err(ddl_err(sqlstate, message)))
+            Some(Err(match response.error_code.as_deref() {
+                Some(code) => {
+                    let (_, sqlstate, message) = error_code_to_sqlstate(code);
+                    ddl_err(sqlstate, message)
+                }
+                None => DdlError::internal("unknown data plane error"),
+            }))
         }
         Ok(_) => None,
     }
@@ -349,8 +351,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 Arc::clone(&plan_lease_scope),
             )
         {
-            return Err(ddl_err(
-                "XX000",
+            return Err(DdlError::internal(
                 "internal error: failed to retain descriptor leases for buffered transaction tasks",
             ));
         }
@@ -375,11 +376,13 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 return Err(ddl_err(sqlstate, message));
             }
             Err(StagingGateError::Rejected { code }) => {
-                let (_, sqlstate, message) = match code {
-                    Some(code) => error_code_to_sqlstate(&code),
-                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-                };
-                return Err(ddl_err(sqlstate, message));
+                return Err(match code {
+                    Some(code) => {
+                        let (_, sqlstate, message) = error_code_to_sqlstate(&code);
+                        ddl_err(sqlstate, message)
+                    }
+                    None => DdlError::internal("unknown data plane error"),
+                });
             }
         };
 
@@ -419,15 +422,13 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         };
 
         if response.status == crate::bridge::envelope::Status::Error {
-            let (_, sqlstate, message) = match response.error_code.as_deref() {
-                Some(code) => error_code_to_sqlstate(code),
-                None => (
-                    "ERROR",
-                    "XX000",
-                    String::from_utf8_lossy(&response.payload).into_owned(),
-                ),
-            };
-            return Err(ddl_err(sqlstate, message));
+            return Err(match response.error_code.as_deref() {
+                Some(code) => {
+                    let (_, sqlstate, message) = error_code_to_sqlstate(code);
+                    ddl_err(sqlstate, message)
+                }
+                None => DdlError::internal(String::from_utf8_lossy(&response.payload)),
+            });
         }
 
         // Shape the STORED rows the write returned, redacted for the caller —
@@ -458,7 +459,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 redaction: Some(redaction.ctx(&state.redaction)),
                 sequences: Some(&sequences),
             })
-            .map_err(|error| ddl_err("XX000", error.message().to_string()))?;
+            .map_err(|error| DdlError::from_error(&crate::Error::from(error)))?;
             // Folded rather than pushed: a statement is ONE result set, however
             // many tasks it planned to.
             if let ShapeOutcome::Rows(shaped) = outcome {

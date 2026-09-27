@@ -106,13 +106,13 @@ pub fn drop_tenant(
 
     let entry = CatalogEntry::DeleteTenant { tenant_id: tid };
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| ddl_err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .delete_tenant(tid)
-                .map_err(|e| ddl_err("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         {
             let mut tenants = match state.tenants.lock() {
@@ -127,7 +127,7 @@ pub fn drop_tenant(
             tid,
             state.credentials.catalog(),
         )
-        .map_err(|e| ddl_err("XX000", format!("quota purge failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("quota purge failed", &e))?;
         crate::control::catalog_entry::post_apply::quota::release_tenant_scope(tenant_id, state);
     }
 
@@ -160,7 +160,7 @@ fn reconcile_tenant_users(
         .credentials
         .catalog()
         .authoritative_tenant_admin(tenant_id.as_u64())
-        .map_err(|error| ddl_err("XX000", format!("load tenant administrator: {error}")))?
+        .map_err(|error| DdlError::from_error_in_context("load tenant administrator", &error))?
     else {
         return Ok(());
     };

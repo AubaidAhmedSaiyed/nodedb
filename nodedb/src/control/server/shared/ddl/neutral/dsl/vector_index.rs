@@ -120,7 +120,7 @@ pub async fn create_vector_index(
             collection,
             &field_name,
         )
-        .map_err(|e| ddl_err("XX000", format!("read vector index params: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("read vector index params", &e))?;
     if existing.is_some() {
         if stmt.header.if_not_exists {
             return Ok(vec![status()]);
@@ -141,7 +141,7 @@ pub async fn create_vector_index(
         .credentials
         .catalog()
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), index_name)
-        .map_err(|e| ddl_err("XX000", format!("read index registry: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("read index registry", &e))?
     {
         if stmt.header.if_not_exists && taken.kind == IndexKind::Vector {
             return Ok(vec![status()]);
@@ -237,7 +237,7 @@ pub async fn create_vector_index(
     if outcome.needs_local_apply() {
         let shared = state
             .self_arc()
-            .map_err(|e| ddl_err("XX000", format!("install vector index params: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("install vector index params", &e))?;
         crate::control::catalog_entry::post_apply::install_vector_index_params(stored, shared)
             .await;
     }

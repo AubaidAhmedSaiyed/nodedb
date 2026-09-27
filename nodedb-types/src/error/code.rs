@@ -32,6 +32,11 @@ impl ErrorCode {
     pub const INSUFFICIENT_BALANCE: Self = Self(1022);
     pub const RATE_EXCEEDED: Self = Self(1023);
     pub const TYPE_GUARD_VIOLATION: Self = Self(1024);
+    /// A transaction rolled back for a reason other than a serialization
+    /// conflict, such as a participant error. The client retries it.
+    pub const TRANSACTION_ROLLBACK: Self = Self(1030);
+    /// The statement cannot run inside an explicit transaction block.
+    pub const ACTIVE_SQL_TRANSACTION: Self = Self(1031);
 
     // Read path (1100–1199)
     pub const COLLECTION_NOT_FOUND: Self = Self(1100);
@@ -52,6 +57,9 @@ impl ErrorCode {
     /// A requested value/record does not exist. Generic: use for lookups
     /// that don't fit `DOCUMENT_NOT_FOUND`'s collection/id shape.
     pub const NOT_FOUND: Self = Self(1114);
+    /// A drop or revoke refused because other objects still depend on the
+    /// named object.
+    pub const DEPENDENT_OBJECTS_EXIST: Self = Self(1115);
 
     // Query (1200–1299)
     pub const PLAN_ERROR: Self = Self(1200);

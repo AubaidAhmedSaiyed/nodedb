@@ -125,6 +125,7 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
         | crate::Error::CascadeCycle { .. }
         | crate::Error::CrossShardInExplicitTransaction
         | crate::Error::SessionCapExceeded { .. }

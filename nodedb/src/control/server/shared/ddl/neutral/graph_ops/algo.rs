@@ -137,7 +137,7 @@ pub async fn algo(
         };
         return match result {
             Ok(payload) => Ok(algo_payload_to_rows(&payload, algorithm)?),
-            Err(e) => Err(ddl_err("XX000", e.to_string())),
+            Err(e) => Err(DdlError::from_error(&e)),
         };
     }
 
@@ -147,7 +147,7 @@ pub async fn algo(
         .await
     {
         Ok(resp) => Ok(algo_payload_to_rows(&resp.payload, algorithm)?),
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
+        Err(e) => Err(DdlError::from_error(&e)),
     }
 }
 
@@ -244,7 +244,7 @@ fn algo_payload_to_rows(
 
     let json_text = response_codec::decode_payload_to_json(payload);
     let rows: Vec<serde_json::Value> = sonic_rs::from_str(&json_text)
-        .map_err(|e| ddl_err("XX000", format!("invalid algorithm result JSON: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("invalid algorithm result JSON: {e}")))?;
 
     let mut shaped_rows = Vec::with_capacity(rows.len());
     for row in &rows {

@@ -66,6 +66,13 @@ impl DdlError {
         }
     }
 
+    /// Build a `DdlError` for an internal fault whose source carries no
+    /// SQLSTATE class: a codec, a storage engine outside `crate::Error`, a
+    /// broken invariant, a system clock. SQLSTATE `XX000`.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(sqlstate::INTERNAL_ERROR, message)
+    }
+
     /// Build a `DdlError` from a classified public error: its code and its
     /// details travel with the SQLSTATE and message the SQL surfaces render.
     pub fn from_public(
@@ -99,6 +106,13 @@ impl DdlError {
             crate::control::server::pgwire::types::error_to_sqlstate(error);
         let public = crate::error_classify::classify(error);
         Self::from_public(sqlstate, format!("{context}: {message}"), &public)
+    }
+
+    /// Put `context` before this error's message. The SQLSTATE, code and
+    /// details stay this error's own.
+    pub fn in_context(mut self, context: &str) -> Self {
+        self.message = format!("{context}: {}", self.message);
+        self
     }
 
     /// Carry `error`'s cause, when it has one, as this error's cause. The
@@ -223,6 +237,9 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         // both without losing anything a client acts on.
         sqlstate::SYNTAX_ERROR => ErrorCode::BAD_REQUEST,
         sqlstate::SERIALIZATION_FAILURE => ErrorCode::WRITE_CONFLICT,
+        sqlstate::TRANSACTION_ROLLBACK => ErrorCode::TRANSACTION_ROLLBACK,
+        sqlstate::ACTIVE_SQL_TRANSACTION => ErrorCode::ACTIVE_SQL_TRANSACTION,
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST => ErrorCode::DEPENDENT_OBJECTS_EXIST,
         sqlstate::TOO_MANY_CONNECTIONS => ErrorCode::RATE_EXCEEDED,
         sqlstate::INTERNAL_ERROR => ErrorCode::INTERNAL,
         // `0A000` here means the default, unambiguous "feature not
@@ -231,10 +248,11 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         // cannot reach this function; see the doc comment above.
         sqlstate::FEATURE_NOT_SUPPORTED => ErrorCode::SQL_NOT_ENABLED,
         "42704" => ErrorCode::UNDEFINED_OBJECT,
-        "42710" | "42P07" | "42723" => ErrorCode::ALREADY_EXISTS,
-        // Invalid/incompatible object definition or a caller reaching a
-        // dependent object still in use — all client-actionable, non-retriable.
-        "42P17" | "42809" | "42P16" | "2BP01" => ErrorCode::BAD_REQUEST,
+        // A duplicate object of any kind, a database (`42P04`) included.
+        "42710" | "42P07" | "42723" | "42P04" => ErrorCode::ALREADY_EXISTS,
+        // Invalid or incompatible object definition: client-actionable and
+        // non-retriable.
+        "42P17" | "42809" | "42P16" => ErrorCode::BAD_REQUEST,
         // A declared literal the column type cannot represent.
         sqlstate::DATATYPE_MISMATCH => ErrorCode::BAD_REQUEST,
         // Default "object not in prerequisite state" meaning of `55006`;
@@ -294,6 +312,135 @@ mod tests {
             code_for_sqlstate(sqlstate::PROGRAM_LIMIT_EXCEEDED),
             ErrorCode::PROGRAM_LIMIT_EXCEEDED
         );
+    }
+
+    /// Transaction-state and dependency SQLSTATEs derive a code whose numeric
+    /// rendering keeps their class.
+    #[test]
+    fn transaction_and_dependency_sqlstates_derive_their_code() {
+        assert_eq!(
+            code_for_sqlstate(sqlstate::TRANSACTION_ROLLBACK),
+            ErrorCode::TRANSACTION_ROLLBACK
+        );
+        assert_eq!(
+            code_for_sqlstate(sqlstate::ACTIVE_SQL_TRANSACTION),
+            ErrorCode::ACTIVE_SQL_TRANSACTION
+        );
+        assert_eq!(
+            code_for_sqlstate(sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
+            ErrorCode::DEPENDENT_OBJECTS_EXIST
+        );
+    }
+
+    /// A typed error behind a context prefix keeps its own SQLSTATE and
+    /// code: a quorum loss during a catalog propose stays retryable.
+    #[test]
+    fn an_error_in_context_keeps_its_class() {
+        let quorum = crate::Error::GroupQuorumUnavailable {
+            group_id: 0,
+            voters: vec![1, 2, 3],
+            unreachable: vec![2, 3],
+        };
+        let e = DdlError::from_error_in_context("metadata propose", &quorum);
+        assert_eq!(e.sqlstate, sqlstate::LOCK_NOT_AVAILABLE);
+        assert_eq!(e.code, ErrorCode::NO_LEADER);
+        assert!(e.message.starts_with("metadata propose: "), "{}", e.message);
+
+        let denied = crate::Error::RejectedAuthz {
+            tenant_id: crate::types::TenantId::new(1),
+            resource: "orders".into(),
+        };
+        let e = DdlError::from_error_in_context("catalog write", &denied);
+        assert_eq!(e.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        assert_eq!(e.code, ErrorCode::AUTHORIZATION_DENIED);
+    }
+
+    /// A typed error with no context keeps its own SQLSTATE and code.
+    #[test]
+    fn a_typed_error_keeps_its_class() {
+        let missing = crate::Error::CollectionNotFound {
+            tenant_id: crate::types::TenantId::new(1),
+            collection: "orders".into(),
+        };
+        let e = DdlError::from_error(&missing);
+        assert_eq!(e.sqlstate, sqlstate::UNDEFINED_TABLE);
+        assert_eq!(e.code, ErrorCode::COLLECTION_NOT_FOUND);
+
+        let deadline = crate::Error::DeadlineExceeded {
+            request_id: crate::types::RequestId::new(1),
+        };
+        let e = DdlError::from_error(&deadline);
+        assert_eq!(e.sqlstate, sqlstate::QUERY_CANCELED);
+        assert_eq!(e.code, ErrorCode::DEADLINE_EXCEEDED);
+    }
+
+    /// A Data-Plane verdict read off an error response keeps its class: a
+    /// duplicate key during an index backfill is `23505`.
+    #[test]
+    fn a_data_plane_verdict_in_context_keeps_its_class() {
+        let duplicate =
+            crate::Error::DataPlane(crate::bridge::envelope::ErrorCode::RejectedConstraint {
+                constraint: "unique".into(),
+                detail: "duplicate key 'a'".into(),
+            });
+        let e = DdlError::from_error_in_context("index backfill", &duplicate);
+        assert_eq!(e.sqlstate, sqlstate::UNIQUE_VIOLATION);
+        assert_eq!(e.code, ErrorCode::CONSTRAINT_VIOLATION);
+    }
+
+    /// A peer's typed refusal keeps its class after it crosses the cluster
+    /// wire back into a `crate::Error`.
+    #[test]
+    fn a_peer_refusal_keeps_its_class() {
+        let wire = nodedb_cluster::rpc_codec::TypedClusterError::RejectedConstraint {
+            collection: "users".into(),
+            constraint: "unique".into(),
+            detail: "duplicate key 'a'".into(),
+        };
+        let e =
+            DdlError::from_error_in_context("peer backfill on node 2", &crate::Error::from(wire));
+        assert_eq!(e.sqlstate, sqlstate::UNIQUE_VIOLATION);
+        assert_eq!(e.code, ErrorCode::CONSTRAINT_VIOLATION);
+    }
+
+    /// A fault with no typed class is `XX000` through the one helper.
+    #[test]
+    fn an_untyped_fault_is_internal() {
+        let e = DdlError::internal("system clock error");
+        assert_eq!(e.sqlstate, sqlstate::INTERNAL_ERROR);
+        assert_eq!(e.code, ErrorCode::INTERNAL);
+    }
+
+    /// A context prefix on a built `DdlError` keeps its SQLSTATE and code.
+    #[test]
+    fn in_context_keeps_the_class() {
+        let e = DdlError::new("42710", "synonym group 'g' already exists")
+            .in_context("clone: copying synonym group 'g'");
+        assert_eq!(e.sqlstate, "42710");
+        assert_eq!(e.code, ErrorCode::ALREADY_EXISTS);
+        assert_eq!(
+            e.message,
+            "clone: copying synonym group 'g': synonym group 'g' already exists"
+        );
+    }
+
+    /// A role still in use keeps `2BP01` and the dependent-objects code.
+    #[test]
+    fn a_role_in_use_is_a_dependent_objects_error() {
+        let in_use = crate::Error::RoleInUse {
+            role: "analyst".into(),
+            dependents: crate::control::security::role_assignment::RoleDependents::Users(vec![
+                "bob".into(),
+            ]),
+        };
+        let e = DdlError::from_error(&in_use);
+        assert_eq!(e.sqlstate, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST);
+        assert_eq!(e.code, ErrorCode::DEPENDENT_OBJECTS_EXIST);
+    }
+
+    #[test]
+    fn a_duplicate_database_is_already_exists() {
+        assert_eq!(code_for_sqlstate("42P04"), ErrorCode::ALREADY_EXISTS);
     }
 
     #[test]

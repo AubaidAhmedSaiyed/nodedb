@@ -51,9 +51,9 @@ pub(super) fn indexed_vector_fields(
         .catalog()
         .list_vector_index_params_in_database(database_id.as_u64())
         .map_err(|e| {
-            DdlError::new(
-                "XX000",
-                format!("read vector indexes of \"{collection}\" for INSERT: {e}"),
+            DdlError::from_error_in_context(
+                &format!("read vector indexes of \"{collection}\" for INSERT"),
+                &e,
             )
         })?;
     let mut named = HashSet::new();

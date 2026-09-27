@@ -87,7 +87,7 @@ pub async fn create_sorted_index(
         .credentials
         .catalog()
         .get_collection(database_id, tenant_id.as_u64(), &collection)
-        .map_err(|e| ddl_err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .is_none()
     {
         return Err(ddl_err(
@@ -170,8 +170,7 @@ pub async fn create_sorted_index(
             plan,
         });
         if !deferred {
-            return Err(ddl_err(
-                "XX000",
+            return Err(DdlError::internal(
                 "CREATE SORTED INDEX: the transaction buffer took no entry to defer the \
                  index build on",
             ));
@@ -266,8 +265,7 @@ pub async fn drop_sorted_index(
             index_name: index_name.clone(),
         })
     {
-        return Err(ddl_err(
-            "XX000",
+        return Err(DdlError::internal(
             "DROP SORTED INDEX: the transaction buffer took no entry to defer the index \
              drop on",
         ));

@@ -60,7 +60,7 @@ pub async fn query_last_values(
     // them.
     let entries: Vec<(u64, i64, f64)> =
         crate::data::executor::response_codec::decode_payload(&payload)
-            .map_err(|e| ddl_err("XX000", format!("LAST_VALUES reply: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("LAST_VALUES reply", &e))?;
 
     let mut rows = Vec::with_capacity(entries.len());
     for (series_id, ts, value) in &entries {
@@ -126,7 +126,7 @@ pub async fn query_last_value(
     // encoded as a null (decoding to `None`), which is a different fact from a
     // payload that could not be read at all.
     let entry: Option<(i64, f64)> = crate::data::executor::response_codec::decode_payload(&payload)
-        .map_err(|e| ddl_err("XX000", format!("LAST_VALUE reply: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("LAST_VALUE reply", &e))?;
 
     let mut rows = Vec::new();
     if let Some((ts, value)) = entry {
@@ -147,8 +147,4 @@ pub async fn query_last_value(
         vec![DdlColType::Int8, DdlColType::Text],
         rows,
     ))])
-}
-
-fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError::new(sqlstate, message)
 }

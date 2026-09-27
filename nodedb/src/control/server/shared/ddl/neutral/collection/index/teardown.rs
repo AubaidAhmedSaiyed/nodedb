@@ -31,7 +31,7 @@ use super::super::super::super::result::DdlError;
 use crate::control::server::shared::session::ddl_buffer;
 use crate::control::server::shared::session::ddl_effect::DeferredDdlEffect;
 
-use super::commit::{commit_collection_mutation, err};
+use super::commit::commit_collection_mutation;
 
 /// Remove every piece of engine and catalog state belonging to `record`,
 /// except the registry and ownership rows the caller removes afterwards.
@@ -92,7 +92,7 @@ async fn secondary(
     let catalog = state.credentials.catalog();
     let Some(mut coll) = catalog
         .get_collection(database_id, tenant_id.as_u64(), &record.collection)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
     else {
         // The registry outlived its collection — the collection teardown
         // path already reclaimed every engine surface, so there is nothing
@@ -199,13 +199,12 @@ async fn vector(
         Ok(appended) => appended,
         Err(e) => {
             // Any record appended before the error never reaches a core.
-            minted
-                .cancel(&state.wal, owner, 0)
-                .await
-                .map_err(|c| err("XX000", format!("cancel vector index drop record: {c}")))?;
-            return Err(err(
-                "XX000",
-                format!("persist vector index drop to WAL: {e}"),
+            minted.cancel(&state.wal, owner, 0).await.map_err(|c| {
+                DdlError::from_error_in_context("cancel vector index drop record", &c)
+            })?;
+            return Err(DdlError::from_error_in_context(
+                "persist vector index drop to WAL",
+                &e,
             ));
         }
     };
@@ -215,12 +214,15 @@ async fn vector(
     // restart while replay still rebuilds the index from those records.
     let Some(lsn) = appended.lsn else {
         minted.settle();
-        return Err(err("XX000", "vector index drop minted no WAL record"));
+        return Err(DdlError::internal("vector index drop minted no WAL record"));
     };
     if let Err(e) = state.wal.wait_durable(lsn).await {
         // The record can still be on disk, so restart replay can reach it.
         minted.hold();
-        return Err(err("XX000", format!("fsync vector index drop: {e}")));
+        return Err(DdlError::from_error_in_context(
+            "fsync vector index drop",
+            &e,
+        ));
     }
 
     dispatch(
@@ -255,7 +257,7 @@ async fn fulltext(
             tenant_id.as_u64(),
             &record.collection,
         )
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .into_iter()
         .filter(|r| r.kind == IndexKind::FullText && r.name != record.name)
         .count();
@@ -324,15 +326,19 @@ pub(crate) async fn dispatch(
             },
         )
         .await
-        .map_err(|e| err("XX000", format!("index teardown dispatch failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("index teardown dispatch failed", &e))?;
 
     if response.status == crate::bridge::envelope::Status::Error {
-        let detail = match response.error_code.as_deref() {
-            Some(crate::bridge::envelope::ErrorCode::Internal { detail, .. }) => detail.clone(),
-            Some(other) => format!("{other:?}"),
-            None => String::from_utf8_lossy(&response.payload).into_owned(),
-        };
-        return Err(err("XX000", format!("index teardown failed: {detail}")));
+        return Err(match response.error_code.as_deref() {
+            Some(code) => DdlError::from_error_in_context(
+                "index teardown failed",
+                &crate::Error::DataPlane(code.clone()),
+            ),
+            None => DdlError::internal(format!(
+                "index teardown failed: {}",
+                String::from_utf8_lossy(&response.payload)
+            )),
+        });
     }
     Ok(())
 }

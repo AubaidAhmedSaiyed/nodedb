@@ -13,7 +13,7 @@ use crate::control::state::SharedState;
 use crate::types::TraceId;
 
 use super::super::super::super::result::DdlError;
-use super::commit::{commit_collection_mutation, err};
+use super::commit::commit_collection_mutation;
 
 /// Backfill `build` on every node and flip it to `Ready`.
 ///
@@ -40,7 +40,7 @@ pub(crate) async fn build_secondary_index(
     let catalog = state.credentials.catalog();
     let Some(coll) = catalog
         .get_collection(database_id, tenant_id.as_u64(), collection)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .filter(|coll| coll.indexes.iter().any(|i| &i.name == index_name))
     else {
         return Ok(());
@@ -67,7 +67,7 @@ pub(crate) async fn build_secondary_index(
     // register of a transaction's buffered entry runs asynchronously.
     super::super::dispatch_register_from_stored(state, &coll)
         .await
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // The backfill runs on the local Data Plane (single node) or the leader
     // (cluster), vShard-local per core.
@@ -91,20 +91,20 @@ pub(crate) async fn build_secondary_index(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     if backfill_resp.status == crate::bridge::envelope::Status::Error {
-        let detail = match backfill_resp.error_code.as_deref() {
-            Some(crate::bridge::envelope::ErrorCode::Internal { detail, .. }) => detail.clone(),
-            Some(other) => format!("{other:?}"),
-            None => String::from_utf8_lossy(&backfill_resp.payload).into_owned(),
-        };
-        let code = if detail.to_lowercase().contains("unique") {
-            "23505"
-        } else {
-            "XX000"
-        };
-        return Err(err(code, detail));
+        // A coded refusal keeps its SQLSTATE: a duplicate key is `23505`.
+        return Err(match backfill_resp.error_code.as_deref() {
+            Some(code) => DdlError::from_error_in_context(
+                "index backfill",
+                &crate::Error::DataPlane(code.clone()),
+            ),
+            None => DdlError::internal(format!(
+                "index backfill: {}",
+                String::from_utf8_lossy(&backfill_resp.payload)
+            )),
+        });
     }
 
     // Every other node backfills the rows it hosts. Single-node and peerless
@@ -147,7 +147,7 @@ async fn mark_ready(state: &SharedState, build: &SecondaryIndexBuild) -> Result<
             build.tenant_id.as_u64(),
             &build.collection,
         )
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
     {
         for idx in ready_coll.indexes.iter_mut() {
             if idx.name == build.index_name {

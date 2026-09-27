@@ -60,7 +60,7 @@ pub async fn kv_incr(
             identity.tenant_id,
             key.as_bytes(),
         )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     let shape = counter_shape(state, identity, &collection, &key, KvCounterKind::Integer)?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
@@ -127,7 +127,7 @@ pub async fn kv_incr_float(
             identity.tenant_id,
             key.as_bytes(),
         )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     let shape = counter_shape(state, identity, &collection, &key, KvCounterKind::Float)?;
     let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
@@ -219,7 +219,7 @@ pub async fn kv_cas(
             identity.tenant_id,
             key.as_bytes(),
         )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     let plan = PhysicalPlan::Kv(KvOp::Cas {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         key: key.as_bytes().to_vec(),
@@ -272,7 +272,7 @@ pub async fn kv_getset(
             identity.tenant_id,
             key.as_bytes(),
         )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     let plan = PhysicalPlan::Kv(KvOp::GetSet {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         key: key.as_bytes().to_vec(),

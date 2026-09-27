@@ -75,7 +75,7 @@ pub async fn drop_continuous_aggregate(
         .credentials
         .catalog()
         .get_continuous_aggregate(database_id.as_u64(), tenant_id.as_u64(), &name)
-        .map_err(|e| err("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .ok_or_else(|| {
             err(
                 "42704",

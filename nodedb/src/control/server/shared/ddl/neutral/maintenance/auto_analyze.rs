@@ -23,7 +23,6 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
 use super::super::super::result::DdlError;
-use super::support::ddl_err;
 
 /// Duration estimate handed to the maintenance budget pre-screen.
 ///
@@ -273,10 +272,7 @@ fn blocking_analyze(
     collection: &str,
 ) -> Result<(), DdlError> {
     let handle = tokio::runtime::Handle::try_current().map_err(|error| {
-        ddl_err(
-            "XX000",
-            format!("auto-ANALYZE needs a Tokio runtime: {error}"),
-        )
+        DdlError::internal(format!("auto-ANALYZE needs a Tokio runtime: {error}"))
     })?;
     // `handle_analyze` reads the collection name off the second whitespace
     // token and lowercases it, so the bare name is what it expects.

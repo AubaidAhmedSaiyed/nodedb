@@ -20,6 +20,8 @@
 //!   node alike, and a replayed log never produces a user holding an
 //!   undefined role.
 
+use std::fmt;
+
 use crate::control::security::catalog::{StoredRole, StoredUser};
 
 use super::identity::Role;
@@ -54,18 +56,38 @@ impl RoleRefusal {
     }
 }
 
+/// What still depends on a custom role, so a DROP ROLE of it is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleDependents {
+    /// Users that hold the role.
+    Users(Vec<String>),
+    /// Roles that inherit from the role.
+    ChildRoles(Vec<String>),
+}
+
+impl fmt::Display for RoleDependents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Users(users) => write!(f, "users still hold it: {}", users.join(", ")),
+            Self::ChildRoles(children) => {
+                write!(f, "other roles inherit from it: {}", children.join(", "))
+            }
+        }
+    }
+}
+
 impl From<RoleRefusal> for crate::Error {
     fn from(refusal: RoleRefusal) -> Self {
         match refusal {
             RoleRefusal::Undefined { name } => crate::Error::UndefinedObject { kind: "role", name },
-            // A refused DROP of a role still in use: a client error. No
-            // `crate::Error` variant carries `2BP01` without a tenant and a
-            // CASCADE hint that does not apply to roles.
-            other @ (RoleRefusal::HeldByUsers { .. } | RoleRefusal::InheritedBy { .. }) => {
-                crate::Error::BadRequest {
-                    detail: other.to_string(),
-                }
-            }
+            RoleRefusal::HeldByUsers { name, users } => crate::Error::RoleInUse {
+                role: name,
+                dependents: RoleDependents::Users(users),
+            },
+            RoleRefusal::InheritedBy { name, children } => crate::Error::RoleInUse {
+                role: name,
+                dependents: RoleDependents::ChildRoles(children),
+            },
         }
     }
 }
@@ -243,6 +265,39 @@ mod tests {
             check_droppable("analyst", [("amy", none.as_slice())], [("junior", "")]),
             Ok(())
         );
+    }
+
+    /// A role still in use keeps the `2BP01` class as a `crate::Error`, and
+    /// its message names the role and its dependents with no tenant and no
+    /// CASCADE hint.
+    #[test]
+    fn a_role_in_use_is_a_dependent_objects_error() {
+        use crate::control::server::pgwire::types::error_to_sqlstate;
+
+        for refusal in [
+            RoleRefusal::HeldByUsers {
+                name: "analyst".into(),
+                users: vec!["bob".into()],
+            },
+            RoleRefusal::InheritedBy {
+                name: "analyst".into(),
+                children: vec!["junior".into()],
+            },
+        ] {
+            let message = refusal.to_string();
+            let err = crate::Error::from(refusal);
+            let (_, state, rendered) = error_to_sqlstate(&err);
+            assert_eq!(state, "2BP01");
+            assert_eq!(rendered, message);
+            assert!(!rendered.contains("tenant"), "{rendered}");
+            assert!(!rendered.contains("CASCADE"), "{rendered}");
+            let public = crate::error_classify::classify(&err);
+            assert_eq!(
+                public.code(),
+                nodedb_types::error::ErrorCode::DEPENDENT_OBJECTS_EXIST
+            );
+            assert_eq!(public.message(), message);
+        }
     }
 
     #[test]
