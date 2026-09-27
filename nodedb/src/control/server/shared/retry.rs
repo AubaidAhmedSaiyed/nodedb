@@ -144,6 +144,7 @@ impl RetryableSchemaChange for Error {
             | Error::VersionCompat { .. }
             | Error::Internal { .. }
             | Error::Shaping(_)
+            | Error::Ddl(_)
             | Error::RemoteTyped { .. }
             | Error::DescriptorVersionAnomaly { .. }
             | Error::CollectionPurgeRowMissing { .. }

@@ -175,7 +175,10 @@ pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::E
         | ErrorCode::DataException { .. }
         | ErrorCode::DispatchCapacity { .. }
         | ErrorCode::ExpiredBeforeExecution
-        | ErrorCode::BadRequest { .. }) => crate::Error::DataPlane(other),
+        | ErrorCode::BadRequest { .. }
+        | ErrorCode::TransactionRollback { .. }
+        | ErrorCode::ActiveSqlTransaction { .. }
+        | ErrorCode::DependentObjectsExist { .. }) => crate::Error::DataPlane(other),
     }
 }
 

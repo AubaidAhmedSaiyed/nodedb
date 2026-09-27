@@ -65,7 +65,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             ("ERROR", sqlstate::BACKUP_TENANT_MISMATCH, err.to_string())
         }
         crate::Error::BackupKeyMismatch => {
-            ("ERROR", sqlstate::BACKUP_KEY_MISMATCH, err.to_string())
+            ("ERROR", sqlstate::BACKUP_KEY_MISMATCH.0, err.to_string())
         }
         crate::Error::PlanError { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
         crate::Error::CollectionNotFound { collection, .. } => (
@@ -184,7 +184,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         }
         crate::Error::TypeMismatch { .. } => ("ERROR", sqlstate::CANNOT_COERCE, err.to_string()),
         crate::Error::DeadlineExceeded { .. } => {
-            ("ERROR", sqlstate::QUERY_CANCELED, err.to_string())
+            ("ERROR", sqlstate::QUERY_CANCELED.0, err.to_string())
         }
         // Nothing ran, and a retry plans against caught-up state.
         crate::Error::AuthorizationStateBehind { .. } => {
@@ -225,7 +225,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         }
         // The session's bearer token expired. The client re-authenticates.
         crate::Error::SessionTokenExpired => {
-            ("ERROR", sqlstate::INVALID_AUTHORIZATION, err.to_string())
+            ("ERROR", sqlstate::AUTH_TOKEN_EXPIRED.0, err.to_string())
         }
         crate::Error::CloneWriteRequiresMaterialize { .. } => (
             "ERROR",
@@ -304,6 +304,12 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             numeric_code_to_sqlstate(e.code()),
             e.message().to_string(),
         ),
+        // A DDL error keeps the exact SQLSTATE its statement reports.
+        crate::Error::Ddl(ddl) => (
+            "ERROR",
+            crate::control::server::shared::ddl::static_sqlstate::static_sqlstate(&ddl.sqlstate),
+            ddl.message.clone(),
+        ),
         // The DDL path renders a regressed consumer offset as an invalid
         // parameter value, so the typed error takes that class too.
         crate::Error::OffsetRegression { .. } => {
@@ -318,7 +324,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
         crate::Error::CrdtAdmissionTimeout { .. } => {
-            ("ERROR", sqlstate::QUERY_CANCELED, err.to_string())
+            ("ERROR", sqlstate::QUERY_CANCELED.0, err.to_string())
         }
         // Statements refused inside an explicit transaction block share
         // the class of `NotInTransactionBlock`.

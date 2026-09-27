@@ -183,6 +183,10 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::AuthExpired)
             }
+            TAG_AUTHENTICATION_FAILED => {
+                skip_fields(reader, field_count)?;
+                Ok(ErrorDetails::AuthenticationFailed)
+            }
             TAG_SYNC_CONNECTION_FAILED => {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::SyncConnectionFailed)
@@ -440,6 +444,7 @@ mod tests {
             ErrorDetails::SqlNotEnabled,
             ErrorDetails::DivisionByZero,
             ErrorDetails::AuthExpired,
+            ErrorDetails::AuthenticationFailed,
             ErrorDetails::SyncConnectionFailed,
             ErrorDetails::Config,
             ErrorDetails::BadRequest,

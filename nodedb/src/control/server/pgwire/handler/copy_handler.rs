@@ -262,7 +262,7 @@ impl CopyHandler for NodeDbCopyHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         cancel_restore(&self.restore_state, self.connection_id);
-        sqlstate(ss::QUERY_CANCELED, "COPY restore aborted")
+        sqlstate(ss::QUERY_CANCELED.0, "COPY restore aborted")
     }
 
     async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>

@@ -6,5 +6,5 @@
 mod public;
 mod unclassified;
 
-pub(crate) use public::classify;
+pub(crate) use public::{classify, dependent_objects_text};
 pub(crate) use unclassified::is_unclassified_failure;

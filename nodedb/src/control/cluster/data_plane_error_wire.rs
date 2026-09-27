@@ -133,6 +133,7 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::RemoteTyped { .. }
+        | crate::Error::Ddl(_)
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
@@ -292,6 +293,11 @@ impl From<ErrorCode> for DataPlaneErrorCode {
             ErrorCode::DispatchCapacity { reason } => Self::DispatchCapacity { reason },
             ErrorCode::ExpiredBeforeExecution => Self::ExpiredBeforeExecution,
             ErrorCode::BadRequest { detail } => Self::BadRequest { detail },
+            ErrorCode::TransactionRollback { detail } => Self::TransactionRollback { detail },
+            ErrorCode::ActiveSqlTransaction { detail } => Self::ActiveSqlTransaction { detail },
+            ErrorCode::DependentObjectsExist { object, detail } => {
+                Self::DependentObjectsExist { object, detail }
+            }
         }
     }
 }
@@ -422,6 +428,15 @@ impl From<DataPlaneErrorCode> for ErrorCode {
             DataPlaneErrorCode::DispatchCapacity { reason } => Self::DispatchCapacity { reason },
             DataPlaneErrorCode::ExpiredBeforeExecution => Self::ExpiredBeforeExecution,
             DataPlaneErrorCode::BadRequest { detail } => Self::BadRequest { detail },
+            DataPlaneErrorCode::TransactionRollback { detail } => {
+                Self::TransactionRollback { detail }
+            }
+            DataPlaneErrorCode::ActiveSqlTransaction { detail } => {
+                Self::ActiveSqlTransaction { detail }
+            }
+            DataPlaneErrorCode::DependentObjectsExist { object, detail } => {
+                Self::DependentObjectsExist { object, detail }
+            }
         }
     }
 }

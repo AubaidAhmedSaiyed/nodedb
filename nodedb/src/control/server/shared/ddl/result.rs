@@ -208,30 +208,65 @@ impl DdlError {
     }
 }
 
-/// The `ErrorCode` a SQLSTATE classifies to when it has exactly one
-/// classification. The single source of truth [`DdlError::new`] and every
-/// `ddl_err`/`err`-style local helper derive from — do not scatter a second
-/// copy of this table.
+/// The `ErrorCode` a SQLSTATE classifies to. The single source of truth
+/// [`DdlError::new`] and every `ddl_err`/`err`-style local helper derive
+/// from — do not scatter a second copy of this table.
 ///
-/// SQLSTATEs whose `ErrorCode` depends on which call site emitted them
-/// (`0A000`, `55006`, `57014`, `XX000`, `02000`) are deliberately absent:
-/// their named constants have type [`sqlstate::AmbiguousSqlstate`], which
-/// cannot reach this function (it takes `&str`), so a caller that needs one
-/// of those meanings is forced to the matching `DdlError::<name>`
-/// constructor instead of silently landing on this table's default for the
-/// bare string.
+/// Each code a SQLSTATE maps to renders that SQLSTATE's class through the
+/// numeric-code table, so a DDL error keeps its class after a node hop.
+///
+/// SQLSTATEs that more than one code shares (`0A000`, `55006`, `28000`,
+/// `XX000`, `02000`) map to their default meaning here. The special
+/// meanings have named constants of type [`sqlstate::AmbiguousSqlstate`],
+/// which cannot reach this function (it takes `&str`), so a caller that
+/// needs one of them is forced to the matching `DdlError::<name>`
+/// constructor, or to a typed error that carries its code.
+///
+/// `57014` has no default meaning: it is sent for a deadline and for a
+/// cancellation that is not one. It maps to `INTERNAL`, never to the
+/// retriable deadline code.
 pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
     match sqlstate_str {
         sqlstate::UNDEFINED_TABLE => ErrorCode::COLLECTION_NOT_FOUND,
         sqlstate::INVALID_CATALOG_NAME => ErrorCode::DATABASE_NOT_FOUND,
         sqlstate::INSUFFICIENT_PRIVILEGE => ErrorCode::AUTHORIZATION_DENIED,
+        // Default credential-failure meaning of `28000`, and `28P01`: one
+        // non-retriable code, so a wrong password and an unknown user read
+        // the same. `AUTH_TOKEN_EXPIRED` and `BACKUP_KEY_MISMATCH` are
+        // ambiguous-typed.
+        sqlstate::INVALID_AUTHORIZATION | sqlstate::INVALID_PASSWORD => {
+            ErrorCode::AUTHENTICATION_FAILED
+        }
         sqlstate::UNDEFINED_FUNCTION => ErrorCode::UNDEFINED_FUNCTION,
         sqlstate::UNDEFINED_COLUMN => ErrorCode::UNDEFINED_COLUMN,
         sqlstate::AMBIGUOUS_COLUMN => ErrorCode::AMBIGUOUS_COLUMN,
         sqlstate::DATA_EXCEPTION => ErrorCode::DATA_EXCEPTION,
+        // A bad parameter value, text representation or datetime format is a
+        // data exception: class `22`, the class the code renders back.
+        "22023" | "22P02" | "22007" => ErrorCode::DATA_EXCEPTION,
+        sqlstate::NUMERIC_VALUE_OUT_OF_RANGE => ErrorCode::OVERFLOW,
         sqlstate::DIVISION_BY_ZERO => ErrorCode::DIVISION_BY_ZERO,
         sqlstate::INVALID_LIMIT_VALUE => ErrorCode::INVALID_LIMIT_VALUE,
         sqlstate::PROGRAM_LIMIT_EXCEEDED => ErrorCode::PROGRAM_LIMIT_EXCEEDED,
+        sqlstate::STATEMENT_TOO_COMPLEX => ErrorCode::FAN_OUT_EXCEEDED,
+        sqlstate::CLONE_DEPTH_EXCEEDED => ErrorCode::CLONE_DEPTH_EXCEEDED,
+        // Every integrity-constraint SQLSTATE is a constraint violation:
+        // class `23`, the class the code renders back.
+        sqlstate::INTEGRITY_CONSTRAINT_VIOLATION
+        | sqlstate::NOT_NULL_VIOLATION
+        | sqlstate::FOREIGN_KEY_VIOLATION
+        | sqlstate::UNIQUE_VIOLATION
+        | sqlstate::CHECK_VIOLATION => ErrorCode::CONSTRAINT_VIOLATION,
+        sqlstate::APPEND_ONLY_VIOLATION => ErrorCode::APPEND_ONLY_VIOLATION,
+        sqlstate::BALANCE_VIOLATION => ErrorCode::BALANCE_VIOLATION,
+        sqlstate::PERIOD_LOCKED => ErrorCode::PERIOD_LOCKED,
+        sqlstate::STATE_TRANSITION_VIOLATION => ErrorCode::STATE_TRANSITION_VIOLATION,
+        sqlstate::TRANSITION_CHECK_VIOLATION => ErrorCode::TRANSITION_CHECK_VIOLATION,
+        sqlstate::RETENTION_VIOLATION => ErrorCode::RETENTION_VIOLATION,
+        sqlstate::LEGAL_HOLD_ACTIVE => ErrorCode::LEGAL_HOLD_ACTIVE,
+        sqlstate::TYPE_GUARD_VIOLATION => ErrorCode::TYPE_GUARD_VIOLATION,
+        sqlstate::PERIOD_LOCK_MISCONFIGURED => ErrorCode::PERIOD_LOCK_MISCONFIGURED,
+        sqlstate::CANNOT_COERCE => ErrorCode::TYPE_MISMATCH,
         // A malformed request and a plan that cannot be built both render as
         // `42601`; both are non-retriable client errors, so one code covers
         // both without losing anything a client acts on.
@@ -239,17 +274,27 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         sqlstate::SERIALIZATION_FAILURE => ErrorCode::WRITE_CONFLICT,
         sqlstate::TRANSACTION_ROLLBACK => ErrorCode::TRANSACTION_ROLLBACK,
         sqlstate::ACTIVE_SQL_TRANSACTION => ErrorCode::ACTIVE_SQL_TRANSACTION,
+        sqlstate::READ_ONLY_SQL_TRANSACTION => ErrorCode::MIRROR_READ_ONLY,
         sqlstate::DEPENDENT_OBJECTS_STILL_EXIST => ErrorCode::DEPENDENT_OBJECTS_EXIST,
         sqlstate::TOO_MANY_CONNECTIONS => ErrorCode::RATE_EXCEEDED,
+        sqlstate::OUT_OF_MEMORY => ErrorCode::MEMORY_EXHAUSTED,
+        sqlstate::SERVER_OVERLOAD => ErrorCode::SERVER_OVERLOAD,
+        sqlstate::DATABASE_DROPPED => ErrorCode::NOT_LEADER,
+        sqlstate::LOCK_NOT_AVAILABLE => ErrorCode::NO_LEADER,
+        sqlstate::MOVE_TENANT_PREFLIGHT_FAILED => ErrorCode::MOVE_TENANT_PREFLIGHT_FAILED,
+        // A target the server could not reach: retriable, class `08`.
+        sqlstate::CONNECTION_FAILURE => ErrorCode::NODE_UNREACHABLE,
+        sqlstate::PROTOCOL_VIOLATION => ErrorCode::HANDSHAKE_FAILED,
+        sqlstate::SERVER_REJECTED_ESTABLISHMENT => ErrorCode::SHAPE_SUBSCRIPTION_FAILED,
         sqlstate::INTERNAL_ERROR => ErrorCode::INTERNAL,
         // `0A000` here means the default, unambiguous "feature not
         // supported" case — the ambiguous named meanings sharing this
         // string (`CANNOT_DROP_DEFAULT_DATABASE`, `CANNOT_CLONE_MIRROR`)
         // cannot reach this function; see the doc comment above.
         sqlstate::FEATURE_NOT_SUPPORTED => ErrorCode::SQL_NOT_ENABLED,
-        "42704" => ErrorCode::UNDEFINED_OBJECT,
+        sqlstate::UNDEFINED_OBJECT => ErrorCode::UNDEFINED_OBJECT,
         // A duplicate object of any kind, a database (`42P04`) included.
-        "42710" | "42P07" | "42723" | "42P04" => ErrorCode::ALREADY_EXISTS,
+        sqlstate::DUPLICATE_OBJECT | "42P07" | "42723" | "42P04" => ErrorCode::ALREADY_EXISTS,
         // Invalid or incompatible object definition: client-actionable and
         // non-retriable.
         "42P17" | "42809" | "42P16" => ErrorCode::BAD_REQUEST,
@@ -258,21 +303,16 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         // Default "object not in prerequisite state" meaning of `55006`;
         // `CLONE_DEPENDENCY` and `CLONE_WRITE_REQUIRES_MATERIALIZE` are
         // ambiguous-typed and cannot reach this function.
-        "55000" | "55006" => ErrorCode::OBJECT_NOT_READY,
+        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE | "55006" => ErrorCode::OBJECT_NOT_READY,
         // Default "no data found" meaning of `02000`;
         // `MOVE_TENANT_ALREADY_AT_TARGET` is ambiguous-typed.
-        "02000" => ErrorCode::NOT_FOUND,
+        sqlstate::NO_DATA => ErrorCode::NOT_FOUND,
         sqlstate::CONFIGURATION_LIMIT_EXCEEDED => ErrorCode::QUOTA_OVERCOMMIT,
         sqlstate::IO_ERROR => ErrorCode::STORAGE,
-        sqlstate::CONNECTION_FAILURE => ErrorCode::DISPATCH,
         "58000" => ErrorCode::INTERNAL,
-        // `22023`/`22P02`/`22007`/`22003`/`42602`/`42000`/`23505` are all
-        // client-supplied-value or client-syntax problems; none of them
-        // carries a distinct retry/classification contract, so one code
-        // covers the group.
-        "22023" | "22P02" | "22007" | "22003" | "42602" | "42000" | "23505" => {
-            ErrorCode::BAD_REQUEST
-        }
+        // Client-syntax problems with no distinct retry or classification
+        // contract: one code covers the group.
+        "42602" | "42000" => ErrorCode::BAD_REQUEST,
         _ => ErrorCode::INTERNAL,
     }
 }
@@ -370,7 +410,7 @@ mod tests {
             request_id: crate::types::RequestId::new(1),
         };
         let e = DdlError::from_error(&deadline);
-        assert_eq!(e.sqlstate, sqlstate::QUERY_CANCELED);
+        assert_eq!(e.sqlstate, sqlstate::QUERY_CANCELED.0);
         assert_eq!(e.code, ErrorCode::DEADLINE_EXCEEDED);
     }
 

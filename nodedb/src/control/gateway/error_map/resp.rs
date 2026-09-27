@@ -120,6 +120,7 @@ impl GatewayErrorMap {
             | Error::VersionCompat { .. }
             | Error::Internal { .. }
             | Error::Shaping(_)
+            | Error::Ddl(_)
             | Error::DescriptorVersionAnomaly { .. }
             | Error::CollectionPurgeRowMissing { .. }
             | Error::CatalogIntegrityViolation { .. }

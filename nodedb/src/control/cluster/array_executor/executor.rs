@@ -177,7 +177,7 @@ mod tests {
         );
         let rebuilt = crate::control::cluster::array_cluster_helpers::cluster_err(error);
         let (_, state, _) = crate::control::server::pgwire::types::error_to_sqlstate(&rebuilt);
-        assert_eq!(state, nodedb_types::error::sqlstate::QUERY_CANCELED);
+        assert_eq!(state, nodedb_types::error::sqlstate::QUERY_CANCELED.0);
     }
 
     #[test]

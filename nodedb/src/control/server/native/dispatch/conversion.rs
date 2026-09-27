@@ -56,7 +56,7 @@ pub(crate) fn native_error_fields(e: &crate::Error) -> NativeErrorFields {
         // token expired mid-connection and it must re-authenticate with a
         // fresh Auth frame. The message names the native Auth frame.
         crate::Error::SessionTokenExpired => (
-            nodedb_types::error::sqlstate::INVALID_AUTHORIZATION,
+            nodedb_types::error::sqlstate::AUTH_TOKEN_EXPIRED.0,
             "OIDC bearer token expired; re-authenticate with a fresh Auth request".into(),
         ),
         // A cross-shard Calvin OCC abort is a serialization failure (40001) —

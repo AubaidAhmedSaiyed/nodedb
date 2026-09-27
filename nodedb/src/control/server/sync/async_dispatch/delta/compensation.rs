@@ -120,6 +120,7 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::RemoteTyped { .. }
+        | crate::Error::Ddl(_)
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
@@ -172,7 +173,8 @@ fn compensation_hint_for_code(code: &ErrorCode) -> CompensationHint {
         | ErrorCode::OllpRetryRequired
         | ErrorCode::CrdtFrontierMismatch { .. }
         | ErrorCode::CollectionDraining { .. }
-        | ErrorCode::RetryableRefusal { .. } => CompensationHint::Retry { retry_after_ms: 0 },
+        | ErrorCode::RetryableRefusal { .. }
+        | ErrorCode::TransactionRollback { .. } => CompensationHint::Retry { retry_after_ms: 0 },
         other @ (ErrorCode::SyncRejected { .. }
         | ErrorCode::SyncNotApplied { .. }
         | ErrorCode::NotFound
@@ -200,7 +202,9 @@ fn compensation_hint_for_code(code: &ErrorCode) -> CompensationHint {
         | ErrorCode::DivisionByZero
         | ErrorCode::UndefinedFunction { .. }
         | ErrorCode::DataException { .. }
-        | ErrorCode::BadRequest { .. }) => CompensationHint::Custom {
+        | ErrorCode::BadRequest { .. }
+        | ErrorCode::ActiveSqlTransaction { .. }
+        | ErrorCode::DependentObjectsExist { .. }) => CompensationHint::Custom {
             constraint: "apply_failed".into(),
             detail: format!("{other:?}"),
         },

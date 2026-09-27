@@ -152,6 +152,10 @@ pub enum ErrorDetails {
     AuthorizationDenied { resource: String },
     #[serde(rename = "auth_expired")]
     AuthExpired,
+    /// Credentials were rejected. Carries nothing that tells a wrong
+    /// password from an unknown user.
+    #[serde(rename = "authentication_failed")]
+    AuthenticationFailed,
     /// Tenant quota: vector dimension exceeds `max_vector_dim`.
     #[serde(rename = "tenant_vector_dim_exceeded")]
     TenantVectorDimExceeded { dim: u32, limit: u32 },

@@ -214,6 +214,20 @@ mod tests {
         assert_eq!(ndb_code, PublicCode::DEPENDENT_OBJECTS_EXIST.0);
     }
 
+    /// A DDL step that failed at COMMIT answers the frame its own DDL
+    /// error carries: the exact SQLSTATE, code and message.
+    #[test]
+    fn a_ddl_error_abort_keeps_its_sqlstate_and_code() {
+        let ddl = crate::control::server::shared::ddl::DdlError::new(
+            "42710",
+            "index 'by_email' already exists",
+        );
+        let (code, message, ndb_code) = frame(&AbortReason::DdlPropose(crate::Error::from(ddl)));
+        assert_eq!(code, "42710");
+        assert_eq!(ndb_code, PublicCode::ALREADY_EXISTS.0);
+        assert_eq!(message, "index 'by_email' already exists");
+    }
+
     /// A commit dispatch error keeps its class instead of reading as a
     /// serialization failure.
     #[test]

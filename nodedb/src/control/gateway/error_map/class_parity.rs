@@ -22,7 +22,7 @@ use crate::control::server::pgwire::types::error_to_sqlstate;
 use super::gateway_map::GatewayErrorMap;
 
 /// The number of `ErrorCode` variants [`variant_index`] numbers.
-const VARIANT_COUNT: usize = 41;
+const VARIANT_COUNT: usize = 44;
 
 /// A dense index per variant. Exhaustive, so a new variant fails to compile
 /// here until it gets an index, and [`every_variant_has_a_sample`] then fails
@@ -70,6 +70,9 @@ fn variant_index(code: &ErrorCode) -> usize {
         ErrorCode::DispatchCapacity { .. } => 38,
         ErrorCode::ExpiredBeforeExecution => 39,
         ErrorCode::BadRequest { .. } => 40,
+        ErrorCode::TransactionRollback { .. } => 41,
+        ErrorCode::ActiveSqlTransaction { .. } => 42,
+        ErrorCode::DependentObjectsExist { .. } => 43,
     }
 }
 
@@ -186,6 +189,12 @@ fn samples() -> Vec<ErrorCode> {
         ErrorCode::DispatchCapacity { reason: text() },
         ErrorCode::ExpiredBeforeExecution,
         ErrorCode::BadRequest { detail: text() },
+        ErrorCode::TransactionRollback { detail: text() },
+        ErrorCode::ActiveSqlTransaction { detail: text() },
+        ErrorCode::DependentObjectsExist {
+            object: "role \"analyst\"".into(),
+            detail: text(),
+        },
     ];
     for constraint in [
         "not_null",
@@ -360,24 +369,24 @@ fn schema_change_is_a_retryable_serialization_failure() {
 #[test]
 fn expired_session_token_is_invalid_authorization_everywhere() {
     let err = crate::Error::SessionTokenExpired;
-    assert_eq!(error_to_sqlstate(&err).1, sqlstate::INVALID_AUTHORIZATION);
+    assert_eq!(error_to_sqlstate(&err).1, sqlstate::AUTH_TOKEN_EXPIRED.0);
     let native = native_error_fields(&err);
-    assert_eq!(native.sqlstate, sqlstate::INVALID_AUTHORIZATION);
+    assert_eq!(native.sqlstate, sqlstate::AUTH_TOKEN_EXPIRED.0);
     assert_eq!(native.code, nodedb_types::error::ErrorCode::AUTH_EXPIRED);
     assert_eq!(
         numeric_code_to_sqlstate(native.code),
-        sqlstate::INVALID_AUTHORIZATION
+        sqlstate::AUTH_TOKEN_EXPIRED.0
     );
     let status = GatewayErrorMap::to_http(&err).0;
     assert_eq!(status, 401);
     assert_eq!(
-        GatewayErrorMap::sqlstate_to_http(sqlstate::INVALID_AUTHORIZATION),
+        GatewayErrorMap::sqlstate_to_http(sqlstate::AUTH_TOKEN_EXPIRED.0),
         status
     );
 }
 
 /// The number of `crate::Error` variants [`error_variant_index`] numbers.
-const ERROR_VARIANT_COUNT: usize = 109;
+const ERROR_VARIANT_COUNT: usize = 110;
 
 /// A dense index per `crate::Error` variant. Exhaustive, so a new variant
 /// fails to compile here until it gets an index, and
@@ -495,6 +504,7 @@ pub(crate) fn error_variant_index(err: &crate::Error) -> usize {
         E::MirrorReadOnly { .. } => 106,
         E::StaleReadNotLeader { .. } => 107,
         E::RoleInUse { .. } => 108,
+        E::Ddl(_) => 109,
     }
 }
 
@@ -836,6 +846,12 @@ pub(crate) fn error_samples() -> Vec<crate::Error> {
                 "bob".into(),
             ]),
         },
+        E::Ddl(Box::new(
+            crate::control::server::shared::ddl::DdlError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                text(),
+            ),
+        )),
     ]
 }
 
@@ -910,7 +926,7 @@ fn classified_sqlstates() -> Vec<(usize, &'static str)> {
         (30, sqlstate::SYNTAX_ERROR),
         (31, sqlstate::SYNTAX_ERROR),
         (32, sqlstate::ACTIVE_SQL_TRANSACTION),
-        (34, sqlstate::QUERY_CANCELED),
+        (34, sqlstate::QUERY_CANCELED.0),
         (44, sqlstate::QUOTA_OVERCOMMIT),
         (62, sqlstate::SYNTAX_ERROR),
         (63, sqlstate::SYNTAX_ERROR),
@@ -933,6 +949,7 @@ fn classified_sqlstates() -> Vec<(usize, &'static str)> {
         (106, sqlstate::READ_ONLY_SQL_TRANSACTION),
         (107, sqlstate::STALE_READ_NOT_LEADER),
         (108, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
+        (109, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
     ]
 }
 
@@ -1063,5 +1080,94 @@ fn transaction_and_dependency_variants_keep_their_sqlstate_across_a_hop() {
                 "{name}: {err:?} after the hop as {rebuilt:?}"
             );
         }
+
+        // Across the SPSC bridge: the Data-Plane code the variant becomes.
+        let bridged = ErrorCode::from(make());
+        let on_bridge = crate::Error::DataPlane(bridged.clone());
+        assert_eq!(
+            error_to_sqlstate(&on_bridge).1,
+            state,
+            "{err:?} across the bridge as {bridged:?}"
+        );
+        assert_eq!(
+            native_error_fields(&on_bridge).code,
+            code,
+            "{err:?} native code across the bridge"
+        );
+
+        // Across the cluster Data-Plane wire: the code survives verbatim.
+        let wire = nodedb_cluster::rpc_codec::DataPlaneErrorCode::from(bridged.clone());
+        let back = ErrorCode::from(wire);
+        assert_eq!(back, bridged, "{err:?} across the cluster wire");
+        assert_eq!(
+            error_to_sqlstate(&crate::Error::DataPlane(back)).1,
+            state,
+            "{err:?} after the cluster wire"
+        );
+    }
+}
+
+/// Each transaction-state and dependency Data-Plane code crosses the cluster
+/// wire verbatim, and renders one SQLSTATE on both sides.
+#[test]
+fn transaction_and_dependency_codes_roundtrip_the_cluster_wire() {
+    use nodedb_cluster::rpc_codec::DataPlaneErrorCode;
+
+    let cases = [
+        (
+            ErrorCode::TransactionRollback {
+                detail: "participant aborted".into(),
+            },
+            sqlstate::TRANSACTION_ROLLBACK,
+        ),
+        (
+            ErrorCode::ActiveSqlTransaction {
+                detail: "VACUUM cannot run inside a transaction block".into(),
+            },
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+        ),
+        (
+            ErrorCode::DependentObjectsExist {
+                object: "collection 'c'".into(),
+                detail: "cannot drop collection 'c': 1 dependent(s) exist (view:v)".into(),
+            },
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+        ),
+    ];
+    for (code, state) in cases {
+        let local = crate::Error::DataPlane(code.clone());
+        assert_eq!(error_to_sqlstate(&local).1, state, "{code:?} locally");
+        let back = ErrorCode::from(DataPlaneErrorCode::from(code.clone()));
+        assert_eq!(back, code, "{code:?} across the cluster wire");
+        let remote = crate::Error::DataPlane(back);
+        assert_eq!(error_to_sqlstate(&remote).1, state, "{code:?} remotely");
+        assert_eq!(
+            native_error_fields(&remote).code,
+            native_error_fields(&local).code,
+            "{code:?} native code"
+        );
+    }
+}
+
+/// A DDL error keeps its exact SQLSTATE and code, including a SQLSTATE no
+/// named constant covers.
+#[test]
+fn a_ddl_error_keeps_its_exact_sqlstate_and_code() {
+    use crate::control::server::shared::ddl::DdlError;
+
+    for state in ["42710", "42P07", sqlstate::INSUFFICIENT_PRIVILEGE, "57014"] {
+        let ddl = if state == "57014" {
+            DdlError::from_error(&crate::Error::DeadlineExceeded {
+                request_id: crate::types::RequestId::new(1),
+            })
+        } else {
+            DdlError::new(state, "refused")
+        };
+        let expected_code = ddl.code;
+        let err = crate::Error::from(ddl);
+        assert_eq!(error_to_sqlstate(&err).1, state, "{err:?}");
+        let native = native_error_fields(&err);
+        assert_eq!(native.sqlstate, state, "{err:?} native SQLSTATE");
+        assert_eq!(native.code, expected_code, "{err:?} native code");
     }
 }

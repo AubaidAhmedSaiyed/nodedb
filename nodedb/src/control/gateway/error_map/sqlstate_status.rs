@@ -16,6 +16,7 @@ use nodedb_types::error::sqlstate;
 /// - 429 for a rate limit
 /// - 501 for an unsupported feature
 pub(super) fn sqlstate_to_http_status(state: &str) -> u16 {
+    const QUERY_CANCELED: &str = sqlstate::QUERY_CANCELED.0;
     match state {
         sqlstate::INSUFFICIENT_PRIVILEGE => 403,
         sqlstate::UNDEFINED_TABLE => 404,
@@ -26,7 +27,7 @@ pub(super) fn sqlstate_to_http_status(state: &str) -> u16 {
         sqlstate::CONFIGURATION_LIMIT_EXCEEDED => 400,
         // No leader or no quorum answered. A retry succeeds later.
         sqlstate::LOCK_NOT_AVAILABLE => 503,
-        sqlstate::QUERY_CANCELED => 504,
+        QUERY_CANCELED => 504,
         _ => class_status(state),
     }
 }
@@ -109,6 +110,6 @@ mod tests {
     fn unavailability_is_503_and_a_deadline_is_504() {
         assert_eq!(sqlstate_to_http_status(sqlstate::SERVER_OVERLOAD), 503);
         assert_eq!(sqlstate_to_http_status(sqlstate::LOCK_NOT_AVAILABLE), 503);
-        assert_eq!(sqlstate_to_http_status(sqlstate::QUERY_CANCELED), 504);
+        assert_eq!(sqlstate_to_http_status(sqlstate::QUERY_CANCELED.0), 504);
     }
 }

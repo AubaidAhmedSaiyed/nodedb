@@ -160,6 +160,22 @@ pub enum DataPlaneErrorCode {
     BadRequest {
         detail: String,
     },
+    /// The whole transaction aborted before any read-set was validated
+    /// (SQLSTATE `40000`).
+    TransactionRollback {
+        detail: String,
+    },
+    /// The statement cannot run in the current transaction state (SQLSTATE
+    /// `25001`).
+    ActiveSqlTransaction {
+        detail: String,
+    },
+    /// A DROP refused because other objects depend on `object` (SQLSTATE
+    /// `2BP01`).
+    DependentObjectsExist {
+        object: String,
+        detail: String,
+    },
 }
 
 /// Wire mirror of `nodedb::bridge::envelope::SyncHold`.

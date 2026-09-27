@@ -141,6 +141,7 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::VersionCompat { .. }
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
+        | crate::Error::Ddl(_)
         | crate::Error::RemoteTyped { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
         | crate::Error::DataPlane(_)

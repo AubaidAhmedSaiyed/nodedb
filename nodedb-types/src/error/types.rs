@@ -97,6 +97,7 @@ impl NodeDbError {
                 | ErrorDetails::DocumentNotFound { .. }
                 | ErrorDetails::AuthorizationDenied { .. }
                 | ErrorDetails::AuthExpired
+                | ErrorDetails::AuthenticationFailed
                 | ErrorDetails::Config
                 | ErrorDetails::SqlNotEnabled
                 | ErrorDetails::UndefinedFunction { .. }

@@ -263,6 +263,17 @@ impl NodeDbError {
         }
     }
 
+    /// Credentials were rejected. `detail` must not say whether the user
+    /// exists.
+    pub fn authentication_failed(detail: impl fmt::Display) -> Self {
+        Self {
+            code: ErrorCode::AUTHENTICATION_FAILED,
+            message: format!("authentication failed: {detail}"),
+            details: ErrorDetails::AuthenticationFailed,
+            cause: None,
+        }
+    }
+
     pub fn auth_expired(detail: impl fmt::Display) -> Self {
         Self {
             code: ErrorCode::AUTH_EXPIRED,

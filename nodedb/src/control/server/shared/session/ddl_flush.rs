@@ -18,6 +18,7 @@ use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, PendingDdlObject, encode_
 use crate::control::catalog_entry::{self, CatalogEntry};
 use crate::control::metadata_proposer::MetadataRaftHandle;
 use crate::control::security::catalog::SystemCatalog;
+use crate::control::server::shared::ddl::DdlError;
 use crate::control::state::SharedState;
 
 use super::connection::SessionId;
@@ -111,16 +112,15 @@ pub(super) fn flush_local(state: &SharedState, buffered: DdlBuffer) -> Option<Ab
                 return Some(AbortReason::DdlPropose(crate::Error::from(refusal)));
             }
             Ok(crate::control::catalog_entry::apply::ApplyOutcome::Applied) => {}
+            // The COMMIT fails with the apply error's own class. The message
+            // names the statement and its catalog entry.
             Err(error) => {
-                return Some(AbortReason::DdlPropose(crate::Error::Internal {
-                    detail: format!(
-                        "transactional DDL local apply failed on statement {} of {} \
-                         (catalog entry {}): {error}; roll back and re-run the transaction",
-                        position + 1,
-                        total,
-                        item.entry.kind()
-                    ),
-                }));
+                return Some(AbortReason::DdlPropose(local_apply_error(
+                    position + 1,
+                    total,
+                    item.entry.kind(),
+                    &error,
+                )));
             }
         }
         crate::control::catalog_entry::post_apply::apply_post_apply_side_effects_sync(
@@ -138,6 +138,21 @@ pub(super) fn flush_local(state: &SharedState, buffered: DdlBuffer) -> Option<Ab
         );
     }
     None
+}
+
+/// The COMMIT error for a local apply that failed on statement `statement`
+/// of `total`. It keeps `error`'s SQLSTATE, code and details.
+fn local_apply_error(
+    statement: usize,
+    total: usize,
+    entry_kind: &str,
+    error: &crate::Error,
+) -> crate::Error {
+    let context = format!(
+        "transactional DDL local apply failed on statement {statement} of {total} \
+         (catalog entry {entry_kind})"
+    );
+    crate::Error::from(DdlError::from_error_in_context(&context, error))
 }
 
 /// Fencing token, metadata log index, preparation lease, and reserved
@@ -495,7 +510,8 @@ mod tests {
     use super::super::{conn_scope, ddl_buffer};
     use super::{
         DdlCommitPlan, MetadataEntry, PendingDdlHandle, PendingDdlObject, SharedState,
-        begin_commit, compensate_finalized, finalize_pending, flush_local, reverse_create,
+        begin_commit, compensate_finalized, finalize_pending, flush_local, local_apply_error,
+        reverse_create,
     };
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -853,5 +869,69 @@ mod tests {
 
         compensate_finalized(&state, &objects)
             .expect("compensate_finalized must propose a reversal batch for the finalized create");
+    }
+
+    /// A local apply that fails at COMMIT reports the apply error's own
+    /// SQLSTATE and code on pgwire and native. Only the message gains the
+    /// statement context.
+    #[test]
+    fn a_local_apply_error_keeps_its_class() {
+        use nodedb_types::error::{ErrorCode, sqlstate};
+
+        use crate::control::server::native::dispatch::native_error_fields;
+        use crate::control::server::pgwire::types::error_to_sqlstate;
+
+        let cases = [
+            (
+                crate::Error::RoleInUse {
+                    role: "analyst".into(),
+                    dependents: crate::control::security::role_assignment::RoleDependents::Users(
+                        vec!["bob".into()],
+                    ),
+                },
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                ErrorCode::DEPENDENT_OBJECTS_EXIST,
+            ),
+            (
+                crate::Error::RejectedAuthz {
+                    tenant_id: crate::types::TenantId::new(7),
+                    resource: "role 'analyst'".into(),
+                },
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                ErrorCode::AUTHORIZATION_DENIED,
+            ),
+            (
+                crate::Error::CollectionNotFound {
+                    tenant_id: crate::types::TenantId::new(7),
+                    collection: "orders".into(),
+                },
+                sqlstate::UNDEFINED_TABLE,
+                ErrorCode::COLLECTION_NOT_FOUND,
+            ),
+            (
+                crate::Error::CollectionPurgeRowMissing {
+                    database_id: 0,
+                    tenant_id: 7,
+                    name: "orders".into(),
+                },
+                sqlstate::INTERNAL_ERROR,
+                ErrorCode::INTERNAL,
+            ),
+        ];
+        for (source, state, code) in cases {
+            let error = local_apply_error(2, 3, "PutCollection", &source);
+            let (_, pg_state, message) = error_to_sqlstate(&error);
+            assert_eq!(pg_state, state, "{source:?} on pgwire");
+            assert!(
+                message.starts_with(
+                    "transactional DDL local apply failed on statement 2 of 3 \
+                     (catalog entry PutCollection): "
+                ),
+                "{message}"
+            );
+            let native = native_error_fields(&error);
+            assert_eq!(native.sqlstate, state, "{source:?} native SQLSTATE");
+            assert_eq!(native.code, code, "{source:?} native code");
+        }
     }
 }

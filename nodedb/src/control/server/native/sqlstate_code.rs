@@ -19,9 +19,9 @@
 //! pgwire.
 //!
 //! A SQLSTATE that more than one code shares (`0A000`, `55006`, `57014`,
-//! `XX000`, `02000` in their special meanings) has a typed constant a `&str`
-//! parameter rejects, so a site that means one of those special codes builds
-//! its frame from the code, not from this table.
+//! `28000`, `XX000`, `02000` in their special meanings) has a typed constant
+//! a `&str` parameter rejects, so a site that means one of those special
+//! codes builds its frame from the code, not from this table.
 
 use nodedb_types::protocol::NativeResponse;
 

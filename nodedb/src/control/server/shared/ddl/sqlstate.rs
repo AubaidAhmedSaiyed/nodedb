@@ -29,7 +29,7 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
     match code {
         ErrorCode::DeadlineExceeded | ErrorCode::ExpiredBeforeExecution => (
             "ERROR",
-            sqlstate::QUERY_CANCELED,
+            sqlstate::QUERY_CANCELED.0,
             "query cancelled due to deadline".into(),
         ),
         ErrorCode::RejectedConstraint { constraint, detail } => {
@@ -223,6 +223,17 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
         ErrorCode::DataException { detail } => ("ERROR", sqlstate::DATA_EXCEPTION, detail.clone()),
         // The same SQLSTATE the Control Plane gives `crate::Error::BadRequest`.
         ErrorCode::BadRequest { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
+        ErrorCode::TransactionRollback { detail } => {
+            ("ERROR", sqlstate::TRANSACTION_ROLLBACK, detail.clone())
+        }
+        ErrorCode::ActiveSqlTransaction { detail } => {
+            ("ERROR", sqlstate::ACTIVE_SQL_TRANSACTION, detail.clone())
+        }
+        ErrorCode::DependentObjectsExist { detail, .. } => (
+            "ERROR",
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            detail.clone(),
+        ),
         // Transient: the client retries after a backoff.
         ErrorCode::DispatchCapacity { reason } => {
             ("ERROR", sqlstate::SERVER_OVERLOAD, reason.clone())

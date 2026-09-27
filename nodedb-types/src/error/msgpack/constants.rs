@@ -90,6 +90,7 @@
 // |  84 | TransactionRollback       |
 // |  85 | ActiveSqlTransaction      |
 // |  86 | DependentObjectsExist     |
+// |  87 | AuthenticationFailed      |
 
 pub(super) const TAG_CONSTRAINT_VIOLATION: u16 = 1;
 pub(super) const TAG_WRITE_CONFLICT: u16 = 2;
@@ -177,3 +178,4 @@ pub(super) const TAG_PROGRAM_LIMIT_EXCEEDED: u16 = 83;
 pub(super) const TAG_TRANSACTION_ROLLBACK: u16 = 84;
 pub(super) const TAG_ACTIVE_SQL_TRANSACTION: u16 = 85;
 pub(super) const TAG_DEPENDENT_OBJECTS_EXIST: u16 = 86;
+pub(super) const TAG_AUTHENTICATION_FAILED: u16 = 87;

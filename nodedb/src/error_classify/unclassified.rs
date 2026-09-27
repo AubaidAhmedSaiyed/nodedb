@@ -97,6 +97,7 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::MemoryExhausted { .. }
         | Error::Backpressure { .. }
         | Error::Shaping(_)
+        | Error::Ddl(_)
         | Error::RemoteTyped { .. }
         | Error::DataPlane(_)
         | Error::Promql(_)

@@ -195,6 +195,7 @@ impl ToMessagePack for ErrorDetails {
                 write1(writer, TAG_AUTHORIZATION_DENIED, resource)
             }
             ErrorDetails::AuthExpired => write_unit(writer, TAG_AUTH_EXPIRED),
+            ErrorDetails::AuthenticationFailed => write_unit(writer, TAG_AUTHENTICATION_FAILED),
             ErrorDetails::HandshakeFailed { server_code } => {
                 write1(writer, TAG_HANDSHAKE_FAILED, server_code)
             }

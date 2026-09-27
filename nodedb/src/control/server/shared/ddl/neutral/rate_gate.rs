@@ -458,7 +458,7 @@ mod tests {
         };
         let err = counter_write_payload("RATE_RESET", Err(deadline))
             .expect_err("a failed dispatch fails the call");
-        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED, "{err:?}");
+        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED.0, "{err:?}");
     }
 
     /// A refusal with no code has no class of its own.
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn the_existence_check_propagates_errors() {
         let err = ttl_from("RATE_CHECK", Err(deadline())).expect_err("a failed read fails");
-        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED, "{err:?}");
+        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED.0, "{err:?}");
         assert!(err.message.starts_with("RATE_CHECK: "), "{}", err.message);
 
         let refused = refusal(Some(ErrorCode::Unsupported {
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn the_counter_read_propagates_errors() {
         let err = counter_from("_rate:g:k", Err(deadline())).expect_err("a failed read fails");
-        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED, "{err:?}");
+        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED.0, "{err:?}");
         assert!(
             err.message.starts_with("RATE_REMAINING: "),
             "{}",
@@ -583,7 +583,7 @@ mod tests {
             sqlstate::INVALID_TEXT_REPRESENTATION,
             "{err:?}"
         );
-        assert_eq!(err.code, nodedb_types::error::ErrorCode::BAD_REQUEST);
+        assert_eq!(err.code, nodedb_types::error::ErrorCode::DATA_EXCEPTION);
     }
 
     /// The TTL read behind `retry after` propagates a dispatch error instead
@@ -592,7 +592,7 @@ mod tests {
     fn the_ttl_read_propagates_errors() {
         let err =
             remaining_ttl_ms("RATE_REMAINING", Err(deadline())).expect_err("a failed read fails");
-        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED, "{err:?}");
+        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED.0, "{err:?}");
     }
 
     /// An absent key and a key with no expiry leave no time. A live key

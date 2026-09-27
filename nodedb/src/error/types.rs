@@ -658,6 +658,13 @@ pub enum Error {
         /// Human-readable detail including actual lag if available.
         detail: String,
     },
+
+    /// A DDL error with its own SQLSTATE, code, details and cause. A DDL step
+    /// that fails at COMMIT, after its statement returned, reports through it
+    /// with the class the statement reports in autocommit. Boxed, so the
+    /// variant adds one pointer to `Error`.
+    #[error("{}", .0.message)]
+    Ddl(Box<crate::control::server::shared::ddl::DdlError>),
 }
 
 /// Result alias for NodeDB operations.
@@ -666,6 +673,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl From<nodedb_types::NodeDbError> for Error {
     fn from(error: nodedb_types::NodeDbError) -> Self {
         Error::Shaping(Box::new(error))
+    }
+}
+
+impl From<crate::control::server::shared::ddl::DdlError> for Error {
+    fn from(error: crate::control::server::shared::ddl::DdlError) -> Self {
+        Error::Ddl(Box::new(error))
     }
 }
 

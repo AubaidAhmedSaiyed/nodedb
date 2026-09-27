@@ -108,36 +108,86 @@ async fn run_one(state: &SharedState, effect: DeferredDdlEffect) -> Result<(), D
     }
 }
 
-/// The COMMIT error for a failed effect. A UNIQUE violation keeps its class,
-/// so the client sees SQLSTATE 23505 as an autocommit `CREATE INDEX` does.
+/// The COMMIT error for a failed effect. It keeps the effect's SQLSTATE,
+/// code, details and cause, the class an autocommit statement reports. The
+/// message names the collection.
 fn effect_error(collection: &str, error: DdlError) -> crate::Error {
-    if error.sqlstate == "23505" {
-        return crate::Error::RejectedConstraint {
-            collection: collection.to_string(),
-            constraint: "unique".to_string(),
-            detail: error.message,
-        };
-    }
-    crate::Error::Internal {
-        detail: format!(
-            "index DDL committed but its engine step failed (SQLSTATE {}): {}",
-            error.sqlstate, error.message
-        ),
-    }
+    crate::Error::from(error.in_context(&format!(
+        "index DDL on '{collection}' committed, but its engine step failed"
+    )))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use nodedb_types::error::{ErrorCode, sqlstate};
 
+    use super::*;
+    use crate::control::server::native::dispatch::native_error_fields;
+    use crate::control::server::pgwire::types::error_to_sqlstate;
+
+    /// A failed effect reports its own SQLSTATE and code at COMMIT, on
+    /// pgwire and native, with the collection in the message.
     #[test]
-    fn a_unique_violation_keeps_its_class() {
-        let error = effect_error("users", DdlError::new("23505", "duplicate 'a'"));
-        assert!(matches!(
-            error,
-            crate::Error::RejectedConstraint { ref constraint, .. } if constraint == "unique"
-        ));
-        let other = effect_error("users", DdlError::internal("core gone"));
-        assert!(matches!(other, crate::Error::Internal { .. }));
+    fn a_failed_effect_keeps_its_class_at_commit() {
+        let refusals = [
+            DdlError::from_error(&crate::Error::DataPlane(
+                crate::bridge::envelope::ErrorCode::RejectedConstraint {
+                    constraint: "unique".into(),
+                    detail: "duplicate 'a'".into(),
+                },
+            )),
+            DdlError::from_error(&crate::Error::RejectedAuthz {
+                tenant_id: crate::types::TenantId::new(1),
+                resource: "collection 'users'".into(),
+            }),
+            DdlError::from_error(&crate::Error::CollectionNotFound {
+                tenant_id: crate::types::TenantId::new(1),
+                collection: "users".into(),
+            }),
+            DdlError::from_error(&crate::Error::RoleInUse {
+                role: "analyst".into(),
+                dependents: crate::control::security::role_assignment::RoleDependents::Users(vec![
+                    "bob".into(),
+                ]),
+            }),
+            DdlError::from_error(&crate::Error::DeadlineExceeded {
+                request_id: crate::types::RequestId::new(1),
+            }),
+            DdlError::new("42710", "index 'by_email' already exists"),
+        ];
+        let expected = [
+            (sqlstate::UNIQUE_VIOLATION, ErrorCode::CONSTRAINT_VIOLATION),
+            (
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                ErrorCode::AUTHORIZATION_DENIED,
+            ),
+            (sqlstate::UNDEFINED_TABLE, ErrorCode::COLLECTION_NOT_FOUND),
+            (
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                ErrorCode::DEPENDENT_OBJECTS_EXIST,
+            ),
+            ("57014", ErrorCode::DEADLINE_EXCEEDED),
+            ("42710", ErrorCode::ALREADY_EXISTS),
+        ];
+        for (refusal, (state, code)) in refusals.into_iter().zip(expected) {
+            let error = effect_error("users", refusal);
+            let (_, pg_state, message) = error_to_sqlstate(&error);
+            assert_eq!(pg_state, state, "{error:?} on pgwire");
+            assert!(
+                message.starts_with("index DDL on 'users' committed"),
+                "{message}"
+            );
+            let native = native_error_fields(&error);
+            assert_eq!(native.sqlstate, state, "{error:?} native SQLSTATE");
+            assert_eq!(native.code, code, "{error:?} native code");
+        }
+    }
+
+    /// An effect that failed with no typed class stays internal.
+    #[test]
+    fn an_untyped_effect_failure_stays_internal() {
+        let error = effect_error("users", DdlError::internal("core gone"));
+        assert_eq!(error_to_sqlstate(&error).1, sqlstate::INTERNAL_ERROR);
+        assert_eq!(native_error_fields(&error).code, ErrorCode::INTERNAL);
     }
 }

@@ -34,7 +34,7 @@ mod tests {
     #[test]
     fn pgwire_deadline() {
         let (code, _) = GatewayErrorMap::to_pgwire(&deadline());
-        assert_eq!(code, sqlstate::QUERY_CANCELED);
+        assert_eq!(code, sqlstate::QUERY_CANCELED.0);
     }
 
     /// Both paths answer `SERIALIZATION_FAILURE`, the SQLSTATE a client

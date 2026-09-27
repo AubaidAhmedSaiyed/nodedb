@@ -171,6 +171,16 @@ pub enum ErrorCode {
     /// a value the target cannot hold. The same verdict the Control Plane
     /// gives `crate::Error::BadRequest`: SQLSTATE `42601` (syntax_error).
     BadRequest { detail: String },
+    /// The whole transaction aborted before any read-set was validated, and
+    /// the client retries it. SQLSTATE `40000` (transaction_rollback).
+    TransactionRollback { detail: String },
+    /// The statement cannot run in the current transaction state, such as
+    /// inside an explicit transaction block. SQLSTATE `25001`
+    /// (active_sql_transaction).
+    ActiveSqlTransaction { detail: String },
+    /// A DROP refused because other objects depend on its target. `object`
+    /// names the target. SQLSTATE `2BP01` (dependent_objects_still_exist).
+    DependentObjectsExist { object: String, detail: String },
 }
 
 /// An expression evaluation failure, as the Data Plane reports it.
@@ -311,11 +321,42 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::InvalidLimitValue { .. }) => Self::DataException {
                 detail: e.to_string(),
             },
-            // Class `40`: the client retries the statement.
-            e @ (crate::Error::CalvinParticipantError
-            | crate::Error::RetryableSchemaChanged { .. }) => Self::RetryableRefusal {
+            // `40000`, as the Control Plane gives it.
+            e @ crate::Error::CalvinParticipantError => Self::TransactionRollback {
+                detail: e.to_string(),
+            },
+            // `40001`: the client retries the statement.
+            e @ crate::Error::RetryableSchemaChanged { .. } => Self::RetryableRefusal {
                 reason: e.to_string(),
             },
+            // `25001`, as the Control Plane gives all three.
+            e @ (crate::Error::CrdtApplyForbiddenInTransaction
+            | crate::Error::NotInTransactionBlock { .. }
+            | crate::Error::CrossShardInExplicitTransaction) => Self::ActiveSqlTransaction {
+                detail: e.to_string(),
+            },
+            // `2BP01`, as the Control Plane gives both. The detail is the
+            // public message the Control Plane renders.
+            crate::Error::DependentObjectsExist {
+                root_kind,
+                root_name,
+                dependent_count,
+                dependents,
+                ..
+            } => {
+                let (object, detail) = crate::error_classify::dependent_objects_text(
+                    root_kind,
+                    &root_name,
+                    dependent_count,
+                    &dependents,
+                );
+                Self::DependentObjectsExist { object, detail }
+            }
+            crate::Error::RoleInUse { role, dependents } => {
+                let object = format!("role \"{role}\"");
+                let detail = crate::Error::RoleInUse { role, dependents }.to_string();
+                Self::DependentObjectsExist { object, detail }
+            }
             crate::Error::CrdtAdmissionRetriesExhausted { .. } => Self::ConflictRetry,
             // Retryable refusals whose class (`55P03`) no Data-Plane code has.
             // The retry contract survives: nothing was applied.
@@ -347,19 +388,14 @@ impl From<crate::Error> for ErrorCode {
                 }
             }
             // Client errors of class `42`, and client errors whose class
-            // (`25`, `2B`, `55`) no Data-Plane code has. `BadRequest` is the
+            // (`25006`, `55`) no Data-Plane code has. `BadRequest` is the
             // class their public code has.
             e @ (crate::Error::CrdtAdmissionInvalidPlan { .. }
             | crate::Error::CrdtAdmissionCallerFence
             | crate::Error::CrdtApplyRequiresAdmission
-            | crate::Error::CrdtApplyForbiddenInTransaction
-            | crate::Error::NotInTransactionBlock { .. }
-            | crate::Error::CrossShardInExplicitTransaction
             | crate::Error::CloneWriteRequiresMaterialize { .. }
             | crate::Error::ObjectNotInPrerequisiteState { .. }
             | crate::Error::MirrorReadOnly { .. }
-            | crate::Error::DependentObjectsExist { .. }
-            | crate::Error::RoleInUse { .. }
             | crate::Error::UndefinedObject { .. }
             | crate::Error::AmbiguousColumn { .. }
             | crate::Error::ExecutionLimitExceeded { .. }
@@ -387,9 +423,9 @@ impl From<crate::Error> for ErrorCode {
                     retry_after_ms: 0,
                 },
             },
-            // Server-side faults and system defects. `Shaping` and
-            // `RemoteTyped` carry a public numeric code that has no
-            // Data-Plane twin, and neither is raised on the Data Plane.
+            // Server-side faults and system defects. `Shaping`,
+            // `RemoteTyped` and `Ddl` carry a public numeric code that has no
+            // Data-Plane twin, and none is raised on the Data Plane.
             e @ (crate::Error::MaterializedSumResolutionMissing { .. }
             | crate::Error::RetryableLeaderChange { .. }
             | crate::Error::MetadataLeaderUnavailable
@@ -409,6 +445,7 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::Internal { .. }
             | crate::Error::Shaping(_)
             | crate::Error::RemoteTyped { .. }
+            | crate::Error::Ddl(_)
             | crate::Error::DescriptorVersionAnomaly { .. }
             | crate::Error::CollectionPurgeRowMissing { .. }
             | crate::Error::CatalogIntegrityViolation { .. }

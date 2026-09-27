@@ -154,6 +154,11 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
         ErrorCode::UndefinedFunction { name } => NodeDbError::undefined_function(name),
         ErrorCode::DataException { detail } => NodeDbError::data_exception(detail),
         ErrorCode::BadRequest { detail } => NodeDbError::bad_request(detail),
+        ErrorCode::TransactionRollback { detail } => NodeDbError::transaction_rollback(detail),
+        ErrorCode::ActiveSqlTransaction { detail } => NodeDbError::active_sql_transaction(detail),
+        ErrorCode::DependentObjectsExist { object, detail } => {
+            NodeDbError::dependent_objects_exist(object, detail)
+        }
         // Nothing was enqueued, and the same request succeeds once capacity
         // frees: the retryable overload class.
         ErrorCode::DispatchCapacity { reason } => NodeDbError::server_overload(reason),

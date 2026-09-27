@@ -401,6 +401,6 @@ mod tests {
             "expected a typed deadline, got {error:?}"
         );
         let (_, state, _) = crate::control::server::pgwire::types::error_to_sqlstate(&error);
-        assert_eq!(state, nodedb_types::error::sqlstate::QUERY_CANCELED);
+        assert_eq!(state, nodedb_types::error::sqlstate::QUERY_CANCELED.0);
     }
 }

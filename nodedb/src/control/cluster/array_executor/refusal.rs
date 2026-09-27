@@ -136,6 +136,7 @@ pub(super) fn execution_error(context: &str, error: crate::Error) -> ClusterErro
         | crate::Error::VersionCompat { .. }
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
+        | crate::Error::Ddl(_)
         | crate::Error::RemoteTyped { .. }
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }

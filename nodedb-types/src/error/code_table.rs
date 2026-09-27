@@ -105,6 +105,7 @@ error_code_table! {
     // Auth / tenant quota.
     AUTHORIZATION_DENIED => AuthorizationDenied { resource: String::new() },
     AUTH_EXPIRED => AuthExpired,
+    AUTHENTICATION_FAILED => AuthenticationFailed,
     TENANT_VECTOR_DIM_EXCEEDED => TenantVectorDimExceeded { dim: 0, limit: 0 },
     TENANT_GRAPH_DEPTH_EXCEEDED => TenantGraphDepthExceeded { depth: 0, limit: 0 },
 
@@ -246,6 +247,7 @@ mod tests {
             ErrorCode::TRANSACTION_ROLLBACK,
             ErrorCode::ACTIVE_SQL_TRANSACTION,
             ErrorCode::DEPENDENT_OBJECTS_EXIST,
+            ErrorCode::AUTHENTICATION_FAILED,
             ErrorCode::QUOTA_OVERCOMMIT,
             ErrorCode::CLONE_DEPTH_EXCEEDED,
             ErrorCode::CLONE_WRITE_REQUIRES_MATERIALIZE,

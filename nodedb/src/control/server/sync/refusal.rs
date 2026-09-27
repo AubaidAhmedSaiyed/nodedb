@@ -65,7 +65,10 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
             | ErrorCode::DataException { .. }
             | ErrorCode::DispatchCapacity { .. }
             | ErrorCode::ExpiredBeforeExecution
-            | ErrorCode::BadRequest { .. } => None,
+            | ErrorCode::BadRequest { .. }
+            | ErrorCode::TransactionRollback { .. }
+            | ErrorCode::ActiveSqlTransaction { .. }
+            | ErrorCode::DependentObjectsExist { .. } => None,
         },
         crate::Error::RejectedConstraint { .. }
         | crate::Error::TxnOverlayMemoryExceeded { .. }
@@ -149,6 +152,7 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::RemoteTyped { .. }
+        | crate::Error::Ddl(_)
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
@@ -284,6 +288,7 @@ fn is_indeterminate(error: &crate::Error) -> bool {
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::RemoteTyped { .. }
+        | crate::Error::Ddl(_)
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
@@ -321,7 +326,8 @@ fn is_indeterminate_code(code: &ErrorCode) -> bool {
         | ErrorCode::OllpRetryRequired
         | ErrorCode::CrdtFrontierMismatch { .. }
         | ErrorCode::CollectionDraining { .. }
-        | ErrorCode::RateExceeded { .. } => true,
+        | ErrorCode::RateExceeded { .. }
+        | ErrorCode::TransactionRollback { .. } => true,
         // A sync hold is decided by the session that owns the stream before
         // it reaches this classifier. Every other code is a verdict.
         ErrorCode::RejectedConstraint { .. }
@@ -354,7 +360,9 @@ fn is_indeterminate_code(code: &ErrorCode) -> bool {
         | ErrorCode::DivisionByZero
         | ErrorCode::UndefinedFunction { .. }
         | ErrorCode::DataException { .. }
-        | ErrorCode::BadRequest { .. } => false,
+        | ErrorCode::BadRequest { .. }
+        | ErrorCode::ActiveSqlTransaction { .. }
+        | ErrorCode::DependentObjectsExist { .. } => false,
     }
 }
 

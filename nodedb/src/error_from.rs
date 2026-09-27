@@ -400,6 +400,7 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::VersionCompat { .. }
             | Error::Internal { .. }
             | Error::Shaping(_)
+            | Error::Ddl(_)
             | Error::DescriptorVersionAnomaly { .. }
             | Error::CollectionPurgeRowMissing { .. }
             | Error::CatalogIntegrityViolation { .. }

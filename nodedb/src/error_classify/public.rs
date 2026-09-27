@@ -263,14 +263,20 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             dependent_count,
             dependents,
         } => {
-            let names: Vec<String> = dependents.iter().map(|(k, n)| format!("{k}:{n}")).collect();
-            NodeDbError::dependent_objects_exist(
-                format!("{root_kind} '{root_name}'"),
-                format!(
-                    "cannot drop {root_kind} '{root_name}': {dependent_count} dependent(s) exist ({})",
-                    names.join(", ")
-                ),
-            )
+            let (object, message) =
+                dependent_objects_text(root_kind, root_name, *dependent_count, dependents);
+            NodeDbError::dependent_objects_exist(object, message)
+        }
+        Error::Ddl(ddl) => {
+            let public = NodeDbError::from_wire_with_details(
+                ddl.code,
+                ddl.message.clone(),
+                ddl.details.as_deref().cloned(),
+            );
+            match &ddl.cause {
+                Some(cause) => public.with_cause((**cause).clone()),
+                None => public,
+            }
         }
         Error::RoleInUse { role, .. } => {
             NodeDbError::dependent_objects_exist(format!("role \"{role}\""), e.to_string())
@@ -370,6 +376,28 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             crate::error_from_data_plane::data_plane_code_to_public(code.clone())
         }
     }
+}
+
+/// The object and the message of a DROP refused for its dependents. The
+/// public error and the Data-Plane code both read it, so both name one
+/// object with one message.
+pub(crate) fn dependent_objects_text(
+    root_kind: &str,
+    root_name: &str,
+    dependent_count: usize,
+    dependents: &[(String, String)],
+) -> (String, String) {
+    let names: Vec<String> = dependents
+        .iter()
+        .map(|(kind, name)| format!("{kind}:{name}"))
+        .collect();
+    (
+        format!("{root_kind} '{root_name}'"),
+        format!(
+            "cannot drop {root_kind} '{root_name}': {dependent_count} dependent(s) exist ({})",
+            names.join(", ")
+        ),
+    )
 }
 
 #[cfg(test)]

@@ -55,8 +55,11 @@ fn is_transient_verdict(code: &ErrorCode) -> bool {
         | ErrorCode::ExpiredBeforeExecution
         | ErrorCode::ConflictRetry
         | ErrorCode::OllpRetryRequired
-        | ErrorCode::TxnOverlayMemoryExceeded { .. } => true,
+        | ErrorCode::TxnOverlayMemoryExceeded { .. }
+        | ErrorCode::TransactionRollback { .. } => true,
         ErrorCode::DeadlineExceeded
+        | ErrorCode::ActiveSqlTransaction { .. }
+        | ErrorCode::DependentObjectsExist { .. }
         | ErrorCode::RejectedConstraint { .. }
         | ErrorCode::RejectedPrevalidation { .. }
         | ErrorCode::SyncRejected { .. }
@@ -141,6 +144,12 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         // Concurrency verdicts that abort the whole attempt before install.
         | ErrorCode::ConflictRetry
         | ErrorCode::OllpRetryRequired
+        // The whole transaction aborted before any read-set was validated.
+        | ErrorCode::TransactionRollback { .. }
+        // Refused by the transaction state, or by the target's dependents,
+        // before the statement ran.
+        | ErrorCode::ActiveSqlTransaction { .. }
+        | ErrorCode::DependentObjectsExist { .. }
         // The staging overlay hit its byte budget, so the transaction's writes
         // were discarded from the overlay and never installed.
         | ErrorCode::TxnOverlayMemoryExceeded { .. }
