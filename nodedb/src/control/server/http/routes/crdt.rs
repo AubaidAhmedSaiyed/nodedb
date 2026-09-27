@@ -104,7 +104,7 @@ pub async fn crdt_apply(
             identity.tenant_id,
             body.doc_id.as_bytes(),
         )
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: nodedb_types::QualifiedCollection::new(

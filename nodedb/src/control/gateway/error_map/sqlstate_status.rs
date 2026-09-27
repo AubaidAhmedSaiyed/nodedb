@@ -3,8 +3,8 @@
 //! SQLSTATE to HTTP status, for an error that reaches HTTP as a SQLSTATE.
 //!
 //! A DDL error carries a SQLSTATE and a numeric code. Several DDL SQLSTATEs
-//! share one code, so the status follows the SQLSTATE. Each class takes the
-//! status `to_http` gives the gateway errors of that class.
+//! share one code, so the status follows the SQLSTATE. `to_http` reads this
+//! table for every gateway error, so it is the one status table.
 
 use nodedb_types::error::sqlstate;
 

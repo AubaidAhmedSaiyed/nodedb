@@ -75,9 +75,9 @@ impl From<TriggerActionError> for crate::Error {
             TriggerActionError::Plan { source } | TriggerActionError::LeaseAdmission { source } => {
                 source
             }
-            TriggerActionError::Transaction { source } => crate::Error::Internal {
-                detail: source.to_string(),
-            },
+            // The transaction error keeps its class: its statement or commit
+            // error, or the Data-Plane verdict that aborted the commit.
+            TriggerActionError::Transaction { source } => source.into(),
         }
     }
 }
@@ -162,6 +162,37 @@ mod tests {
             }
             other => panic!("expected the planner error to survive, got {other:?}"),
         }
+    }
+
+    /// A commit abort keeps the Data-Plane verdict that decided it.
+    #[test]
+    fn a_failed_transaction_keeps_its_abort_code() {
+        let error = TriggerActionError::Transaction {
+            source: SystemTxnError::Commit {
+                detail: "serialization failure against a concurrent write".to_owned(),
+                code: Some(Box::new(crate::bridge::envelope::ErrorCode::ConflictRetry)),
+            },
+        };
+        match crate::Error::from(error) {
+            crate::Error::DataPlane(crate::bridge::envelope::ErrorCode::ConflictRetry) => {}
+            other => panic!("expected the abort code to survive, got {other:?}"),
+        }
+    }
+
+    /// A commit that failed to dispatch keeps the dispatch error.
+    #[test]
+    fn a_failed_commit_dispatch_keeps_its_error() {
+        let error = TriggerActionError::Transaction {
+            source: SystemTxnError::CommitFailed {
+                source: crate::Error::DeadlineExceeded {
+                    request_id: crate::types::RequestId::new(1),
+                },
+            },
+        };
+        assert!(matches!(
+            crate::Error::from(error),
+            crate::Error::DeadlineExceeded { .. }
+        ));
     }
 
     #[test]

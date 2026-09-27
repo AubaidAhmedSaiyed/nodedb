@@ -47,12 +47,22 @@ pub enum SystemTxnError {
         detail: String,
         code: Option<Box<crate::bridge::envelope::ErrorCode>>,
     },
+
+    /// COMMIT aborted on a dispatch or DDL-propose error. The transaction
+    /// applied nothing. `source` keeps its own class.
+    #[error("system transaction aborted at commit: {source}")]
+    CommitFailed {
+        #[source]
+        source: crate::Error,
+    },
 }
 
 impl From<SystemTxnError> for crate::Error {
     fn from(error: SystemTxnError) -> Self {
         match error {
-            SystemTxnError::Begin { source } | SystemTxnError::Statement { source, .. } => source,
+            SystemTxnError::Begin { source }
+            | SystemTxnError::Statement { source, .. }
+            | SystemTxnError::CommitFailed { source } => source,
             SystemTxnError::Commit {
                 code: Some(code), ..
             } => crate::Error::DataPlane(*code),
@@ -200,10 +210,27 @@ pub async fn run_statements_atomically(
 
     match commit::run_commit(scope.sessions(), scope.session_id(), identity, state, &dp).await {
         CommitOutcome::Committed => Ok(()),
-        CommitOutcome::Aborted { reason } => Err(SystemTxnError::Commit {
+        CommitOutcome::Aborted { reason } => Err(commit_abort_error(reason)),
+    }
+}
+
+/// The error a commit abort answers with. A dispatch or DDL-propose error
+/// keeps its own class. Every other abort carries its Data-Plane verdict
+/// when one decided it.
+fn commit_abort_error(reason: AbortReason) -> SystemTxnError {
+    match reason {
+        AbortReason::Dispatch(source) | AbortReason::DdlPropose(source) => {
+            SystemTxnError::CommitFailed { source }
+        }
+        reason @ (AbortReason::Serialization
+        | AbortReason::NoTransaction
+        | AbortReason::BatchRejected { .. }
+        | AbortReason::CalvinCancelled
+        | AbortReason::CalvinTimeout
+        | AbortReason::SchemaChanged { .. }) => SystemTxnError::Commit {
             detail: describe(&reason),
             code: abort_code(&reason).map(Box::new),
-        }),
+        },
     }
 }
 
@@ -279,11 +306,12 @@ fn abort_code(reason: &AbortReason) -> Option<crate::bridge::envelope::ErrorCode
         AbortReason::Serialization | AbortReason::SchemaChanged { .. } => {
             Some(crate::bridge::envelope::ErrorCode::ConflictRetry)
         }
-        AbortReason::NoTransaction
-        | AbortReason::CalvinCancelled
-        | AbortReason::CalvinTimeout
-        | AbortReason::Dispatch(_)
-        | AbortReason::DdlPropose(_) => None,
+        // The cross-shard coordinator ran out of time or was cancelled at
+        // its deadline: the deadline class, `57014`.
+        AbortReason::CalvinCancelled | AbortReason::CalvinTimeout => {
+            Some(crate::bridge::envelope::ErrorCode::DeadlineExceeded)
+        }
+        AbortReason::NoTransaction | AbortReason::Dispatch(_) | AbortReason::DdlPropose(_) => None,
     }
 }
 

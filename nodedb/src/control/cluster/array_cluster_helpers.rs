@@ -105,6 +105,21 @@ pub(super) fn cluster_err(e: nodedb_cluster::error::ClusterError) -> Error {
         // A shard's Data-Plane verdict keeps its code, so the statement
         // renders the SQLSTATE a single-node execution renders.
         nodedb_cluster::error::ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
+        // The shard still refused after the fan-out's reroute retry. The
+        // vShard's owner is moving, so the client retries the statement.
+        nodedb_cluster::error::ClusterError::WrongOwner {
+            vshard_id,
+            expected_owner_node,
+        } => match expected_owner_node {
+            Some(leader_node) => Error::NotLeader {
+                vshard_id: crate::types::VShardId::new(vshard_id),
+                leader_node,
+                leader_addr: String::new(),
+            },
+            None => Error::NoLeader {
+                vshard_id: crate::types::VShardId::new(vshard_id),
+            },
+        },
         other => Error::Internal {
             detail: format!("array cluster: {other}"),
         },
@@ -152,5 +167,24 @@ mod tests {
             Error::DataPlane(rebuilt) => assert_eq!(rebuilt, code),
             other => panic!("expected the typed verdict, got {other:?}"),
         }
+    }
+
+    /// A shard that still refused after the reroute retry answers the
+    /// retryable leader class, never `Internal`.
+    #[test]
+    fn a_persistent_wrong_owner_is_a_leader_error() {
+        let known = nodedb_cluster::error::ClusterError::WrongOwner {
+            vshard_id: 7,
+            expected_owner_node: Some(3),
+        };
+        assert!(matches!(
+            cluster_err(known),
+            Error::NotLeader { leader_node: 3, .. }
+        ));
+        let unknown = nodedb_cluster::error::ClusterError::WrongOwner {
+            vshard_id: 7,
+            expected_owner_node: None,
+        };
+        assert!(matches!(cluster_err(unknown), Error::NoLeader { .. }));
     }
 }

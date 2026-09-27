@@ -18,9 +18,10 @@ pub(super) fn ddl_error_to_api(error: crate::control::server::shared::ddl::DdlEr
     }
 }
 
+/// Map a gateway error to the HTTP error the client reads, through the one
+/// `crate::Error` to `ApiError` conversion.
 pub(super) fn gateway_error(error: crate::Error) -> ApiError {
-    let (status, msg) = crate::control::gateway::GatewayErrorMap::to_http(&error);
-    ApiError::HttpStatus(status, msg)
+    ApiError::from(error)
 }
 
 /// Map a Data-Plane refusal to the HTTP error the client reads. A typed

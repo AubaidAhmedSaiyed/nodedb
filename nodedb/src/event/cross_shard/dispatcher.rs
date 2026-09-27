@@ -188,10 +188,22 @@ async fn send_write(
                 detail: format!("transport: {e}"),
             })?;
 
-    let RaftRpc::VShardEnvelope(response_bytes) = response_rpc else {
-        return Err(crate::Error::Dispatch {
-            detail: "unexpected RPC response type".to_string(),
-        });
+    let response_bytes = match response_rpc {
+        RaftRpc::VShardEnvelope(response_bytes) => response_bytes,
+        // The target's handler failed. Its typed error names why.
+        RaftRpc::VShardRefusal(refusal) => {
+            return Err(crate::Error::Dispatch {
+                detail: format!(
+                    "target refused: {}",
+                    nodedb_cluster::error::ClusterError::from(refusal.error)
+                ),
+            });
+        }
+        _ => {
+            return Err(crate::Error::Dispatch {
+                detail: "unexpected RPC response type".to_string(),
+            });
+        }
     };
 
     let response_env =

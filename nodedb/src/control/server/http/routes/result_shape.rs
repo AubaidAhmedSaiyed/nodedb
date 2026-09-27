@@ -16,30 +16,21 @@ use crate::control::server::response_shape::cell::row_to_wire_json;
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use nodedb_types::NodeDbError;
-use nodedb_types::error::ErrorCode;
 
 use super::super::auth::ApiError;
 
 /// Map a shaping error to the HTTP error the client reads, keeping its
-/// numeric code. A statement-level refusal the shaper raises per row — an
-/// unknown sequence, `currval` before `nextval`, a bad accessor argument,
-/// division by zero — is the caller's error and answers `400`; anything
-/// else is the server's and answers `500`.
+/// numeric code. The status follows the SQLSTATE the code renders on
+/// pgwire, through the one gateway status table. A per-row refusal, such as
+/// an unknown sequence or a division by zero, answers its client class.
+/// An internal error answers `500`.
 pub(super) fn shape_error_to_api(e: NodeDbError) -> ApiError {
     let code = e.code();
-    let status = if matches!(
-        code,
-        ErrorCode::UNDEFINED_OBJECT
-            | ErrorCode::OBJECT_NOT_READY
-            | ErrorCode::PLAN_ERROR
-            | ErrorCode::DIVISION_BY_ZERO
-            | ErrorCode::DATA_EXCEPTION
-            | ErrorCode::BAD_REQUEST
-    ) {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
+    let state = crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(code);
+    let status = StatusCode::from_u16(crate::control::gateway::GatewayErrorMap::sqlstate_to_http(
+        state,
+    ))
+    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     ApiError::Coded {
         status,
         message: e.message().to_string(),

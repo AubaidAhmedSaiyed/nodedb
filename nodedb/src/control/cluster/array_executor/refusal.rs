@@ -5,9 +5,11 @@
 //! A coded refusal crosses as `ClusterError::DataPlane`, so the coordinator
 //! rebuilds `crate::Error::DataPlane(code)` and renders the SQLSTATE a
 //! single-node execution renders. Only a refusal with no code is a storage
-//! error.
+//! error. A local-execution error keeps its class where the cluster wire has
+//! one.
 
 use nodedb_cluster::error::ClusterError;
+use nodedb_cluster::rpc_codec::DataPlaneErrorCode;
 
 use crate::bridge::envelope::Response;
 
@@ -23,12 +25,36 @@ pub(super) fn refusal_error(context: &str, response: &Response) -> ClusterError 
     }
 }
 
-/// The cluster error for a local-execution error. A Data-Plane verdict keeps
-/// its code. Every other error is a storage error with `context` before its
-/// message.
+/// The cluster error for a local-execution error.
+///
+/// - A Data-Plane verdict keeps its code.
+/// - A deadline and a capacity refusal cross as their Data-Plane verdicts.
+/// - A missing leader crosses as `WrongOwner`, so the coordinator re-reads
+///   its routing and retries.
+/// - Every other error is a storage error with `context` before its message.
 pub(super) fn execution_error(context: &str, error: crate::Error) -> ClusterError {
     match error {
         crate::Error::DataPlane(code) => ClusterError::DataPlane { code: code.into() },
+        crate::Error::DeadlineExceeded { .. } => ClusterError::DataPlane {
+            code: DataPlaneErrorCode::DeadlineExceeded,
+        },
+        capacity @ crate::Error::DispatchCapacity { .. } => ClusterError::DataPlane {
+            code: DataPlaneErrorCode::DispatchCapacity {
+                reason: capacity.to_string(),
+            },
+        },
+        crate::Error::NotLeader {
+            vshard_id,
+            leader_node,
+            ..
+        } => ClusterError::WrongOwner {
+            vshard_id: vshard_id.as_u32(),
+            expected_owner_node: (leader_node != 0).then_some(leader_node),
+        },
+        crate::Error::NoLeader { vshard_id } => ClusterError::WrongOwner {
+            vshard_id: vshard_id.as_u32(),
+            expected_owner_node: None,
+        },
         other => ClusterError::Storage {
             detail: format!("{context}: {other}"),
         },
@@ -80,6 +106,35 @@ mod tests {
             ClusterError::Storage { detail } => assert!(detail.starts_with("array slice: ")),
             other => panic!("expected a storage error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_local_deadline_crosses_as_the_deadline_verdict() {
+        let error = crate::Error::DeadlineExceeded {
+            request_id: RequestId::new(1),
+        };
+        assert!(matches!(
+            execution_error("array put", error),
+            ClusterError::DataPlane {
+                code: DataPlaneErrorCode::DeadlineExceeded
+            }
+        ));
+    }
+
+    #[test]
+    fn a_missing_leader_crosses_as_wrong_owner() {
+        let error = crate::Error::NotLeader {
+            vshard_id: crate::types::VShardId::new(9),
+            leader_node: 4,
+            leader_addr: "10.0.0.4:9000".into(),
+        };
+        assert!(matches!(
+            execution_error("array put raft propose", error),
+            ClusterError::WrongOwner {
+                vshard_id: 9,
+                expected_owner_node: Some(4)
+            }
+        ));
     }
 
     #[test]

@@ -353,6 +353,10 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::NOT_LEADER => sqlstate::DATABASE_DROPPED,
         // Mirrors the `CloneWriteRequiresMaterialize` arm.
         Ec::CLONE_WRITE_REQUIRES_MATERIALIZE => sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE.0,
+        // Mirrors the `BackupTenantMismatch` arm.
+        Ec::BACKUP_TENANT_MISMATCH => sqlstate::BACKUP_TENANT_MISMATCH,
+        // Mirrors the `BackupKeyMismatch` arm.
+        Ec::BACKUP_KEY_MISMATCH => sqlstate::BACKUP_KEY_MISMATCH,
         // The codes below mirror the Data-Plane code table
         // (`error_code_to_sqlstate`) for the public code each Data-Plane code
         // classifies to, so a verdict that crossed a node as a numeric code
