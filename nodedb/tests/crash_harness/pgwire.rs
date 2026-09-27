@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::CrashHarness;
 
 /// Bounded retry budget for the `Error::RetryableSchemaChanged` condition
-/// (rendered over pgwire as `XX000: schema changed during execution
+/// (rendered over pgwire as `40001: schema changed during execution
 /// (<descriptor>); please retry`).
 ///
 /// The server already retries this condition server-side for ~750ms
@@ -32,9 +32,9 @@ const SCHEMA_CHANGE_RETRY_BACKOFF: Duration = Duration::from_millis(150);
 
 /// Substring of `Error::RetryableSchemaChanged`'s Display text
 /// (`#[error("schema changed during execution ({descriptor}); please retry")]`
-/// in `nodedb/src/error/types.rs`). The message is the durable signal: a code
-/// alone would blanket-retry unrelated internal errors, because the class this
-/// condition carries depends on the mapper in front of it.
+/// in `nodedb/src/error/types.rs`). The message is the durable signal: the
+/// code alone would also retry every other serialization failure, which
+/// shares `40001`.
 /// The server was still reporting `RetryableSchemaChanged` when the
 /// client-side retry budget ran out.
 ///

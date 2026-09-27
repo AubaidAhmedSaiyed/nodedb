@@ -81,12 +81,15 @@ use super::rpc::ShardRpcDispatch;
 /// answers `WrongOwner` until the coordinator's routing table catches up (the
 /// single retry in `call_with_wrong_owner_retry` already re-reads the live
 /// table). Counting it as a liveness failure would open the shared breaker and
-/// then fast-fail healthy shards' slice/put/agg/delete with `CircuitOpen`. Only
-/// `WrongOwner` is excluded — every genuine transport/timeout/unreachable error
-/// still counts, mirroring `RetryPolicy::is_retryable`'s conservative policy.
+/// then fast-fail healthy shards' slice/put/agg/delete with `CircuitOpen`.
+/// `WrongOwner` and a typed Data-Plane verdict are excluded. Every genuine
+/// transport/timeout/unreachable error still counts, mirroring
+/// `RetryPolicy::is_retryable`'s conservative policy.
 fn counts_against_breaker(err: &ClusterError) -> bool {
     match err {
         ClusterError::WrongOwner { .. } => false,
+        // A typed Data-Plane verdict comes from a healthy shard that answered.
+        ClusterError::DataPlane { .. } => false,
         // An unresponsive peer is exactly what the breaker exists to shed
         // load from, so a shard timeout counts like any other liveness failure.
         ClusterError::ShardTimeout { .. } => true,

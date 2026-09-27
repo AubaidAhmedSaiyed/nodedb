@@ -105,14 +105,17 @@ pub async fn dispatch_unregister_collection(
                 .ok_or_else(|| crate::Error::Dispatch {
                     detail: format!("collection reclaim channel closed on core {core_id}"),
                 })?;
+            // A coded refusal keeps its Data-Plane code.
             if response.status != Status::Ok {
-                return Err(crate::Error::Storage {
-                    engine: "collection-purge".into(),
-                    detail: format!(
-                        "UnregisterCollection for tenant {tenant_id} collection '{name}' \
-                         failed on core {core_id}: {:?}",
-                        response.error_code
-                    ),
+                return Err(match response.error_code {
+                    Some(code) => crate::Error::DataPlane(*code),
+                    None => crate::Error::Storage {
+                        engine: "collection-purge".into(),
+                        detail: format!(
+                            "UnregisterCollection for tenant {tenant_id} collection '{name}' \
+                             failed on core {core_id} with no error code"
+                        ),
+                    },
                 });
             }
             Ok(())

@@ -145,6 +145,11 @@ impl NexarArrayDispatch {
                     detail: "array shard response: failed to decode VShardEnvelope".into(),
                 }
             }),
+            // The shard's Data Plane refused with a typed verdict. It keeps
+            // its code, the same error the local short-circuit returns.
+            RaftRpc::VShardRefusal(refusal) => {
+                Err(nodedb_cluster::error::ClusterError::DataPlane { code: refusal.code })
+            }
             other => Err(nodedb_cluster::error::ClusterError::Transport {
                 detail: format!(
                     "array shard RPC: unexpected response type {:?}",

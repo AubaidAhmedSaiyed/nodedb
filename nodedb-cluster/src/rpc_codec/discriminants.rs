@@ -151,6 +151,10 @@ pub const RPC_AUTH_LEASE_RENEW_RESP: u8 = 50;
 /// `RPC_AUTH_BARRIER_RESP`.
 pub const RPC_AUTH_BARRIER_REQ: u8 = 51;
 pub const RPC_AUTH_BARRIER_RESP: u8 = 52;
+/// Answer to an `RPC_VSHARD_ENVELOPE` request whose handler returned a typed
+/// Data-Plane verdict. It carries the verdict code in place of a response
+/// envelope.
+pub const RPC_VSHARD_REFUSAL: u8 = 53;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

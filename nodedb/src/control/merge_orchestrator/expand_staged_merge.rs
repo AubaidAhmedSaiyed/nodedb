@@ -18,7 +18,7 @@
 
 use nodedb_types::TenantId;
 
-use crate::bridge::envelope::{PhysicalPlan, Status};
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
 use crate::control::state::SharedState;
 use crate::types::VShardId;
@@ -181,15 +181,10 @@ async fn resolve_merge_arms(
         task.txn_id,
     )
     .await?;
-    if resolve_resp.status != Status::Ok {
-        return Err(crate::Error::Dispatch {
-            detail: format!(
-                "in-transaction MERGE resolve failed: {:?}",
-                resolve_resp.error_code
-            ),
-        });
-    }
-    decode_resolve(&resolve_resp.payload)
+    // A refused resolve keeps its Data-Plane code.
+    let payload =
+        crate::control::server::shared::response_payload::payload_or_typed_error(resolve_resp)?;
+    decode_resolve(&payload)
 }
 
 /// Rewrite the three resolved arms into concrete point-write tasks appended

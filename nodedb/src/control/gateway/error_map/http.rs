@@ -4,13 +4,22 @@
 
 use super::gateway_map::GatewayErrorMap;
 use super::remote_code::remote_code_to_http_status;
+use super::sqlstate_status::sqlstate_to_http_status;
 use crate::Error;
 
 impl GatewayErrorMap {
+    /// Map a SQLSTATE into an HTTP status, for an error that reaches HTTP as
+    /// a SQLSTATE, such as a DDL error. Each class takes the status
+    /// [`Self::to_http`] gives the gateway errors of that class.
+    pub fn sqlstate_to_http(sqlstate: &str) -> u16 {
+        sqlstate_to_http_status(sqlstate)
+    }
+
     /// Map a gateway error into `(http_status_code, message)` for HTTP.
     ///
     /// Uses standard HTTP status semantics:
     /// - 400 Bad Request for client-side errors (bad SQL, not found)
+    /// - 401 Unauthorized for an expired session token
     /// - 403 Forbidden for authz errors
     /// - 409 Conflict for write-conflict / constraint violations
     /// - 429 Too Many Requests for a rate-gate refusal
@@ -25,11 +34,14 @@ impl GatewayErrorMap {
                 format!("cluster in leader election; leader hint: {leader_addr}"),
             ),
             Error::DeadlineExceeded { .. } => (504, err.to_string()),
-            Error::RetryableSchemaChanged { .. } => (503, err.to_string()),
+            // The retryable serialization class, the status a write conflict
+            // takes on every path.
+            Error::RetryableSchemaChanged { .. } => (409, err.to_string()),
             Error::CollectionNotFound { collection, .. } => {
                 (404, format!("collection \"{collection}\" does not exist"))
             }
             Error::RejectedAuthz { .. } => (403, err.to_string()),
+            Error::SessionTokenExpired => (401, err.to_string()),
             Error::BadRequest { detail } => (400, detail.clone()),
             Error::PlanError { detail } => (400, detail.clone()),
             Error::RejectedConstraint { detail, .. } => (409, detail.clone()),

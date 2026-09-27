@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Every Data-Plane `ErrorCode` answers one class on native, pgwire and HTTP.
+//! Every Data-Plane `ErrorCode`, and each Control-Plane error a client acts
+//! on, answers one class on native, pgwire and HTTP.
 //!
 //! pgwire renders a Data-Plane verdict as its SQLSTATE. A native client reads
 //! the numeric `nodedb_types` code on the frame. The two agree when the
@@ -275,6 +276,23 @@ fn classified_data_plane_codes_are_not_http_500() {
     }
 }
 
+/// The SQLSTATE status table agrees with the gateway status table for every
+/// Data-Plane code. A DDL error and a query error of one class answer one
+/// HTTP status.
+#[test]
+fn sqlstate_status_agrees_with_the_gateway_status() {
+    for code in samples() {
+        let err = crate::Error::DataPlane(code.clone());
+        let (_, pg_state, _) = error_to_sqlstate(&err);
+        let (status, _) = GatewayErrorMap::to_http(&err);
+        assert_eq!(
+            GatewayErrorMap::sqlstate_to_http(pg_state),
+            status,
+            "{code:?} is {pg_state} on pgwire"
+        );
+    }
+}
+
 /// `Unsupported` is feature-not-supported on every surface.
 #[test]
 fn unsupported_is_feature_not_supported_everywhere() {
@@ -286,4 +304,74 @@ fn unsupported_is_feature_not_supported_everywhere() {
     let native = native_error_fields(&err);
     assert_eq!(native.code, nodedb_types::error::ErrorCode::SQL_NOT_ENABLED);
     assert_eq!(GatewayErrorMap::to_http(&err).0, 501);
+}
+
+/// Control-Plane errors a client acts on. Each has a class of its own.
+fn control_plane_samples() -> Vec<crate::Error> {
+    vec![
+        crate::Error::RetryableSchemaChanged {
+            descriptor: "orders".into(),
+        },
+        crate::Error::SessionTokenExpired,
+    ]
+}
+
+/// A Control-Plane error has one class on native and pgwire, and its native
+/// numeric code renders in that class.
+#[test]
+fn control_plane_errors_have_one_class_on_native_and_pgwire() {
+    for err in control_plane_samples() {
+        let (_, pg_state, _) = error_to_sqlstate(&err);
+        assert_ne!(pg_state, sqlstate::INTERNAL_ERROR, "{err:?} has no class");
+
+        let native = native_error_fields(&err);
+        assert_eq!(native.sqlstate, pg_state, "native SQLSTATE for {err:?}");
+        let native_state = numeric_code_to_sqlstate(native.code);
+        assert_eq!(
+            class(native_state),
+            class(pg_state),
+            "{err:?}: pgwire sends {pg_state}, native code {} renders {native_state}",
+            native.code
+        );
+    }
+}
+
+/// A schema change the server could not absorb is the retryable
+/// serialization class on every surface.
+#[test]
+fn schema_change_is_a_retryable_serialization_failure() {
+    let err = crate::Error::RetryableSchemaChanged {
+        descriptor: "orders".into(),
+    };
+    assert_eq!(error_to_sqlstate(&err).1, sqlstate::SERIALIZATION_FAILURE);
+    let native = native_error_fields(&err);
+    assert_eq!(native.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+    assert_eq!(native.code, nodedb_types::error::ErrorCode::WRITE_CONFLICT);
+    assert!(crate::error_classify::classify(&err).is_retriable());
+    let status = GatewayErrorMap::to_http(&err).0;
+    assert_eq!(status, 409);
+    assert_eq!(
+        GatewayErrorMap::sqlstate_to_http(sqlstate::SERIALIZATION_FAILURE),
+        status
+    );
+}
+
+/// An expired session token is invalid authorization on every surface.
+#[test]
+fn expired_session_token_is_invalid_authorization_everywhere() {
+    let err = crate::Error::SessionTokenExpired;
+    assert_eq!(error_to_sqlstate(&err).1, sqlstate::INVALID_AUTHORIZATION);
+    let native = native_error_fields(&err);
+    assert_eq!(native.sqlstate, sqlstate::INVALID_AUTHORIZATION);
+    assert_eq!(native.code, nodedb_types::error::ErrorCode::AUTH_EXPIRED);
+    assert_eq!(
+        numeric_code_to_sqlstate(native.code),
+        sqlstate::INVALID_AUTHORIZATION
+    );
+    let status = GatewayErrorMap::to_http(&err).0;
+    assert_eq!(status, 401);
+    assert_eq!(
+        GatewayErrorMap::sqlstate_to_http(sqlstate::INVALID_AUTHORIZATION),
+        status
+    );
 }

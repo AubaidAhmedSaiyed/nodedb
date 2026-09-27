@@ -16,9 +16,10 @@
 
 use serde_json::{Map, Value as JsonValue};
 
-use crate::bridge::envelope::{PhysicalPlan, Status};
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
 use crate::engine::random::alias::AliasTable;
 use crate::engine::random::csprng::SeedableRng;
@@ -172,7 +173,9 @@ pub async fn weighted_pick(
                 tenant_id,
                 &audit_key_bytes,
             )
-            .map_err(|e| ddl_err("XX000", format!("WEIGHTED_PICK: audit surrogate bind: {e}")))?;
+            .map_err(|e| {
+                DdlError::from_error_in_context("WEIGHTED_PICK: audit surrogate bind", &e)
+            })?;
         let audit_plan = PhysicalPlan::Kv(KvOp::Put {
             collection: nodedb_types::QualifiedCollection::new(
                 DatabaseId::DEFAULT,
@@ -190,7 +193,8 @@ pub async fn weighted_pick(
         // once its audit record is durable: Raft in cluster mode, else the
         // write funnel's `AppendHere`. A pick returned without its record is
         // an unaudited pick reported as an audited one.
-        let resp = crate::control::server::dispatch_utils::dispatch_durable_autocommit_write(
+        // A refused audit write keeps its SQLSTATE and code.
+        crate::control::server::dispatch_utils::dispatch_durable_autocommit_write(
             state,
             crate::control::server::dispatch_utils::AutocommitWrite {
                 tenant_id,
@@ -207,16 +211,8 @@ pub async fn weighted_pick(
             },
         )
         .await
-        .map_err(|e| ddl_err("XX000", format!("WEIGHTED_PICK: audit write: {e}")))?;
-        if resp.status != crate::bridge::envelope::Status::Ok {
-            return Err(ddl_err(
-                "XX000",
-                format!(
-                    "WEIGHTED_PICK: the audit write was refused: {:?}",
-                    resp.error_code
-                ),
-            ));
-        }
+        .and_then(payload_or_typed_error)
+        .map_err(|e| DdlError::from_error_in_context("WEIGHTED_PICK: audit write", &e))?;
     }
 
     // Step 5: Build response rows.
@@ -265,7 +261,9 @@ async fn scan_all_entries(
     });
     gate.inject_rls(&mut plan)?;
 
-    let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+    // A refused scan is not an empty collection: a pick from it draws from
+    // rows the scan never returned. It keeps its SQLSTATE and code.
+    let payload = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
         crate::types::DatabaseId::DEFAULT,
@@ -274,22 +272,13 @@ async fn scan_all_entries(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
-
-    // A refused scan is not an empty collection: a pick from it draws from
-    // rows the scan never returned.
-    if resp.status != Status::Ok {
-        return Err(ddl_err(
-            "XX000",
-            format!(
-                "WEIGHTED_PICK: the scan of '{collection}' was refused: {:?}",
-                resp.error_code
-            ),
-        ));
-    }
+    .and_then(payload_or_typed_error)
+    .map_err(|e| {
+        DdlError::from_error_in_context(&format!("WEIGHTED_PICK: the scan of '{collection}'"), &e)
+    })?;
 
     // KV scan returns a flat msgpack array of entry maps.
-    let payload_text = crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
+    let payload_text = crate::data::executor::response_codec::decode_payload_to_json(&payload);
     let json: serde_json::Value = sonic_rs::from_str(&payload_text).map_err(|e| {
         ddl_err(
             "XX000",

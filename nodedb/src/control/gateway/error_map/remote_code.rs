@@ -23,6 +23,7 @@ pub(super) fn remote_code_to_http_status(code: nodedb_types::error::ErrorCode) -
         Ec::DEADLINE_EXCEEDED => 504,
         Ec::COLLECTION_NOT_FOUND | Ec::DOCUMENT_NOT_FOUND => 404,
         Ec::AUTHORIZATION_DENIED => 403,
+        Ec::AUTH_EXPIRED => 401,
         Ec::BAD_REQUEST
         | Ec::PLAN_ERROR
         | Ec::TYPE_MISMATCH

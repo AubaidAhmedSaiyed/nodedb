@@ -108,7 +108,8 @@ pub(crate) async fn drop_kv_index(
 }
 
 /// Dispatch a KV index plan through the autocommit write funnel, which
-/// appends its WAL record, and fail on a refused reply.
+/// appends its WAL record, and fail on a refused reply. A refusal keeps its
+/// SQLSTATE and code.
 async fn dispatch_durable(
     state: &SharedState,
     tenant_id: TenantId,
@@ -117,7 +118,7 @@ async fn dispatch_durable(
     plan: PhysicalPlan,
     step: &str,
 ) -> Result<(), DdlError> {
-    let response = crate::control::server::dispatch_utils::dispatch_autocommit_write(
+    crate::control::server::dispatch_utils::dispatch_autocommit_write(
         state,
         crate::control::server::dispatch_utils::AutocommitWrite {
             tenant_id,
@@ -130,23 +131,10 @@ async fn dispatch_durable(
         },
     )
     .await
+    .and_then(crate::control::server::shared::response_payload::payload_or_typed_error)
     .map_err(|e| {
-        err(
-            "XX000",
-            format!("key-value index {step} on '{collection}': {e}"),
-        )
+        DdlError::from_error_in_context(&format!("key-value index {step} on '{collection}'"), &e)
     })?;
-
-    if response.status == crate::bridge::envelope::Status::Error {
-        let detail = match response.error_code.as_deref() {
-            Some(code) => format!("{code:?}"),
-            None => String::from_utf8_lossy(&response.payload).into_owned(),
-        };
-        return Err(err(
-            "XX000",
-            format!("key-value index {step} on '{collection}' was refused: {detail}"),
-        ));
-    }
     Ok(())
 }
 

@@ -44,6 +44,7 @@ pub(super) fn shape_error_to_api(e: NodeDbError) -> ApiError {
         status,
         message: e.message().to_string(),
         code,
+        cause: e.cause().map(|cause| Box::new(cause.clone())),
     }
 }
 

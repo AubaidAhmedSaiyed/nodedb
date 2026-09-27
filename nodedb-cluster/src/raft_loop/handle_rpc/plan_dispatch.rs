@@ -9,7 +9,7 @@ use crate::forward::{ChunkSink, PlanExecutor};
 use crate::multi_raft::MultiRaft;
 use crate::rpc_codec::{
     DataProposeRequest, DataProposeResponse, ExecuteRequest, MetadataProposeRequest, ProposeTarget,
-    RaftRpc, TypedClusterError,
+    RaftRpc, TypedClusterError, VShardRefusal,
 };
 
 use super::super::loop_core::{CommitApplier, RaftLoop};
@@ -52,10 +52,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     }
 
     // VShardEnvelope — dispatch to registered handler (Event Plane, etc.).
+    // A typed Data-Plane verdict answers as a `VShardRefusal` frame, so the
+    // caller rebuilds the same code. Any other handler error closes the stream.
     pub(super) async fn handle_vshard_envelope_rpc(&self, bytes: Vec<u8>) -> Result<RaftRpc> {
         if let Some(ref handler) = self.vshard_handler {
-            let response_bytes = handler(bytes).await?;
-            Ok(RaftRpc::VShardEnvelope(response_bytes))
+            match handler(bytes).await {
+                Ok(response_bytes) => Ok(RaftRpc::VShardEnvelope(response_bytes)),
+                Err(ClusterError::DataPlane { code }) => {
+                    Ok(RaftRpc::VShardRefusal(VShardRefusal { code }))
+                }
+                Err(other) => Err(other),
+            }
         } else {
             Err(ClusterError::Transport {
                 detail: "VShardEnvelope handler not configured".into(),

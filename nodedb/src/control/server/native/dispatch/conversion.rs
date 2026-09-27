@@ -51,11 +51,12 @@ pub(crate) fn native_error_fields(e: &crate::Error) -> NativeErrorFields {
         crate::Error::CollectionNotFound { collection, .. } => {
             ("42P01", format!("collection '{collection}' not found"))
         }
-        // Same SQLSTATE as the "not authenticated" responses in
-        // `session::request`: the client's stored bearer token expired
-        // mid-connection and it must re-authenticate with a fresh Auth frame.
+        // The SQLSTATE pgwire renders, and the one the "not authenticated"
+        // responses in `session::request` carry. The client's stored bearer
+        // token expired mid-connection and it must re-authenticate with a
+        // fresh Auth frame. The message names the native Auth frame.
         crate::Error::SessionTokenExpired => (
-            "28000",
+            nodedb_types::error::sqlstate::INVALID_AUTHORIZATION,
             "OIDC bearer token expired; re-authenticate with a fresh Auth request".into(),
         ),
         // A cross-shard Calvin OCC abort is a serialization failure (40001) —

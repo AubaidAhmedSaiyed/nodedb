@@ -37,12 +37,12 @@ mod tests {
         assert_eq!(code, sqlstate::QUERY_CANCELED);
     }
 
-    /// Both paths answer `INTERNAL_ERROR` from the shared table, with the
-    /// variant's own message naming the descriptor.
+    /// Both paths answer `SERIALIZATION_FAILURE`, the SQLSTATE a client
+    /// retries on, with the variant's own message naming the descriptor.
     #[test]
     fn pgwire_schema_changed() {
         let (code, msg) = GatewayErrorMap::to_pgwire(&schema_changed());
-        assert_eq!(code, sqlstate::INTERNAL_ERROR);
+        assert_eq!(code, sqlstate::SERIALIZATION_FAILURE);
         assert!(msg.contains("users"));
     }
 

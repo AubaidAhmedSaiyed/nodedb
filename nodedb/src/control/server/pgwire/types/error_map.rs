@@ -204,6 +204,16 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::SourceFrozen { .. } => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
+        // A descriptor changed under the statement and the server's own
+        // retries ran out. The client retries the statement, so it takes
+        // SERIALIZATION_FAILURE (40001), the SQLSTATE drivers retry on.
+        crate::Error::RetryableSchemaChanged { .. } => {
+            ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
+        }
+        // The session's bearer token expired. The client re-authenticates.
+        crate::Error::SessionTokenExpired => {
+            ("ERROR", sqlstate::INVALID_AUTHORIZATION, err.to_string())
+        }
         crate::Error::CloneWriteRequiresMaterialize { .. } => (
             "ERROR",
             sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE.0,
@@ -298,7 +308,8 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         // Mirrors the `RejectedConstraint` arm.
         Ec::CONSTRAINT_VIOLATION => sqlstate::UNIQUE_VIOLATION,
         // Mirrors the `ConflictRetry` / `CalvinSerializationConflict` /
-        // `SourceFrozen` arms, and `OllpExhausted` when it exhausted on drift.
+        // `SourceFrozen` / `RetryableSchemaChanged` arms, and `OllpExhausted`
+        // when it exhausted on drift.
         Ec::WRITE_CONFLICT => sqlstate::SERIALIZATION_FAILURE,
         // Mirrors the `DeadlineExceeded` arm.
         Ec::DEADLINE_EXCEEDED => sqlstate::QUERY_CANCELED,
@@ -328,6 +339,8 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::FAN_OUT_EXCEEDED => sqlstate::STATEMENT_TOO_COMPLEX,
         // Mirrors the `RejectedAuthz` arm.
         Ec::AUTHORIZATION_DENIED => sqlstate::INSUFFICIENT_PRIVILEGE,
+        // Mirrors the `SessionTokenExpired` arm.
+        Ec::AUTH_EXPIRED => sqlstate::INVALID_AUTHORIZATION,
         // Mirrors the `RateExceeded` arm.
         Ec::RATE_EXCEEDED => sqlstate::TOO_MANY_CONNECTIONS,
         // Mirrors the `MemoryExhausted` / `Backpressure` arms.

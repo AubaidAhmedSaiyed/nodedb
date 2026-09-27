@@ -16,6 +16,7 @@
 
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::KvOp;
@@ -99,7 +100,7 @@ pub async fn rate_check(
             tenant_id,
             rate_key.as_bytes(),
         )
-        .map_err(|e| super::kv_atomic::ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error_in_context("RATE_CHECK", &e))?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, RATE_COLLECTION),
         key: rate_key.as_bytes().to_vec(),
@@ -116,40 +117,33 @@ pub async fn rate_check(
         shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
     });
 
-    match dispatch_counter_write(state, tenant_id, vshard, plan).await {
-        Ok(resp) if resp.status == Status::Ok => {
-            let payload_text =
-                crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            let current: i64 = sonic_rs::from_str::<serde_json::Value>(&payload_text)
-                .ok()
-                .and_then(|v| v.get("value")?.as_i64())
-                .unwrap_or(1);
+    let payload = counter_write_payload(
+        "RATE_CHECK",
+        dispatch_counter_write(state, tenant_id, vshard, plan).await,
+    )?;
+    let payload_text = crate::data::executor::response_codec::decode_payload_to_json(&payload);
+    let current: i64 = sonic_rs::from_str::<serde_json::Value>(&payload_text)
+        .ok()
+        .and_then(|v| v.get("value")?.as_i64())
+        .unwrap_or(1);
 
-            if current > max_count {
-                // Read TTL to compute retry_after_ms.
-                let ttl_remaining = read_ttl_ms(state, tenant_id, vshard, &rate_key).await;
-                Err(ddl_err(
-                    "53300",
-                    format!(
-                        "rate limit exceeded for {gate_name}:{key}, retry after {ttl_remaining}ms (current={current}, max={max_count})"
-                    ),
-                ))
-            } else {
-                let result = serde_json::json!({
-                    "allowed": true,
-                    "current": current,
-                    "max_count": max_count,
-                    "remaining": max_count - current,
-                });
-                Ok(vec![single_text_col("rate_check", result.to_string())])
-            }
-        }
-        Ok(resp) => {
-            let payload_text =
-                crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            Err(ddl_err("XX000", payload_text))
-        }
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
+    if current > max_count {
+        // Read TTL to compute retry_after_ms.
+        let ttl_remaining = read_ttl_ms(state, tenant_id, vshard, &rate_key).await;
+        Err(ddl_err(
+            "53300",
+            format!(
+                "rate limit exceeded for {gate_name}:{key}, retry after {ttl_remaining}ms (current={current}, max={max_count})"
+            ),
+        ))
+    } else {
+        let result = serde_json::json!({
+            "allowed": true,
+            "current": current,
+            "max_count": max_count,
+            "remaining": max_count - current,
+        });
+        Ok(vec![single_text_col("rate_check", result.to_string())])
     }
 }
 
@@ -259,26 +253,17 @@ pub async fn rate_reset(
         provenance: None,
     });
 
-    match dispatch_counter_write(state, tenant_id, vshard, plan).await {
-        Ok(resp) if resp.status == Status::Ok => {
-            let result = serde_json::json!({
-                "gate": gate_name,
-                "key": key,
-                "reset": true,
-            });
-            Ok(vec![single_text_col("rate_reset", result.to_string())])
-        }
-        // A refusal arrives as an error status inside an `Ok` response. The
-        // counter is still there, so the reset did not happen.
-        Ok(resp) => Err(ddl_err(
-            "XX000",
-            format!(
-                "RATE_RESET: the counter delete was refused: {:?}",
-                resp.error_code
-            ),
-        )),
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
-    }
+    // A refusal means the counter is still there, so the reset did not happen.
+    counter_write_payload(
+        "RATE_RESET",
+        dispatch_counter_write(state, tenant_id, vshard, plan).await,
+    )?;
+    let result = serde_json::json!({
+        "gate": gate_name,
+        "key": key,
+        "reset": true,
+    });
+    Ok(vec![single_text_col("rate_reset", result.to_string())])
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -306,6 +291,19 @@ async fn dispatch_counter_write(
         },
     )
     .await
+}
+
+/// The payload of a counter write, or its error with `context` before the
+/// message. A refusal arrives as an error status inside an `Ok` response. A
+/// coded refusal keeps its SQLSTATE and code. Only a refusal with no code is
+/// `XX000`.
+fn counter_write_payload(
+    context: &str,
+    result: crate::Result<crate::bridge::envelope::Response>,
+) -> Result<Vec<u8>, DdlError> {
+    result
+        .and_then(payload_or_typed_error)
+        .map_err(|e| DdlError::from_error_in_context(context, &e))
 }
 
 /// Read TTL remaining for a KV key (in milliseconds).
@@ -375,4 +373,61 @@ fn parse_u64(s: &str, func: &str, param: &str) -> Result<u64, DdlError> {
 
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::error::sqlstate;
+
+    use super::*;
+    use crate::bridge::envelope::{ErrorCode, Payload, Response};
+    use crate::types::{Lsn, RequestId};
+
+    fn refusal(code: Option<ErrorCode>) -> Response {
+        Response {
+            request_id: RequestId::new(1),
+            status: Status::Error,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: Lsn::ZERO,
+            error_code: code.map(Box::new),
+            read_set_valid: None,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    /// A refused counter write keeps its SQLSTATE and code, with the function
+    /// name before the message.
+    #[test]
+    fn a_coded_refusal_keeps_its_sqlstate() {
+        let refused = refusal(Some(ErrorCode::Unsupported {
+            detail: "not on this engine".into(),
+        }));
+        let err = counter_write_payload("RATE_CHECK", Ok(refused))
+            .expect_err("a refused counter write fails the call");
+        assert_eq!(err.sqlstate, sqlstate::FEATURE_NOT_SUPPORTED, "{err:?}");
+        assert_eq!(err.code, nodedb_types::error::ErrorCode::SQL_NOT_ENABLED);
+        assert!(err.message.starts_with("RATE_CHECK: "), "{}", err.message);
+    }
+
+    /// A dispatch error keeps its own class too.
+    #[test]
+    fn a_dispatch_error_keeps_its_sqlstate() {
+        let deadline = crate::Error::DeadlineExceeded {
+            request_id: RequestId::new(1),
+        };
+        let err = counter_write_payload("RATE_RESET", Err(deadline))
+            .expect_err("a failed dispatch fails the call");
+        assert_eq!(err.sqlstate, sqlstate::QUERY_CANCELED, "{err:?}");
+    }
+
+    /// A refusal with no code has no class of its own.
+    #[test]
+    fn a_refusal_with_no_code_is_internal() {
+        let err = counter_write_payload("RATE_RESET", Ok(refusal(None)))
+            .expect_err("a refused counter write fails the call");
+        assert_eq!(err.sqlstate, sqlstate::INTERNAL_ERROR, "{err:?}");
+    }
 }

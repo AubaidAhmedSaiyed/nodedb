@@ -102,6 +102,9 @@ pub(super) fn cluster_err(e: nodedb_cluster::error::ClusterError) -> Error {
         nodedb_cluster::error::ClusterError::ShardTimeout { .. } => Error::DeadlineExceeded {
             request_id: crate::types::RequestId::new(0),
         },
+        // A shard's Data-Plane verdict keeps its code, so the statement
+        // renders the SQLSTATE a single-node execution renders.
+        nodedb_cluster::error::ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
         other => Error::Internal {
             detail: format!("array cluster: {other}"),
         },
@@ -127,5 +130,27 @@ pub(super) fn array_resp_msg_type(opcode: u32) -> Option<VShardMessageType> {
         87 => Some(VShardMessageType::ArrayShardDeleteResp),
         89 => Some(VShardMessageType::ArrayShardSurrogateBitmapResp),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::ErrorCode;
+
+    /// A shard verdict that crossed the cluster keeps its code at the
+    /// coordinator, never `Internal`.
+    #[test]
+    fn a_shard_verdict_keeps_its_code() {
+        let code = ErrorCode::Unsupported {
+            detail: "not on this engine".into(),
+        };
+        let wire = nodedb_cluster::error::ClusterError::DataPlane {
+            code: code.clone().into(),
+        };
+        match cluster_err(wire) {
+            Error::DataPlane(rebuilt) => assert_eq!(rebuilt, code),
+            other => panic!("expected the typed verdict, got {other:?}"),
+        }
     }
 }

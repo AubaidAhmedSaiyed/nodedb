@@ -74,7 +74,9 @@ pub(super) struct ArrayWriteSubmit {
 ///
 /// An error-status response is surfaced as a typed error: a committed entry that
 /// failed to apply must reach the propose waiter as a failure, not an empty
-/// success, and must NOT advance the floor.
+/// success, and must NOT advance the floor. A coded refusal is
+/// `crate::Error::DataPlane`, so the waiter classifies it and a final refusal
+/// records its marker. The funnel's own errors keep their variant.
 pub(super) async fn submit_array_write(
     state: &Arc<SharedState>,
     params: ArrayWriteSubmit,
@@ -125,19 +127,11 @@ pub(super) async fn submit_array_write(
             change_feed: ChangeFeedOwner::Unowned,
         },
     )
-    .await
-    .map_err(|e| crate::Error::Internal {
-        detail: format!("{op_label}: {e}"),
-    })?;
+    .await?;
     let response = outcome.response;
 
     if response.status != Status::Ok {
-        let detail = response
-            .error_code
-            .as_ref()
-            .map(|c| format!("{op_label} error: {c:?}"))
-            .unwrap_or_else(|| format!("{op_label} returned error status"));
-        return Err(crate::Error::Internal { detail });
+        return Err(apply_refusal(op_label, &response));
     }
     // The response carries the write-version this replica stamped alongside the
     // payload; an array plan names no user collection, so it is `Lsn::ZERO` here
@@ -288,27 +282,93 @@ pub(super) fn build_array_request(
     }
 }
 
-/// Await a Data Plane response, mapping timeout / channel-closed / error-status
-/// into `crate::Error::Internal` with a contextual `op_label`.
+/// Await a Data Plane response. An error status becomes [`apply_refusal`].
+/// A timeout or a closed channel becomes `crate::Error::Internal` with a
+/// contextual `op_label`.
 pub(super) async fn await_data_plane(
     rx: impl std::future::Future<Output = Result<Response, ()>>,
     op_label: &str,
 ) -> ProposeResult {
     match tokio::time::timeout(Duration::from_secs(30), rx).await {
         Ok(Ok(resp)) if resp.status == Status::Ok => Ok(AppliedWrite::from_response(&resp)),
-        Ok(Ok(resp)) => {
-            let detail = resp
-                .error_code
-                .as_ref()
-                .map(|c| format!("{op_label} error: {c:?}"))
-                .unwrap_or_else(|| format!("{op_label} returned error status"));
-            Err(crate::Error::Internal { detail })
-        }
+        Ok(Ok(resp)) => Err(apply_refusal(op_label, &resp)),
         Ok(Err(_)) => Err(crate::Error::Internal {
             detail: format!("{op_label}: response channel closed"),
         }),
         Err(_) => Err(crate::Error::Internal {
             detail: format!("{op_label}: deadline exceeded"),
         }),
+    }
+}
+
+/// The typed error for a Data-Plane response with a non-`Ok` status.
+///
+/// A coded refusal is `crate::Error::DataPlane` with its own code. Only a
+/// refusal with no code is `crate::Error::Internal`.
+pub(super) fn apply_refusal(op_label: &str, response: &Response) -> crate::Error {
+    match response.error_code.as_deref() {
+        Some(code) => crate::Error::DataPlane(code.clone()),
+        None => crate::Error::Internal {
+            detail: format!("{op_label} returned error status"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::{ErrorCode, Payload};
+    use crate::types::{Lsn, RequestId};
+
+    fn refusal(code: Option<ErrorCode>) -> Response {
+        Response {
+            request_id: RequestId::new(1),
+            status: Status::Error,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: Lsn::ZERO,
+            error_code: code.map(Box::new),
+            read_set_valid: None,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    /// A coded refusal of a committed array write keeps its code, so the
+    /// final-refusal check sees it.
+    #[test]
+    fn a_coded_refusal_keeps_its_code() {
+        let code = ErrorCode::RejectedPrevalidation {
+            reason: "cell out of bounds".into(),
+        };
+        let error = apply_refusal("array cell write", &refusal(Some(code.clone())));
+        match &error {
+            crate::Error::DataPlane(kept) => assert_eq!(kept, &code),
+            other => panic!("expected the typed refusal, got {other:?}"),
+        }
+        assert!(crate::control::server::dispatch_utils::error_is_final_refusal(&error));
+    }
+
+    #[test]
+    fn a_refusal_with_no_code_is_internal() {
+        match apply_refusal("OpenArray", &refusal(None)) {
+            crate::Error::Internal { detail } => assert!(detail.starts_with("OpenArray")),
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
+
+    /// The Data-Plane response await keeps the code as well.
+    #[tokio::test]
+    async fn awaiting_a_coded_refusal_keeps_its_code() {
+        let code = ErrorCode::Unsupported {
+            detail: "not on this engine".into(),
+        };
+        let response = refusal(Some(code.clone()));
+        let result = await_data_plane(async move { Ok::<_, ()>(response) }, "OpenArray").await;
+        match result {
+            Err(crate::Error::DataPlane(kept)) => assert_eq!(kept, code),
+            other => panic!("expected the typed refusal, got {other:?}"),
+        }
     }
 }

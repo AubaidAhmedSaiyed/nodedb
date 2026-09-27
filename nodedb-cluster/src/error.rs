@@ -118,6 +118,16 @@ pub enum ClusterError {
     #[error("storage error: {detail}")]
     Storage { detail: String },
 
+    /// A shard's Data Plane refused the request with a typed verdict.
+    ///
+    /// The code crosses the node hop verbatim as `RaftRpc::VShardRefusal`, so
+    /// the coordinator renders the SQLSTATE a single-node execution renders.
+    /// The message uses the code's `Debug` form for logs only.
+    #[error("data plane refused the request: {code:?}")]
+    DataPlane {
+        code: crate::rpc_codec::DataPlaneErrorCode,
+    },
+
     #[error("codec error: {detail}")]
     Codec { detail: String },
 

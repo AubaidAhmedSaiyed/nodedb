@@ -32,6 +32,7 @@ use super::shuffle::{
     ShufflePushEnd, ShufflePushRequest,
 };
 use super::surrogate::{AssignSurrogateRequest, AssignSurrogateResponse};
+use super::vshard::VShardRefusal;
 use super::{
     auth_lease, calvin_submit, cluster_mgmt, data_propose, execute, metadata, raft_msgs,
     read_index, reservation, shuffle, surrogate, vshard,
@@ -157,6 +158,9 @@ pub enum RaftRpc {
     AuthLeaseRenewResponse(AuthLeaseRenewResponse),
     AuthBarrierRequest(AuthBarrierRequest),
     AuthBarrierResponse(AuthBarrierResponse),
+    // Answer to a `VShardEnvelope` request whose handler refused with a
+    // typed Data-Plane verdict.
+    VShardRefusal(VShardRefusal),
 }
 
 /// Encode a [`RaftRpc`] into a framed binary message stamped with `epoch`.
@@ -232,6 +236,7 @@ pub fn encode(rpc: &RaftRpc, epoch: &crate::cluster_epoch::ClusterEpochState) ->
         RaftRpc::AuthLeaseRenewResponse(m) => auth_lease::encode_renew_resp(m, &mut out),
         RaftRpc::AuthBarrierRequest(m) => auth_lease::encode_barrier_req(m, &mut out),
         RaftRpc::AuthBarrierResponse(m) => auth_lease::encode_barrier_resp(m, &mut out),
+        RaftRpc::VShardRefusal(m) => vshard::encode_vshard_refusal(m, &mut out),
     }?;
     super::header::stamp_epoch(&mut out, epoch)?;
     Ok(out)
@@ -333,6 +338,7 @@ pub fn decode(data: &[u8], epoch: &crate::cluster_epoch::ClusterEpochState) -> R
         RPC_AUTH_LEASE_RENEW_RESP => auth_lease::decode_renew_resp(payload),
         RPC_AUTH_BARRIER_REQ => auth_lease::decode_barrier_req(payload),
         RPC_AUTH_BARRIER_RESP => auth_lease::decode_barrier_resp(payload),
+        RPC_VSHARD_REFUSAL => vshard::decode_vshard_refusal(payload),
         _ => Err(ClusterError::Codec {
             detail: format!("unknown rpc_type: {rpc_type}"),
         }),

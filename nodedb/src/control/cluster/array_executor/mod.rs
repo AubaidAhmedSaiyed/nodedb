@@ -28,10 +28,12 @@
 //! - [`read`]: read/scan handlers (slice, aggregate, surrogate-bitmap scan) plus
 //!   the response-row parsers.
 //! - [`write`]: write handlers (put, delete).
+//! - [`refusal`]: the typed cluster error a Data-Plane refusal answers with.
 
 pub mod cells;
 mod executor;
 mod read;
+mod refusal;
 mod trait_impl;
 mod write;
 

@@ -14,6 +14,7 @@ mod native;
 mod pgwire;
 mod remote_code;
 mod resp;
+mod sqlstate_status;
 #[cfg(test)]
 mod system_dispatch_refusal;
 #[cfg(test)]

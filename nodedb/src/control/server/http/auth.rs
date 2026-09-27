@@ -320,6 +320,9 @@ pub enum ApiError {
         status: StatusCode,
         message: String,
         code: nodedb_types::error::ErrorCode,
+        /// The typed error that caused this one, such as the Data-Plane
+        /// refusal behind a DDL phase failure. `None` when there is none.
+        cause: Option<Box<nodedb_types::NodeDbError>>,
     },
 }
 
@@ -343,8 +346,13 @@ impl IntoResponse for ApiError {
                 status,
                 message,
                 code,
+                cause,
             } => {
                 let body = HttpError::with_code(message, code.to_string());
+                let body = match cause {
+                    Some(cause) => body.caused_by(&cause),
+                    None => body,
+                };
                 (status, axum::Json(body)).into_response()
             }
             other => {

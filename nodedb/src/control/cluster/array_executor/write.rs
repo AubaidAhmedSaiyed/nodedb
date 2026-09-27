@@ -14,6 +14,7 @@ use nodedb_cluster::error::{ClusterError, Result};
 
 use super::cells::flatten_blob_vec;
 use super::executor::DataPlaneArrayExecutor;
+use super::refusal::{execution_error, refusal_error};
 use crate::control::server::dispatch_utils::{
     ChangeFeedOwner, SubmitOutcome, SubmitWrite, WalDurability, WriteOrdering, submit_write,
 };
@@ -130,9 +131,7 @@ impl DataPlaneArrayExecutor {
                     entry,
                 )
                 .await
-                .map_err(|e| ClusterError::Storage {
-                    detail: format!("{op_label} raft propose: {e}"),
-                })?;
+                .map_err(|e| execution_error(&format!("{op_label} raft propose"), e))?;
             let affected =
                 require_affected_count(&apply_payload).map_err(|e| ClusterError::Storage {
                     detail: format!("{op_label}: {e}"),
@@ -154,20 +153,10 @@ impl DataPlaneArrayExecutor {
             single_node_submit(array_id, VShardId::new(local_vshard_id), plan),
         )
         .await
-        .map_err(|e| ClusterError::Storage {
-            detail: format!("{op_label}: {e}"),
-        })?;
+        .map_err(|e| execution_error(op_label, e))?;
 
         if outcome.response.status == crate::bridge::envelope::Status::Error {
-            let detail = outcome
-                .response
-                .error_code
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "unknown Data Plane error".into());
-            return Err(ClusterError::Storage {
-                detail: format!("{op_label} Data Plane error: {detail}"),
-            });
+            return Err(refusal_error(op_label, &outcome.response));
         }
 
         // Ack with the LSN the funnel actually minted. `None` would mean the

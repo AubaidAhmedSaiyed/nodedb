@@ -66,3 +66,4 @@ pub use shuffle::{
     ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, SortKey,
 };
 pub use surrogate::{AssignSurrogateRequest, AssignSurrogateResponse};
+pub use vshard::VShardRefusal;

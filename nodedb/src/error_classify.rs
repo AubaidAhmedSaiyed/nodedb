@@ -191,7 +191,11 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::InvalidLimitValue { clause, value } => {
             NodeDbError::invalid_limit_value(*clause, value.clone())
         }
-        Error::RetryableSchemaChanged { .. } => NodeDbError::plan_error(e.to_string()),
+        // Same contract as a write conflict, which callers already retry.
+        Error::RetryableSchemaChanged { descriptor } => NodeDbError::write_conflict(
+            descriptor.clone(),
+            "schema changed during execution; retry the statement".to_owned(),
+        ),
         Error::RetryableLeaderChange {
             group_id,
             log_index,
@@ -309,7 +313,7 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             NodeDbError::bad_request("session terminated: idle timeout exceeded".to_owned())
         }
         Error::SessionTokenExpired => {
-            NodeDbError::bad_request("session terminated: OIDC token expired".to_owned())
+            NodeDbError::auth_expired("session closed: OIDC token expired")
         }
         Error::SessionKilledByAdmin => {
             NodeDbError::bad_request("session terminated by administrator".to_owned())

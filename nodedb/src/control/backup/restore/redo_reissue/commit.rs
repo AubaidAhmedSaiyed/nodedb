@@ -144,10 +144,14 @@ pub(super) async fn commit_collection(
     let mut records = 0usize;
     for batch in batch_units(units) {
         let payload = batch_payload(&collection, batch);
+        // A Data-Plane verdict keeps its code.
         commit_record(state, target, &payload)
             .await
-            .map_err(|e| crate::Error::Internal {
-                detail: format!("restore: re-issuing rows of '{collection}' failed: {e}"),
+            .map_err(|e| match e {
+                crate::Error::DataPlane(_) => e,
+                other => crate::Error::Internal {
+                    detail: format!("restore: re-issuing rows of '{collection}' failed: {other}"),
+                },
             })?;
         records += 1;
     }
