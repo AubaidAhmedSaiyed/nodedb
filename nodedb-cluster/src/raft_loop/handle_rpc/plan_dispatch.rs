@@ -52,22 +52,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     }
 
     // VShardEnvelope — dispatch to registered handler (Event Plane, etc.).
-    // A typed Data-Plane verdict answers as a `VShardRefusal` frame, so the
-    // caller rebuilds the same code. Any other handler error closes the stream.
+    // Every handler error answers as a typed `VShardRefusal` frame, so the
+    // caller rebuilds the same `ClusterError` instead of seeing a closed
+    // stream.
     pub(super) async fn handle_vshard_envelope_rpc(&self, bytes: Vec<u8>) -> Result<RaftRpc> {
-        if let Some(ref handler) = self.vshard_handler {
-            match handler(bytes).await {
-                Ok(response_bytes) => Ok(RaftRpc::VShardEnvelope(response_bytes)),
-                Err(ClusterError::DataPlane { code }) => {
-                    Ok(RaftRpc::VShardRefusal(VShardRefusal { code }))
-                }
-                Err(other) => Err(other),
-            }
-        } else {
-            Err(ClusterError::Transport {
+        let result = match self.vshard_handler {
+            Some(ref handler) => handler(bytes).await,
+            None => Err(ClusterError::Transport {
                 detail: "VShardEnvelope handler not configured".into(),
-            })
-        }
+            }),
+        };
+        Ok(vshard_answer(result))
     }
 
     // Streaming physical-plan execution (L4) — delegate to the PlanExecutor's
@@ -79,6 +74,15 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         sink: impl ChunkSink,
     ) -> Option<TypedClusterError> {
         self.plan_executor.execute_plan_streaming(req, sink).await
+    }
+}
+
+/// The frame that answers a VShardEnvelope request: the handler's response
+/// envelope, or its typed error as a refusal.
+fn vshard_answer(result: Result<Vec<u8>>) -> RaftRpc {
+    match result {
+        Ok(response_bytes) => RaftRpc::VShardEnvelope(response_bytes),
+        Err(error) => RaftRpc::VShardRefusal(VShardRefusal::from(error)),
     }
 }
 
@@ -130,6 +134,34 @@ mod tests {
         DataProposeRequest {
             target: ProposeTarget::Sequencer,
             bytes: vec![7, 7, 7],
+        }
+    }
+
+    /// A handler error such as `WrongOwner` answers as a typed refusal the
+    /// caller rebuilds, not as a closed stream.
+    #[test]
+    fn a_handler_error_answers_as_a_typed_refusal() {
+        let answer = vshard_answer(Err(ClusterError::WrongOwner {
+            vshard_id: 7,
+            expected_owner_node: None,
+        }));
+        match answer {
+            RaftRpc::VShardRefusal(refusal) => assert!(matches!(
+                ClusterError::from(refusal.error),
+                ClusterError::WrongOwner {
+                    vshard_id: 7,
+                    expected_owner_node: None
+                }
+            )),
+            other => panic!("expected a refusal frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_handler_response_answers_as_an_envelope() {
+        match vshard_answer(Ok(vec![1, 2, 3])) {
+            RaftRpc::VShardEnvelope(bytes) => assert_eq!(bytes, vec![1, 2, 3]),
+            other => panic!("expected a response envelope, got {other:?}"),
         }
     }
 

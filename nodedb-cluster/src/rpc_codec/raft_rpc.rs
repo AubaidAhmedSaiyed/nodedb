@@ -158,8 +158,8 @@ pub enum RaftRpc {
     AuthLeaseRenewResponse(AuthLeaseRenewResponse),
     AuthBarrierRequest(AuthBarrierRequest),
     AuthBarrierResponse(AuthBarrierResponse),
-    // Answer to a `VShardEnvelope` request whose handler refused with a
-    // typed Data-Plane verdict.
+    // Answer to a `VShardEnvelope` request whose handler failed. It carries
+    // the handler's typed error.
     VShardRefusal(VShardRefusal),
 }
 

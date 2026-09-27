@@ -24,6 +24,7 @@ pub mod raft_msgs;
 pub mod raft_rpc;
 pub mod read_index;
 pub mod reservation;
+pub mod shard_error;
 pub mod shuffle;
 pub mod surrogate;
 pub mod vshard;
@@ -60,6 +61,7 @@ pub use read_index::{ReadIndexOutcome, ReadIndexRequest, ReadIndexResponse};
 pub use reservation::{
     ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
 };
+pub use shard_error::{RaftErrorWire, ShardErrorWire};
 pub use shuffle::{
     JoinKeyPair, PartNodeEntry, ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse,
     ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse,

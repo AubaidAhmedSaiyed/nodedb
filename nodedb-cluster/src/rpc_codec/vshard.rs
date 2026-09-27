@@ -7,19 +7,28 @@
 //! the handler. The envelope bytes are passed through raw (already serialized
 //! in their own binary format).
 //!
-//! A handler that refuses with a typed Data-Plane verdict answers with a
-//! [`VShardRefusal`] frame instead of a response envelope.
+//! A handler that fails answers with a [`VShardRefusal`] frame instead of a
+//! response envelope. The frame carries the handler's typed error.
 
-use super::data_plane_error::DataPlaneErrorCode;
 use super::discriminants::{RPC_VSHARD_ENVELOPE, RPC_VSHARD_REFUSAL};
 use super::header::write_frame;
 use super::raft_rpc::RaftRpc;
+use super::shard_error::ShardErrorWire;
 use crate::error::{ClusterError, Result};
 
-/// A typed Data-Plane verdict that answers a VShardEnvelope request.
-#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+/// The typed error that answers a VShardEnvelope request. The caller
+/// rebuilds it with `ClusterError::from`.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct VShardRefusal {
-    pub code: DataPlaneErrorCode,
+    pub error: ShardErrorWire,
+}
+
+impl From<ClusterError> for VShardRefusal {
+    fn from(error: ClusterError) -> Self {
+        Self {
+            error: error.into(),
+        }
+    }
 }
 
 pub(super) fn encode_vshard_envelope(bytes: &[u8], out: &mut Vec<u8>) -> Result<()> {
@@ -54,19 +63,85 @@ pub(super) fn decode_vshard_refusal(payload: &[u8]) -> Result<RaftRpc> {
 mod tests {
     use super::*;
     use crate::cluster_epoch::ClusterEpochState;
+    use crate::rpc_codec::DataPlaneErrorCode;
     use crate::rpc_codec::{decode, encode};
 
+    /// Encode a shard error as a refusal frame, decode it, and rebuild it.
+    fn round_trip(error: ClusterError) -> ClusterError {
+        let epoch = ClusterEpochState::default();
+        let rpc = RaftRpc::VShardRefusal(VShardRefusal::from(error));
+        let encoded = encode(&rpc, &epoch).expect("encode");
+        match decode(&encoded, &epoch).expect("decode") {
+            RaftRpc::VShardRefusal(refusal) => ClusterError::from(refusal.error),
+            other => panic!("decoded the wrong variant: {other:?}"),
+        }
+    }
+
     #[test]
-    fn a_refusal_survives_the_wire() {
+    fn a_data_plane_refusal_survives_the_wire() {
         let code = DataPlaneErrorCode::Unsupported {
             detail: "not on this engine".into(),
         };
-        let epoch = ClusterEpochState::default();
-        let rpc = RaftRpc::VShardRefusal(VShardRefusal { code: code.clone() });
-        let encoded = encode(&rpc, &epoch).expect("encode");
-        match decode(&encoded, &epoch).expect("decode") {
-            RaftRpc::VShardRefusal(refusal) => assert_eq!(refusal.code, code),
-            other => panic!("decoded the wrong variant: {other:?}"),
+        match round_trip(ClusterError::DataPlane { code: code.clone() }) {
+            ClusterError::DataPlane { code: rebuilt } => assert_eq!(rebuilt, code),
+            other => panic!("expected the typed refusal, got {other:?}"),
+        }
+    }
+
+    /// `WrongOwner` crosses typed, so the coordinator's reroute retry sees it.
+    #[test]
+    fn wrong_owner_survives_the_wire() {
+        let error = ClusterError::WrongOwner {
+            vshard_id: 7,
+            expected_owner_node: Some(3),
+        };
+        assert!(matches!(
+            round_trip(error),
+            ClusterError::WrongOwner {
+                vshard_id: 7,
+                expected_owner_node: Some(3)
+            }
+        ));
+    }
+
+    #[test]
+    fn a_raft_redirect_keeps_its_leader_hint() {
+        let error = ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
+            leader_hint: Some(5),
+        });
+        assert!(matches!(
+            round_trip(error),
+            ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
+                leader_hint: Some(5)
+            })
+        ));
+    }
+
+    #[test]
+    fn a_codec_error_survives_the_wire() {
+        let error = ClusterError::Codec {
+            detail: "bad request body".into(),
+        };
+        match round_trip(error) {
+            ClusterError::Codec { detail } => assert_eq!(detail, "bad request body"),
+            other => panic!("expected the codec error, got {other:?}"),
+        }
+    }
+
+    /// An error with no wire mirror keeps its message.
+    #[test]
+    fn an_untyped_error_keeps_its_message() {
+        let error =
+            ClusterError::BspBarrier(crate::distributed_graph::BspBarrierError::Incomplete {
+                algorithm: "pagerank".into(),
+                iteration: 3,
+                acked: 1,
+                expected: 2,
+            });
+        let message = error.to_string();
+        match round_trip(error) {
+            ClusterError::RemoteUntyped { detail } => assert_eq!(detail, message),
+            other => panic!("expected the untyped error, got {other:?}"),
         }
     }
 }

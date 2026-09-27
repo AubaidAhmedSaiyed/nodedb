@@ -228,4 +228,9 @@ pub enum ClusterError {
 
     #[error("timeseries gather error: {0}")]
     TsGather(#[from] crate::distributed_timeseries::TsGatherError),
+
+    /// A remote node answered with an error whose type has no wire mirror.
+    /// `detail` is that error's message.
+    #[error("remote error: {detail}")]
+    RemoteUntyped { detail: String },
 }
