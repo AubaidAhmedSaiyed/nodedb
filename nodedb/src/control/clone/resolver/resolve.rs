@@ -7,7 +7,6 @@ use nodedb_types::{CloneStatus, Lsn, TenantId};
 
 use crate::control::server::shared::plan_util::extract_collection;
 use crate::control::state::SharedState;
-use crate::types::VShardId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::metadata::ClonePredicatesNote;
@@ -160,13 +159,8 @@ pub fn resolve_read(
             let SourceRewrite::Task(source_plan) = rewritten else {
                 continue;
             };
-            let source_vshard = VShardId::from_collection_in_database(
-                src_db_id,
-                &crate::control::planner::sql_plan_convert::convert::db_qualified(
-                    src_db_id,
-                    src_coll_name,
-                ),
-            );
+            let source_vshard =
+                nodedb_types::CollectionKey::from_bare(src_db_id, src_coll_name).vshard();
             this_level_tasks.push(PhysicalTask {
                 tenant_id,
                 vshard_id: source_vshard,

@@ -210,11 +210,19 @@ pub async fn create_graph_index(
                 let shard = VShardId::from_key(parent.as_bytes());
                 let src_surrogate = state
                     .surrogate_assigner
-                    .assign(database_id, tenant_id, &collection, parent.as_bytes())
+                    .assign(
+                        nodedb_types::CollectionKey::from_bare(database_id, &collection),
+                        tenant_id,
+                        parent.as_bytes(),
+                    )
                     .map_err(|e| ddl_err("XX000", e.to_string()))?;
                 let dst_surrogate = state
                     .surrogate_assigner
-                    .assign(database_id, tenant_id, &collection, child.as_bytes())
+                    .assign(
+                        nodedb_types::CollectionKey::from_bare(database_id, &collection),
+                        tenant_id,
+                        child.as_bytes(),
+                    )
                     .map_err(|e| ddl_err("XX000", e.to_string()))?;
                 edges_by_shard.entry(shard).or_default().push(BatchEdge {
                     collection: nodedb_types::QualifiedCollection::new(database_id, &collection),

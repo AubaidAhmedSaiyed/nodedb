@@ -25,7 +25,7 @@ use crate::control::server::shared::clone_write::{
     CloneCheckedOutcome, InterceptAndAuthorizeParams, intercept_and_authorize,
 };
 use crate::event::EventSource;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId};
 
 /// The write a KV push applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,9 +101,8 @@ impl KvPushDispatcher for SharedStateKvDispatcher<'_> {
         let mut plan = match op {
             KvPushWriteOp::Put { body, ttl_ms } => {
                 let surrogate = self.shared.surrogate_assigner.assign(
-                    database_id,
+                    nodedb_types::CollectionKey::from_bare(database_id, &collection),
                     tenant_id,
-                    &collection,
                     &key,
                 )?;
                 PhysicalPlan::Kv(KvOp::Put {
@@ -136,7 +135,7 @@ impl KvPushDispatcher for SharedStateKvDispatcher<'_> {
 
         let task = nodedb_physical::physical_task::PhysicalTask {
             tenant_id,
-            vshard_id: VShardId::from_collection_in_database(database_id, &collection),
+            vshard_id: nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard(),
             database_id,
             plan,
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
@@ -189,7 +188,7 @@ impl KvPushDispatcher for SharedStateKvDispatcher<'_> {
         let owner = RecordOwner {
             tenant_id,
             database_id,
-            vshard_id: VShardId::from_collection_in_database(database_id, collection),
+            vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
         };
         // A delete of no keys applies nothing. Its provenance moves the mark,
         // and its records make the move durable.

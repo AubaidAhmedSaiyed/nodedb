@@ -34,7 +34,9 @@ pub(crate) async fn dispatch_local(
     plan: PhysicalPlan,
     txn_id: Option<TxnId>,
 ) -> crate::Result<Response> {
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection_qualified);
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection_qualified)?
+            .vshard();
     dispatch_local_on_vshard(state, tenant_id, database_id, vshard_id, plan, txn_id).await
 }
 

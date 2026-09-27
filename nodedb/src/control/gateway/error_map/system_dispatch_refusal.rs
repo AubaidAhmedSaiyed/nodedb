@@ -114,8 +114,7 @@ async fn dispatch_system_keeps_the_refusal_code() {
         SystemTask::new(
             SystemReason::DdlApply,
             TenantId::new(1),
-            DatabaseId::DEFAULT,
-            COLLECTION,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLLECTION),
             set_params_plan(),
         ),
         Duration::from_secs(5),

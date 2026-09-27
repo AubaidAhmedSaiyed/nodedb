@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use nodedb_types::id::{DatabaseId, VShardId};
+use nodedb_types::id::DatabaseId;
 
 /// Take a backup of `tenant` over `client` and return the envelope bytes.
 pub async fn drain_backup(client: &tokio_postgres::Client, tenant: u64) -> Result<Vec<u8>, String> {
@@ -48,11 +48,15 @@ pub async fn push_restore(
 /// Calvin scheduler.
 pub fn names_on_two_vshards(prefix: &str) -> (String, String) {
     let first = format!("{prefix}_a");
-    let first_vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &first).as_u32();
+    let first_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &first)
+        .vshard()
+        .as_u32();
     let second = (0..512u32)
         .map(|i| format!("{prefix}_b_{i}"))
         .find(|name| {
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, name).as_u32()
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, name)
+                .vshard()
+                .as_u32()
                 != first_vshard
         })
         .unwrap_or_else(|| panic!("no {prefix}_b name on another vShard in 512 tries"));

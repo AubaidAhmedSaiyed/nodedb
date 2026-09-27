@@ -75,3 +75,23 @@ pub fn sequencer_backpressure_drop(epoch: u64, dropped_count: u64, drops: &[(u32
     .with_backtrace()
     .emit();
 }
+
+/// Report an epoch batch skipped because one of its transactions has an
+/// underivable participant set.
+///
+/// Called from the one site that detects it: `apply`'s `restore_derived`
+/// pass over a decoded epoch batch.
+pub fn sequencer_participants_underivable(epoch: u64, raft_index: u64, detail: &str) {
+    let ctx = context::SequencerParticipantsUnderivable {
+        epoch,
+        raft_index,
+        detail,
+    };
+    let _ = Capture::new(
+        EventKind::InvariantViolation,
+        "Calvin sequencer: epoch batch carries a transaction with underivable participants",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}

@@ -71,10 +71,14 @@ impl CoreLoop {
         ) {
             return false;
         }
-        let vshard = crate::types::VShardId::from_collection_in_database(
+        let Some(vshard) = self.replay_vshard(
+            "vector",
+            record_lsn,
             DatabaseId::new(database_id),
             &collection,
-        );
+        ) else {
+            return false;
+        };
         let rls_write_check = nodedb_types::RlsWriteCheck::already_decided_elsewhere();
         let task = Self::replay_vector_task(
             nodedb_types::TenantId::new(tenant_id),

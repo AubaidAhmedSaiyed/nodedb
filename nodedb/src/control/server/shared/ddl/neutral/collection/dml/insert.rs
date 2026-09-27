@@ -260,7 +260,7 @@ pub async fn insert_document(
         Err(e) => return Some(Err(e)),
     };
     let vec_vshard =
-        crate::types::VShardId::from_collection_in_database(database_id, &parsed.coll_name);
+        nodedb_types::CollectionKey::from_bare(database_id, &parsed.coll_name).vshard();
     for (field_name, vector) in extract_vector_fields(&fields) {
         if indexed.contains(&field_name) {
             continue;
@@ -292,9 +292,8 @@ pub async fn insert_document(
             }
         }
         let surrogate = match state.surrogate_assigner.assign(
-            database_id,
+            nodedb_types::CollectionKey::from_bare(database_id, &parsed.coll_name),
             tenant_id,
-            &parsed.coll_name,
             parsed.doc_id.as_bytes(),
         ) {
             Ok(s) => s,

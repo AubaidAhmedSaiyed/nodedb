@@ -337,8 +337,9 @@ fn drop_discards_invalid_staged_calvin_write() {
 
     // The read entry's collection must home to the staged request's vShard for
     // the read-set check to consider it.
-    let read_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "dropcoll").as_u32();
+    let read_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "dropcoll")
+        .vshard()
+        .as_u32();
 
     // A read of `dropcoll` observed at LSN 50 — stale against the seed's write
     // at LSN 100 → the read-set is no longer current → abort vote.
@@ -439,8 +440,9 @@ fn point_read_at_write_lsn_commits_and_flush_applies() {
     );
     assert_eq!(seed.status, Status::Ok, "seed write must commit: {seed:?}");
 
-    let point_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "pointcoll").as_u32();
+    let point_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "pointcoll")
+        .vshard()
+        .as_u32();
 
     // A Point read of the exact same key observed at LSN 10 (== the write) is
     // still current: no write happened AFTER the read.
@@ -521,8 +523,9 @@ fn stale_point_read_of_kv_key_aborts_stage_and_drop_discards() {
     );
     assert_eq!(seed.status, Status::Ok, "seed write must commit: {seed:?}");
 
-    let stale_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "stalecoll").as_u32();
+    let stale_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "stalecoll")
+        .vshard()
+        .as_u32();
 
     // A Point read of the exact same key observed at LSN 5 — stale against the
     // write at LSN 10 → the read-set is no longer current → abort vote.
@@ -607,8 +610,9 @@ fn stale_point_read_of_kv_key_aborts_stage_and_drop_discards() {
 fn absent_kv_key_phantom_insert_causes_abort() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
-    let phantom_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "phantomkv").as_u32();
+    let phantom_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "phantomkv")
+        .vshard()
+        .as_u32();
 
     // The key was absent when read at (the then-current watermark) LSN 5 — no
     // write is seeded yet.
@@ -683,8 +687,9 @@ fn absent_kv_key_phantom_insert_causes_abort() {
 fn absent_document_phantom_insert_is_caught() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
-    let doc_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "phantomdocs").as_u32();
+    let doc_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "phantomdocs")
+        .vshard()
+        .as_u32();
 
     // The document was absent when read: capture degraded the miss to a
     // collection-scoped predicate on "phantomdocs" at read_lsn 5.
@@ -757,8 +762,9 @@ fn absent_document_phantom_insert_is_caught() {
 fn absent_document_read_without_matching_insert_still_commits() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
-    let doc_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "phantomdocs").as_u32();
+    let doc_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "phantomdocs")
+        .vshard()
+        .as_u32();
 
     let absent_doc_read = VersionedReadEntry {
         engine: EngineTag::Document,

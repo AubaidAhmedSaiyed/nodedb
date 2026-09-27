@@ -461,7 +461,7 @@ mod tests {
         PhysicalTask {
             tenant_id,
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, ARRAY),
+            vshard_id: nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, ARRAY).vshard(),
             plan: crate::bridge::envelope::PhysicalPlan::Array(ArrayOp::Put {
                 array_id: ArrayId::in_database(tenant_id, DatabaseId::DEFAULT, ARRAY),
                 cells_msgpack: zerompk::to_msgpack_vec(&cells).expect("encode cells"),

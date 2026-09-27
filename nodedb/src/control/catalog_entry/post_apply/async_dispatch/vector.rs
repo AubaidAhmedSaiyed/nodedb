@@ -33,7 +33,7 @@ use tokio::sync::oneshot;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::dispatch_utils::{MintedRecords, RecordOwner};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId};
 use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::StoredVectorIndexParams;
 
@@ -343,7 +343,7 @@ fn append_redo(
     let owner = RecordOwner {
         tenant_id: TenantId::new(target.tenant_id),
         database_id,
-        vshard_id: VShardId::from_collection_in_database(database_id, target.collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, target.collection).vshard(),
     };
     let outcome = minted.append_plan(
         &shared.wal,

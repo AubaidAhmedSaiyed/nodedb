@@ -45,7 +45,7 @@
 
 use super::core_loop::CoreLoop;
 use crate::bridge::envelope::{PhysicalPlan, Status};
-use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId};
 use nodedb_physical::physical_plan::ColumnarOp;
 use nodedb_types::RlsWriteCheck;
 use nodedb_types::Value;
@@ -102,7 +102,13 @@ impl CoreLoop {
         }
 
         let tid = TenantId::new(tenant_id);
-        let vshard_id = VShardId::from_collection_in_database(database_id, &record.collection);
+        // The record decoded as this shape, so a skip is `Some(0)`, never a
+        // fall-through to the row-payload decoders.
+        let Some(vshard_id) =
+            self.replay_vshard("columnar", record_lsn, database_id, &record.collection)
+        else {
+            return Some(0);
+        };
 
         // The task carries the real predicate even though today's handlers read
         // only `task.request.{database_id, tenant_id}`. A placeholder plan would
@@ -260,7 +266,13 @@ impl CoreLoop {
         }
 
         let tid = TenantId::new(tenant_id);
-        let vshard_id = VShardId::from_collection_in_database(database_id, &record.collection);
+        // The record decoded as this shape, so a skip is `Some(0)`, never a
+        // fall-through to the row-payload decoders.
+        let Some(vshard_id) =
+            self.replay_vshard("columnar", record_lsn, database_id, &record.collection)
+        else {
+            return Some(0);
+        };
         let replay_check = RlsWriteCheck::already_decided_elsewhere();
 
         let response = if record.is_update {

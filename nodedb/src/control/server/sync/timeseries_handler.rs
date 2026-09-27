@@ -253,7 +253,7 @@ impl SyncSession {
             "timeseries push decoded, dispatching to Data Plane"
         );
 
-        let vshard = VShardId::from_collection_in_database(database_id, &msg.collection);
+        let vshard = nodedb_types::CollectionKey::from_bare(database_id, &msg.collection).vshard();
 
         match dispatcher
             .dispatch_ingest(
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(calls[0].1, database_id);
         assert_eq!(
             calls[0].2,
-            VShardId::from_collection_in_database(database_id, "metrics")
+            nodedb_types::CollectionKey::from_bare(database_id, "metrics").vshard()
         );
     }
 
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(calls[0].1, DatabaseId::DEFAULT);
         assert_eq!(
             calls[0].2,
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "metrics")
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "metrics").vshard()
         );
         assert_eq!(calls[0].3, "metrics");
         // ILP payload must contain the collection name and lite_id.

@@ -45,7 +45,7 @@ pub struct SortedIndexTarget<'a> {
 impl SortedIndexTarget<'_> {
     /// The vShard holding both the collection's rows and its index trees.
     fn vshard(&self) -> VShardId {
-        VShardId::from_collection_in_database(self.database_id, self.collection)
+        nodedb_types::CollectionKey::from_bare(self.database_id, self.collection).vshard()
     }
 }
 

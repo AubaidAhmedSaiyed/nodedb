@@ -42,7 +42,10 @@ async fn snapshot_round_trip_builder_to_applier() {
     let pks = ["pk0", "pk1", "pk2", "pk3", "pk4"];
 
     // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+        DatabaseId::DEFAULT,
+        COLL,
+    ));
     let routing = single_node_routing();
     assert!(
         routing.vshards_for_group(DATA_GROUP_ID).contains(&vshard),
@@ -87,7 +90,11 @@ async fn snapshot_round_trip_builder_to_applier() {
     // The source must have a surrogate binding for pk0 (proves inserts allocated
     // identities the snapshot will carry).
     let source_surrogate = source_catalog
-        .get_surrogate_for_pk(DatabaseId::DEFAULT, tid, COLL, pks[0].as_bytes())
+        .get_surrogate_for_pk(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLL),
+            tid,
+            pks[0].as_bytes(),
+        )
         .expect("source get_surrogate_for_pk")
         .expect("source must have a surrogate for pk0");
 
@@ -154,7 +161,11 @@ async fn snapshot_round_trip_builder_to_applier() {
     //     rebound on apply.
     let target_catalog = target.shared.credentials.catalog().clone();
     let target_surrogate = target_catalog
-        .get_surrogate_for_pk(DatabaseId::DEFAULT, tid, COLL, pks[0].as_bytes())
+        .get_surrogate_for_pk(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLL),
+            tid,
+            pks[0].as_bytes(),
+        )
         .expect("target get_surrogate_for_pk")
         .expect("target must have a rebound surrogate for pk0");
     assert_eq!(
@@ -186,7 +197,10 @@ async fn snapshot_round_trip_timeseries() {
     ];
 
     // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+        DatabaseId::DEFAULT,
+        COLL,
+    ));
     assert!(
         single_node_routing()
             .vshards_for_group(DATA_GROUP_ID)
@@ -278,7 +292,10 @@ async fn snapshot_round_trip_vector() {
     ];
 
     // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+        DatabaseId::DEFAULT,
+        COLL,
+    ));
     assert!(
         single_node_routing()
             .vshards_for_group(DATA_GROUP_ID)
@@ -370,7 +387,10 @@ async fn snapshot_round_trip_edges() {
     const FANOUT: usize = 8;
 
     // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+        DatabaseId::DEFAULT,
+        COLL,
+    ));
     assert!(
         single_node_routing()
             .vshards_for_group(DATA_GROUP_ID)

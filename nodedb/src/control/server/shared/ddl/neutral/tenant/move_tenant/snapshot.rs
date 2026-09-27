@@ -45,8 +45,7 @@ pub async fn run(
         sync_dispatch::SystemTask::new(
             sync_dispatch::SystemReason::TenantLifecycle,
             tenant_id,
-            source_db_id,
-            "__system",
+            nodedb_types::CollectionKey::from_bare(source_db_id, "__system"),
             plan,
         ),
         timeout,

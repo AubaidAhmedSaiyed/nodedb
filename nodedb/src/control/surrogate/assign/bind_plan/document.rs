@@ -38,7 +38,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
             document_id,
             surrogate,
             ..
-        } => binder.resolve_in_place(collection.as_str(), document_id.as_bytes(), surrogate),
+        } => binder.resolve_in_place(
+            binder.plan_key(collection.as_str())?,
+            document_id.as_bytes(),
+            surrogate,
+        ),
         DocumentOp::BatchInsert {
             collection,
             documents,
@@ -60,7 +64,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
                 });
             }
             for ((document_id, _value), surrogate) in documents.iter().zip(surrogates.iter_mut()) {
-                binder.resolve_in_place(collection.as_str(), document_id.as_bytes(), surrogate)?;
+                binder.resolve_in_place(
+                    binder.plan_key(collection.as_str())?,
+                    document_id.as_bytes(),
+                    surrogate,
+                )?;
             }
             Ok(())
         }
@@ -78,8 +86,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
                 resolved_insert_identities.iter_mut().enumerate()
             {
                 let carried = nodedb_types::Surrogate::new(*surrogate);
-                let bound =
-                    binder.resolve(target_collection.as_str(), document_id.as_bytes(), carried)?;
+                let bound = binder.resolve(
+                    binder.plan_key(target_collection.as_str())?,
+                    document_id.as_bytes(),
+                    carried,
+                )?;
                 if bound == carried {
                     continue;
                 }
@@ -110,7 +121,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
                         surrogate,
                         ..
                     } => binder.resolve_in_place(
-                        collection.as_str(),
+                        binder.plan_key(collection.as_str())?,
                         document_id.as_bytes(),
                         surrogate,
                     )?,

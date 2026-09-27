@@ -39,10 +39,7 @@ use nodedb_cluster::calvin::{
     sequencer::{SequencerConfig, new_inbox},
     types::{EngineKeySet, ReadWriteSet, SchedulerInput, SortedVec, TxClass, VersionedReadSet},
 };
-use nodedb_types::{
-    TenantId,
-    id::{DatabaseId, VShardId},
-};
+use nodedb_types::{TenantId, id::DatabaseId};
 use tokio::sync::mpsc;
 
 use super::cluster_common::{spawn_with_sequencer, try_recv_txn, wait_for_sequencer_leader};
@@ -54,7 +51,9 @@ fn two_distinct_vshard_collections() -> (String, String) {
     let mut first: Option<(String, u32)> = None;
     for i in 0u32..512 {
         let name = format!("ollp_col_{i}");
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+            .vshard()
+            .as_u32();
         if let Some((ref fname, fv)) = first {
             if fv != vshard {
                 return (fname.clone(), name);
@@ -137,9 +136,12 @@ async fn ollp_bulk_update_txclass_admitted_and_fanned_out() {
 
     // Find two collections that hash to distinct vshards.
     let (col_static, col_ollp) = two_distinct_vshard_collections();
-    let vs_static =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_static).as_u32();
-    let vs_ollp = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_ollp).as_u32();
+    let vs_static = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &col_static)
+        .vshard()
+        .as_u32();
+    let vs_ollp = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &col_ollp)
+        .vshard()
+        .as_u32();
 
     // Wire per-vshard fan-out receivers on every replica.
     let mut rxs_static: Vec<mpsc::Receiver<SchedulerInput>> = Vec::new();

@@ -234,7 +234,9 @@ pub(crate) async fn dispatch_crdt_apply_admitted_outcome(
             });
         }
     };
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    // `collection` is the plan's database-qualified name.
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let workflow = CrdtAdmissionWorkflow {
         state,
         tenant_id,
@@ -296,8 +298,7 @@ async fn preview(
             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
                 workflow.tenant_id,
-                workflow.database_id,
-                workflow.collection,
+                nodedb_types::CollectionKey::from_qualified_str(workflow.database_id, workflow.collection)?,
                 PhysicalPlan::Crdt(CrdtOp::PreviewApply {
                     collection: nodedb_types::QualifiedCollection::from_stored(
                         workflow.collection.to_owned(),
@@ -425,7 +426,9 @@ pub(crate) async fn dispatch_crdt_restore_admitted(
         event_source,
         policy,
     } = request;
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    // `collection` is the plan's database-qualified name.
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let workflow = CrdtAdmissionWorkflow {
         state,
         tenant_id,
@@ -491,8 +494,7 @@ async fn generate_restore_delta(
             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
                 workflow.tenant_id,
-                workflow.database_id,
-                workflow.collection,
+                nodedb_types::CollectionKey::from_qualified_str(workflow.database_id, workflow.collection)?,
                 PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
                     collection: nodedb_types::QualifiedCollection::from_stored(
                         workflow.collection.to_owned(),
@@ -1065,7 +1067,7 @@ mod tests {
         let task = nodedb_physical::physical_task::PhysicalTask {
             tenant_id,
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, "docs"),
+            vshard_id: nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs").vshard(),
             plan: apply_plan(),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,
@@ -1115,7 +1117,7 @@ mod tests {
         let task = nodedb_physical::physical_task::PhysicalTask {
             tenant_id,
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, "docs"),
+            vshard_id: nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs").vshard(),
             plan: apply_plan(),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,

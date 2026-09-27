@@ -9,7 +9,7 @@
 
 use nodedb_test_support::pgwire_harness::TestServer;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 
 /// Binding target (holds the balance) and binding source (drives it) for
 /// [`autocommit_update_from_join_on_a_sum_source_folds_the_balance`]. The names
@@ -26,8 +26,8 @@ const JOIN_SOURCE: &str = "atm_adjust";
 #[test]
 fn materialized_sum_source_and_target_are_co_resident() {
     assert_eq!(
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, SUM_SOURCE),
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, SUM_TARGET),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SUM_SOURCE).vshard(),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SUM_TARGET).vshard(),
         "the autocommit sum test must exercise the CO-RESIDENT path; \
          rename the collections until the two hashes agree again"
     );

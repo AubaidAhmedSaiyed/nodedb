@@ -18,7 +18,7 @@ pub use fusion::{
 pub use materialized_sum_delta::{
     binding_amount, binding_insert_deltas, binding_join_value, json_to_decimal,
 };
-pub use materialized_sum_homing::{db_qualified, sum_target_is_co_resident, sum_target_vshard};
+pub use materialized_sum_homing::{sum_target_is_co_resident, sum_target_vshard};
 pub use materialized_sum_images::{
     BindingDelta, apply_conflict_assignments, apply_update_assignments, binding_image_deltas,
     coalesce_binding_deltas,

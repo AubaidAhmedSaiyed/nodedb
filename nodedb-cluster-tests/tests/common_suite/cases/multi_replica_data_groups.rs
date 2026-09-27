@@ -121,7 +121,9 @@ async fn data_group_is_multi_replica_and_survives_leader_loss() {
         .await;
 
     // Resolve the collection's data group.
-    let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    let vshard = nodedb_cluster::routing::vshard_for_collection(
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLL),
+    );
     let group_id = {
         let routing = cluster.nodes[0]
             .shared

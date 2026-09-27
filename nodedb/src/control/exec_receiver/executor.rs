@@ -279,14 +279,23 @@ impl LocalPlanExecutor {
         //
         // The vshard is not carried on the wire; re-derive it as a pure
         // function of the plan's primary collection, matching the gateway
-        // router's `CollectionHomed` arm (`vshard_for_collection`).
-        let vshard_id = crate::types::VShardId::new(
-            crate::control::gateway::version_set::touched_collections(&plan)
-                .into_iter()
-                .next()
-                .map(|name| nodedb_cluster::routing::vshard_for_collection(database_id, &name))
-                .unwrap_or(0),
-        );
+        // router's `CollectionHomed` arm (`vshard_for_collection`). The plan
+        // carries the database-qualified name, de-qualified into the
+        // canonical key before hashing.
+        let vshard_raw = match crate::control::gateway::version_set::touched_collections(&plan)
+            .into_iter()
+            .next()
+        {
+            Some(name) => match nodedb_types::CollectionKey::from_qualified_str(database_id, &name)
+            {
+                Ok(key) => nodedb_cluster::routing::vshard_for_collection(key),
+                Err(error) => {
+                    return ExecuteResponse::err(execution_error_to_typed(error.into()));
+                }
+            },
+            None => 0,
+        };
+        let vshard_id = crate::types::VShardId::new(vshard_raw);
         if let Err(error) = reject_unadmitted_crdt_apply(&plan) {
             return ExecuteResponse::err(error);
         }

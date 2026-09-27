@@ -80,7 +80,7 @@ pub fn extract_db_scoped_collection(key: &str, tenant_id: u64) -> Option<&str> {
 /// consumes the output exactly as before.
 ///
 /// `vshard_of` maps a collection name to its vshard (the caller passes the
-/// canonical `vshard_for_collection(DEFAULT, _)`), matching the Raft snapshot
+/// canonical `vshard_for_collection` over the default-database key), matching the Raft snapshot
 /// SEND builder. Every section kind the snapshot carries is classified here so
 /// adding a section without updating this filter is impossible to miss:
 ///

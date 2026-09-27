@@ -63,7 +63,10 @@ fn read_catalog_surrogates(
 ) -> Vec<(String, u32)> {
     let catalog = shared.credentials.catalog();
     catalog
-        .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), collection)
+        .scan_surrogates_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection),
+            TenantId::new(1),
+        )
         .unwrap_or_default()
         .into_iter()
         .map(|(pk_bytes, surrogate)| {

@@ -5,7 +5,7 @@
 use nodedb_sql::types::{KvInsertIntent, SqlExpr, SqlValue};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 
 use super::super::convert::ConvertContext;
@@ -25,6 +25,7 @@ pub(in super::super) fn convert_kv_insert(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let collection_key = ctx.collection_key(collection);
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
@@ -33,7 +34,7 @@ pub(in super::super) fn convert_kv_insert(
     } else {
         assignments_to_update_values(on_conflict_updates)?
     };
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = collection_key.vshard();
     let ttl_ms = ttl_secs * 1000;
     let mut tasks = Vec::with_capacity(entries.len());
     for (key_val, value_cols) in entries {
@@ -59,7 +60,7 @@ pub(in super::super) fn convert_kv_insert(
             }
             buf
         };
-        let surrogate = assign_for_pk(ctx, collection, &key)?;
+        let surrogate = assign_for_pk(ctx, collection_key, &key)?;
         let op = match intent {
             KvInsertIntent::Insert => KvOp::Insert {
                 collection: qualified_collection.clone(),

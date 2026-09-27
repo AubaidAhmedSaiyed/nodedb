@@ -16,6 +16,11 @@ pub enum CalvinError {
     )]
     SingleVshardTxn { vshard: u32 },
 
+    /// A key-set collection name lacks the qualifier of the transaction's
+    /// database, so its vShard cannot be derived.
+    #[error("calvin key set: {0}")]
+    CollectionKey(#[from] nodedb_types::CollectionKeyError),
+
     /// A sequencer-layer error. See [`crate::calvin::sequencer::error::SequencerError`]
     /// for the full variant set.
     #[error("sequencer error: {0}")]

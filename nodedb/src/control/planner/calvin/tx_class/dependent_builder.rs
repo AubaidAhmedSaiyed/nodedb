@@ -287,8 +287,9 @@ mod tests {
         // vshard. This is exactly the shape the contended single-shard
         // predicate-write routing path builds.
         let tasks = vec![bulk_delete_task("users")];
-        let want_vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "users").as_u32();
+        let want_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users")
+            .vshard()
+            .as_u32();
 
         // Strict builder rejects the single-vshard write set.
         let strict = build_dependent_tx_class(&tasks, TenantId::new(1), "users", &[7, 8], &[]);

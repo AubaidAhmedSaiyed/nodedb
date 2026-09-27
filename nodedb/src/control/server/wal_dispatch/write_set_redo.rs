@@ -76,7 +76,8 @@ pub fn append_write_set_redo(
         // A cross-collection entry homes to a different vShard, so it's re-derived
         // per entry rather than reusing the caller-hoisted `vshard_id`.
         let entry_vshard_id = match &entry.collection {
-            Some(c) => VShardId::from_collection_in_database(database_id, c),
+            // A write-set entry names its storage collection, the qualified name.
+            Some(c) => nodedb_types::CollectionKey::from_qualified_str(database_id, c)?.vshard(),
             None => vshard_id,
         };
         let lsn = if entry.is_delete {
@@ -112,7 +113,9 @@ pub fn mint_dispatch_local_redo(
     if resp.status != Status::Ok || resp.write_set.is_empty() {
         return Ok(());
     }
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    // `collection` is the plan's database-qualified name.
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     append_write_set_redo(
         wal,
         tenant_id,

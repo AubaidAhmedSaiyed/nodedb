@@ -88,8 +88,25 @@ impl SequencerStateMachine {
             SequencerEntry::EpochBatch { mut batch } => {
                 // Re-derive the participating_vshards field which is skipped
                 // during serialization (it is computed from write_set collection names).
+                // A class whose participants cannot be derived makes the entry
+                // as unusable as one that fails to decode, so it is skipped the
+                // same way.
                 for txn in &mut batch.txns {
-                    txn.tx_class.restore_derived();
+                    if let Err(err) = txn.tx_class.restore_derived() {
+                        error!(
+                            epoch = batch.epoch,
+                            raft_index = index,
+                            error = %err,
+                            "sequencer state machine: epoch batch carries a transaction \
+                             with underivable participants; skipping entry"
+                        );
+                        crate::diag::sequencer_participants_underivable(
+                            batch.epoch,
+                            index,
+                            &err.to_string(),
+                        );
+                        return;
+                    }
                 }
 
                 // A halted state machine has already diverged from the log;
@@ -475,14 +492,16 @@ mod tests {
     };
     use nodedb_types::{
         TenantId,
-        id::{DatabaseId, VShardId},
+        id::{CollectionKey, DatabaseId},
     };
 
     fn find_two_distinct_collections() -> (String, String) {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..512 {
             let name = format!("col_{i}");
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             if let Some((ref fname, fv)) = first {
                 if fv != vshard {
                     return (fname.clone(), name);
@@ -501,8 +520,12 @@ mod tests {
         // We'll use find_two_distinct_collections and use whatever vshards they hash to.
         let (col_a, col_b) = find_two_distinct_collections();
         let _ = (vshard_a, vshard_b); // actual vshard ids come from the collection hash
-        let real_va = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_a).as_u32();
-        let real_vb = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_b).as_u32();
+        let real_va = CollectionKey::from_bare(DatabaseId::DEFAULT, &col_a)
+            .vshard()
+            .as_u32();
+        let real_vb = CollectionKey::from_bare(DatabaseId::DEFAULT, &col_b)
+            .vshard()
+            .as_u32();
         let write_set = ReadWriteSet::new(vec![
             EngineKeySet::Document {
                 collection: col_a,

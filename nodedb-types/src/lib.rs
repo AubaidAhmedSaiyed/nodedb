@@ -100,8 +100,8 @@ pub use graph::{Direction, GraphStats};
 pub use hlc::{ClockSkew, Hlc, HlcClock, MAX_CLOCK_SKEW_NS};
 pub use hnsw::{HnswCheckpoint, HnswNodeSnapshot, HnswParams};
 pub use id::{
-    CollectionId, DatabaseId, DocumentId, EdgeId, EdgeIdParseError, IdError, IdType, NodeId,
-    QualifiedCollection, ShapeId, TenantId,
+    CollectionId, CollectionKey, CollectionKeyError, DatabaseId, DocumentId, EdgeId,
+    EdgeIdParseError, IdError, IdType, NodeId, QualifiedCollection, ShapeId, TenantId,
 };
 pub use identity::KeyRepr;
 pub use json_msgpack::{

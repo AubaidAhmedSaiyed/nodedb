@@ -6,7 +6,7 @@ use nodedb_sql::types::{EngineType, Filter, SqlValue};
 use nodedb_types::SystemTimeScope;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 
 use super::super::aggregate::{
@@ -54,7 +54,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         let sort = convert_sort_keys(sort_keys);
         return Ok(vec![PhysicalTask {
             tenant_id,
-            vshard_id: VShardId::from_collection_in_database(database_id, ""),
+            vshard_id: nodedb_types::CollectionKey::from_bare(database_id, "").vshard(),
             database_id,
             plan: PhysicalPlan::Query(QueryOp::ProviderScan {
                 provider: Some(collection.to_string()),
@@ -73,13 +73,12 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         }]);
     }
 
-    let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
-    let collection = coll_qualified.as_str();
     let filter_bytes = serialize_filters(filters)?;
     let proj_names = extract_projection_names(projection, window_functions);
     let sort = convert_sort_keys(sort_keys);
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    let vshard = collection_key.vshard();
 
     let physical = match engine {
         EngineType::Timeseries => {
@@ -217,12 +216,11 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_document_index_look
         tenant_id,
         database_id,
     } = args;
-    let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
-    let collection = coll_qualified.as_str();
     let filter_bytes = serialize_filters(filters)?;
     let proj_names = extract_projection_names(projection, &[]);
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    let vshard = collection_key.vshard();
     let physical = PhysicalPlan::Document(DocumentOp::IndexedFetch {
         collection: qualified_collection,
         path: field.into(),
@@ -250,10 +248,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
     tenant_id: TenantId,
     ctx: &super::super::convert::ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = collection_key.vshard();
     let physical = match engine {
         EngineType::KeyValue => PhysicalPlan::Kv(KvOp::Get {
             collection: qualified_collection.clone(),
@@ -265,7 +262,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
             let pk_string = sql_value_to_string(key_value);
             let pk_bytes = pk_string.clone().into_bytes();
             let surrogate = match ctx.surrogate_assigner.as_ref() {
-                Some(a) => match a.lookup(ctx.database_id, ctx.tenant_id, collection, &pk_bytes)? {
+                Some(a) => match a.lookup(collection_key, ctx.tenant_id, &pk_bytes)? {
                     Some(s) => s,
                     None => {
                         // No surrogate bound in the target database yet.

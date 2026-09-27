@@ -11,7 +11,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
@@ -44,7 +44,7 @@ pub async fn verify_hash_chain(
     gate.refuse_if_any_redaction(&collection, "the hash chain")?;
 
     // Scan all documents.
-    let vshard = VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
     let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         limit: usize::MAX,

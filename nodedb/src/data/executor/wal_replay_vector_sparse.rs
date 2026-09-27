@@ -82,10 +82,14 @@ impl CoreLoop {
             return false;
         }
         self.record_sparse_doc_undo(database_id, tenant_id, (&collection, &field_name), &doc_id);
-        let vshard = crate::types::VShardId::from_collection_in_database(
+        let Some(vshard) = self.replay_vshard(
+            "sparse_vector",
+            record_lsn,
             DatabaseId::new(database_id),
             &collection,
-        );
+        ) else {
+            return false;
+        };
         let task = Self::replay_vector_task(
             nodedb_types::TenantId::new(tenant_id),
             DatabaseId::new(database_id),
@@ -149,10 +153,14 @@ impl CoreLoop {
             return false;
         }
         self.record_sparse_doc_undo(database_id, tenant_id, (&collection, &field_name), &doc_id);
-        let vshard = crate::types::VShardId::from_collection_in_database(
+        let Some(vshard) = self.replay_vshard(
+            "sparse_vector",
+            record_lsn,
             DatabaseId::new(database_id),
             &collection,
-        );
+        ) else {
+            return false;
+        };
         let task = Self::replay_vector_task(
             nodedb_types::TenantId::new(tenant_id),
             DatabaseId::new(database_id),

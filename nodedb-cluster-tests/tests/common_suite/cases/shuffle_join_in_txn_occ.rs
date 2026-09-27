@@ -67,13 +67,15 @@ use common::occ_shuffle::{
 /// Four collection names whose vShard ids are pairwise distinct, so a transaction
 /// that reads two of them (the join sides) and writes the other two is genuinely
 /// multi-vShard on both its read set and its write set. Deterministic:
-/// `VShardId::from_collection_in_database` is a pure function of the database id +
+/// `VShardId::from_collection` is a pure function of the database id +
 /// collection-name bytes.
 fn distinct_vshard_quad() -> (String, String, String, String) {
     let mut chosen: Vec<(String, u32)> = Vec::new();
     for i in 0u32..2048 {
         let name = format!("shuffle_join_occ_{i}");
-        let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+        let v = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+            .vshard()
+            .as_u32();
         if chosen.iter().all(|(_, cv)| *cv != v) {
             chosen.push((name, v));
             if chosen.len() == 4 {

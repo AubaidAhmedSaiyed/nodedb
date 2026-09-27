@@ -103,8 +103,7 @@ pub async fn convert_collection(
         SystemTask::new(
             SystemReason::DdlApply,
             tenant_id,
-            database_id,
-            &collection,
+            nodedb_types::CollectionKey::from_bare(database_id, &collection),
             plan,
         ),
         Duration::from_secs(60),

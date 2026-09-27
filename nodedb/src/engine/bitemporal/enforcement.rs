@@ -153,8 +153,7 @@ async fn run_one(state: &Arc<SharedState>, entry: &Entry) {
         crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
             crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
             tenant_id,
-            entry.database_id,
-            &entry.collection,
+            nodedb_types::CollectionKey::from_bare(entry.database_id, &entry.collection),
             plan,
         ),
         Duration::from_secs(DISPATCH_DEADLINE_SECS),

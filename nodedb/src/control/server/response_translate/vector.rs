@@ -88,7 +88,9 @@ fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
 /// user's PK through this single catalog call. Returns `None` when the
 /// catalog has no PK mapping for the surrogate (headless row, or a document
 /// that was never written) — callers must leave the row's identifier
-/// untouched in that case rather than fabricate a value.
+/// untouched in that case rather than fabricate a value. `collection` is the
+/// plan's database-qualified name, de-qualified into the canonical key; a
+/// name that does not de-qualify also resolves to `None`.
 pub(crate) fn resolve_surrogate_pk(
     state: &SharedState,
     database_id: DatabaseId,
@@ -97,8 +99,9 @@ pub(crate) fn resolve_surrogate_pk(
     surrogate: Surrogate,
 ) -> Option<String> {
     let catalog = state.credentials.catalog();
+    let key = nodedb_types::CollectionKey::from_qualified_str(database_id, collection).ok()?;
     let pk_bytes = catalog
-        .get_pk_for_surrogate(database_id, tenant_id, collection, surrogate)
+        .get_pk_for_surrogate(key, tenant_id, surrogate)
         .ok()??;
     String::from_utf8(pk_bytes).ok()
 }

@@ -91,7 +91,8 @@ impl TestStack {
         let task = PhysicalTask {
             tenant_id,
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
+            vshard_id: nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection)
+                .vshard(),
             plan,
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -165,7 +166,7 @@ impl TestStack {
             .appender(NO_APPLY_KEY)
             .append_timeseries_batch(
                 TenantId::new(1),
-                VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection).vshard(),
                 DatabaseId::DEFAULT,
                 &wal_payload,
             )

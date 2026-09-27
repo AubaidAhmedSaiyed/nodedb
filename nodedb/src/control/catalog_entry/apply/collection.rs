@@ -178,9 +178,8 @@ pub fn finalize_purge(
         catalog,
     )?;
     catalog.delete_all_surrogates_for_collection(
-        database_id,
+        nodedb_types::CollectionKey::from_bare(database_id, name),
         nodedb_types::TenantId::new(tenant_id),
-        name,
     )?;
     // An index cannot outlive the collection it indexes. Its identity rows,
     // its ownership rows, and any engine-side build parameters go with the

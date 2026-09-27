@@ -41,7 +41,8 @@ pub struct AssignSurrogateRequest {
     pub vshard_id: u32,
     pub database_id: u64,
     pub tenant_id: u64,
-    /// Collection the surrogate is scoped to.
+    /// Bare catalog name of the collection the surrogate is scoped to. With
+    /// `database_id` it forms the canonical collection key.
     pub collection: String,
     /// Primary-key bytes of the endpoint whose surrogate is being resolved.
     pub pk: Vec<u8>,

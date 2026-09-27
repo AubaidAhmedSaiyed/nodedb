@@ -242,9 +242,11 @@ async fn native_commit_makes_strict_row_visible_to_every_read_path() {
             .shared
             .surrogate_assigner
             .lookup(
-                nodedb_types::DatabaseId::DEFAULT,
+                nodedb_types::CollectionKey::from_bare(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "native_committed_visibility"
+                ),
                 nodedb_types::TenantId::new(1),
-                "native_committed_visibility",
                 b"a1",
             )
             .expect("lookup committed PK binding")

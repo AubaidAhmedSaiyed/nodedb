@@ -11,7 +11,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
@@ -51,11 +51,15 @@ pub async fn balance_as_of(
     gate.refuse_if_field_redacted(&collection, &column, "the as-of balance")?;
 
     // Read current balance from the target document.
-    let vshard = VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
     let pk_bytes = key.as_bytes().to_vec();
     let surrogate = state
         .surrogate_assigner
-        .lookup(database_id, tenant_id, &collection, &pk_bytes)
+        .lookup(
+            nodedb_types::CollectionKey::from_bare(database_id, &collection),
+            tenant_id,
+            &pk_bytes,
+        )
         .map_err(|e| err("XX000", &format!("surrogate lookup failed: {e}")))?
         .unwrap_or(nodedb_types::Surrogate::ZERO);
     let mut get_plan =
@@ -115,7 +119,7 @@ pub async fn balance_as_of(
 
     // Scan the source collection for rows where join_column = key AND created_at > as_of.
     let source_vshard =
-        VShardId::from_collection_in_database(database_id, &mat_def.source_collection);
+        nodedb_types::CollectionKey::from_bare(database_id, &mat_def.source_collection).vshard();
     let mut source_scan =
         PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
             collection: nodedb_types::QualifiedCollection::new(

@@ -316,10 +316,11 @@ fn should_fire_on_this_node(sched: &ScheduleDef, state: &SharedState) -> bool {
     if let Some(ref collection) = sched.target_collection {
         // Collection-targeted schedule: fire only on the shard leader in
         // the database that owns the schedule definition.
-        let vshard_id = nodedb_cluster::routing::vshard_for_collection(
-            nodedb_types::id::DatabaseId::new(sched.database_id),
-            collection,
-        );
+        let vshard_id =
+            nodedb_cluster::routing::vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+                nodedb_types::id::DatabaseId::new(sched.database_id),
+                collection,
+            ));
         let routing = routing_lock.read().unwrap_or_else(|p| p.into_inner());
         match routing.leader_for_vshard(vshard_id) {
             Ok(leader) => leader == node_id,
@@ -365,10 +366,10 @@ fn is_raft_group_healthy(sched: &ScheduleDef, state: &SharedState) -> bool {
         .target_collection
         .as_ref()
         .map(|c| {
-            nodedb_cluster::routing::vshard_for_collection(
+            nodedb_cluster::routing::vshard_for_collection(nodedb_types::CollectionKey::from_bare(
                 nodedb_types::id::DatabaseId::new(sched.database_id),
                 c,
-            )
+            ))
         })
         .unwrap_or(0); // Cross-collection → coordinator vShard 0.
 

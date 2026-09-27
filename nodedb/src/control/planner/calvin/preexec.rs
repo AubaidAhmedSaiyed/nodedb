@@ -21,7 +21,7 @@ use nodedb_types::TenantId;
 
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 
 /// One implicit graph edge surfaced from the pre-execution reconnaissance scan.
@@ -84,7 +84,7 @@ pub async fn run_preexec_scan(
     collection: &str,
     filter_bytes: Vec<u8>,
 ) -> crate::Result<PreexecScan> {
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    let vshard_id = nodedb_types::CollectionKey::from_bare(database_id, collection).vshard();
 
     let scan_plan = PhysicalPlan::Document(DocumentOp::Scan {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),

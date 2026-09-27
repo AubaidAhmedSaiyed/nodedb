@@ -294,7 +294,9 @@ mod tests {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..1024 {
             let name = format!("coll_{i}");
-            let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let v = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             match &first {
                 Some((fname, fv)) if *fv != v => return (fname.clone(), name),
                 Some(_) => {}
@@ -351,7 +353,8 @@ mod tests {
 
     #[test]
     fn single_vshard_builder_preserves_database_scope() {
-        let mut task = point_insert_task("db_scoped", 1);
+        // A plan in a non-default database names its collection qualified.
+        let mut task = point_insert_task("7/db_scoped", 1);
         task.database_id = DatabaseId::new(7);
         let tx = build_single_vshard_tx_class(&[task], TenantId::new(1), &[])
             .expect("valid single-vshard TxClass");
@@ -444,14 +447,16 @@ mod tests {
             .map(|v| v.as_u32())
             .collect();
         for coll in [col_a.as_str(), col_b.as_str(), "read_col", "scan_col"] {
-            let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, coll).as_u32();
+            let v = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, coll)
+                .vshard()
+                .as_u32();
             assert!(
                 participants.contains(&v),
                 "participant set must include the vShard of {coll}"
             );
         }
         // Every write shard is still present (the read union never drops one).
-        for v in tx.write_set.participating_vshards() {
+        for v in tx.write_set.participating_vshards().expect("participants") {
             assert!(
                 participants.contains(&v.as_u32()),
                 "read union must not drop a write shard"
@@ -470,7 +475,10 @@ mod tests {
         // Participants collapse to the write-derived set when there are no reads.
         assert_eq!(
             tx.participating_vshards(),
-            tx.write_set.participating_vshards().as_slice()
+            tx.write_set
+                .participating_vshards()
+                .expect("participants")
+                .as_slice()
         );
     }
 
@@ -557,8 +565,9 @@ mod tests {
         // One point-write task → one collection → one vshard. This is exactly the
         // shape the contended point-write routing path builds.
         let tasks = vec![point_insert_task("users", 7)];
-        let want_vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "users").as_u32();
+        let want_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users")
+            .vshard()
+            .as_u32();
 
         // Strict builder rejects the single-vshard write set.
         let strict = build_static_tx_class(&tasks, TenantId::new(1), &[]);

@@ -20,7 +20,8 @@ use crate::types::{DatabaseId, TenantId, VShardId};
 /// collection's rows may travel in a single write.
 const REISSUE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Write `plan`, restored into `collection`, durably.
+/// Write `plan`, restored into `collection`, durably. `collection` is the
+/// bare catalog name in `database_id`.
 ///
 /// Branches identically to a normal write:
 /// - Cluster: `to_replicated_entry` + `propose_replicated_entry`.
@@ -35,7 +36,7 @@ pub async fn reissue_plan_durably(
     collection: &str,
     plan: PhysicalPlan,
 ) -> crate::Result<()> {
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, collection).vshard();
 
     if let Some(proposer) = state.async_raft_proposer() {
         let entry = crate::control::wal_replication::to_replicated_entry(
@@ -89,8 +90,7 @@ pub async fn reissue_plan_durably(
         sync_dispatch::SystemTask::new(
             sync_dispatch::SystemReason::BackupRestore,
             tenant_id,
-            database_id,
-            collection,
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
             plan,
         )
         .with_minted(minted),

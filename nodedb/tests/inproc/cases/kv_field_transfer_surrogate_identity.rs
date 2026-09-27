@@ -52,7 +52,10 @@ async fn kv_field_set_on_existing_key_persists_a_real_surrogate() {
 
     let catalog = server.shared.credentials.catalog();
     let bindings = catalog
-        .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), "cf")
+        .scan_surrogates_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "cf"),
+            TenantId::new(1),
+        )
         .expect("scan persisted surrogate bindings for cf");
 
     assert_eq!(
@@ -94,7 +97,10 @@ async fn kv_transfer_persists_two_distinct_surrogates() {
 
     let catalog = server.shared.credentials.catalog();
     let bindings = catalog
-        .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), "ct")
+        .scan_surrogates_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "ct"),
+            TenantId::new(1),
+        )
         .expect("scan persisted surrogate bindings for ct");
 
     // Fix: two bindings (debit from the insert, credit from the transfer),

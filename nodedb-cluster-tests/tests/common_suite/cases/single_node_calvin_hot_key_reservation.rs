@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use nodedb::control::cluster::calvin::scheduler::lock::LockKey;
 use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
-use nodedb_types::id::{DatabaseId, VShardId};
+use nodedb_types::id::DatabaseId;
 
 use common::cluster_harness::{TestClusterNode, wait_for};
 
@@ -41,7 +41,9 @@ fn sequencer_leader(node: &TestClusterNode) -> u64 {
 fn other_vshard_collection(exclude_vshard: u32) -> String {
     for i in 0u32..4096 {
         let name = format!("hkr_other_{i}");
-        if VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32()
+        if nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+            .vshard()
+            .as_u32()
             != exclude_vshard
         {
             return name;
@@ -81,7 +83,9 @@ async fn hot_key_read_reservation_installs_self_upgrades_and_releases() {
     .await;
 
     let hot_coll = "hkr_hot_kv";
-    let hot_vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, hot_coll).as_u32();
+    let hot_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, hot_coll)
+        .vshard()
+        .as_u32();
     let other_coll = other_vshard_collection(hot_vshard);
 
     node.client

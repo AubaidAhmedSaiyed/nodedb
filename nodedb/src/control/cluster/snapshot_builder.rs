@@ -58,7 +58,10 @@ impl DataPlaneSnapshotBuilder {
     /// vshard-of-key logic is never duplicated. Matches the canonical routing
     /// function (`vshard_for_collection`) used by the RESTORE topology splitter.
     fn vshard_of(collection: &str) -> u32 {
-        nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, collection)
+        nodedb_cluster::routing::vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+            DatabaseId::DEFAULT,
+            collection,
+        ))
     }
 
     /// Capture PK→surrogate bindings for every active collection whose vshard
@@ -81,9 +84,8 @@ impl DataPlaneSnapshotBuilder {
             .filter(|c| group_vshards.contains(&Self::vshard_of(&c.name)))
         {
             let bindings = catalog.scan_surrogates_for_collection(
-                DatabaseId::DEFAULT,
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &coll.name),
                 TenantId::new(coll.tenant_id),
-                &coll.name,
             )?;
             for (pk, surrogate) in bindings {
                 merged.surrogate_pk.push(SurrogateBindEntry {
@@ -113,8 +115,7 @@ impl DataPlaneSnapshotBuilder {
             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::ClusterSnapshot,
                 TenantId::new(tenant_id),
-                DatabaseId::DEFAULT,
-                "__system",
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "__system"),
                 plan,
             ),
             TENANT_SNAPSHOT_TIMEOUT,
@@ -199,7 +200,7 @@ impl DataPlaneSnapshotBuilder {
 
         // Graph edges: the versioned edge key embeds the collection as its
         // FIRST `\x00`-delimited component, and edge writes are homed at
-        // `vshard_for_collection(DEFAULT, collection)` — the SAME routing
+        // `vshard_for_collection` over the default-database key — the SAME routing
         // function `Self::vshard_of` uses. So edges route through the identical
         // vshard filter every other section uses. The restore path parses the
         // key and rebuilds CSR, so no key transformation is needed here.

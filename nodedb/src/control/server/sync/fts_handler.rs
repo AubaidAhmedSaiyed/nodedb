@@ -197,9 +197,11 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         collection: &str,
         doc_id: &str,
     ) -> crate::Result<Surrogate> {
-        self.shared
-            .surrogate_assigner
-            .assign(database_id, tenant_id, collection, doc_id.as_bytes())
+        self.shared.surrogate_assigner.assign(
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
+            tenant_id,
+            doc_id.as_bytes(),
+        )
     }
 }
 

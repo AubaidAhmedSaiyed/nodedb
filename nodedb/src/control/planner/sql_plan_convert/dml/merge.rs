@@ -5,7 +5,7 @@
 use nodedb_sql::types::{MergeClauseKind, MergePlanAction, MergePlanClause, SqlExpr, SqlPlan};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_physical::physical_plan::document::merge_types::{
@@ -45,6 +45,7 @@ pub(in super::super) fn convert_merge(
         tenant_id,
         ctx,
     } = args;
+    let target_key = ctx.collection_key(target);
     let target_qualified = super::super::convert::db_qualified(ctx.database_id, target);
     let qualified_target = nodedb_types::QualifiedCollection::new(ctx.database_id, target);
     let target = target_qualified.as_str();
@@ -68,7 +69,7 @@ pub(in super::super) fn convert_merge(
         .map(convert_clause)
         .collect::<crate::Result<Vec<_>>>()?;
 
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, target);
+    let vshard = target_key.vshard();
     // A declared PRIMARY KEY implies NOT NULL; the Data Plane checks a MATCHED
     // or NOT-MATCHED-BY-SOURCE UPDATE arm's post-image against this name.
     let declared_primary_key = super::declared_primary_key_name(ctx, target)?;

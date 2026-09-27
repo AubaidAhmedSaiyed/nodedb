@@ -194,9 +194,8 @@ impl RowBuilder<'_> {
     /// under that surrogate, over the row it names.
     fn bind(&self, identity: &RowIdentity, key: StorageKey) -> crate::Result<CarriedIdentity> {
         let surrogate = self.state.surrogate_assigner.bind(
-            self.database_id,
+            nodedb_types::CollectionKey::from_bare(self.database_id, self.collection),
             self.tenant,
-            self.collection,
             identity.as_str().as_bytes(),
             key.surrogate(),
         )?;

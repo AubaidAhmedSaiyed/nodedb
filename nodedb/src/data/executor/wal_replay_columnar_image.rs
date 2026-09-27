@@ -25,7 +25,7 @@ use crate::bridge::envelope::{ErrorCode, PhysicalPlan};
 use crate::data::executor::handlers::columnar_write::ndb_field_to_value;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::task::ExecutionTask;
-use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId};
 
 /// One decoded row of a `columnar_image` record.
 struct ImageRow {
@@ -146,10 +146,14 @@ impl CoreLoop {
                 return Some(0);
             }
         };
+        let Some(vshard) = self.replay_vshard("columnar", record_lsn, database_id, collection)
+        else {
+            return Some(0);
+        };
         let task = Self::replay_task(
             tid,
             database_id,
-            VShardId::from_collection_in_database(database_id, collection),
+            vshard,
             PhysicalPlan::Columnar(ColumnarOp::Insert {
                 collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 payload: plan_payload,

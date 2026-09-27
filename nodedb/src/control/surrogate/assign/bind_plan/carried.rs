@@ -19,6 +19,8 @@ use crate::types::{DatabaseId, TenantId};
 /// One `(collection, pk_bytes) → surrogate` identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarriedIdentity {
+    /// The bare catalog name. With the binding database it forms the
+    /// canonical `CollectionKey`.
     pub collection: String,
     pub pk_bytes: Vec<u8>,
     pub surrogate: Surrogate,
@@ -55,9 +57,8 @@ pub fn bind_carried_identities(
 ) -> crate::Result<()> {
     for identity in identities {
         let bound = assigner.bind(
-            database_id,
+            nodedb_types::CollectionKey::from_bare(database_id, &identity.collection),
             tenant_id,
-            &identity.collection,
             &identity.pk_bytes,
             identity.surrogate,
         )?;

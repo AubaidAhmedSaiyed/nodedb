@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 
 use nodedb_physical::physical_plan::PhysicalPlan;
-use nodedb_types::Surrogate;
+use nodedb_types::{CollectionKey, Surrogate};
 
 use super::super::SurrogateAssigner;
 use super::carried::CarriedIdentity;
@@ -52,17 +52,32 @@ impl<'a> IdentityBinder<'a> {
         self.recorded.map(RefCell::into_inner).unwrap_or_default()
     }
 
-    fn record(&self, collection: &str, pk_bytes: &[u8], surrogate: Surrogate) {
+    /// The canonical key of a collection named on a plan. Plans carry the
+    /// database-qualified name, so it is de-qualified here.
+    pub(super) fn plan_key<'c>(&self, qualified: &'c str) -> crate::Result<CollectionKey<'c>> {
+        Ok(CollectionKey::from_qualified_str(
+            self.database_id,
+            qualified,
+        )?)
+    }
+
+    /// The canonical key of a collection named by its bare catalog name, as
+    /// an array plan names its array.
+    pub(super) fn bare_key<'c>(&self, bare: &'c str) -> CollectionKey<'c> {
+        CollectionKey::from_bare(self.database_id, bare)
+    }
+
+    fn record(&self, key: CollectionKey<'_>, pk_bytes: &[u8], surrogate: Surrogate) {
         if let Some(recorded) = &self.recorded {
             recorded.borrow_mut().push(CarriedIdentity {
-                collection: collection.to_string(),
+                collection: key.name().to_string(),
                 pk_bytes: pk_bytes.to_vec(),
                 surrogate,
             });
         }
     }
 
-    /// The authoritative surrogate for `(collection, pk_bytes)`.
+    /// The authoritative surrogate for `(key, pk_bytes)`.
     ///
     /// A non-ZERO `carried` value came from the coordinator that planned the
     /// write: install it first-wins and return the bound value, which is the
@@ -71,24 +86,18 @@ impl<'a> IdentityBinder<'a> {
     /// only: an existing binding or ZERO. ZERO is never written.
     pub(super) fn resolve(
         &self,
-        collection: &str,
+        key: CollectionKey<'_>,
         pk_bytes: &[u8],
         carried: Surrogate,
     ) -> crate::Result<Surrogate> {
         if carried != Surrogate::ZERO {
-            let bound = self.assigner.bind(
-                self.database_id,
-                self.tenant_id,
-                collection,
-                pk_bytes,
-                carried,
-            )?;
-            self.record(collection, pk_bytes, bound);
+            let bound = self.assigner.bind(key, self.tenant_id, pk_bytes, carried)?;
+            self.record(key, pk_bytes, bound);
             return Ok(bound);
         }
         Ok(self
             .assigner
-            .lookup(self.database_id, self.tenant_id, collection, pk_bytes)?
+            .lookup(key, self.tenant_id, pk_bytes)?
             .unwrap_or(Surrogate::ZERO))
     }
 
@@ -96,30 +105,30 @@ impl<'a> IdentityBinder<'a> {
     /// its own big-endian bytes, the same key `assign_anonymous` binds under.
     pub(super) fn resolve_self_keyed(
         &self,
-        collection: &str,
+        key: CollectionKey<'_>,
         carried: Surrogate,
     ) -> crate::Result<Surrogate> {
-        self.resolve(collection, &carried.as_u32().to_be_bytes(), carried)
+        self.resolve(key, &carried.as_u32().to_be_bytes(), carried)
     }
 
     /// [`Self::resolve`] writing the authoritative value back into `slot`.
     pub(super) fn resolve_in_place(
         &self,
-        collection: &str,
+        key: CollectionKey<'_>,
         pk_bytes: &[u8],
         slot: &mut Surrogate,
     ) -> crate::Result<()> {
-        *slot = self.resolve(collection, pk_bytes, *slot)?;
+        *slot = self.resolve(key, pk_bytes, *slot)?;
         Ok(())
     }
 
     /// [`Self::resolve_self_keyed`] writing the authoritative value back into `slot`.
     pub(super) fn resolve_self_keyed_in_place(
         &self,
-        collection: &str,
+        key: CollectionKey<'_>,
         slot: &mut Surrogate,
     ) -> crate::Result<()> {
-        *slot = self.resolve_self_keyed(collection, *slot)?;
+        *slot = self.resolve_self_keyed(key, *slot)?;
         Ok(())
     }
 
@@ -128,27 +137,24 @@ impl<'a> IdentityBinder<'a> {
     /// this; a live apply always carries a non-ZERO value and binds it.
     pub(super) fn resolve_or_assign_in_place(
         &self,
-        collection: &str,
+        key: CollectionKey<'_>,
         document_id: &str,
         slot: &mut Surrogate,
     ) -> crate::Result<()> {
         if *slot != Surrogate::ZERO {
-            return self.resolve_in_place(collection, document_id.as_bytes(), slot);
+            return self.resolve_in_place(key, document_id.as_bytes(), slot);
         }
         tracing::warn!(
             database_id = self.database_id.as_u64(),
             tenant_id = self.tenant_id.as_u64(),
-            collection,
+            collection = key.name(),
             document_id,
             "CRDT apply carries no surrogate; allocating locally, which can diverge across replicas"
         );
-        *slot = self.assigner.assign(
-            self.database_id,
-            self.tenant_id,
-            collection,
-            document_id.as_bytes(),
-        )?;
-        self.record(collection, document_id.as_bytes(), *slot);
+        *slot = self
+            .assigner
+            .assign(key, self.tenant_id, document_id.as_bytes())?;
+        self.record(key, document_id.as_bytes(), *slot);
         Ok(())
     }
 }

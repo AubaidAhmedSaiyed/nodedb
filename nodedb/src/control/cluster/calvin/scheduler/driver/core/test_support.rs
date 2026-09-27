@@ -175,7 +175,9 @@ pub(super) fn make_sequenced_txn(epoch: u64, position: u32) -> SequencedTxn {
 /// The vShard that `"test_coll"` homes to in the default database. A
 /// scheduler built on this vShard owns the reads of [`make_validate_only_txn`].
 pub(super) fn test_coll_vshard() -> u32 {
-    VShardId::from_collection_in_database(DatabaseId::DEFAULT, "test_coll").as_u32()
+    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "test_coll")
+        .vshard()
+        .as_u32()
 }
 
 /// Build a static `SequencedTxn` at `(epoch, position)` that reaches the

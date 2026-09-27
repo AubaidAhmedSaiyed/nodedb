@@ -36,11 +36,11 @@ use std::sync::Arc;
 use nodedb_cluster::{
     AssignSurrogateRequest, AssignSurrogateResponse, NexarTransport, RaftRpc, RoutingTable,
 };
-use nodedb_types::Surrogate;
+use nodedb_types::{CollectionKey, Surrogate};
 
 use crate::control::server::exchange::resolve::register_peers_from_topology;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{TenantId, TraceId, VShardId};
 
 /// Where a routed surrogate exchange for a given home vShard must run.
 enum Route<'a> {
@@ -123,9 +123,8 @@ fn leader_for(
 /// its `collection`, or either without the scoping ids, names no row.
 struct ExchangeKey<'a> {
     vshard: VShardId,
-    database_id: DatabaseId,
+    collection: CollectionKey<'a>,
     tenant_id: TenantId,
-    collection: &'a str,
     pk: &'a [u8],
     trace_id: TraceId,
 }
@@ -138,9 +137,8 @@ fn build_request(
 ) -> AssignSurrogateRequest {
     let ExchangeKey {
         vshard,
-        database_id,
-        tenant_id,
         collection,
+        tenant_id,
         pk,
         trace_id,
     } = key;
@@ -151,9 +149,11 @@ fn build_request(
     );
     AssignSurrogateRequest {
         vshard_id: vshard.as_u32(),
-        database_id: database_id.as_u64(),
+        database_id: collection.database_id().as_u64(),
         tenant_id: tenant_id.as_u64(),
-        collection: collection.to_string(),
+        // The bare catalog name: the leader rebuilds the canonical key from
+        // it and `database_id`.
+        collection: collection.name().to_string(),
         pk: pk.to_vec(),
         deadline_remaining_ms,
         trace_id: trace_id.0,
@@ -198,7 +198,7 @@ async fn send_to_leader(
 /// vShard's leader when this node is not the leader.
 ///
 /// `vshard` is the endpoint key's home vShard (the caller resolves it from the
-/// key, e.g. via [`VShardId::from_key`]). `database_id` / `tenant_id` scope the
+/// key, e.g. via [`VShardId::from_key`]). `collection` and `tenant_id` scope the
 /// identity; `trace_id` is propagated to the leader-side handler for tracing.
 ///
 /// Returns the authoritative `Surrogate` (`Surrogate::ZERO` only in the
@@ -207,24 +207,20 @@ async fn send_to_leader(
 pub async fn assign_surrogate_routed(
     state: &SharedState,
     vshard: VShardId,
-    database_id: DatabaseId,
+    collection: CollectionKey<'_>,
     tenant_id: TenantId,
-    collection: &str,
     pk: &[u8],
     trace_id: TraceId,
 ) -> crate::Result<Surrogate> {
-    match route_for(state, vshard, collection)? {
-        Route::Local => state
-            .surrogate_assigner
-            .assign(database_id, tenant_id, collection, pk),
+    match route_for(state, vshard, collection.name())? {
+        Route::Local => state.surrogate_assigner.assign(collection, tenant_id, pk),
         Route::Remote { leader, transport } => {
             let req = build_request(
                 state,
                 ExchangeKey {
                     vshard,
-                    database_id,
-                    tenant_id,
                     collection,
+                    tenant_id,
                     pk,
                     trace_id,
                 },
@@ -252,24 +248,20 @@ pub async fn assign_surrogate_routed(
 pub async fn lookup_surrogate_routed(
     state: &SharedState,
     vshard: VShardId,
-    database_id: DatabaseId,
+    collection: CollectionKey<'_>,
     tenant_id: TenantId,
-    collection: &str,
     pk: &[u8],
     trace_id: TraceId,
 ) -> crate::Result<Option<Surrogate>> {
-    match route_for(state, vshard, collection)? {
-        Route::Local => state
-            .surrogate_assigner
-            .lookup(database_id, tenant_id, collection, pk),
+    match route_for(state, vshard, collection.name())? {
+        Route::Local => state.surrogate_assigner.lookup(collection, tenant_id, pk),
         Route::Remote { leader, transport } => {
             let req = build_request(
                 state,
                 ExchangeKey {
                     vshard,
-                    database_id,
-                    tenant_id,
                     collection,
+                    tenant_id,
                     pk,
                     trace_id,
                 },
@@ -287,7 +279,8 @@ pub async fn lookup_surrogate_routed(
                 None => Err(crate::Error::Internal {
                     detail: format!(
                         "surrogate-exchange: leader node {leader} answered a lookup for \
-                         '{collection}' without a found flag; cannot tell a hit from a miss"
+                         '{}' without a found flag; cannot tell a hit from a miss",
+                        collection.name()
                     ),
                 }),
             }

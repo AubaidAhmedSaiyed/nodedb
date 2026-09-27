@@ -15,22 +15,20 @@ impl PhysicalSurrogateAssigner for SurrogateAssigner {
 
     fn assign(
         &self,
-        database_id: nodedb_types::DatabaseId,
+        key: nodedb_types::CollectionKey<'_>,
         tenant_id: nodedb_types::TenantId,
-        collection: &str,
         pk_bytes: &[u8],
     ) -> Result<nodedb_types::Surrogate, SurrogateAssignError> {
-        Self::assign(self, database_id, tenant_id, collection, pk_bytes)
+        Self::assign(self, key, tenant_id, pk_bytes)
             .map_err(|e| SurrogateAssignError::Backend(e.to_string()))
     }
 
     fn assign_fresh(
         &self,
-        database_id: nodedb_types::DatabaseId,
+        key: nodedb_types::CollectionKey<'_>,
         tenant_id: nodedb_types::TenantId,
-        collection: &str,
     ) -> Result<(nodedb_types::Surrogate, String), SurrogateAssignError> {
-        Self::assign_fresh(self, database_id, tenant_id, collection)
+        Self::assign_fresh(self, key, tenant_id)
             .map_err(|e| SurrogateAssignError::Backend(e.to_string()))
     }
 }

@@ -48,4 +48,32 @@ impl CoreLoop {
             resolved_now_ms: None,
         }
     }
+
+    /// The vShard a replayed record's collection homes to.
+    ///
+    /// A replay record carries the stored, database-qualified collection
+    /// name. It is de-qualified into the canonical `CollectionKey`, so the
+    /// replay task carries the same vShard the live write did. A name that
+    /// does not de-qualify is reported as a record that cannot be applied,
+    /// and the caller skips the record.
+    pub(in crate::data::executor) fn replay_vshard(
+        &mut self,
+        engine: &str,
+        record_lsn: u64,
+        database_id: DatabaseId,
+        stored_collection: &str,
+    ) -> Option<crate::types::VShardId> {
+        match nodedb_types::CollectionKey::from_qualified_str(database_id, stored_collection) {
+            Ok(key) => Some(key.vshard()),
+            Err(error) => {
+                self.replay_record_unapplied(
+                    engine,
+                    "collection key",
+                    record_lsn,
+                    &error.to_string(),
+                );
+                None
+            }
+        }
+    }
 }

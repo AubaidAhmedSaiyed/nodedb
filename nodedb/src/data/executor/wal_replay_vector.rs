@@ -172,10 +172,15 @@ impl CoreLoop {
                     // compat doc-id slot (always `None` on this write path)
                     // maps straight through to `pk_bytes` for fidelity.
                     let pk_bytes = doc_id.as_ref().map(|d| d.as_bytes().to_vec());
-                    let vshard = crate::types::VShardId::from_collection_in_database(
+                    let Some(vshard) = self.replay_vshard(
+                        "vector",
+                        record_lsn,
                         DatabaseId::new(database_id),
                         &collection,
-                    );
+                    ) else {
+                        skipped += 1;
+                        continue;
+                    };
                     let task = Self::replay_vector_task(
                         nodedb_types::TenantId::new(tenant_id),
                         DatabaseId::new(database_id),

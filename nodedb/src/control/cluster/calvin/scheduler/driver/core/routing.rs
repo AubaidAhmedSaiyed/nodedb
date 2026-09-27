@@ -14,8 +14,7 @@ use nodedb_physical::physical_plan::{
 };
 
 use crate::types::{DatabaseId, VShardId};
-#[cfg(test)]
-use nodedb_types::QualifiedCollection;
+use nodedb_types::{CollectionKey, QualifiedCollection};
 
 /// Where a `PhysicalPlan` routes for Calvin cross-shard scheduling purposes.
 ///
@@ -38,23 +37,35 @@ pub(crate) enum PlanRouting {
     Unroutable(&'static str),
 }
 
+/// Whether any read in `reads` homes to `vshard_id`. A read entry carries the
+/// plan's database-qualified name. An entry that does not de-qualify homes
+/// nowhere, so a txn whose only work is such a read fails loudly as one that
+/// homes no local work.
 pub(crate) fn homes_versioned_read(
     reads: &nodedb_types::calvin::VersionedReadSet,
     database_id: DatabaseId,
     vshard_id: u32,
 ) -> bool {
     reads.iter().any(|entry| {
-        VShardId::from_collection_in_database(database_id, &entry.collection).as_u32() == vshard_id
+        CollectionKey::from_qualified_str(database_id, &entry.collection)
+            .is_ok_and(|key| key.vshard().as_u32() == vshard_id)
     })
 }
 
-fn collection_vshard_in_database(database_id: DatabaseId, collection: &str) -> VShardId {
-    VShardId::from_collection_in_database(database_id, collection)
+/// Route a collection-homed write to the vShard of its canonical key. The
+/// plan carries the database-qualified name, de-qualified here.
+fn collection_routing(database_id: DatabaseId, collection: &QualifiedCollection) -> PlanRouting {
+    match CollectionKey::from_qualified(database_id, collection) {
+        Ok(key) => PlanRouting::Vshards(vec![key.vshard()]),
+        Err(_) => PlanRouting::Unroutable(
+            "collection name lacks the qualifier of the transaction's database",
+        ),
+    }
 }
 
 #[cfg(test)]
 fn collection_vshard(collection: &str) -> VShardId {
-    collection_vshard_in_database(DatabaseId::DEFAULT, collection)
+    CollectionKey::from_bare(DatabaseId::DEFAULT, collection).vshard()
 }
 
 /// Returns the routing decision for `plan`. Exhaustive over every
@@ -105,10 +116,7 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         // was derived from homes elsewhere, and the pair is dual-homed by the
         // two tasks' own vshards rather than by one plan claiming both.
         | DocumentOp::ApplyBalanceDelta { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(
-                database_id,
-                collection.as_str(),
-            )])
+            collection_routing(database_id, collection)
         }
         // Never scheduled: the write-resolve orchestrator proposes it through
         // Raft directly, on the vshard of the collection it resolved.
@@ -117,10 +125,7 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         ),
         DocumentOp::InsertSelect {
             target_collection, ..
-        } => PlanRouting::Vshards(vec![collection_vshard_in_database(
-            database_id,
-            target_collection.as_str(),
-        )]),
+        } => collection_routing(database_id, target_collection),
         // Both join the target with a DIFFERENT source collection; nothing on
         // the plan enforces the two live on the same vshard.
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => PlanRouting::Unroutable(
@@ -165,10 +170,7 @@ fn kv_routing(op: &KvOp, database_id: DatabaseId) -> PlanRouting {
         // that collection's vshard like every other single-collection write.
         | KvOp::PredicateUpdate { collection, .. }
         | KvOp::PredicateDelete { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(
-                database_id,
-                collection.as_str(),
-            )])
+            collection_routing(database_id, collection)
         }
         // Source and dest are DIFFERENT collections; no co-location guarantee.
         KvOp::TransferItem { .. } => PlanRouting::Unroutable(
@@ -216,12 +218,7 @@ fn vector_routing(op: &VectorOp, database_id: DatabaseId) -> PlanRouting {
         | VectorOp::DirectInsertIfAbsent { collection, .. }
         | VectorOp::DirectDelete { collection, .. }
         | VectorOp::DirectTruncate { collection, .. }
-        | VectorOp::DirectUpdate { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(
-                database_id,
-                collection.as_str(),
-            )])
-        }
+        | VectorOp::DirectUpdate { collection, .. } => collection_routing(database_id, collection),
         // Never scheduled: the write-resolve orchestrator proposes it through
         // Raft directly, on the vshard of the collection it resolved.
         VectorOp::ResolvedDirectWrite { .. } => PlanRouting::Unroutable(
@@ -305,10 +302,7 @@ fn graph_routing(op: &GraphOp) -> PlanRouting {
 fn timeseries_routing(op: &TimeseriesOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         TimeseriesOp::Ingest { collection, .. } | TimeseriesOp::Truncate { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(
-                database_id,
-                collection.as_str(),
-            )])
+            collection_routing(database_id, collection)
         }
         // Read-only: it reports the lines the wrapped ingest would store and
         // mutates nothing.
@@ -323,12 +317,7 @@ fn columnar_routing(op: &ColumnarOp, database_id: DatabaseId) -> PlanRouting {
         | ColumnarOp::Delete { collection, .. }
         | ColumnarOp::ResolvedUpdate { collection, .. }
         | ColumnarOp::ResolvedDelete { collection, .. }
-        | ColumnarOp::Truncate { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(
-                database_id,
-                collection.as_str(),
-            )])
-        }
+        | ColumnarOp::Truncate { collection, .. } => collection_routing(database_id, collection),
         ColumnarOp::Scan { .. }
         | ColumnarOp::MaterializeScan { .. }
         | ColumnarOp::ResolveDml { .. } => PlanRouting::NotAWrite,
@@ -347,12 +336,7 @@ fn crdt_routing(op: &CrdtOp, database_id: DatabaseId) -> PlanRouting {
         | CrdtOp::SetConstraints { collection, .. }
         | CrdtOp::DropConstraints { collection, .. }
         | CrdtOp::RestoreToVersion { collection, .. }
-        | CrdtOp::ImportSnapshot { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(
-                database_id,
-                collection.as_str(),
-            )])
-        }
+        | CrdtOp::ImportSnapshot { collection, .. } => collection_routing(database_id, collection),
         CrdtOp::Read { .. }
         | CrdtOp::PreviewApply { .. }
         | CrdtOp::ReadConstraints { .. }
@@ -570,21 +554,23 @@ mod tests {
 
     #[test]
     fn collection_routing_preserves_database_scope() {
+        let db = DatabaseId::new(7);
         let collection = (0..2048)
             .map(|i| format!("db_scoped_{i}"))
             .find(|name| {
-                collection_vshard_in_database(DatabaseId::DEFAULT, name)
-                    != collection_vshard_in_database(DatabaseId::new(7), name)
+                CollectionKey::from_bare(DatabaseId::DEFAULT, name).vshard()
+                    != CollectionKey::from_bare(db, name).vshard()
             })
             .expect("collection whose home differs by database");
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {
-            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
+            collection: QualifiedCollection::new(db, &collection),
             restart_identity: false,
             resolved_sum_targets: Vec::new(),
             declared_primary_key: None,
         });
-        let expected = collection_vshard_in_database(DatabaseId::new(7), &collection);
-        match plan_vshard_in_database(&plan, DatabaseId::new(7)) {
+        // The plan carries the qualified name; the home is the bare key's.
+        let expected = CollectionKey::from_bare(db, &collection).vshard();
+        match plan_vshard_in_database(&plan, db) {
             PlanRouting::Vshards(actual) => assert_eq!(actual, vec![expected]),
             PlanRouting::ControlPlaneOnly | PlanRouting::NotAWrite | PlanRouting::Unroutable(_) => {
                 panic!("document truncate must be database-scoped")

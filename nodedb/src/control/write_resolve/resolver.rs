@@ -33,10 +33,15 @@ pub trait EngineWriteResolver: Send + Sync {
     fn collection(&self) -> &str;
 
     /// Control Plane. Home vShard the resolved write is proposed to.
-    /// Collection-homed by default; the graph resolver overrides this since
-    /// an edge is key-homed on its source endpoint instead.
-    fn vshard(&self, database_id: DatabaseId) -> VShardId {
-        VShardId::from_collection_in_database(database_id, self.collection())
+    /// Collection-homed by default: `collection()` is the plan's
+    /// database-qualified name, de-qualified into the canonical key. The
+    /// graph resolver overrides this since an edge is key-homed on its source
+    /// endpoint instead.
+    fn vshard(&self, database_id: DatabaseId) -> crate::Result<VShardId> {
+        Ok(
+            nodedb_types::CollectionKey::from_qualified_str(database_id, self.collection())?
+                .vshard(),
+        )
     }
 
     /// Control Plane. Pure, no I/O: the read-only op that resolves this write.

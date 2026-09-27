@@ -16,7 +16,7 @@
 
 use crate::control::security::catalog::StoredCollection;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 use nodedb_types::QualifiedCollection;
 
@@ -122,7 +122,7 @@ async fn dispatch_durable(
         crate::control::server::dispatch_utils::AutocommitWrite {
             tenant_id,
             database_id,
-            vshard_id: VShardId::from_collection_in_database(database_id, collection),
+            vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
             plan,
             trace_id: TraceId::ZERO,
             event_source: crate::event::EventSource::User,

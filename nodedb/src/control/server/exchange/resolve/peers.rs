@@ -16,9 +16,10 @@ use nodedb_cluster::{
 };
 
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 
-/// Producer nodes that own `collection`'s data: resolve its vShard → owning
+/// Producer nodes that own `collection`'s data. `collection` is the plan's
+/// database-qualified name. Resolve its canonical key's vShard → owning
 /// group → leader. A user collection is single-vShard-homed, so this is one
 /// node; returned as a deduped sorted vec for generality.
 pub(super) fn producer_nodes(
@@ -26,7 +27,9 @@ pub(super) fn producer_nodes(
     database_id: DatabaseId,
     collection: &str,
 ) -> crate::Result<Vec<u64>> {
-    let vshard = VShardId::from_collection_in_database(database_id, collection).as_u32();
+    let vshard = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?
+        .vshard()
+        .as_u32();
     let group = routing
         .group_for_vshard(vshard)
         .map_err(|e| crate::Error::Internal {

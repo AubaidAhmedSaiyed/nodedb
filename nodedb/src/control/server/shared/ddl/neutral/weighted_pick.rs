@@ -88,7 +88,7 @@ pub async fn weighted_pick(
     }
 
     let tenant_id = identity.tenant_id;
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
 
     // `collection` is a caller argument, so the scan it names is authorized and
     // row-filtered here — a pick is a read of every row in the collection. The
@@ -165,9 +165,11 @@ pub async fn weighted_pick(
         let audit_surrogate = state
             .surrogate_assigner
             .assign(
-                crate::types::DatabaseId::DEFAULT,
+                nodedb_types::CollectionKey::from_bare(
+                    crate::types::DatabaseId::DEFAULT,
+                    "_system_random_audit",
+                ),
                 tenant_id,
-                "_system_random_audit",
                 &audit_key_bytes,
             )
             .map_err(|e| ddl_err("XX000", format!("WEIGHTED_PICK: audit surrogate bind: {e}")))?;
@@ -193,10 +195,11 @@ pub async fn weighted_pick(
             crate::control::server::dispatch_utils::AutocommitWrite {
                 tenant_id,
                 database_id: DatabaseId::DEFAULT,
-                vshard_id: VShardId::from_collection_in_database(
+                vshard_id: nodedb_types::CollectionKey::from_bare(
                     DatabaseId::DEFAULT,
                     "_system_random_audit",
-                ),
+                )
+                .vshard(),
                 plan: audit_plan,
                 trace_id: TraceId::ZERO,
                 event_source: crate::event::EventSource::User,

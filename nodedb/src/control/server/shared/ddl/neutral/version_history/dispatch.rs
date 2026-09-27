@@ -22,7 +22,7 @@ use crate::control::server::shared::clone_write::{
 use crate::control::server::shared::ddl::sync_dispatch::dispatch_authorized;
 use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 
 use super::super::super::result::DdlError;
 
@@ -45,7 +45,7 @@ pub(super) async fn dispatch_authorized_read(
     let task = PhysicalTask {
         tenant_id: identity.tenant_id,
         database_id,
-        vshard_id: VShardId::from_collection_in_database(database_id, collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
         plan,
         post_set_op: PostSetOp::None,
         txn_id: None,

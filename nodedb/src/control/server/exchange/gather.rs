@@ -340,8 +340,8 @@ pub(crate) fn gather_all_cores_stream(
 /// timeseries, spatial, vector, text)
 ///
 /// Standard collections are *single-vShard-homed*: all rows for a collection
-/// live on exactly one vShard determined by `vshard_for_collection(database_id,
-/// &name)`.  The data-plane scan is **not** vshard-scoped, so broadcasting the
+/// live on exactly one vShard determined by `vshard_for_collection` over the
+/// collection's canonical key.  The data-plane scan is **not** vshard-scoped, so broadcasting the
 /// plan to every vShard via `Exchange{Gather}` causes the owning node to return
 /// the full collection once per route that lands on it — 1 024× duplication.
 ///

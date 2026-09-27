@@ -121,9 +121,8 @@ fn source_surrogate(
     state
         .surrogate_assigner
         .lookup(
-            source_db_id,
+            nodedb_types::CollectionKey::from_qualified_str(source_db_id, source_coll_qualified)?,
             tenant_id,
-            source_coll_qualified,
             document_id.as_bytes(),
         )
         .map_err(|e| write_err(format!("clone write source surrogate lookup: {e}")))

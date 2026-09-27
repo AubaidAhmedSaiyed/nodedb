@@ -226,10 +226,12 @@ impl CoreLoop {
                     continue;
                 }
 
-                let vshard = crate::types::VShardId::from_collection_in_database(
-                    database_id,
-                    &payload.collection,
-                );
+                let Some(vshard) =
+                    self.replay_vshard("spatial", record_lsn, database_id, &payload.collection)
+                else {
+                    skipped += 1;
+                    continue;
+                };
                 let task = Self::replay_spatial_task(
                     nodedb_types::TenantId::new(tenant_id),
                     database_id,
@@ -327,10 +329,12 @@ impl CoreLoop {
                     continue;
                 }
 
-                let vshard = crate::types::VShardId::from_collection_in_database(
-                    database_id,
-                    &payload.collection,
-                );
+                let Some(vshard) =
+                    self.replay_vshard("spatial", record_lsn, database_id, &payload.collection)
+                else {
+                    skipped += 1;
+                    continue;
+                };
                 let task = Self::replay_spatial_task(
                     nodedb_types::TenantId::new(tenant_id),
                     database_id,

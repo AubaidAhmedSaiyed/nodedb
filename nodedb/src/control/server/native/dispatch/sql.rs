@@ -316,10 +316,12 @@ async fn execute_planned(
     // sequencer so it commits atomically. Single-shard (and best-effort) keep
     // the existing per-task gateway/SPSC dispatch loop below unchanged.
     // Autocommit single-statement dispatch: no session read-set to widen with.
-    match classify_dispatch(
-        &tasks,
-        &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
-    ) {
+    let sum_read_vshards = match crate::control::planner::calvin::read_vshards_of(&sum_target_reads)
+    {
+        Ok(vshards) => vshards,
+        Err(error) => return resp(error_to_native(seq, &error)),
+    };
+    match classify_dispatch(&tasks, &sum_read_vshards) {
         DispatchClass::SingleShard { .. } => {}
         DispatchClass::MultiShard { .. } => {
             // Dispatching to Calvin here applies the statement durably at

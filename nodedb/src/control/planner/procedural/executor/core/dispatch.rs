@@ -531,7 +531,9 @@ mod cross_shard_origination_tests {
     fn remote_homed_name(prefix: &str) -> String {
         for i in 0..4096u32 {
             let name = format!("{prefix}_{i}");
-            let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &name);
+            let vshard = nodedb_cluster::routing::vshard_for_collection(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name),
+            );
             if vshard % 2 == 1 {
                 return name;
             }
@@ -544,7 +546,9 @@ mod cross_shard_origination_tests {
     fn local_homed_name(prefix: &str) -> String {
         for i in 0..4096u32 {
             let name = format!("{prefix}_{i}");
-            let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &name);
+            let vshard = nodedb_cluster::routing::vshard_for_collection(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name),
+            );
             if vshard.is_multiple_of(2) {
                 return name;
             }
@@ -610,7 +614,10 @@ mod cross_shard_origination_tests {
         assert_eq!(req.cascade_depth, 0);
         assert_eq!(
             req.target_vshard,
-            nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &tgt)
+            nodedb_cluster::routing::vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+                DatabaseId::DEFAULT,
+                &tgt,
+            ))
         );
     }
 

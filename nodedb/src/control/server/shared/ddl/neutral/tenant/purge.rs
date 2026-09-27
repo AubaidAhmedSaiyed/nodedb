@@ -79,8 +79,7 @@ pub async fn purge_tenant(
         sync_dispatch::SystemTask::new(
             sync_dispatch::SystemReason::TenantLifecycle,
             tenant_id,
-            database_id,
-            "__system",
+            nodedb_types::CollectionKey::from_bare(database_id, "__system"),
             plan,
         ),
         std::time::Duration::from_secs(300),

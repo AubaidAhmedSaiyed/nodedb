@@ -225,9 +225,11 @@ pub(super) fn assign_kv_surrogate(
     collection: &str,
     key: &[u8],
 ) -> crate::Result<nodedb_types::Surrogate> {
-    ctx.state
-        .surrogate_assigner
-        .assign(ctx.database_id(), ctx.tenant_id(), collection, key)
+    ctx.state.surrogate_assigner.assign(
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+        ctx.tenant_id(),
+        key,
+    )
 }
 
 pub(crate) fn build_cas(

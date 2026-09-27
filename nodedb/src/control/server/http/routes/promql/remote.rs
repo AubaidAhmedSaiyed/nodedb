@@ -23,7 +23,7 @@ use crate::control::promql::{self, types::DEFAULT_LOOKBACK_MS};
 use crate::control::server::http::admission::admit_without_rate_limit;
 use crate::control::server::http::auth::{AppState, ResolvedIdentity};
 use crate::control::server::http::peer::PeerAddr;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -103,7 +103,8 @@ pub async fn remote_write(
             continue;
         }
 
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+        let vshard =
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
             payload: ilp_payload.into_bytes(),

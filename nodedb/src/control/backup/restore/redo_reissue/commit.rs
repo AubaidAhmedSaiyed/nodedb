@@ -21,7 +21,7 @@ use crate::control::wal_replication::transaction_redo::{
     RedoTarget, TransactionRedoPayload, apply_transaction_redo,
 };
 use crate::event::EventSource;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use crate::wal::{RedoRecord, RedoSubRecord};
 
 use super::units::{CollectionUnits, RowUnit};
@@ -139,7 +139,7 @@ pub(super) async fn commit_collection(
     let target = RedoTarget {
         tenant_id,
         database_id,
-        vshard_id: VShardId::from_collection_in_database(database_id, &collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard(),
     };
     let mut records = 0usize;
     for batch in batch_units(units) {
@@ -159,6 +159,7 @@ mod tests {
     use nodedb_types::Surrogate;
 
     use super::*;
+    use crate::types::VShardId;
 
     fn unit(ops: usize, payload_len: usize, pk: &str) -> RowUnit {
         RowUnit {

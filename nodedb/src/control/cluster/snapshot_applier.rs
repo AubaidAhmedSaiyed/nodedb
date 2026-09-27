@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use nodedb_cluster::routing::vshard_for_collection;
 use nodedb_types::Surrogate;
-use nodedb_types::id::DatabaseId;
+use nodedb_types::id::{CollectionKey, DatabaseId};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
@@ -108,7 +108,10 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             for coll in collections.iter().filter(|c| {
                 c.is_active
-                    && group_vshards.contains(&vshard_for_collection(DatabaseId::DEFAULT, &c.name))
+                    && group_vshards.contains(&vshard_for_collection(CollectionKey::from_bare(
+                        DatabaseId::DEFAULT,
+                        &c.name,
+                    )))
             }) {
                 collections_to_clear.push((coll.tenant_id, coll.name.clone()));
             }
@@ -133,8 +136,7 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::ClusterSnapshot,
                 TenantId::new(0),
-                DatabaseId::DEFAULT,
-                "__system",
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "__system"),
                 plan,
             ),
             SNAPSHOT_APPLY_TIMEOUT,
@@ -158,9 +160,8 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
             for e in &snap.surrogate_pk {
                 catalog
                     .put_surrogate(
-                        DatabaseId::DEFAULT,
+                        CollectionKey::from_bare(DatabaseId::DEFAULT, &e.collection),
                         TenantId::new(e.tenant_id),
-                        &e.collection,
                         &e.pk,
                         Surrogate::new(e.surrogate),
                     )

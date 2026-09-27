@@ -100,9 +100,8 @@ pub async fn crdt_apply(
         .shared
         .surrogate_assigner
         .assign(
-            crate::types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(crate::types::DatabaseId::DEFAULT, &collection),
             identity.tenant_id,
-            &collection,
             body.doc_id.as_bytes(),
         )
         .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -125,10 +124,11 @@ pub async fn crdt_apply(
 
     let task = PhysicalTask {
         tenant_id: identity.tenant_id,
-        vshard_id: crate::types::VShardId::from_collection_in_database(
+        vshard_id: nodedb_types::CollectionKey::from_bare(
             crate::types::DatabaseId::DEFAULT,
             &collection,
-        ),
+        )
+        .vshard(),
         database_id: crate::types::DatabaseId::DEFAULT,
         plan,
         post_set_op: PostSetOp::None,

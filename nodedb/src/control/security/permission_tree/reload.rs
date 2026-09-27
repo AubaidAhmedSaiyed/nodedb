@@ -21,7 +21,7 @@ use crate::control::server::dispatch_utils::{
     LocalRead, dispatch_local_read, reject_data_plane_error,
 };
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 
 use super::cache::{PermissionCache, TreeSource, TreeSourceKind};
 use super::event_handler::{extract_edge, extract_grant};
@@ -127,7 +127,7 @@ async fn scan_source(
         state,
         TenantId::new(source.tenant_id),
         database_id,
-        VShardId::from_collection_in_database(database_id, &source.collection),
+        nodedb_types::CollectionKey::from_bare(database_id, &source.collection).vshard(),
         LocalRead::DocumentScan {
             collection: QualifiedCollection::new(database_id, &source.collection),
         },

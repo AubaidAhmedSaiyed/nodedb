@@ -45,10 +45,7 @@ use nodedb_cluster::calvin::{
     sequencer::{SequencerConfig, new_inbox},
     types::{EngineKeySet, ReadWriteSet, SchedulerInput, SortedVec, TxClass, VersionedReadSet},
 };
-use nodedb_types::{
-    TenantId,
-    id::{DatabaseId, VShardId},
-};
+use nodedb_types::{TenantId, id::DatabaseId};
 use tokio::sync::mpsc;
 
 use super::cluster_common::{spawn_with_sequencer, try_recv_txn, wait_for_sequencer_leader};
@@ -59,7 +56,9 @@ fn two_distinct_collections() -> (String, String) {
     let mut first: Option<(String, u32)> = None;
     for i in 0u32..512 {
         let name = format!("col_{i}");
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+            .vshard()
+            .as_u32();
         if let Some((ref fname, fv)) = first {
             if fv != vshard {
                 return (fname.clone(), name);
@@ -130,8 +129,12 @@ async fn scheduler_catchup_via_raft_log_replay() {
 
     // Wire per-vshard receivers on every node so we can verify fan-out.
     let (col_a, col_b) = two_distinct_collections();
-    let va = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_a).as_u32();
-    let vb = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_b).as_u32();
+    let va = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &col_a)
+        .vshard()
+        .as_u32();
+    let vb = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &col_b)
+        .vshard()
+        .as_u32();
 
     let mut vshard_rxs_a: Vec<mpsc::Receiver<SchedulerInput>> = Vec::new();
     let mut vshard_rxs_b: Vec<mpsc::Receiver<SchedulerInput>> = Vec::new();

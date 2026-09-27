@@ -267,7 +267,10 @@ mod tests {
     #[test]
     fn the_fixture_is_co_resident() {
         assert!(
-            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                TARGET,
+            ),
             "'{SOURCE}' and '{TARGET}' must share a vShard: a cross-shard binding's balance \
              travels on its own task and is never folded into the source write's transaction"
         );

@@ -71,7 +71,7 @@ pub(crate) async fn build_secondary_index(
 
     // The backfill runs on the local Data Plane (single node) or the leader
     // (cluster), vShard-local per core.
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, collection).vshard();
     let backfill_plan = crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::BackfillIndex {
             collection: nodedb_types::QualifiedCollection::new(database_id, collection),

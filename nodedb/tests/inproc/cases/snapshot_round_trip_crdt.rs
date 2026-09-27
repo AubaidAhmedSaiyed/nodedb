@@ -36,7 +36,10 @@ async fn snapshot_round_trip_crdt() {
     const DOC: &str = "doc1";
 
     // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+        DatabaseId::DEFAULT,
+        COLL,
+    ));
     assert!(
         single_node_routing()
             .vshards_for_group(DATA_GROUP_ID)

@@ -162,7 +162,11 @@ pub async fn crdt_apply(
 
     let surrogate = state
         .surrogate_assigner
-        .assign(database_id, tenant_id, collection, document_id.as_bytes())
+        .assign(
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
+            tenant_id,
+            document_id.as_bytes(),
+        )
         .map_err(|e| DdlError::new("XX000", e.to_string()))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
@@ -179,7 +183,7 @@ pub async fn crdt_apply(
     });
     let task = PhysicalTask {
         tenant_id,
-        vshard_id: crate::types::VShardId::from_collection_in_database(database_id, collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
         database_id,
         plan,
         post_set_op: PostSetOp::None,

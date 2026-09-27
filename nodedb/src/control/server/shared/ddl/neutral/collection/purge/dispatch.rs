@@ -52,7 +52,7 @@ pub async fn dispatch_unregister_collection(
         // cannot resolve it, so the files are never orphaned.
         let homing_core = dispatcher
             .router()
-            .resolve(VShardId::from_collection_in_database(database, name))
+            .resolve(nodedb_types::CollectionKey::from_bare(database, name).vshard())
             .unwrap_or(0);
         for core_id in 0..num_cores {
             let request_id = state.next_request_id();

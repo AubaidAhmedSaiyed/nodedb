@@ -18,7 +18,8 @@
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::dispatch_utils::MintedRecords;
-use crate::types::{DatabaseId, TenantId};
+use crate::types::TenantId;
+use nodedb_types::CollectionKey;
 
 /// Why a Data-Plane dispatch carries no user identity.
 ///
@@ -87,8 +88,9 @@ impl SystemReason {
 pub(crate) struct SystemTask<'a> {
     pub(super) reason: SystemReason,
     pub(super) tenant_id: TenantId,
-    pub(super) database_id: DatabaseId,
-    pub(super) collection: &'a str,
+    /// Canonical key of the collection the task homes to. Its database is the
+    /// task's database.
+    pub(super) collection: CollectionKey<'a>,
     pub(super) plan: PhysicalPlan,
     /// Records the caller appended for this task, under their outcome-floor
     /// window. `None` when the task appends nothing.
@@ -104,14 +106,12 @@ impl<'a> SystemTask<'a> {
     pub(crate) fn new(
         reason: SystemReason,
         tenant_id: TenantId,
-        database_id: DatabaseId,
-        collection: &'a str,
+        collection: CollectionKey<'a>,
         plan: PhysicalPlan,
     ) -> Self {
         Self {
             reason,
             tenant_id,
-            database_id,
             collection,
             plan,
             minted: None,

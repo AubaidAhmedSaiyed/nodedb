@@ -51,7 +51,8 @@ pub async fn gather_single_node(
         return gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await;
     }
     if let Some(collection) = plan.collection() {
-        let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+        let vshard_id =
+            nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
         return gather_single_owning_core(
             state,
             tenant_id,
@@ -69,8 +70,8 @@ pub async fn gather_single_node(
 /// Dispatch `plan` to the single Data-Plane core that owns `vshard_id` and
 /// gather the one bounded response into a [`GatherOutcome`].
 ///
-/// `vshard_id` is the collection's owning vShard
-/// (`VShardId::from_collection_in_database(database_id, collection)`); the
+/// `vshard_id` is the collection's owning vShard (the vShard of its
+/// canonical `CollectionKey`); the
 /// dispatcher's `VShardRouter` resolves it to the one core holding the
 /// collection's rows.
 ///
@@ -78,7 +79,7 @@ pub async fn gather_single_node(
 /// `read_version_lsn` and exactly one `shard_watermarks` entry keyed to the
 /// collection's vShard — matching the cluster `dispatch_local` path so an
 /// in-transaction read records the same OCC read-set entry the write-set uses
-/// (writes home to the same `from_collection_in_database` vShard). Aggregate
+/// (writes home to the same `CollectionKey` vShard). Aggregate
 /// finalization (`finalize_aggregate`) is a passthrough over the merged array,
 /// so one complete aggregate row in yields one row out.
 pub async fn gather_single_owning_core(

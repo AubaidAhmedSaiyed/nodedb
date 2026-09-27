@@ -140,6 +140,41 @@ impl DomainContext for SequencerBackpressureDrop<'_> {
     }
 }
 
+/// An epoch batch carries a transaction whose participant set cannot be
+/// derived: a key-set collection name lacks the qualifier of the
+/// transaction's database. No constructor builds such a class.
+pub(super) struct SequencerParticipantsUnderivable<'a> {
+    pub epoch: u64,
+    pub raft_index: u64,
+    pub detail: &'a str,
+}
+
+impl DomainContext for SequencerParticipantsUnderivable<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb_cluster.sequencer_participants_underivable"
+    }
+
+    fn grouping_key(&self) -> String {
+        // One bug: a class reached the log without passing construction. The
+        // epoch, index, and offending name are the occurrence.
+        "underivable".to_owned()
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "epoch": self.epoch,
+            "raft_index": self.raft_index,
+            "detail": self.detail,
+            "why_fatal": "the batch is skipped like an undecodable entry, so none of its \
+                          transactions is fanned out and their completion waiters never \
+                          resolve until their own deadlines elapse",
+            "operator_action": "find the proposer that built this transaction class without \
+                                a TxClass constructor, or the corruption that altered its \
+                                key-set collection names",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

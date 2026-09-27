@@ -44,7 +44,7 @@ pub(super) async fn dispatch_kv(
     // `RequestAuthScope::builder` so the dispatched task and `$auth.database_id`
     // resolve from the same value and cannot drift apart.
     let database_id = DatabaseId::DEFAULT;
-    let vshard = VShardId::from_collection_in_database(database_id, &session.collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &session.collection).vshard();
     // Extracted before `plan` is moved into `authorize_resp_task`, which
     // consumes it for RLS injection and task construction — metering needs
     // the collection/engine shape after dispatch succeeds below, and by then
@@ -108,7 +108,7 @@ pub(super) async fn dispatch_kv_write(
     // DatabaseId::DEFAULT is deliberate here, resolved once and threaded
     // through `authorize_resp_task` via `RequestAuthScope::builder`.
     let database_id = DatabaseId::DEFAULT;
-    let vshard = VShardId::from_collection_in_database(database_id, &session.collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &session.collection).vshard();
     // See `dispatch_kv` above: extracted before `authorize_resp_task` moves
     // `plan`, since metering needs the plan shape after dispatch succeeds.
     let plan_metering_info = state
@@ -454,7 +454,8 @@ mod tests {
             surrogate_ceiling: None,
         });
         let vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &session.collection)
+                .vshard();
 
         let result = authorize_resp_task(
             &state,

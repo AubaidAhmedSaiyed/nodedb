@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use nodedb_types::calvin::{ReadKeyIdent, VersionedReadEntry};
 use nodedb_types::{DatabaseId, TenantId};
 
-use crate::types::{Lsn, VShardId};
+use crate::types::Lsn;
 
 use super::CoreLoop;
 
@@ -333,21 +333,21 @@ impl CoreLoop {
         let db = task.request.database_id;
         let tenant = TenantId::new(tid);
         let local_vshard = task.request.vshard_id.as_u32();
-        versioned_reads
-            .iter()
-            .filter(|entry| {
-                VShardId::from_collection_in_database(db, &entry.collection).as_u32()
-                    == local_vshard
-            })
-            .all(|entry| {
-                self.write_index.read_is_valid(
+        // An entry carries the plan's database-qualified name. One that does not
+        // de-qualify cannot be homed or validated, so the read set fails closed.
+        versioned_reads.iter().all(|entry| {
+            match nodedb_types::CollectionKey::from_qualified_str(db, &entry.collection) {
+                Err(_) => false,
+                Ok(key) if key.vshard().as_u32() != local_vshard => true,
+                Ok(_) => self.write_index.read_is_valid(
                     db,
                     tenant,
                     &entry.collection,
                     &entry.key,
                     entry.read_lsn,
-                )
-            })
+                ),
+            }
+        })
     }
 
     /// Record a committed document/vector write's version, keyed by the
@@ -1141,7 +1141,7 @@ pub(crate) mod tests {
     /// The vShard `collection` homes to in the default database — mirrors the
     /// homing `read_set_still_current` filters entries by.
     fn local_vshard(collection: &str) -> VShardId {
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection)
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection).vshard()
     }
 
     /// Some vShard other than `than`, for exercising the cross-shard filter.

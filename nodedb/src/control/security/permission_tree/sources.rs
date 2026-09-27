@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 
 use super::types::PermissionTreeDef;
 
@@ -43,7 +43,9 @@ impl SourceSet {
             for collection in [governed.as_str(), def.permission_table.as_str()] {
                 set.collections.insert(collection.to_owned());
                 set.vshards.insert(
-                    VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection).as_u32(),
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection)
+                        .vshard()
+                        .as_u32(),
                 );
             }
         }
@@ -150,8 +152,9 @@ mod tests {
         assert!(index.is_source_collection("docs"));
         assert!(index.is_source_collection("grants"));
         assert!(!index.is_source_collection("other"));
-        let grants_vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "grants").as_u32();
+        let grants_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "grants")
+            .vshard()
+            .as_u32();
         assert!(index.is_source_vshard(grants_vshard));
         defs.clear();
         index.rebuild(&defs);

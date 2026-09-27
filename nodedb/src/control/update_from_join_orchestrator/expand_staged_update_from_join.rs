@@ -14,7 +14,6 @@ use crate::control::target_identity::{
     bare_collection_name, derive_document_id, resolve_target_pk,
 };
 use crate::query::ResolvedUpdateRowWire;
-use crate::types::VShardId;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -67,8 +66,11 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
 
     // Recomputed rather than reusing the staged task's vShard, keeping dispatch
     // classification honest, like the MERGE / INSERT SELECT expanders.
-    let vshard_id =
-        VShardId::from_collection_in_database(task.database_id, target_collection.as_str());
+    let vshard_id = nodedb_types::CollectionKey::from_qualified_str(
+        task.database_id,
+        target_collection.as_str(),
+    )?
+    .vshard();
 
     // A join-column rewrite debits the target left and credits the one joined —
     // resolving post-images alone would leave the abandoned target overstated.

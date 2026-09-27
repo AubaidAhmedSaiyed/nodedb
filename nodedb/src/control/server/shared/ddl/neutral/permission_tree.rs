@@ -135,8 +135,7 @@ async fn source_group_barrier(state: &SharedState, sources: &[String]) -> crate:
     };
     let mut targets: Vec<nodedb_cluster::GroupCoverage> = Vec::new();
     for source in sources {
-        let vshard =
-            crate::types::VShardId::from_collection_in_database(DatabaseId::DEFAULT, source);
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, source).vshard();
         let group_id =
             crate::control::security::auth_fence::cluster::group_of_vshard(state, vshard.as_u32())?;
         if targets.iter().any(|target| target.group_id == group_id) {

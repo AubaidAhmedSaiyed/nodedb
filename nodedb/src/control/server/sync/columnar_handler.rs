@@ -175,9 +175,8 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
                 surrogates.push(nodedb_types::Surrogate::ZERO);
             } else {
                 surrogates.push(self.shared.surrogate_assigner.assign(
-                    database_id,
+                    nodedb_types::CollectionKey::from_bare(database_id, &collection),
                     tenant_id,
-                    &collection,
                     &pk,
                 )?);
             }
@@ -341,7 +340,8 @@ impl SyncSession {
         let decoded = decoded_rows.len() as u64;
 
         let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(self.database_id(), &msg.collection);
+        let vshard =
+            nodedb_types::CollectionKey::from_bare(self.database_id(), &msg.collection).vshard();
 
         debug!(
             session = %self.session_id,

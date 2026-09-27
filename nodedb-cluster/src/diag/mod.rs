@@ -30,7 +30,11 @@ mod recording;
 mod inert;
 
 #[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
-pub use recording::{sequencer_backpressure_drop, sequencer_epoch_gap};
+pub use recording::{
+    sequencer_backpressure_drop, sequencer_epoch_gap, sequencer_participants_underivable,
+};
 
 #[cfg(not(all(feature = "diagnostics", not(target_arch = "wasm32"))))]
-pub use inert::{sequencer_backpressure_drop, sequencer_epoch_gap};
+pub use inert::{
+    sequencer_backpressure_drop, sequencer_epoch_gap, sequencer_participants_underivable,
+};

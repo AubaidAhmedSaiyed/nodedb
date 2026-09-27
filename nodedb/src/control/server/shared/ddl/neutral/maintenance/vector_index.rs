@@ -43,7 +43,7 @@ pub async fn handle_show_vector_index(
     // or:   SHOW VECTOR INDEX status ON <collection>
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
     let tenant_id = identity.tenant_id;
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     let plan = PhysicalPlan::Vector(VectorOp::QueryStats {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
@@ -140,7 +140,7 @@ pub async fn handle_alter_vector_index_seal(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
     let tenant_id = identity.tenant_id;
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     let plan = PhysicalPlan::Vector(VectorOp::Seal {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
@@ -173,7 +173,7 @@ pub async fn handle_alter_vector_index_compact(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
     let tenant_id = identity.tenant_id;
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     let plan = PhysicalPlan::Vector(VectorOp::CompactIndex {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),

@@ -30,7 +30,7 @@ use tokio::sync::RwLockReadGuard;
 use crate::control::security::auth_lease::lease_status;
 use crate::control::security::permission_tree::{PermissionCache, reload};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId};
 
 use super::cluster::{behind, group_of_vshard, hosts_group};
 
@@ -50,7 +50,8 @@ pub async fn permission_view(
             .filter(|source| source.tenant_id == tenant_id.as_u64())
         {
             let vshard =
-                VShardId::from_collection_in_database(DatabaseId::DEFAULT, &source.collection);
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &source.collection)
+                    .vshard();
             let group_id = group_of_vshard(state, vshard.as_u32())?;
             if !hosts_group(state, group_id) {
                 return Err(behind(format!(

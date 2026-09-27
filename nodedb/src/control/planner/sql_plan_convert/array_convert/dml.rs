@@ -9,7 +9,7 @@ use nodedb_sql::types_array::{ArrayCoordLiteral, ArrayInsertRow};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::engine::array::wal::{ArrayDeleteCell, ArrayPutCell};
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::{ArrayOp, ClusterArrayOp};
 
 use super::super::convert::ConvertContext;
@@ -44,7 +44,7 @@ pub(in super::super) fn convert_insert_array(
         })?;
 
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
     let system_now_ms = chrono::Utc::now().timestamp_millis();
 
     if ctx.cluster_enabled {
@@ -57,7 +57,7 @@ pub(in super::super) fn convert_insert_array(
                     format: "msgpack".into(),
                     detail: format!("array coord pk encode: {e}"),
                 })?;
-            let surrogate = ctx.surrogate_for_pk(name, &pk_bytes)?;
+            let surrogate = ctx.surrogate_for_pk(ctx.collection_key(name), &pk_bytes)?;
             let hilbert =
                 encode_hilbert_prefix(&schema, &coord).map_err(|e| crate::Error::PlanError {
                     detail: format!("INSERT INTO ARRAY {name}: Hilbert prefix: {e}"),
@@ -111,7 +111,7 @@ pub(in super::super) fn convert_insert_array(
                 format: "msgpack".into(),
                 detail: format!("array coord pk encode: {e}"),
             })?;
-        let surrogate = ctx.surrogate_for_pk(name, &pk_bytes)?;
+        let surrogate = ctx.surrogate_for_pk(ctx.collection_key(name), &pk_bytes)?;
         cells.push(ArrayPutCell {
             coord,
             attrs,
@@ -175,7 +175,7 @@ pub(in super::super) fn convert_delete_array(
         })?;
 
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
     let system_now_ms = chrono::Utc::now().timestamp_millis();
 
     if ctx.cluster_enabled {

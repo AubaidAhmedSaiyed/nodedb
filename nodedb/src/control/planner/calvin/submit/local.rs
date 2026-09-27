@@ -82,6 +82,9 @@ pub async fn submit_and_await_calvin_with_timeout(
         && tx_class
             .write_set
             .participating_vshards_in_database(tx_class.database_id)
+            .map_err(|e| Error::BadRequest {
+                detail: format!("Calvin transaction write set: {e}"),
+            })?
             .iter()
             .any(|vshard| {
                 state

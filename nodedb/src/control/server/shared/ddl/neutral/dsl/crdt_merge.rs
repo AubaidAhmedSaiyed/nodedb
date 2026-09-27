@@ -97,7 +97,11 @@ pub async fn crdt_merge(
 
     let target_surrogate = state
         .surrogate_assigner
-        .assign(database_id, tenant_id, collection, target_id.as_bytes())
+        .assign(
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
+            tenant_id,
+            target_id.as_bytes(),
+        )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     let apply_plan = PhysicalPlan::Crdt(CrdtOp::Apply {
@@ -114,7 +118,7 @@ pub async fn crdt_merge(
     });
     let task = PhysicalTask {
         tenant_id,
-        vshard_id: crate::types::VShardId::from_collection_in_database(database_id, collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
         database_id,
         plan: apply_plan,
         post_set_op: PostSetOp::None,

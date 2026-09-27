@@ -136,8 +136,7 @@ async fn dispatch_rename_ops(
             sync_dispatch::SystemTask::new(
                 sync_dispatch::SystemReason::TenantLifecycle,
                 tenant_id,
-                target_db_id,
-                "__system",
+                nodedb_types::CollectionKey::from_bare(target_db_id, "__system"),
                 plan,
             ),
             RENAME_DISPATCH_TIMEOUT,

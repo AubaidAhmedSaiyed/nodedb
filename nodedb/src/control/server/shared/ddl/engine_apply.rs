@@ -35,8 +35,7 @@ pub(crate) async fn apply_in_engine(
         SystemTask::new(
             SystemReason::DdlApply,
             tenant_id,
-            database_id,
-            collection,
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
             plan,
         ),
         timeout,
@@ -74,8 +73,7 @@ pub(crate) async fn refuse_materialized_vector_index(
         SystemTask::new(
             SystemReason::DdlApply,
             tenant_id,
-            database_id,
-            collection,
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
             plan,
         ),
         timeout,

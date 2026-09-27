@@ -103,7 +103,15 @@ pub async fn run_commit(
     // The interactive-COMMIT read-set widens dispatch classification: a txn that
     // writes shard X but read shard Y participates in {X, Y} and must route
     // through Calvin with Y as a participant. Autocommit has no session read-set.
-    let read_vshards = read_vshards_of(&read_set);
+    let read_vshards = match read_vshards_of(&read_set) {
+        Ok(vshards) => vshards,
+        Err(error) => {
+            reservation_release::release_and_rollback(state, sessions, session_id).await;
+            return CommitOutcome::Aborted {
+                reason: AbortReason::Dispatch(error),
+            };
+        }
+    };
 
     // In-transaction `MERGE`, `UPDATE ... FROM <source>`, and `INSERT ... SELECT`
     // are resolved + staged into concrete, surrogate-carrying point writes

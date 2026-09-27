@@ -65,9 +65,8 @@ pub(super) async fn handle_zadd(
         .unwrap_or_default();
 
         let surrogate = match state.surrogate_assigner.assign(
-            crate::types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(crate::types::DatabaseId::DEFAULT, &index_name),
             session.tenant_id,
-            &index_name,
             &member,
         ) {
             Ok(s) => s,

@@ -26,7 +26,7 @@ use nodedb_wal::record::RecordType;
 use super::core_loop::CoreLoop;
 use super::timeseries_checkpoint::stamp::TsReplayStamp;
 use crate::bridge::envelope::{PhysicalPlan, Status};
-use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId};
 use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp};
 
 /// The key of one columnar-family collection on a core.
@@ -213,10 +213,15 @@ impl CoreLoop {
         if self.claim_for_validation() {
             return false;
         }
+        let Some(vshard) =
+            self.replay_vshard("columnar", record_lsn, database_id, &record.collection)
+        else {
+            return false;
+        };
         let task = Self::replay_task(
             TenantId::new(tenant_id),
             database_id,
-            VShardId::from_collection_in_database(database_id, &record.collection),
+            vshard,
             PhysicalPlan::Columnar(ColumnarOp::Truncate {
                 collection: nodedb_types::QualifiedCollection::from_stored(
                     record.collection.clone(),
@@ -287,10 +292,15 @@ impl CoreLoop {
         if self.claim_for_validation() {
             return false;
         }
+        let Some(vshard) =
+            self.replay_vshard("timeseries", record_lsn, database_id, &record.collection)
+        else {
+            return false;
+        };
         let task = Self::replay_task(
             tid,
             database_id,
-            VShardId::from_collection_in_database(database_id, &record.collection),
+            vshard,
             PhysicalPlan::Timeseries(TimeseriesOp::Truncate {
                 collection: nodedb_types::QualifiedCollection::from_stored(
                     record.collection.clone(),

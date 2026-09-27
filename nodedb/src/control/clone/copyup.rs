@@ -18,7 +18,7 @@ use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
 use crate::bridge::envelope::{Priority, Request, Status};
 use crate::control::state::SharedState;
-use crate::types::{ReadConsistency, RequestId, TraceId, VShardId};
+use crate::types::{ReadConsistency, RequestId, TraceId};
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
 
 /// Parameters for a KV copy-up operation.
@@ -47,15 +47,12 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
         source_value_bytes,
     } = params;
 
-    let target_coll_qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
-        target_db_id,
-        target_collection,
-    );
+    let target_key = nodedb_types::CollectionKey::from_bare(target_db_id, target_collection);
 
     // Allocate a surrogate for the target KV row.
     let surrogate = state
         .surrogate_assigner
-        .assign(target_db_id, tenant_id, &target_coll_qualified, &kv_key)
+        .assign(target_key, tenant_id, &kv_key)
         .map_err(|e| crate::Error::Storage {
             engine: "clone_kv_copyup".into(),
             detail: format!("surrogate alloc failed: {e}"),
@@ -72,7 +69,7 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
         provenance: None,
     });
 
-    let vshard_id = VShardId::from_collection_in_database(target_db_id, &target_coll_qualified);
+    let vshard_id = target_key.vshard();
     let req_id = RequestId::new(
         state
             .request_id_counter
@@ -159,18 +156,14 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
     } = params;
 
     // Allocate a fresh target surrogate using the (collection, doc_id) key.
+    let target_key = nodedb_types::CollectionKey::from_bare(target_db_id, target_collection);
     let target_coll_qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
         target_db_id,
         target_collection,
     );
     let target_surrogate = state
         .surrogate_assigner
-        .assign(
-            target_db_id,
-            tenant_id,
-            &target_coll_qualified,
-            source_doc_id.as_bytes(),
-        )
+        .assign(target_key, tenant_id, source_doc_id.as_bytes())
         .map_err(|e| crate::Error::Storage {
             engine: "clone_copyup".into(),
             detail: format!("surrogate alloc failed: {e}"),
@@ -227,7 +220,7 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
         resolved_sum_targets: Vec::new(),
     });
 
-    let vshard_id = VShardId::from_collection_in_database(target_db_id, &target_coll_qualified);
+    let vshard_id = target_key.vshard();
     let req_id = RequestId::new(
         state
             .request_id_counter

@@ -184,7 +184,10 @@ fn filter_node_snapshot(
         tenant_id,
         source_vshards,
         |collection| {
-            nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, collection)
+            nodedb_cluster::routing::vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+                DatabaseId::DEFAULT,
+                collection,
+            ))
         },
     );
     zerompk::to_msgpack_vec(&snap).map_err(|e| Error::Internal {
@@ -233,9 +236,8 @@ fn push_metadata_sections(
     let mut binds: Vec<nodedb_types::backup_envelope::SurrogateBindBlob> = Vec::new();
     for coll in &collections {
         let rows = catalog.scan_surrogates_for_collection(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &coll.name),
             TenantId::new(tenant_id),
-            &coll.name,
         )?;
         for (pk, surrogate) in rows {
             binds.push(nodedb_types::backup_envelope::SurrogateBindBlob {
@@ -313,8 +315,7 @@ async fn snapshot_self(
             sync_dispatch::SystemReason::BackupRestore,
             TenantId::new(tenant_id),
             // TODO(A8-followup): backup/restore not yet multi-database.
-            DatabaseId::DEFAULT,
-            "__system",
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "__system"),
             plan.clone(),
         ),
         NODE_SNAPSHOT_TIMEOUT,

@@ -77,8 +77,7 @@ pub async fn show_continuous_aggregates(
         sync_dispatch::SystemTask::new(
             sync_dispatch::SystemReason::CatalogMaintenance,
             tenant_id,
-            database_id,
-            "__system",
+            nodedb_types::CollectionKey::from_bare(database_id, "__system"),
             PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
         ),
         Duration::from_secs(5),

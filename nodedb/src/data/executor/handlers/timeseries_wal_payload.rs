@@ -92,10 +92,13 @@ impl CoreLoop {
                 "msgpack"
             }
         });
+        let Some(vshard) = self.replay_vshard("timeseries", record_lsn, db_id, collection) else {
+            return 0;
+        };
         let mut task = Self::replay_task(
             tid,
             db_id,
-            crate::types::VShardId::from_collection_in_database(db_id, collection),
+            vshard,
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 payload: payload.to_vec(),
@@ -197,10 +200,13 @@ impl CoreLoop {
         // tenant_id, request_id}` — it never inspects the embedded plan.
         // Embed empty vecs for the plan-level surrogates/provenance to avoid
         // cloning the owned values we need to pass as explicit args below.
+        let Some(vshard) = self.replay_vshard("columnar", record_lsn, db_id, collection) else {
+            return 0;
+        };
         let task = Self::replay_task(
             tid,
             db_id,
-            crate::types::VShardId::from_collection_in_database(db_id, collection),
+            vshard,
             PhysicalPlan::Columnar(ColumnarOp::Insert {
                 collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 payload: payload.to_vec(),

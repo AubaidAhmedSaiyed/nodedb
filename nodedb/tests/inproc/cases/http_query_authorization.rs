@@ -279,9 +279,8 @@ async fn crdt_apply_rejects_ungranted_custom_role_before_surrogate_assignment() 
         srv.shared
             .surrogate_assigner
             .lookup(
-                DatabaseId::DEFAULT,
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection),
                 TenantId::new(1),
-                collection,
                 doc_id.as_bytes(),
             )
             .expect("look up CRDT document surrogate"),

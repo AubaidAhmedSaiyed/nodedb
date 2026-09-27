@@ -249,8 +249,7 @@ pub async fn create_continuous_aggregate(
             sync_dispatch::SystemTask::new(
                 sync_dispatch::SystemReason::CatalogMaintenance,
                 tenant_id,
-                database_id,
-                &def.source,
+                nodedb_types::CollectionKey::from_bare(database_id, &def.source),
                 plan,
             ),
             Duration::from_secs(5),

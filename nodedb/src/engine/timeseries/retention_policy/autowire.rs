@@ -72,8 +72,7 @@ pub async fn register_tiers(
             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
                 tenant_id,
-                DatabaseId::new(def.database_id),
-                &source,
+                nodedb_types::CollectionKey::from_bare(DatabaseId::new(def.database_id), &source),
                 plan,
             ),
             Duration::from_secs(5),
@@ -118,8 +117,7 @@ pub async fn unregister_tiers(
             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
                 tenant_id,
-                DatabaseId::new(def.database_id),
-                route_collection,
+                nodedb_types::CollectionKey::from_bare(DatabaseId::new(def.database_id), route_collection),
                 plan,
             ),
             Duration::from_secs(5),

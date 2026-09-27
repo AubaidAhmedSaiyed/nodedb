@@ -17,43 +17,27 @@
 //! that both planes call. It reads no catalog and touches no storage, which is
 //! also what lets the Data Plane use it without holding Control-Plane state.
 
-use crate::types::{DatabaseId, VShardId};
+use nodedb_types::CollectionKey;
 
-/// Qualify a catalog collection name into the db-scoped name every plan carries.
-///
-/// Homing hashes the name AS IT APPEARS ON THE PLAN, so a target named only by
-/// the catalog has to be qualified the same way before it can be compared with a
-/// source that already is.
-pub fn db_qualified(database_id: DatabaseId, collection: &str) -> String {
-    nodedb_types::QualifiedCollection::new(database_id, collection)
-        .as_str()
-        .to_owned()
-}
+use crate::types::{DatabaseId, VShardId};
 
 /// The vShard a materialized-sum target collection homes to.
 ///
-/// `target_collection` is the CATALOG name carried on the binding; it is
-/// qualified here so the result matches how the target's own writes route.
+/// `target_collection` is the bare CATALOG name carried on the binding. It
+/// forms the same [`CollectionKey`] the target's own writes route by.
 pub fn sum_target_vshard(database_id: DatabaseId, target_collection: &str) -> VShardId {
-    VShardId::from_collection_in_database(
-        database_id,
-        &db_qualified(database_id, target_collection),
-    )
+    CollectionKey::from_bare(database_id, target_collection).vshard()
 }
 
 /// Whether the balance write may ride the source write's transaction.
 ///
-/// `source_collection` is the source's name as it appears on the plan — the same
-/// string its own task is homed on. `true` means one core owns both rows and the
-/// derived write is atomic for free; `false` means the balance needs its own
-/// task on the target's vShard, dual-homed with the source through Calvin.
-pub fn sum_target_is_co_resident(
-    database_id: DatabaseId,
-    source_collection: &str,
-    target_collection: &str,
-) -> bool {
-    VShardId::from_collection_in_database(database_id, source_collection)
-        == sum_target_vshard(database_id, target_collection)
+/// `source` is the source collection's key, de-qualified from the name on the
+/// plan by the caller. The target shares the source's database. `true` means
+/// one core owns both rows and the derived write is atomic for free. `false`
+/// means the balance needs its own task on the target's vShard, dual-homed
+/// with the source through Calvin.
+pub fn sum_target_is_co_resident(source: CollectionKey<'_>, target_collection: &str) -> bool {
+    source.vshard() == sum_target_vshard(source.database_id(), target_collection)
 }
 
 #[cfg(test)]
@@ -68,9 +52,9 @@ mod tests {
         for i in 0..256 {
             let source = format!("src_{i}");
             let target = format!("dst_{i}");
-            let co_resident = sum_target_is_co_resident(db, &source, &target);
-            let same_home = VShardId::from_collection_in_database(db, &source)
-                == sum_target_vshard(db, &target);
+            let source_key = CollectionKey::from_bare(db, &source);
+            let co_resident = sum_target_is_co_resident(source_key, &target);
+            let same_home = source_key.vshard() == sum_target_vshard(db, &target);
             assert_eq!(co_resident, same_home);
         }
     }
@@ -80,8 +64,9 @@ mod tests {
     #[test]
     fn a_collection_is_co_resident_with_itself() {
         for db in [DatabaseId::DEFAULT, DatabaseId::new(7)] {
-            let qualified = db_qualified(db, "ledger");
-            assert!(sum_target_is_co_resident(db, &qualified, "ledger"));
+            let qualified = nodedb_types::QualifiedCollection::new(db, "ledger");
+            let source = CollectionKey::from_qualified(db, &qualified).expect("qualified");
+            assert!(sum_target_is_co_resident(source, "ledger"));
         }
     }
 
@@ -92,7 +77,13 @@ mod tests {
     fn distinct_collections_are_usually_cross_shard() {
         let db = DatabaseId::DEFAULT;
         let cross = (0..512)
-            .filter(|i| !sum_target_is_co_resident(db, &format!("src_{i}"), &format!("dst_{i}")))
+            .filter(|i| {
+                let source = format!("src_{i}");
+                !sum_target_is_co_resident(
+                    CollectionKey::from_bare(db, &source),
+                    &format!("dst_{i}"),
+                )
+            })
             .count();
         assert!(
             cross > 256,

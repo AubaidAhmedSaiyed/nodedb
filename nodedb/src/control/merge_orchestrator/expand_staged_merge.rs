@@ -91,8 +91,11 @@ pub(crate) async fn resolve_and_emit_merge_ops(
         })?;
     let target_pk = resolve_target_pk(&target, "MERGE")?;
 
-    let vshard_id =
-        VShardId::from_collection_in_database(task.database_id, target_collection.as_str());
+    let vshard_id = nodedb_types::CollectionKey::from_qualified_str(
+        task.database_id,
+        target_collection.as_str(),
+    )?
+    .vshard();
     let mut out: Vec<PhysicalTask> = Vec::new();
     emit_arms(
         state,
@@ -205,9 +208,8 @@ fn emit_arms(
     for (_join_key, body) in arms.inserts {
         let surrogate = assign_target_surrogate(
             state,
-            task.database_id,
+            nodedb_types::CollectionKey::from_qualified_str(task.database_id, target_collection)?,
             task.tenant_id,
-            target_collection,
             target_pk,
             &body,
         )?;

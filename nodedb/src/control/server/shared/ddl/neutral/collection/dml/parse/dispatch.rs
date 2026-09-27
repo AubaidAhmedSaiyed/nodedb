@@ -266,13 +266,12 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         return Err(ddl_err(sqlstate, message));
     }
 
+    let sum_read_vshards = crate::control::planner::calvin::read_vshards_of(&sum_target_reads)
+        .map_err(|error| DdlError::from_error(&error))?;
     if !in_txn_block
         && state.sequencer_inbox.get().is_some()
         && matches!(
-            crate::control::planner::calvin::classify_dispatch(
-                &tasks,
-                &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
-            ),
+            crate::control::planner::calvin::classify_dispatch(&tasks, &sum_read_vshards),
             crate::control::planner::calvin::DispatchClass::MultiShard { .. }
         )
     {

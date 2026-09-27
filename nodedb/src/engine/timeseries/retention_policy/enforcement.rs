@@ -102,8 +102,7 @@ async fn enforcement_loop(
                             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
                                 tenant_id,
-                                DatabaseId::new(policy.database_id),
-                                &policy.collection,
+                                nodedb_types::CollectionKey::from_bare(DatabaseId::new(policy.database_id), &policy.collection),
                                 plan,
                             ),
                             Duration::from_secs(30),
@@ -133,8 +132,7 @@ async fn enforcement_loop(
                 crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                     crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
                     tenant_id,
-                    DatabaseId::new(policy.database_id),
-                    &policy.collection,
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::new(policy.database_id), &policy.collection),
                     plan,
                 ),
                 Duration::from_secs(30),
@@ -193,8 +191,10 @@ async fn check_watermark_coverage(
         crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
             crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
             tenant_id,
-            DatabaseId::new(policy.database_id),
-            &policy.collection,
+            nodedb_types::CollectionKey::from_bare(
+                DatabaseId::new(policy.database_id),
+                &policy.collection,
+            ),
             plan,
         ),
         Duration::from_secs(10),

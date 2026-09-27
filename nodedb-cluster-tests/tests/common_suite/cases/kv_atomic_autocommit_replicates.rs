@@ -18,7 +18,7 @@ use common::cluster_harness::TestCluster;
 
 use std::time::{Duration, Instant};
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 
 const COUNTERS: &str = "repl_kv_ctr";
 const BOARD: &str = "repl_kv_board";
@@ -47,7 +47,7 @@ fn counts_three(read: &Result<Option<String>, String>) -> bool {
 
 /// The leader node id of the data group that owns `collection`.
 fn group_leader(cluster: &TestCluster, collection: &str) -> u64 {
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection).vshard();
     let routing = cluster.nodes[0]
         .shared
         .cluster_routing

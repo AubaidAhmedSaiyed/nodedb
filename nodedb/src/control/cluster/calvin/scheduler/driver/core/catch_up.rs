@@ -237,7 +237,7 @@ mod tests {
     use nodedb_cluster::calvin::types::{EpochBatch, SchedulerInput, SequencedTxn};
     use nodedb_cluster::calvin::{CalvinCompletionRegistry, SequencerEntry};
     use nodedb_types::TenantId;
-    use nodedb_types::id::{DatabaseId, VShardId};
+    use nodedb_types::id::DatabaseId;
 
     use crate::control::cluster::calvin::scheduler::driver::core::test_support::{
         build_test_scheduler, build_test_scheduler_with_data_side, fill_tenant_inflight,
@@ -378,8 +378,9 @@ mod tests {
     async fn drain_replays_dropped_input_into_lock_table_end_to_end() {
         // Use the vShard that "test_coll" hashes to, so the batch's fan-out targets —
         // and its replay decodes for — this scheduler's vShard.
-        let vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "test_coll").as_u32();
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "test_coll")
+            .vshard()
+            .as_u32();
         let (mut scheduler, _dir) = build_test_scheduler(vshard);
         ensure_sequencer_leader(&scheduler);
 
@@ -466,8 +467,9 @@ mod tests {
     /// epoch 1 (delivered live, in-flight) must be skipped.
     #[tokio::test]
     async fn drain_skips_in_flight_overlap_no_double_dispatch_end_to_end() {
-        let vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "test_coll").as_u32();
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "test_coll")
+            .vshard()
+            .as_u32();
         let (mut scheduler, _dir) = build_test_scheduler(vshard);
         ensure_sequencer_leader(&scheduler);
 

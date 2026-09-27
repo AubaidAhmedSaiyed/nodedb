@@ -19,7 +19,7 @@
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 
 use super::super::result::{DdlError, DdlResult};
@@ -58,7 +58,7 @@ pub async fn transfer(
         return Err(ddl_err("42601", "TRANSFER: amount must be positive"));
     }
 
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
 
     // Dispatch to Data Plane — entire read+validate+write is atomic (single TPC
     // core). Routed through the protocol-neutral in-transaction staging gate
@@ -76,18 +76,16 @@ pub async fn transfer(
     let debit_surrogate = state
         .surrogate_assigner
         .assign(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
             identity.tenant_id,
-            &collection,
             &source_bytes,
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let credit_surrogate = state
         .surrogate_assigner
         .assign(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
             identity.tenant_id,
-            &collection,
             &dest_bytes,
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
@@ -141,8 +139,10 @@ pub async fn transfer_item(
 
     // Cross-collection transfers must be on the same vshard.
     // Validate this upfront to prevent silent failures.
-    let vshard_src = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &source_collection);
-    let vshard_dst = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &dest_collection);
+    let vshard_src =
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &source_collection).vshard();
+    let vshard_dst =
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &dest_collection).vshard();
     if source_collection != dest_collection && vshard_src != vshard_dst {
         return Err(ddl_err(
             "0A000",
@@ -163,9 +163,8 @@ pub async fn transfer_item(
     let surrogate = state
         .surrogate_assigner
         .assign(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &dest_collection),
             identity.tenant_id,
-            &dest_collection,
             &dest_bytes,
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;

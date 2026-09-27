@@ -15,8 +15,12 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
             pk_bytes,
             ..
         } => match pk_bytes {
-            Some(pk) => binder.resolve_in_place(collection.as_str(), pk, surrogate),
-            None => binder.resolve_self_keyed_in_place(collection.as_str(), surrogate),
+            Some(pk) => {
+                binder.resolve_in_place(binder.plan_key(collection.as_str())?, pk, surrogate)
+            }
+            None => {
+                binder.resolve_self_keyed_in_place(binder.plan_key(collection.as_str())?, surrogate)
+            }
         },
         VectorOp::BatchInsert {
             collection,
@@ -24,7 +28,10 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
             ..
         } => {
             for surrogate in surrogates.iter_mut() {
-                binder.resolve_self_keyed_in_place(collection.as_str(), surrogate)?;
+                binder.resolve_self_keyed_in_place(
+                    binder.plan_key(collection.as_str())?,
+                    surrogate,
+                )?;
             }
             Ok(())
         }
@@ -32,7 +39,8 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
             collection,
             document_surrogate,
             ..
-        } => binder.resolve_self_keyed_in_place(collection.as_str(), document_surrogate),
+        } => binder
+            .resolve_self_keyed_in_place(binder.plan_key(collection.as_str())?, document_surrogate),
         VectorOp::DirectUpsert {
             collection,
             surrogate,
@@ -50,7 +58,12 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
             surrogate,
             pk_bytes,
             ..
-        } => bind_keyed_or_self(binder, collection.as_str(), pk_bytes, surrogate),
+        } => bind_keyed_or_self(
+            binder,
+            binder.plan_key(collection.as_str())?,
+            pk_bytes,
+            surrogate,
+        ),
         VectorOp::ResolveDirectWrite(inner) => bind(binder, inner),
         VectorOp::ResolvedDirectWrite {
             collection,
@@ -63,7 +76,12 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
                         surrogate,
                         pk_bytes,
                         ..
-                    } => bind_keyed_or_self(binder, collection.as_str(), pk_bytes, surrogate)?,
+                    } => bind_keyed_or_self(
+                        binder,
+                        binder.plan_key(collection.as_str())?,
+                        pk_bytes,
+                        surrogate,
+                    )?,
                     // Named by a surrogate bound when the row was inserted.
                     VectorResolvedMutation::Delete { .. }
                     | VectorResolvedMutation::Update { .. } => {}
@@ -98,12 +116,12 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
 /// An empty `pk_bytes` is a headless row: self-key it.
 fn bind_keyed_or_self(
     binder: &IdentityBinder<'_>,
-    collection: &str,
+    key: nodedb_types::CollectionKey<'_>,
     pk_bytes: &[u8],
     surrogate: &mut nodedb_types::Surrogate,
 ) -> crate::Result<()> {
     if pk_bytes.is_empty() {
-        return binder.resolve_self_keyed_in_place(collection, surrogate);
+        return binder.resolve_self_keyed_in_place(key, surrogate);
     }
-    binder.resolve_in_place(collection, pk_bytes, surrogate)
+    binder.resolve_in_place(key, pk_bytes, surrogate)
 }

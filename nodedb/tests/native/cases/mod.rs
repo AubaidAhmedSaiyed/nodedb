@@ -3,6 +3,7 @@
 mod native_clone_read_intercept;
 mod native_clone_write_intercept;
 mod native_create_then_dml;
+mod native_database_collection_key_placement;
 mod native_direct_op_txn_overlay;
 mod native_dml_affected_counts;
 mod native_dml_outcome_conformance;

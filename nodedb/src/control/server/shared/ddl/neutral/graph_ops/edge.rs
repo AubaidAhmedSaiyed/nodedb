@@ -80,28 +80,15 @@ pub async fn insert_edge(
     let vsrc = VShardId::from_key(src.as_bytes());
     let vdst = VShardId::from_key(dst.as_bytes());
 
-    let src_surrogate = assign_surrogate_routed(
-        state,
-        vsrc,
-        database_id,
-        tenant_id,
-        &collection,
-        src.as_bytes(),
-        TraceId::ZERO,
-    )
-    .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
-    let dst_surrogate = assign_surrogate_routed(
-        state,
-        vdst,
-        database_id,
-        tenant_id,
-        &collection,
-        dst.as_bytes(),
-        TraceId::ZERO,
-    )
-    .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    let key = nodedb_types::CollectionKey::from_bare(database_id, &collection);
+    let src_surrogate =
+        assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), TraceId::ZERO)
+            .await
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    let dst_surrogate =
+        assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), TraceId::ZERO)
+            .await
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     // Write policy decides the `PROPERTIES` image before staging: this handler
     // dispatches as trusted internal work, so nothing downstream resolves a policy.
@@ -256,28 +243,15 @@ pub async fn delete_edge(
     let vsrc = VShardId::from_key(src.as_bytes());
     let vdst = VShardId::from_key(dst.as_bytes());
 
-    let src_surrogate = assign_surrogate_routed(
-        state,
-        vsrc,
-        database_id,
-        tenant_id,
-        &collection,
-        src.as_bytes(),
-        TraceId::ZERO,
-    )
-    .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
-    let dst_surrogate = assign_surrogate_routed(
-        state,
-        vdst,
-        database_id,
-        tenant_id,
-        &collection,
-        dst.as_bytes(),
-        TraceId::ZERO,
-    )
-    .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    let key = nodedb_types::CollectionKey::from_bare(database_id, &collection);
+    let src_surrogate =
+        assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), TraceId::ZERO)
+            .await
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    let dst_surrogate =
+        assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), TraceId::ZERO)
+            .await
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     // A delete carries no image, so the policy compiles into the plan's write-gate
     // slot and is decided in the Data Plane against the edge's stored properties.

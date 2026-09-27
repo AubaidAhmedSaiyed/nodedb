@@ -2,7 +2,7 @@
 
 //! Collection names that home on distinct vShards.
 
-use nodedb_types::id::{DatabaseId, VShardId};
+use nodedb_types::id::DatabaseId;
 
 /// One collection name per prefix, `<prefix>_<n>`, each on a vShard no other
 /// returned name homes on. A transaction that writes two of them spans two
@@ -13,8 +13,9 @@ pub fn names_on_distinct_vshards<const N: usize>(prefixes: [&str; N]) -> [String
         let (name, vshard) = (0..512u32)
             .map(|i| {
                 let name = format!("{prefix}_{i}");
-                let vshard =
-                    VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+                let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                    .vshard()
+                    .as_u32();
                 (name, vshard)
             })
             .find(|(_, vshard)| !taken.contains(vshard))
@@ -30,7 +31,9 @@ pub const SINGLE_NODE_DATA_GROUPS: u32 = 4;
 
 /// The data Raft group a single-node server applies writes to `name` in.
 pub fn single_node_data_group(name: &str) -> u32 {
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, name).as_u32();
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, name)
+        .vshard()
+        .as_u32();
     1 + vshard % SINGLE_NODE_DATA_GROUPS
 }
 

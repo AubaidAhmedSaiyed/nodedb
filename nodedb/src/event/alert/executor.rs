@@ -192,8 +192,10 @@ async fn execute_aggregate_scan(
         sync_dispatch::SystemTask::new(
             sync_dispatch::SystemReason::EventPlane,
             tenant_id,
-            crate::types::DatabaseId::new(alert.database_id),
-            &alert.collection,
+            nodedb_types::CollectionKey::from_bare(
+                crate::types::DatabaseId::new(alert.database_id),
+                &alert.collection,
+            ),
             plan,
         ),
         Duration::from_secs(30),

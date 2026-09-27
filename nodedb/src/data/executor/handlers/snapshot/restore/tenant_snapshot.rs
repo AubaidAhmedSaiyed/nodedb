@@ -492,10 +492,8 @@ mod tests {
         let task = CoreLoop::replay_vector_task(
             crate::types::TenantId::new(0),
             nodedb_types::DatabaseId::DEFAULT,
-            crate::types::VShardId::from_collection_in_database(
-                nodedb_types::DatabaseId::DEFAULT,
-                "emb",
-            ),
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "emb")
+                .vshard(),
             PhysicalPlan::Meta(MetaOp::WalAppend {
                 payload: Vec::new(),
             }),

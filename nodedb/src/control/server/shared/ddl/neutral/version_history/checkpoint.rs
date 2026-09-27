@@ -48,8 +48,7 @@ pub async fn create_checkpoint(
         SystemTask::new(
             SystemReason::CatalogMaintenance,
             tenant_id,
-            database_id,
-            &collection,
+            nodedb_types::CollectionKey::from_bare(database_id, &collection),
             plan,
         ),
         timeout,

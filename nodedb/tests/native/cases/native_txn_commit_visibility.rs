@@ -17,7 +17,6 @@ use std::time::Duration;
 use nodedb_test_support::native_harness::{do_handshake, read_frame, write_frame};
 use nodedb_test_support::pgwire_harness::TestServer;
 
-use nodedb_types::id::VShardId;
 use nodedb_types::protocol::opcodes::ResponseStatus;
 use nodedb_types::protocol::text_fields::TextFields;
 use nodedb_types::protocol::{HelloFrame, NativeRequest, NativeResponse, OpCode, RequestFields};
@@ -82,7 +81,8 @@ fn collection_on_nonzero_core() -> String {
     for i in 0..64u32 {
         let name = format!("native_txn_vis_{i}");
         let vshard =
-            VShardId::from_collection_in_database(nodedb::types::DatabaseId::DEFAULT, &name)
+            nodedb_types::CollectionKey::from_bare(nodedb::types::DatabaseId::DEFAULT, &name)
+                .vshard()
                 .as_u32();
         if !(vshard as usize).is_multiple_of(NUM_CORES) {
             return name;

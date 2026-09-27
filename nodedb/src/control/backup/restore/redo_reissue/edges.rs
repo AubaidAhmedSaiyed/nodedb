@@ -39,10 +39,11 @@ fn node_identity(
     collection: &str,
     node_id: &str,
 ) -> crate::Result<CarriedIdentity> {
-    let surrogate =
-        state
-            .surrogate_assigner
-            .assign(database_id, tenant, collection, node_id.as_bytes())?;
+    let surrogate = state.surrogate_assigner.assign(
+        nodedb_types::CollectionKey::from_bare(database_id, collection),
+        tenant,
+        node_id.as_bytes(),
+    )?;
     Ok(CarriedIdentity {
         collection: collection.to_string(),
         pk_bytes: node_id.as_bytes().to_vec(),

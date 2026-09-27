@@ -17,7 +17,7 @@ use common::cluster_harness::TestCluster;
 use std::time::{Duration, Instant};
 
 use nodedb::control::wal_replication::{ReplicableWrite, to_replicated_entry};
-use nodedb::types::{DatabaseId, TenantId, VShardId};
+use nodedb::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 
 const COLL: &str = "dup_proposal_ctr";
@@ -62,7 +62,7 @@ async fn a_proposal_committed_twice_moves_the_counter_once() {
         .wait_for_full_apply_convergence(Duration::from_secs(15))
         .await;
 
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, COLL);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLL).vshard();
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut committed = 0;
     let mut entry_bytes: Option<Vec<u8>> = None;
@@ -99,7 +99,11 @@ async fn a_proposal_committed_twice_moves_the_counter_once() {
                 let surrogate = leader
                     .shared
                     .surrogate_assigner
-                    .assign(DatabaseId::DEFAULT, TenantId::new(TENANT), COLL, b"ctr")
+                    .assign(
+                        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLL),
+                        TenantId::new(TENANT),
+                        b"ctr",
+                    )
                     .expect("the seeded key has a surrogate");
                 let plan = PhysicalPlan::Kv(KvOp::Incr {
                     collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLL),

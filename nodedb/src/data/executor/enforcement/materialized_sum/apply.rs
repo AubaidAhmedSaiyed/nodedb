@@ -128,17 +128,19 @@ impl CoreLoop {
         images: &RowImages<'_>,
     ) -> crate::Result<Vec<TargetWrite>> {
         let mut writes: Vec<TargetWrite> = Vec::new();
+        // The source's canonical key, de-qualified from the plan's name once.
+        let source = nodedb_types::CollectionKey::from_qualified_str(
+            DatabaseId::new(ctx.database_id),
+            ctx.collection,
+        )?;
         for binding in bindings {
             // Whether one core owns both rows. The Control Plane asked the SAME
             // question, from the same plane-neutral function, when it decided
             // whether the balance could ride this transaction — so the two
             // cannot disagree about which bindings this core is responsible
             // for.
-            let co_resident = crate::query::sum_target_is_co_resident(
-                DatabaseId::new(ctx.database_id),
-                ctx.collection,
-                &binding.target_collection,
-            );
+            let co_resident =
+                crate::query::sum_target_is_co_resident(source, &binding.target_collection);
             // A binding the plan DEFERRED is applied by its own
             // `ApplyBalanceDelta` task on the target's core. Applying it here as
             // well would double-count it — and this transaction belongs to the
@@ -384,11 +386,17 @@ mod tests {
     #[test]
     fn the_local_fixture_is_co_resident() {
         assert!(
-            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                TARGET,
+            ),
             "'{SOURCE}' and '{TARGET}' must share a vShard for the inline fold to be observable"
         );
         assert!(
-            !crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, REMOTE_TARGET),
+            !crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                REMOTE_TARGET,
+            ),
             "'{REMOTE_TARGET}' must NOT share '{SOURCE}'s vShard; it pins the deferred path"
         );
     }
@@ -777,13 +785,19 @@ mod tests {
     #[test]
     fn the_local_fixture_is_co_resident_for_path_level_tests() {
         assert!(
-            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                TARGET,
+            ),
             "'{SOURCE}' and '{TARGET}' must share a vShard: the inline fold writes the target \
              inside the source's transaction, on the source's core, and each core opens its own \
              document store"
         );
         assert!(
-            !crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, REMOTE_TARGET),
+            !crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                REMOTE_TARGET,
+            ),
             "'{REMOTE_TARGET}' must NOT share '{SOURCE}'s vShard; it pins the deferred rule"
         );
     }
@@ -1375,8 +1389,10 @@ mod tests {
                 if [SOURCE, TARGET, JOIN_SOURCE].contains(&candidate.as_str()) {
                     continue;
                 }
-                if crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, &candidate)
-                {
+                if crate::query::sum_target_is_co_resident(
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                    &candidate,
+                ) {
                     return candidate;
                 }
             }
@@ -1458,7 +1474,10 @@ mod tests {
         // path instead and leave the collision this test exists for uncovered.
         for target in [TARGET, second_target.as_str()] {
             assert!(
-                crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, target),
+                crate::query::sum_target_is_co_resident(
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                    target,
+                ),
                 "'{target}' must share '{SOURCE}'s vShard for its inline fold to be observable"
             );
         }

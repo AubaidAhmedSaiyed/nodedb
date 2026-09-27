@@ -54,7 +54,8 @@ pub async fn rate_check(
 
     let rate_key = format!("_rate:{gate_name}:{key}");
     let tenant_id = identity.tenant_id;
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, RATE_COLLECTION);
+    let vshard =
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, RATE_COLLECTION).vshard();
     let ttl_ms = window_secs * 1000;
 
     // Fixed-window semantics: TTL is set ONLY on the first call (new key).
@@ -94,9 +95,8 @@ pub async fn rate_check(
     let surrogate = state
         .surrogate_assigner
         .assign(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, RATE_COLLECTION),
             tenant_id,
-            RATE_COLLECTION,
             rate_key.as_bytes(),
         )
         .map_err(|e| super::kv_atomic::ddl_err("XX000", e.to_string()))?;
@@ -174,7 +174,8 @@ pub async fn rate_remaining(
 
     let rate_key = format!("_rate:{gate_name}:{key}");
     let tenant_id = identity.tenant_id;
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, RATE_COLLECTION);
+    let vshard =
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, RATE_COLLECTION).vshard();
 
     // Read current counter value (non-destructive).
     let plan = PhysicalPlan::Kv(KvOp::Get {
@@ -245,7 +246,8 @@ pub async fn rate_reset(
 
     let rate_key = format!("_rate:{gate_name}:{key}");
     let tenant_id = identity.tenant_id;
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, RATE_COLLECTION);
+    let vshard =
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, RATE_COLLECTION).vshard();
 
     let plan = PhysicalPlan::Kv(KvOp::Delete {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, RATE_COLLECTION),

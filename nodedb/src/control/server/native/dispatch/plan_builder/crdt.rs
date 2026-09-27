@@ -42,9 +42,8 @@ pub(crate) fn build_apply(
     });
 
     let surrogate = ctx.state.surrogate_assigner.assign(
-        ctx.database_id(),
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
         ctx.tenant_id(),
-        collection,
         document_id.as_bytes(),
     )?;
 
@@ -144,9 +143,8 @@ pub(crate) fn build_list_insert(
             })?;
 
     let surrogate = ctx.state.surrogate_assigner.assign(
-        ctx.database_id(),
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
         ctx.tenant_id(),
-        collection,
         document_id.as_bytes(),
     )?;
 
@@ -170,9 +168,8 @@ pub(crate) fn build_list_delete(
     let index = require_list_index(fields.list_index, "list_index")?;
 
     let surrogate = ctx.state.surrogate_assigner.assign(
-        ctx.database_id(),
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
         ctx.tenant_id(),
-        collection,
         document_id.as_bytes(),
     )?;
 
@@ -196,9 +193,8 @@ pub(crate) fn build_list_move(
     let to_index = require_list_index(fields.list_to_index, "list_to_index")?;
 
     let surrogate = ctx.state.surrogate_assigner.assign(
-        ctx.database_id(),
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
         ctx.tenant_id(),
-        collection,
         document_id.as_bytes(),
     )?;
 

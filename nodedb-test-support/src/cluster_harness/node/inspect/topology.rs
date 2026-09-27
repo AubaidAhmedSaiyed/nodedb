@@ -221,8 +221,9 @@ impl TestClusterNode {
     /// group mapping yet (e.g. before the CREATE COLLECTION DDL has
     /// propagated).
     pub fn group_id_for_collection(&self, collection: &str) -> Option<u64> {
-        let vshard =
-            nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, collection);
+        let vshard = nodedb_cluster::routing::vshard_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection),
+        );
         self.shared
             .cluster_routing
             .as_ref()?

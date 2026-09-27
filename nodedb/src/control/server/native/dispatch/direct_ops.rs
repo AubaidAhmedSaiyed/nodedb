@@ -33,8 +33,6 @@ pub(crate) async fn handle_direct_op(
         .as_deref()
         .unwrap_or("default")
         .to_lowercase();
-    let vshard_key = fields.document_id.as_deref().unwrap_or(&collection);
-    let vshard_id = ctx.vshard_for_key(vshard_key);
     let tenant_id = ctx.tenant_id();
 
     // CRDT Apply allocates a surrogate while planning, and a KV counter plans
@@ -71,6 +69,7 @@ pub(crate) async fn handle_direct_op(
         Ok(p) => p,
         Err(e) => return error_to_native_with_sqlstate(seq, "42601", &e),
     };
+    let vshard_id = ctx.task_vshard(&plan, fields.document_id.as_deref(), &collection);
 
     // Apply RLS before any special Control-Plane orchestration can observe the plan.
     if let Err(e) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
@@ -359,12 +358,14 @@ pub(crate) async fn handle_direct_op(
         }
         // Only reads to widen with are those materialized-sum settlement stamped
         // on the source rows its shipped balances folded from.
+        let sum_read_vshards =
+            match crate::control::planner::calvin::read_vshards_of(&sum_target_reads) {
+                Ok(vshards) => vshards,
+                Err(error) => return error_to_native(seq, &error),
+            };
         let route_to_calvin = !in_txn_block
             && matches!(
-                classify_dispatch(
-                    &tasks,
-                    &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
-                ),
+                classify_dispatch(&tasks, &sum_read_vshards),
                 DispatchClass::MultiShard { .. }
             );
         if route_to_calvin {

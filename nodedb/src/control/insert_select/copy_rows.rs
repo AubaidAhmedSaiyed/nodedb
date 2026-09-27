@@ -119,9 +119,8 @@ pub(crate) fn assign_page_rows(
         };
         let surrogate = assign_target_surrogate(
             state,
-            database_id,
+            nodedb_types::CollectionKey::from_qualified_str(database_id, target_collection)?,
             tenant_id,
-            target_collection,
             &spec.target_pk,
             &value,
         )?;

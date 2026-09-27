@@ -176,8 +176,12 @@ mod tests {
         assert_eq!(stats.binds, 1);
         assert_eq!(stats.binds_skipped, 0);
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, TenantId::new(0), "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                TenantId::new(0),
+                b"alice"
+            )
+            .unwrap(),
             Some(nodedb_types::Surrogate::new(7))
         );
     }
@@ -201,8 +205,12 @@ mod tests {
         assert_eq!(stats.binds, 0);
         assert_eq!(stats.binds_skipped, 1);
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, TenantId::new(0), "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                TenantId::new(0),
+                b"alice"
+            )
+            .unwrap(),
             None,
             "a pre-drop binding must stay deleted"
         );
@@ -225,8 +233,12 @@ mod tests {
         .expect("replay");
         assert_eq!(stats.binds, 1);
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, TenantId::new(0), "users", b"bob")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                TenantId::new(0),
+                b"bob"
+            )
+            .unwrap(),
             Some(nodedb_types::Surrogate::new(11))
         );
     }
@@ -245,8 +257,12 @@ mod tests {
             hwm_after_first
         );
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, TenantId::new(0), "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                TenantId::new(0),
+                b"alice"
+            )
+            .unwrap(),
             Some(nodedb_types::Surrogate::new(7))
         );
     }

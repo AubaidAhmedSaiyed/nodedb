@@ -97,7 +97,11 @@ fn derive_surrogates(
         if pk.is_empty() {
             out.push(Surrogate::ZERO);
         } else {
-            out.push(assigner.assign(ctx.database_id(), ctx.tenant_id(), collection, &pk)?);
+            out.push(assigner.assign(
+                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+                ctx.tenant_id(),
+                &pk,
+            )?);
         }
     }
     Ok(out)

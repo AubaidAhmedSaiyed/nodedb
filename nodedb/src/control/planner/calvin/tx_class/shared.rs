@@ -495,7 +495,7 @@ mod routing_agreement_tests {
         vec![
             task(
                 source_write(),
-                VShardId::from_collection_in_database(DB, SOURCE),
+                nodedb_types::CollectionKey::from_bare(DB, SOURCE).vshard(),
             ),
             task(balance_write(), crate::query::sum_target_vshard(DB, TARGET)),
         ]
@@ -531,8 +531,8 @@ mod routing_agreement_tests {
     #[test]
     fn the_fixture_spans_two_vshards() {
         assert_ne!(
-            VShardId::from_collection_in_database(DB, SOURCE),
-            VShardId::from_collection_in_database(DB, TARGET),
+            nodedb_types::CollectionKey::from_bare(DB, SOURCE).vshard(),
+            nodedb_types::CollectionKey::from_bare(DB, TARGET).vshard(),
             "the balance-pairing case only exists when source and target hash apart"
         );
     }
@@ -560,8 +560,8 @@ mod routing_agreement_tests {
         let tx = build_static_tx_class(&tasks, TENANT, &[]).expect("build the transaction class");
 
         let mut expected = vec![
-            VShardId::from_collection_in_database(DB, SOURCE),
-            VShardId::from_collection_in_database(DB, TARGET),
+            nodedb_types::CollectionKey::from_bare(DB, SOURCE).vshard(),
+            nodedb_types::CollectionKey::from_bare(DB, TARGET).vshard(),
         ];
         expected.sort_by_key(|v| v.as_u32());
         assert_eq!(

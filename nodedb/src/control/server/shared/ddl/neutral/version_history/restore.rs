@@ -64,7 +64,11 @@ pub async fn restore_version(
 
     let surrogate = state
         .surrogate_assigner
-        .assign(database_id, tenant_id, &collection, doc_id.as_bytes())
+        .assign(
+            nodedb_types::CollectionKey::from_bare(database_id, &collection),
+            tenant_id,
+            doc_id.as_bytes(),
+        )
         .map_err(|e| err("XX000", format!("surrogate assign: {e}")))?;
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);

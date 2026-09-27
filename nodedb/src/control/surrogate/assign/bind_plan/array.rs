@@ -28,7 +28,8 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut ArrayOp) -> crate::Resu
                         detail: format!("array coord pk encode: {e}"),
                     }
                 })?;
-                let bound = binder.resolve(&array_id.name, &pk_bytes, cell.surrogate)?;
+                let bound =
+                    binder.resolve(binder.bare_key(&array_id.name), &pk_bytes, cell.surrogate)?;
                 if bound != cell.surrogate {
                     cell.surrogate = bound;
                     rewritten = true;

@@ -31,7 +31,7 @@ use nodedb_types::{Surrogate, TenantId};
 
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TraceId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 
 /// What a plan-time reconnaissance read observed, and the version it observed
@@ -177,7 +177,8 @@ async fn execute_read(
         });
     }
 
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let response = dispatch_to_data_plane(
         state,
         tenant_id,

@@ -10,7 +10,7 @@
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::{KvCounterShape, KvOp, PhysicalPlan};
 use nodedb_sql::planner::dml_helpers::KvCounterKind;
 
@@ -52,13 +52,12 @@ pub async fn kv_incr(
 
     let ttl_ms = parse_optional_ttl(&args[3..])?;
 
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
     let surrogate = state
         .surrogate_assigner
         .assign(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
             identity.tenant_id,
-            &collection,
             key.as_bytes(),
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
@@ -120,13 +119,12 @@ pub async fn kv_incr_float(
         ));
     }
 
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
     let surrogate = state
         .surrogate_assigner
         .assign(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
             identity.tenant_id,
-            &collection,
             key.as_bytes(),
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
@@ -213,13 +211,12 @@ pub async fn kv_cas(
     let expected = unquote(&args[2]);
     let new_value = unquote(&args[3]);
 
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
     let surrogate = state
         .surrogate_assigner
         .assign(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
             identity.tenant_id,
-            &collection,
             key.as_bytes(),
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
@@ -267,13 +264,12 @@ pub async fn kv_getset(
     let key = unquote(&args[1]);
     let new_value = unquote(&args[2]);
 
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
     let surrogate = state
         .surrogate_assigner
         .assign(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
             identity.tenant_id,
-            &collection,
             key.as_bytes(),
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;

@@ -59,12 +59,9 @@ pub(super) fn decode_plan(
     ) = &mut plan
         && *surrogate == nodedb_types::Surrogate::ZERO
         && !pk_bytes.is_empty()
-        && let Ok(Some(resolved)) = catalog_ref.get_surrogate_for_pk(
-            database_id,
-            crate::types::TenantId::new(tenant_id),
-            collection.as_str(),
-            pk_bytes,
-        )
+        && let Ok(key) = nodedb_types::CollectionKey::from_qualified(database_id, collection)
+        && let Ok(Some(resolved)) =
+            catalog_ref.get_surrogate_for_pk(key, crate::types::TenantId::new(tenant_id), pk_bytes)
     {
         *surrogate = resolved;
     }

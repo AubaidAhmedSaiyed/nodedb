@@ -114,8 +114,7 @@ pub async fn drop_continuous_aggregate(
             sync_dispatch::SystemTask::new(
                 sync_dispatch::SystemReason::CatalogMaintenance,
                 tenant_id,
-                database_id,
-                &stored.source,
+                nodedb_types::CollectionKey::from_bare(database_id, &stored.source),
                 plan,
             ),
             Duration::from_secs(5),

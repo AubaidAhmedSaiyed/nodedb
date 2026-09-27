@@ -203,7 +203,18 @@ impl NodeDbPgHandler {
         // Autocommit statement routing: the only reads to widen with are the
         // ones the materialized-sum settlement stamped on the source rows its
         // shipped balances were folded from.
-        let sum_read_vshards = crate::control::planner::calvin::read_vshards_of(&sum_target_reads);
+        let sum_read_vshards =
+            match crate::control::planner::calvin::read_vshards_of(&sum_target_reads) {
+                Ok(vshards) => vshards,
+                Err(error) => {
+                    let (severity, code, message) = error_to_sqlstate(&error);
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        severity.to_owned(),
+                        code.to_owned(),
+                        message,
+                    ))));
+                }
+            };
         match classify_dispatch(&tasks, &sum_read_vshards) {
             DispatchClass::SingleShard { .. } => {
                 // A single-shard dependent-predicate write (e.g. `DELETE ...

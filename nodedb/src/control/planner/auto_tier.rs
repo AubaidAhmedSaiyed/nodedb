@@ -14,7 +14,7 @@
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::TimeseriesOp;
 
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -229,7 +229,7 @@ fn build_scan_task(
     } = scope;
     PhysicalTask {
         tenant_id,
-        vshard_id: VShardId::from_collection_in_database(database_id, collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
         database_id,
         plan: PhysicalPlan::Timeseries(TimeseriesOp::Scan {
             collection: nodedb_types::QualifiedCollection::new(database_id, collection),

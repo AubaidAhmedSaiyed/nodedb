@@ -124,7 +124,8 @@ async fn dispatch_external_crdt_apply(
     .map_err(crate::Error::from)?;
     let task = nodedb_physical::physical_task::PhysicalTask {
         tenant_id,
-        vshard_id: VShardId::from_collection_in_database(ctx.database_id(), collection.as_str()),
+        vshard_id: nodedb_types::CollectionKey::from_qualified(ctx.database_id(), &collection)?
+            .vshard(),
         database_id: ctx.database_id(),
         plan,
         post_set_op: nodedb_physical::physical_task::PostSetOp::None,

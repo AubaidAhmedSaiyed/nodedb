@@ -20,7 +20,7 @@ use crate::control::state::SharedState;
 use crate::control::wal_replication::{
     ReplicableWrite, propose_replicated_entry, to_replicated_entry,
 };
-use crate::types::{RequestId, VShardId};
+use crate::types::RequestId;
 
 /// Apply `plan`, a resolved write on `collection`, and return the Data-Plane
 /// response the statement renders.
@@ -56,7 +56,9 @@ pub(crate) async fn apply_orchestrated_write(
         return Ok(resp);
     };
 
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    // `collection` is the plan's database-qualified name.
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let replicable = ReplicableWrite::decide_for_replication(&plan)?;
     let entry =
         to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)?.ok_or_else(|| {

@@ -13,7 +13,7 @@
 use nodedb_sql::types::{EngineType, Filter, SortKey, SqlExpr, SqlPlan};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -93,7 +93,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
             join_type.as_str().to_string()
         };
 
-        let vshard = VShardId::from_collection_in_database(ctx.database_id, &left_collection);
+        let vshard =
+            nodedb_types::CollectionKey::from_qualified_str(ctx.database_id, &left_collection)?
+                .vshard();
 
         return Ok(vec![PhysicalTask {
             tenant_id,
@@ -212,7 +214,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     let collection = db_qualified(ctx.database_id, &raw_collection);
     let qualified_collection =
         nodedb_types::QualifiedCollection::new(ctx.database_id, &raw_collection);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, &collection);
+    let vshard = ctx.collection_key(&raw_collection).vshard();
 
     let group_strs = group_by_to_strings(group_by);
     let agg_specs: Vec<AggregateSpec> = aggregates.iter().map(agg_expr_to_spec).collect();

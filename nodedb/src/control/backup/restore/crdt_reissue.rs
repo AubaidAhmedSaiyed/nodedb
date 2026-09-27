@@ -17,7 +17,7 @@ use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::server::dispatch_utils::{AutocommitWrite, dispatch_autocommit_write};
 use crate::control::state::SharedState;
 use crate::event::EventSource;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 /// Per-import dispatch timeout. Generous: a collection's Loro snapshot may be
@@ -37,7 +37,8 @@ async fn reissue_crdt_collection(
     collection: &str,
     bytes: Vec<u8>,
 ) -> crate::Result<()> {
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    // `collection` is the stored, database-qualified name.
+    let vshard = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let plan = PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
         tenant_id: tenant_id.as_u64(),
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),

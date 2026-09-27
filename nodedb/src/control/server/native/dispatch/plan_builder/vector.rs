@@ -75,9 +75,8 @@ pub(crate) fn build_batch_insert(
     let mut surrogates = Vec::with_capacity(vectors.len());
     for _ in &vectors {
         surrogates.push(assigner.assign_anonymous(
-            ctx.database_id(),
+            nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
             ctx.tenant_id(),
-            collection,
         )?);
     }
 
@@ -109,15 +108,17 @@ pub(crate) fn build_insert(
     let (surrogate, pk_bytes) = match fields.document_id.as_deref() {
         Some(pk) if !pk.is_empty() => (
             assigner.assign(
-                ctx.database_id(),
+                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
                 ctx.tenant_id(),
-                collection,
                 pk.as_bytes(),
             )?,
             Some(pk.as_bytes().to_vec()),
         ),
         _ => (
-            assigner.assign_anonymous(ctx.database_id(), ctx.tenant_id(), collection)?,
+            assigner.assign_anonymous(
+                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+                ctx.tenant_id(),
+            )?,
             None,
         ),
     };

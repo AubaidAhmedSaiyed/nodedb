@@ -62,7 +62,7 @@ pub(in crate::control::backup::restore) async fn reissue_kv_tables(
             state,
             "kv",
             collection,
-            crate::types::VShardId::from_collection_in_database(database_id, collection),
+            nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
             rows.len(),
         );
         let now_ms = std::time::SystemTime::now()
@@ -73,9 +73,11 @@ pub(in crate::control::backup::restore) async fn reissue_kv_tables(
             let Some(ttl_ms) = remaining_ttl_ms(expire_at_ms, now_ms) else {
                 continue;
             };
-            let surrogate = state
-                .surrogate_assigner
-                .assign(database_id, tenant, &stored, &key)?;
+            let surrogate = state.surrogate_assigner.assign(
+                nodedb_types::CollectionKey::from_bare(database_id, collection),
+                tenant,
+                &key,
+            )?;
             let plan = PhysicalPlan::Kv(KvOp::Put {
                 collection: QualifiedCollection::from_stored(stored.clone()),
                 key,

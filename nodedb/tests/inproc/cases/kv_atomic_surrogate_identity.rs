@@ -52,7 +52,10 @@ async fn kv_incr_on_fresh_key_persists_a_real_surrogate() {
     // binding synchronously during plan conversion.
     let catalog = server.shared.credentials.catalog();
     let bindings = catalog
-        .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), "c")
+        .scan_surrogates_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "c"),
+            TenantId::new(1),
+        )
         .expect("scan persisted surrogate bindings for c");
 
     assert_eq!(

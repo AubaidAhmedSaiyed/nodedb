@@ -31,7 +31,7 @@ pub(super) fn tenant() -> TenantId {
 }
 
 pub(super) fn vshard() -> VShardId {
-    VShardId::from_collection_in_database(DatabaseId::DEFAULT, COLLECTION)
+    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLLECTION).vshard()
 }
 
 /// A `SharedState` whose bridge's Data-Plane side the test drives by hand.

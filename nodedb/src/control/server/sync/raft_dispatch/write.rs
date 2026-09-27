@@ -11,7 +11,6 @@ use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{ReplicableWrite, to_replicated_entry};
 use crate::event::EventSource;
-use crate::types::VShardId;
 
 use super::admission_guard::reject_unadmitted_crdt_apply;
 use super::outcome::SyncDispatchOutcome;
@@ -88,7 +87,7 @@ pub(crate) async fn dispatch_write_replicated(
         vshard_id,
     };
     let refused = reject_unadmitted_crdt_apply(&plan).and_then(|()| {
-        if vshard_id == VShardId::from_collection_in_database(database_id, collection) {
+        if vshard_id == nodedb_types::CollectionKey::from_bare(database_id, collection).vshard() {
             Ok(())
         } else {
             Err(crate::Error::Internal {
@@ -139,8 +138,7 @@ pub(crate) async fn dispatch_write_replicated(
     let task = crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
         crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
         tenant_id,
-        database_id,
-        collection,
+        nodedb_types::CollectionKey::from_bare(database_id, collection),
         plan,
     );
     let resp = if local_frontier_mutation {

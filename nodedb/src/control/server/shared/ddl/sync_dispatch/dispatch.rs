@@ -55,17 +55,17 @@ pub(crate) async fn dispatch_system_response_with_source(
     timeout: Duration,
     event_source: crate::event::EventSource,
 ) -> crate::Result<Response> {
-    let vshard_id = VShardId::from_collection_in_database(task.database_id, task.collection);
+    let vshard_id = task.collection.vshard();
     tracing::trace!(
         reason = task.reason.label(),
-        collection = task.collection,
+        collection = task.collection.name(),
         "system-initiated data plane dispatch"
     );
     dispatch_plan(
         state,
         PlanDispatch {
             tenant_id: task.tenant_id,
-            database_id: task.database_id,
+            database_id: task.collection.database_id(),
             vshard_id,
             plan: task.plan,
             timeout,
@@ -92,6 +92,8 @@ pub(crate) async fn dispatch_system_response_with_source(
 /// mints that type, so an entry point that authorizes without running clone-write
 /// and clone-read interception fails to compile instead of silently reading a
 /// `Shadowed` clone target-locally.
+///
+/// `collection` is the bare catalog name in the task's database.
 pub(crate) async fn dispatch_authorized(
     state: &SharedState,
     checked: CloneCheckedTask,
@@ -99,7 +101,7 @@ pub(crate) async fn dispatch_authorized(
     timeout: Duration,
 ) -> crate::Result<Vec<u8>> {
     let task = checked.into_authorized().into_physical_task();
-    let vshard_id = VShardId::from_collection_in_database(task.database_id, collection);
+    let vshard_id = nodedb_types::CollectionKey::from_bare(task.database_id, collection).vshard();
     let tenant_id = task.tenant_id;
     let resp = dispatch_plan(
         state,

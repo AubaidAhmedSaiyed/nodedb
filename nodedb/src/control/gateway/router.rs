@@ -9,7 +9,8 @@
 //!
 //! 1. Consult the `strategy_fn` closure (backed by the catalog) for the plan's
 //!    primary collection to determine its [`PartitionStrategy`]:
-//!    - `CollectionHomed` → one vShard derived from [`vshard_for_collection`].
+//!    - `CollectionHomed` → one vShard derived from [`vshard_for_collection`]
+//!      over the collection's canonical key.
 //!    - `KeyPartitioned` → one vShard per distinct key via [`VShardId::from_key`]
 //!      (deduplicated; multiple keys mapping to the same vShard share one route).
 //! 2. Look up the Raft group leader for each vShard in the routing table.
@@ -27,7 +28,7 @@
 
 use nodedb_cluster::routing::{RoutingTable, vshard_for_collection};
 use nodedb_types::PartitionStrategy;
-use nodedb_types::id::{DatabaseId, VShardId};
+use nodedb_types::id::{CollectionKey, DatabaseId, VShardId};
 
 use nodedb_physical::physical_plan::PhysicalPlan;
 
@@ -73,7 +74,7 @@ pub fn route_plan(
 
     // In single-node mode every plan runs locally.
     let Some(routing) = routing else {
-        let vshard_id = primary_vshard(&plan, database_id);
+        let vshard_id = primary_vshard(&plan, database_id)?;
         return Ok(vec![TaskRoute {
             plan,
             decision: RouteDecision::Local,
@@ -156,10 +157,12 @@ fn route_single_collection(
     match strategy {
         PartitionStrategy::CollectionHomed => {
             // Byte-identical to the original primary_vshard / resolve_decision path.
-            let vshard_id = primary_name
-                .as_deref()
-                .map(|name| vshard_for_collection(database_id, name))
-                .unwrap_or(0);
+            let vshard_id = match primary_name.as_deref() {
+                Some(name) => {
+                    vshard_for_collection(CollectionKey::from_qualified_str(database_id, name)?)
+                }
+                None => 0,
+            };
             let decision = resolve_decision(vshard_id, local_node_id, Some(routing), None);
             Ok(vec![TaskRoute {
                 plan,
@@ -295,15 +298,20 @@ pub fn is_task_vshard_scoped(plan: &PhysicalPlan) -> bool {
     )
 }
 
-/// Determine the primary vShard for a plan by hashing the first collection name.
+/// Determine the primary vShard for a plan from its first collection.
 ///
-/// Falls back to vShard 0 for plans that have no named collection (Meta ops).
-fn primary_vshard(plan: &PhysicalPlan, database_id: DatabaseId) -> u32 {
-    touched_collections(plan)
-        .into_iter()
-        .next()
-        .map(|name| vshard_for_collection(database_id, &name))
-        .unwrap_or(0)
+/// The plan carries the database-qualified name. It is de-qualified into the
+/// canonical key before hashing, so the route matches the vShard every other
+/// path homes the collection to. Falls back to vShard 0 for plans that have
+/// no named collection (Meta ops).
+fn primary_vshard(plan: &PhysicalPlan, database_id: DatabaseId) -> Result<u32> {
+    match touched_collections(plan).into_iter().next() {
+        Some(name) => Ok(vshard_for_collection(CollectionKey::from_qualified_str(
+            database_id,
+            &name,
+        )?)),
+        None => Ok(0),
+    }
 }
 
 #[cfg(test)]
@@ -462,7 +470,7 @@ mod tests {
         // would (the collection's owner).
         assert_eq!(
             routes[0].vshard_id,
-            vshard_for_collection(DatabaseId::DEFAULT, "events")
+            vshard_for_collection(CollectionKey::from_bare(DatabaseId::DEFAULT, "events"))
         );
     }
 
@@ -470,7 +478,8 @@ mod tests {
     fn find_collection_for_vshard(target: u32) -> String {
         for i in 0u64.. {
             let name = format!("col_{i}");
-            if vshard_for_collection(DatabaseId::DEFAULT, &name) == target {
+            if vshard_for_collection(CollectionKey::from_bare(DatabaseId::DEFAULT, &name)) == target
+            {
                 return name;
             }
         }

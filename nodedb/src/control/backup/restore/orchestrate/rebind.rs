@@ -28,9 +28,8 @@ pub(super) fn rebind_surrogates(
     let database_id = crate::types::DatabaseId::DEFAULT;
     for e in binds {
         state.surrogate_assigner.bind(
-            database_id,
+            nodedb_types::CollectionKey::from_bare(database_id, &e.collection),
             TenantId::new(e.tenant_id),
-            &e.collection,
             &e.pk,
             Surrogate::new(e.surrogate),
         )?;

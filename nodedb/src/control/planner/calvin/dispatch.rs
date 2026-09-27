@@ -49,6 +49,7 @@ use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::types::VShardId;
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
+use nodedb_types::CollectionKey;
 
 pub use crate::control::planner::calvin::predicate::predicate_class;
 pub use crate::control::planner::calvin::write_class::is_write_plan;
@@ -77,14 +78,22 @@ pub fn is_dependent_predicate(plan: &PhysicalPlan) -> bool {
 ///
 /// Each [`ReadSetEntry`] homes to its collection's vShard using the SAME
 /// collection→vShard map `ReadWriteSet::participating_vshards` uses to derive the
-/// `TxClass` read_set's participants. Each read retains its session database so
-/// classification and the database-scoped transaction class agree. A read with
-/// no extractable collection contributes nothing.
-pub fn read_vshards_of(reads: &[ReadSetEntry]) -> BTreeSet<u32> {
+/// `TxClass` read_set's participants. An entry carries the plan's
+/// database-qualified name, so it is de-qualified into a [`CollectionKey`]
+/// before hashing. Each read retains its session database so classification
+/// and the database-scoped transaction class agree. A read with no extractable
+/// collection contributes nothing.
+pub fn read_vshards_of(reads: &[ReadSetEntry]) -> crate::Result<BTreeSet<u32>> {
     reads
         .iter()
         .filter(|e| !e.collection.is_empty())
-        .map(|e| VShardId::from_collection_in_database(e.database_id, &e.collection).as_u32())
+        .map(|e| {
+            Ok(
+                CollectionKey::from_qualified_str(e.database_id, &e.collection)?
+                    .vshard()
+                    .as_u32(),
+            )
+        })
         .collect()
 }
 
@@ -160,7 +169,7 @@ pub(crate) async fn dispatch_calvin_or_fast(
     // Interactive COMMIT threads its session read-set here; autocommit passes an
     // empty slice. The read vShards widen both the classification (below) and the
     // TxClass read_set participants (in `build_static_tx_class`) in lockstep.
-    let read_vshards = read_vshards_of(reads);
+    let read_vshards = read_vshards_of(reads)?;
     let class = classify_dispatch(tasks, &read_vshards);
 
     match &class {
@@ -454,7 +463,9 @@ mod tests {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..512 {
             let name = format!("dispatch_home_{i}");
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             match first {
                 Some((ref fname, fv)) if fv != vshard => return (fname.clone(), name),
                 None => first = Some((name, vshard)),
@@ -484,10 +495,12 @@ mod tests {
         // cross-node transaction. This test guarantees a future refactor of
         // `read_vshards_of` / `classify_dispatch` cannot reopen that hole.
         let (write_coll, read_coll) = two_distinct_vshard_collections();
-        let write_vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, &write_coll).as_u32();
-        let read_vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, &read_coll).as_u32();
+        let write_vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &write_coll)
+            .vshard()
+            .as_u32();
+        let read_vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &read_coll)
+            .vshard()
+            .as_u32();
 
         let tasks = vec![doc_insert_task(write_vshard)];
 
@@ -504,7 +517,8 @@ mod tests {
 
         // The homing step under test: a foreign-collection read must home to a
         // vShard distinct from the write's, contributing a new participant.
-        let read_vshards = read_vshards_of(std::slice::from_ref(&read_entry));
+        let read_vshards =
+            read_vshards_of(std::slice::from_ref(&read_entry)).expect("read vshards");
         assert!(
             read_vshards.contains(&read_vshard) && !read_vshards.contains(&write_vshard),
             "read entry for `{read_coll}` must home to vShard {read_vshard}, not the write's {write_vshard}"

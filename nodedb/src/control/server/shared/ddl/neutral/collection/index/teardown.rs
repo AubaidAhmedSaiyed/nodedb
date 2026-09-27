@@ -182,8 +182,7 @@ async fn vector(
     //
     // The record's outcome-floor window opens before the append and closes
     // from the drop's outcome.
-    let vshard =
-        crate::types::VShardId::from_collection_in_database(database_id, &record.collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &record.collection).vshard();
     let owner = RecordOwner {
         tenant_id,
         database_id,
@@ -307,7 +306,7 @@ pub(crate) async fn dispatch(
     plan: crate::bridge::envelope::PhysicalPlan,
     minted: Option<MintedRecords>,
 ) -> Result<(), DdlError> {
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, collection).vshard();
     let response =
         crate::control::server::dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
             state,

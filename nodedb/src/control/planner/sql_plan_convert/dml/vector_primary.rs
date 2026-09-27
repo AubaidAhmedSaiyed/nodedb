@@ -9,7 +9,7 @@
 //! statement never created mints no binding.
 
 use nodedb_sql::types::{Filter, SqlExpr, SqlValue, VectorPrimaryInsertIntent, VectorPrimaryRow};
-use nodedb_types::{RlsWriteCheck, Surrogate};
+use nodedb_types::{CollectionKey, RlsWriteCheck, Surrogate};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
@@ -47,24 +47,27 @@ pub(in super::super) struct VectorPrimaryInsertArgs<'a> {
 }
 
 /// The routing every vector-primary task shares.
-struct Routing {
+struct Routing<'a> {
+    /// Canonical key: placement and surrogate identity.
+    key: CollectionKey<'a>,
     qualified: nodedb_types::QualifiedCollection,
     collection: String,
     vshard: VShardId,
 }
 
-fn routing(ctx: &ConvertContext, collection: &str) -> Routing {
+fn routing<'a>(ctx: &ConvertContext, collection: &'a str) -> Routing<'a> {
+    let key = ctx.collection_key(collection);
     let qualified = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = db_qualified(ctx.database_id, collection);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection.as_str());
     Routing {
+        key,
         qualified,
         collection,
-        vshard,
+        vshard: key.vshard(),
     }
 }
 
-fn task(tenant_id: TenantId, r: &Routing, ctx: &ConvertContext, op: VectorOp) -> PhysicalTask {
+fn task(tenant_id: TenantId, r: &Routing<'_>, ctx: &ConvertContext, op: VectorOp) -> PhysicalTask {
     PhysicalTask {
         tenant_id,
         vshard_id: r.vshard,
@@ -150,7 +153,7 @@ pub(in super::super) fn convert_vector_primary_insert(
             .collect();
         let (doc_id, surrogate) = resolve_doc_identity_with_declared(
             ctx,
-            collection,
+            r.key,
             primary_key,
             declared.as_deref(),
             &row_fields,
@@ -222,7 +225,7 @@ pub(in super::super) fn convert_vector_primary_insert(
 /// serialize `filters` for the Data Plane to evaluate on the sidecar rows.
 fn write_targets(
     ctx: &ConvertContext,
-    collection: &str,
+    collection: CollectionKey<'_>,
     filters: &[Filter],
     target_keys: &[SqlValue],
 ) -> crate::Result<VectorWriteTargets> {
@@ -246,7 +249,7 @@ pub(in super::super) fn convert_vector_primary_delete(
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let r = routing(ctx, collection);
-    let targets = write_targets(ctx, r.collection.as_str(), filters, target_keys)?;
+    let targets = write_targets(ctx, r.key, filters, target_keys)?;
     Ok(vec![task(
         tenant_id,
         &r,
@@ -321,7 +324,7 @@ pub(in super::super) fn convert_vector_primary_update(
         });
     }
     let r = routing(ctx, collection);
-    let targets = write_targets(ctx, r.collection.as_str(), filters, target_keys)?;
+    let targets = write_targets(ctx, r.key, filters, target_keys)?;
     let payload_patch: Vec<(String, UpdateValue)> = assignments_to_update_values(assignments)?;
     Ok(vec![task(
         tenant_id,

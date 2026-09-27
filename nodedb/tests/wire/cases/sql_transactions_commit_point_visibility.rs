@@ -7,7 +7,7 @@
 //! A write staged on the wrong core leaves the owning core's overlay empty,
 //! so COMMIT would resolve and install nothing there.
 
-use nodedb_types::id::{DatabaseId, VShardId};
+use nodedb_types::id::DatabaseId;
 
 use crate::harness::TestServer;
 
@@ -17,7 +17,9 @@ fn collection_on_nonzero_core(prefix: &str) -> String {
     (0..64u32)
         .map(|i| format!("{prefix}_{i}"))
         .find(|name| {
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, name).as_u32();
+            let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, name)
+                .vshard()
+                .as_u32();
             !(vshard as usize).is_multiple_of(NUM_CORES)
         })
         .expect("a candidate collection hashes off core 0")

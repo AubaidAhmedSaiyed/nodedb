@@ -223,7 +223,7 @@ async fn generic_gather(
         && let Some(collection) = plan.collection()
     {
         let vshard_id =
-            crate::types::VShardId::from_collection_in_database(database_id, collection);
+            nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
         let resp = dispatch_single_owning_core(
             state,
             tenant_id,
