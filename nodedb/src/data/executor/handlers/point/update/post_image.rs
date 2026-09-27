@@ -103,14 +103,7 @@ impl CoreLoop {
         } else {
             strict_format::value_to_binary_tuple(&ndb_val, schema, collection)
         };
-        result.map_err(|e| match e {
-            crate::Error::UnknownStrictField { column, .. } => {
-                ErrorCode::UndefinedColumn { column }
-            }
-            other => ErrorCode::Internal {
-                detail: format!("strict re-encode: {other}"),
-            },
-        })
+        result.map_err(ErrorCode::from)
     }
 
     /// Apply the assignments and recompute generated columns, touching no

@@ -143,6 +143,12 @@ fn locate_error(cte_name: &str, arm: &str, err: super::eval::EvalError) -> Error
         ErrorCode::Unsupported { detail } => ErrorCode::Unsupported {
             detail: format!("WITH RECURSIVE '{cte_name}' ({arm}): {detail}"),
         },
+        ErrorCode::DataException { detail } => ErrorCode::DataException {
+            detail: format!("WITH RECURSIVE '{cte_name}' ({arm}): {detail}"),
+        },
+        ErrorCode::BadRequest { detail } => ErrorCode::BadRequest {
+            detail: format!("WITH RECURSIVE '{cte_name}' ({arm}): {detail}"),
+        },
         other => other,
     }
 }

@@ -87,15 +87,14 @@ pub(super) async fn dispatch_authorized_read(
 /// into [`crate::Error::RejectedAuthz`], so the client-visible SQLSTATE stays
 /// the same with clone interception running ahead of it. Everything else the gate
 /// can raise (a clone read shape with no sound rewrite, a catalog read failure)
-/// is an internal-error class the client cannot act on by SQLSTATE alone, so it
-/// carries its own message under `XX000`. Both SQLSTATEs have exactly one
-/// `ErrorCode` meaning, so `DdlError::new` derives the right code for each.
+/// keeps the SQLSTATE, code and details the SQLSTATE table gives it, with the
+/// read named before its message.
 fn gate_error(error: crate::Error) -> DdlError {
     match error {
         crate::Error::RejectedAuthz { resource, .. } => {
             DdlError::new("42501", format!("permission denied: {resource}"))
         }
-        other => DdlError::new("XX000", format!("version-history read: {other}")),
+        other => DdlError::from_error_in_context("version-history read", &other),
     }
 }
 

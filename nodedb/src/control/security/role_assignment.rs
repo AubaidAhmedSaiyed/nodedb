@@ -58,9 +58,14 @@ impl From<RoleRefusal> for crate::Error {
     fn from(refusal: RoleRefusal) -> Self {
         match refusal {
             RoleRefusal::Undefined { name } => crate::Error::UndefinedObject { kind: "role", name },
-            other => crate::Error::BadRequest {
-                detail: other.to_string(),
-            },
+            // A refused DROP of a role still in use: a client error. No
+            // `crate::Error` variant carries `2BP01` without a tenant and a
+            // CASCADE hint that does not apply to roles.
+            other @ (RoleRefusal::HeldByUsers { .. } | RoleRefusal::InheritedBy { .. }) => {
+                crate::Error::BadRequest {
+                    detail: other.to_string(),
+                }
+            }
         }
     }
 }

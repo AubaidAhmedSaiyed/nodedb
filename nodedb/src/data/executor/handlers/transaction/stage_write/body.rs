@@ -124,14 +124,7 @@ impl CoreLoop {
                 )
             } else {
                 strict_format::bytes_to_binary_tuple(&encoded_input, schema, collection)
-            }
-            .map_err(|e| match e {
-                crate::Error::UnknownStrictField { .. } => e,
-                other => crate::Error::Serialization {
-                    format: "binary_tuple".into(),
-                    detail: other.to_string(),
-                },
-            })?;
+            }?;
             Ok(stored)
         } else {
             Ok(value)
@@ -243,14 +236,7 @@ impl CoreLoop {
                     )
                 } else {
                     strict_format::value_to_binary_tuple(&ndb_val, schema, collection)
-                }
-                .map_err(|e| match e {
-                    crate::Error::UnknownStrictField { .. } => e,
-                    other => crate::Error::Serialization {
-                        format: "binary_tuple".into(),
-                        detail: other.to_string(),
-                    },
-                })?;
+                }?;
                 Ok(bytes)
             }
             None => Ok(doc_format::encode_to_msgpack(&doc)),

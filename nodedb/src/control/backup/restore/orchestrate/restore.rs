@@ -109,17 +109,21 @@ pub async fn restore_tenant(
         // applier's own register hook and a later boot seed are both
         // idempotent with it. A registration failure fails the restore.
         for coll in &restored_collections {
-            // A Data-Plane verdict keeps its code.
+            // A classified error keeps its class. Only a machinery failure
+            // gains the restore context.
             dispatch_register_from_stored(state, coll)
                 .await
-                .map_err(|e| match e {
-                    Error::DataPlane(_) => e,
-                    other => Error::Internal {
-                        detail: format!(
-                            "restore: Data Plane registration of collection '{}' failed: {other}",
-                            coll.name
-                        ),
-                    },
+                .map_err(|e| {
+                    if crate::error_classify::is_unclassified_failure(&e) {
+                        Error::Internal {
+                            detail: format!(
+                                "restore: Data Plane registration of collection '{}' failed: {e}",
+                                coll.name
+                            ),
+                        }
+                    } else {
+                        e
+                    }
                 })?;
         }
     }

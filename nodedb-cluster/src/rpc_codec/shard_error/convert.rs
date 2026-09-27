@@ -122,6 +122,10 @@ impl From<ClusterError> for ShardErrorWire {
                 Self::SnapshotApplyFailed { group_id, detail }
             }
             ClusterError::RemoteUntyped { detail } => Self::Untyped { detail },
+            ClusterError::ShardExecution { error, detail } => Self::ShardExecution {
+                error: *error,
+                detail,
+            },
             // Coordinator-side error families. Their message crosses.
             other @ (ClusterError::MigrationCheckpoint(_)
             | ClusterError::MigrationRecovery(_)
@@ -252,6 +256,10 @@ impl From<ShardErrorWire> for ClusterError {
                 Self::SnapshotApplyFailed { group_id, detail }
             }
             ShardErrorWire::Untyped { detail } => Self::RemoteUntyped { detail },
+            ShardErrorWire::ShardExecution { error, detail } => Self::ShardExecution {
+                error: Box::new(error),
+                detail,
+            },
         }
     }
 }

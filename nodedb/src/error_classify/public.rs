@@ -33,7 +33,9 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             NodeDbError::backup_tenant_mismatch(*expected, *actual)
         }
         Error::BackupKeyMismatch => NodeDbError::backup_key_mismatch(),
-        Error::OffsetRegression { .. } => NodeDbError::bad_request(e.to_string()),
+        // Class `22`, the class of the `22023` SQLSTATE the SQL surfaces
+        // render for a regressed offset.
+        Error::OffsetRegression { .. } => NodeDbError::data_exception(e.to_string()),
         Error::DeadlineExceeded { .. } => NodeDbError::deadline_exceeded(),
         // Same contract as a write conflict, which callers already retry.
         Error::RetryableRefusal { reason } => NodeDbError::write_conflict("crdt", reason.clone()),
@@ -205,9 +207,17 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::MetadataLeaderUnavailable => NodeDbError::dispatch(
             "metadata raft group has no elected leader yet; retry exhausted".to_string(),
         ),
-        Error::AuthorizationStateBehind { .. } => NodeDbError::cluster(e.to_string()),
-        Error::GroupQuorumUnavailable { .. } => NodeDbError::cluster(e.to_string()),
-        Error::GroupMarksUnavailable { .. } => NodeDbError::cluster(e.to_string()),
+        // The code renders `55P03`, the SQLSTATE pgwire gives the variant, so
+        // the class survives a node hop as a bare numeric code.
+        Error::AuthorizationStateBehind { .. } => NodeDbError::from_wire(
+            nodedb_types::error::ErrorCode::STALE_READ_NOT_LEADER,
+            e.to_string(),
+        ),
+        // The code renders `55P03`, the SQLSTATE pgwire gives both variants.
+        // Nothing was applied, and a retry succeeds once a majority answers.
+        Error::GroupQuorumUnavailable { .. } | Error::GroupMarksUnavailable { .. } => {
+            NodeDbError::from_wire(nodedb_types::error::ErrorCode::NO_LEADER, e.to_string())
+        }
         Error::ExecutionLimitExceeded { detail } => NodeDbError::bad_request(detail),
         Error::LimitExceeded {
             limit_name,
@@ -273,9 +283,21 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
              this node is running in embedded/local mode"
                 .to_owned(),
         ),
-        Error::OllpExhausted { retries, cause } => NodeDbError::bad_request(format!(
-            "optimistic retry gave up after {retries} attempts: {cause}"
-        )),
+        // The code follows the cause, the same way pgwire picks the SQLSTATE,
+        // so the class survives a node hop as a bare numeric code.
+        Error::OllpExhausted { retries, cause } => {
+            let message = format!("optimistic retry gave up after {retries} attempts: {cause}");
+            let code = match cause {
+                crate::OllpExhaustedCause::PredicateDrift => {
+                    nodedb_types::error::ErrorCode::WRITE_CONFLICT
+                }
+                crate::OllpExhaustedCause::PreAdmission(inner) => classify(inner).code(),
+                crate::OllpExhaustedCause::AdmissionRefused { .. } => {
+                    nodedb_types::error::ErrorCode::RATE_EXCEEDED
+                }
+            };
+            NodeDbError::from_wire(code, message)
+        }
         Error::SessionCapExceeded { cap } => NodeDbError::bad_request(format!(
             "session cap ({cap}) exceeded — rejecting new login"
         )),
@@ -346,34 +368,6 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
     }
 }
 
-/// True when the error carries neither a client-matchable classification from
-/// [`classify`] nor a retry contract a caller matches by variant. Only these
-/// may be re-wrapped in a transport error.
-pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
-    matches!(
-        e,
-        Error::Wal(_)
-            | Error::Dispatch { .. }
-            | Error::Storage { .. }
-            | Error::ColdStorage { .. }
-            | Error::Serialization { .. }
-            | Error::Codec { .. }
-            | Error::SegmentCorrupted { .. }
-            | Error::Crdt(_)
-            | Error::Io(_)
-            | Error::Config { .. }
-            | Error::Encryption { .. }
-            | Error::Bridge { .. }
-            | Error::VersionCompat { .. }
-            | Error::Internal { .. }
-            | Error::DescriptorVersionAnomaly { .. }
-            | Error::CatalogIntegrityViolation { .. }
-            | Error::CollectionPurgeRowMissing { .. }
-            | Error::MaterializedSumResolutionMissing { .. }
-            | Error::CascadeCycle { .. }
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use nodedb_types::error::ErrorCode;
@@ -412,23 +406,65 @@ mod tests {
         assert!(err.to_string().contains("secret_vault"));
     }
 
-    /// Verdicts the state machine reached must never be re-wrapped as
-    /// transport failures; machinery failures may be.
+    /// Retry exhaustion carries the code of its cause: drift is a write
+    /// conflict, a refused gate is a rate refusal, and a pre-admission
+    /// failure keeps the class of the error that caused it.
     #[test]
-    fn only_machinery_failures_are_unclassified() {
-        assert!(!super::is_unclassified_failure(
-            &Error::RejectedConstraint {
-                collection: "docs".to_owned(),
-                constraint: "unique".to_owned(),
-                detail: "duplicate key value 'dup'".to_owned(),
-            }
-        ));
-        assert!(!super::is_unclassified_failure(&Error::RejectedAuthz {
-            tenant_id: TenantId::new(1),
-            resource: "docs".to_owned(),
-        }));
-        assert!(super::is_unclassified_failure(&Error::Internal {
-            detail: "apply error".to_owned(),
-        }));
+    fn ollp_exhaustion_takes_the_code_of_its_cause() {
+        let drift = Error::OllpExhausted {
+            retries: 3,
+            cause: crate::OllpExhaustedCause::PredicateDrift,
+        };
+        assert_eq!(classify(&drift).code(), ErrorCode::WRITE_CONFLICT);
+
+        let refused = Error::OllpExhausted {
+            retries: 3,
+            cause: crate::OllpExhaustedCause::AdmissionRefused {
+                detail: "circuit open".to_owned(),
+            },
+        };
+        assert_eq!(classify(&refused).code(), ErrorCode::RATE_EXCEEDED);
+
+        let pre_admission = Error::OllpExhausted {
+            retries: 3,
+            cause: crate::OllpExhaustedCause::PreAdmission(Box::new(Error::CollectionNotFound {
+                tenant_id: TenantId::new(1),
+                collection: "orders".to_owned(),
+            })),
+        };
+        let public = classify(&pre_admission);
+        assert_eq!(public.code(), ErrorCode::COLLECTION_NOT_FOUND);
+        assert!(public.message().contains("orders"));
+    }
+
+    /// A retryable cluster refusal carries the code whose SQLSTATE class is
+    /// the one pgwire renders, so the class survives a node hop.
+    #[test]
+    fn retryable_cluster_refusals_carry_the_leader_class_code() {
+        let quorum = Error::GroupQuorumUnavailable {
+            group_id: 1,
+            voters: vec![1, 2, 3],
+            unreachable: vec![2, 3],
+        };
+        assert_eq!(classify(&quorum).code(), ErrorCode::NO_LEADER);
+        let marks = Error::GroupMarksUnavailable {
+            group_id: 1,
+            refused_by: vec![2],
+        };
+        assert_eq!(classify(&marks).code(), ErrorCode::NO_LEADER);
+        let behind = Error::AuthorizationStateBehind {
+            detail: "roles".to_owned(),
+        };
+        assert_eq!(classify(&behind).code(), ErrorCode::STALE_READ_NOT_LEADER);
+        let regression = Error::OffsetRegression {
+            stream: "s".to_owned(),
+            group: "g".to_owned(),
+            partition_id: 0,
+            current_lsn: 2,
+            current_sequence: 2,
+            attempted_lsn: 1,
+            attempted_sequence: 1,
+        };
+        assert_eq!(classify(&regression).code(), ErrorCode::DATA_EXCEPTION);
     }
 }

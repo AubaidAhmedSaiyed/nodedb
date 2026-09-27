@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use nodedb_cluster::ClusterError;
 use nodedb_cluster::rpc_codec::{ExecuteRequest, RaftRpc};
 use tracing::debug;
 
@@ -345,20 +346,58 @@ pub(super) async fn dispatch_remote_stream(
     Ok(Box::pin(head.chain(rest)))
 }
 
-/// Map a pre-row [`nodedb_cluster::ClusterError`] from a streaming dispatch to a
-/// retryable internal [`Error`].
+/// Map a pre-row [`nodedb_cluster::ClusterError`] from a streaming dispatch to
+/// an [`Error`].
 ///
-/// A `StreamTerminal` carrying a typed `NotLeader` / `DescriptorMismatch` maps
-/// through the same [`map_typed_cluster_error`] used by the one-shot path so the
-/// gateway retry loop handles it identically. Any other cluster error becomes a
-/// transport-style `NotLeader` (leader_node = 0) so the next attempt re-resolves
-/// routing rather than re-entrenching an unreachable node.
-fn map_stream_cluster_error(err: nodedb_cluster::ClusterError, vshard_id: u64) -> Error {
+/// A typed error (`StreamTerminal`, `ShardExecution`) maps through the same
+/// [`map_typed_cluster_error`] used by the one-shot path, so the gateway retry
+/// loop handles it identically. A Data-Plane verdict keeps its code. Any other
+/// cluster error becomes a transport-style `NotLeader` (leader_node = 0), so
+/// the next attempt re-resolves routing rather than re-entrenching an
+/// unreachable node.
+fn map_stream_cluster_error(err: ClusterError, vshard_id: u64) -> Error {
     match err {
-        nodedb_cluster::ClusterError::StreamTerminal { error, .. } => {
+        ClusterError::StreamTerminal { error, .. } | ClusterError::ShardExecution { error, .. } => {
             map_typed_cluster_error(*error, vshard_id)
         }
-        other => Error::NotLeader {
+        // A verdict from a shard that answered. Retrying it on another route
+        // repeats it, so it keeps its SQLSTATE.
+        ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
+        other @ (ClusterError::Raft(_)
+        | ClusterError::VShardNotMapped { .. }
+        | ClusterError::GroupNotFound { .. }
+        | ClusterError::LearnerNotCaughtUp { .. }
+        | ClusterError::MigrationInProgress { .. }
+        | ClusterError::MigrationPauseBudgetExceeded { .. }
+        | ClusterError::NodeUnreachable { .. }
+        | ClusterError::GhostNotFound { .. }
+        | ClusterError::Transport { .. }
+        | ClusterError::ShardTimeout { .. }
+        | ClusterError::Storage { .. }
+        | ClusterError::Codec { .. }
+        | ClusterError::UnsupportedWireVersion { .. }
+        | ClusterError::CircuitOpen { .. }
+        | ClusterError::JoinGroupDisappeared { .. }
+        | ClusterError::JoinCommitTimeout { .. }
+        | ClusterError::ReadIndexNotLeader { .. }
+        | ClusterError::ReadIndexTimeout { .. }
+        | ClusterError::Config { .. }
+        | ClusterError::MigrationCheckpoint(_)
+        | ClusterError::MigrationRecovery(_)
+        | ClusterError::WrongOwner { .. }
+        | ClusterError::Calvin(_)
+        | ClusterError::SnapshotCrcMismatch { .. }
+        | ClusterError::SnapshotOffsetRegression { .. }
+        | ClusterError::PartialSnapshotCorrupt { .. }
+        | ClusterError::PartialSnapshotCleanupFailed { .. }
+        | ClusterError::SnapshotApplyFailed { .. }
+        | ClusterError::Mirror(_)
+        | ClusterError::BspBarrier(_)
+        | ClusterError::VectorGather(_)
+        | ClusterError::SpatialGather(_)
+        | ClusterError::Bm25Gather(_)
+        | ClusterError::TsGather(_)
+        | ClusterError::RemoteUntyped { .. }) => Error::NotLeader {
             vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
             leader_node: 0,
             leader_addr: format!("stream dispatch error: {other}"),

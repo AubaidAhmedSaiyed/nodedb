@@ -251,10 +251,51 @@ impl RetryPolicy {
 
     /// Determine if an error is retryable.
     ///
-    /// Only transport errors (connection failures, timeouts) are retried.
-    /// Codec errors, circuit-open errors, and application errors are not.
+    /// Only transport errors (connection failures) are retried. Codec errors,
+    /// circuit-open errors, shard timeouts, and application errors are not.
     pub fn is_retryable(err: &ClusterError) -> bool {
-        matches!(err, ClusterError::Transport { .. })
+        match err {
+            ClusterError::Transport { .. } => true,
+            // A timed-out send may still have reached the peer, so resending
+            // it can apply the request twice.
+            ClusterError::ShardTimeout { .. } => false,
+            ClusterError::Raft(_)
+            | ClusterError::VShardNotMapped { .. }
+            | ClusterError::GroupNotFound { .. }
+            | ClusterError::LearnerNotCaughtUp { .. }
+            | ClusterError::MigrationInProgress { .. }
+            | ClusterError::MigrationPauseBudgetExceeded { .. }
+            | ClusterError::NodeUnreachable { .. }
+            | ClusterError::GhostNotFound { .. }
+            | ClusterError::StreamTerminal { .. }
+            | ClusterError::Storage { .. }
+            | ClusterError::DataPlane { .. }
+            | ClusterError::Codec { .. }
+            | ClusterError::UnsupportedWireVersion { .. }
+            | ClusterError::CircuitOpen { .. }
+            | ClusterError::JoinGroupDisappeared { .. }
+            | ClusterError::JoinCommitTimeout { .. }
+            | ClusterError::ReadIndexNotLeader { .. }
+            | ClusterError::ReadIndexTimeout { .. }
+            | ClusterError::Config { .. }
+            | ClusterError::MigrationCheckpoint(_)
+            | ClusterError::MigrationRecovery(_)
+            | ClusterError::WrongOwner { .. }
+            | ClusterError::Calvin(_)
+            | ClusterError::SnapshotCrcMismatch { .. }
+            | ClusterError::SnapshotOffsetRegression { .. }
+            | ClusterError::PartialSnapshotCorrupt { .. }
+            | ClusterError::PartialSnapshotCleanupFailed { .. }
+            | ClusterError::SnapshotApplyFailed { .. }
+            | ClusterError::Mirror(_)
+            | ClusterError::BspBarrier(_)
+            | ClusterError::VectorGather(_)
+            | ClusterError::SpatialGather(_)
+            | ClusterError::Bm25Gather(_)
+            | ClusterError::TsGather(_)
+            | ClusterError::RemoteUntyped { .. }
+            | ClusterError::ShardExecution { .. } => false,
+        }
     }
 }
 

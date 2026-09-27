@@ -51,12 +51,122 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
                 reason: capacity.to_string(),
             },
         },
-        other => {
-            let message = other.to_string();
-            let code = u32::from(nodedb_types::error::NodeDbError::from(other).code().0);
-            TypedClusterError::Internal { code, message }
-        }
+        // Every other error crosses as its public numeric code and message.
+        // The coordinator renders the SQLSTATE that code maps to.
+        other @ (crate::Error::TxnOverlayMemoryExceeded { .. }
+        | crate::Error::RejectedAuthz { .. }
+        | crate::Error::OffsetRegression { .. }
+        | crate::Error::ConflictRetry { .. }
+        | crate::Error::CalvinSerializationConflict
+        | crate::Error::CalvinParticipantError
+        | crate::Error::RejectedPrevalidation { .. }
+        | crate::Error::RetryableRefusal { .. }
+        | crate::Error::AppendOnlyViolation { .. }
+        | crate::Error::BalanceViolation { .. }
+        | crate::Error::MaterializedSumTargetNotFound { .. }
+        | crate::Error::MaterializedSumResolutionMissing { .. }
+        | crate::Error::PeriodLocked { .. }
+        | crate::Error::PeriodLockMisconfigured { .. }
+        | crate::Error::RetentionViolation { .. }
+        | crate::Error::LegalHoldActive { .. }
+        | crate::Error::StateTransitionViolation { .. }
+        | crate::Error::TransitionCheckViolation { .. }
+        | crate::Error::TypeGuardViolation { .. }
+        | crate::Error::TypeMismatch { .. }
+        | crate::Error::InsufficientBalance { .. }
+        | crate::Error::RateExceeded { .. }
+        | crate::Error::CollectionNotFound { .. }
+        | crate::Error::DocumentNotFound { .. }
+        | crate::Error::CollectionDeactivated { .. }
+        | crate::Error::VShardAdmissionCapacityExceeded { .. }
+        | crate::Error::CrdtAdmissionRetriesExhausted { .. }
+        | crate::Error::CrdtAdmissionInvalidPlan { .. }
+        | crate::Error::CrdtAdmissionCallerFence
+        | crate::Error::CrdtApplyRequiresAdmission
+        | crate::Error::CrdtApplyForbiddenInTransaction
+        | crate::Error::NotInTransactionBlock { .. }
+        | crate::Error::CrdtAdmissionTimeout { .. }
+        | crate::Error::NoLeader { .. }
+        | crate::Error::NotLeader { .. }
+        | crate::Error::FanOutExceeded { .. }
+        | crate::Error::CrossCollectionNotColocated { .. }
+        | crate::Error::SourceFrozen { .. }
+        | crate::Error::CloneWriteRequiresMaterialize { .. }
+        | crate::Error::BadRequest { .. }
+        | crate::Error::BackupTenantMismatch { .. }
+        | crate::Error::BackupKeyMismatch
+        | crate::Error::QuotaOvercommit { .. }
+        | crate::Error::PlanError { .. }
+        | crate::Error::FeatureNotSupported { .. }
+        | crate::Error::UndefinedFunction { .. }
+        | crate::Error::UndefinedObject { .. }
+        | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::UndefinedColumn { .. }
+        | crate::Error::AmbiguousColumn { .. }
+        | crate::Error::UnknownStrictField { .. }
+        | crate::Error::DivisionByZero
+        | crate::Error::DataException { .. }
+        | crate::Error::InvalidLimitValue { .. }
+        | crate::Error::RetryableSchemaChanged { .. }
+        | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::GroupQuorumUnavailable { .. }
+        | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::ExecutionLimitExceeded { .. }
+        | crate::Error::LimitExceeded { .. }
+        | crate::Error::Wal(_)
+        | crate::Error::Dispatch { .. }
+        | crate::Error::Storage { .. }
+        | crate::Error::ColdStorage { .. }
+        | crate::Error::Serialization { .. }
+        | crate::Error::Codec { .. }
+        | crate::Error::SegmentCorrupted { .. }
+        | crate::Error::MemoryExhausted { .. }
+        | crate::Error::Backpressure { .. }
+        | crate::Error::Crdt(_)
+        | crate::Error::Io(_)
+        | crate::Error::Config { .. }
+        | crate::Error::Encryption { .. }
+        | crate::Error::Bridge { .. }
+        | crate::Error::VersionCompat { .. }
+        | crate::Error::Internal { .. }
+        | crate::Error::Shaping(_)
+        | crate::Error::RemoteTyped { .. }
+        | crate::Error::DescriptorVersionAnomaly { .. }
+        | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CatalogIntegrityViolation { .. }
+        | crate::Error::Promql(_)
+        | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::CascadeCycle { .. }
+        | crate::Error::CrossShardInExplicitTransaction
+        | crate::Error::SequencerUnavailable
+        | crate::Error::SessionCapExceeded { .. }
+        | crate::Error::SessionIdleTimeout
+        | crate::Error::SessionTokenExpired
+        | crate::Error::SessionKilledByAdmin
+        | crate::Error::SessionUserDropped
+        | crate::Error::OidcProviderTenantUnbound
+        | crate::Error::OidcProviderTenantUnavailable { .. }
+        | crate::Error::ExternalRoleUndefined { .. }
+        | crate::Error::OidcNoDefaultDatabase { .. }
+        | crate::Error::TenantVectorDimExceeded { .. }
+        | crate::Error::TenantGraphDepthExceeded { .. }
+        | crate::Error::RoleInheritanceCycle { .. }
+        | crate::Error::RoleInheritanceDepthExceeded { .. }
+        | crate::Error::OllpExhausted { .. }
+        | crate::Error::MirrorReadOnly { .. }
+        | crate::Error::StaleReadNotLeader { .. }) => numeric_typed(other),
     }
+}
+
+/// The wire error for a local error with no typed wire carrier: its public
+/// numeric code from `NodeDbError::from(err).code()`, and its message. The
+/// coordinator rebuilds it as `Error::RemoteTyped`.
+pub(crate) fn numeric_typed(err: crate::Error) -> TypedClusterError {
+    let message = err.to_string();
+    let code = u32::from(nodedb_types::error::NodeDbError::from(err).code().0);
+    TypedClusterError::Internal { code, message }
 }
 
 /// Widen a pointer-width count to the wire's fixed `u64`.

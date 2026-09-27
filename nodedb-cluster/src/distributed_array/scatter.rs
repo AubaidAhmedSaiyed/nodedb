@@ -82,18 +82,52 @@ use super::rpc::ShardRpcDispatch;
 /// single retry in `call_with_wrong_owner_retry` already re-reads the live
 /// table). Counting it as a liveness failure would open the shared breaker and
 /// then fast-fail healthy shards' slice/put/agg/delete with `CircuitOpen`.
-/// `WrongOwner` and a typed Data-Plane verdict are excluded. Every genuine
-/// transport/timeout/unreachable error still counts, mirroring
+/// `WrongOwner` and a typed verdict from a shard that answered are excluded.
+/// Every genuine transport/timeout/unreachable error still counts, mirroring
 /// `RetryPolicy::is_retryable`'s conservative policy.
 fn counts_against_breaker(err: &ClusterError) -> bool {
     match err {
         ClusterError::WrongOwner { .. } => false,
-        // A typed Data-Plane verdict comes from a healthy shard that answered.
-        ClusterError::DataPlane { .. } => false,
+        // A typed verdict comes from a healthy shard that answered.
+        ClusterError::DataPlane { .. }
+        | ClusterError::ShardExecution { .. }
+        | ClusterError::StreamTerminal { .. } => false,
         // An unresponsive peer is exactly what the breaker exists to shed
         // load from, so a shard timeout counts like any other liveness failure.
         ClusterError::ShardTimeout { .. } => true,
-        _ => true,
+        ClusterError::Raft(_)
+        | ClusterError::VShardNotMapped { .. }
+        | ClusterError::GroupNotFound { .. }
+        | ClusterError::LearnerNotCaughtUp { .. }
+        | ClusterError::MigrationInProgress { .. }
+        | ClusterError::MigrationPauseBudgetExceeded { .. }
+        | ClusterError::NodeUnreachable { .. }
+        | ClusterError::GhostNotFound { .. }
+        | ClusterError::Transport { .. }
+        | ClusterError::Storage { .. }
+        | ClusterError::Codec { .. }
+        | ClusterError::UnsupportedWireVersion { .. }
+        | ClusterError::CircuitOpen { .. }
+        | ClusterError::JoinGroupDisappeared { .. }
+        | ClusterError::JoinCommitTimeout { .. }
+        | ClusterError::ReadIndexNotLeader { .. }
+        | ClusterError::ReadIndexTimeout { .. }
+        | ClusterError::Config { .. }
+        | ClusterError::MigrationCheckpoint(_)
+        | ClusterError::MigrationRecovery(_)
+        | ClusterError::Calvin(_)
+        | ClusterError::SnapshotCrcMismatch { .. }
+        | ClusterError::SnapshotOffsetRegression { .. }
+        | ClusterError::PartialSnapshotCorrupt { .. }
+        | ClusterError::PartialSnapshotCleanupFailed { .. }
+        | ClusterError::SnapshotApplyFailed { .. }
+        | ClusterError::Mirror(_)
+        | ClusterError::BspBarrier(_)
+        | ClusterError::VectorGather(_)
+        | ClusterError::SpatialGather(_)
+        | ClusterError::Bm25Gather(_)
+        | ClusterError::TsGather(_)
+        | ClusterError::RemoteUntyped { .. } => true,
     }
 }
 

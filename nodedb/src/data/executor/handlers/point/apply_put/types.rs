@@ -140,9 +140,60 @@ pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::E
             collection,
             detail: "collection has an active legal hold: DELETE rejected".to_string(),
         },
-        other => crate::Error::Storage {
-            engine: "enforcement".into(),
-            detail: format!("unexpected enforcement error: {other:?}"),
-        },
+        // Every other verdict keeps its code, so the statement renders the
+        // SQLSTATE the transactional path renders for it.
+        other @ (ErrorCode::DeadlineExceeded
+        | ErrorCode::RejectedConstraint { .. }
+        | ErrorCode::RejectedPrevalidation { .. }
+        | ErrorCode::RetryableRefusal { .. }
+        | ErrorCode::SyncRejected { .. }
+        | ErrorCode::SyncNotApplied { .. }
+        | ErrorCode::NotFound
+        | ErrorCode::RejectedAuthz { .. }
+        | ErrorCode::ConflictRetry
+        | ErrorCode::CrdtFrontierMismatch { .. }
+        | ErrorCode::FanOutExceeded
+        | ErrorCode::ResourcesExhausted
+        | ErrorCode::RejectedDanglingEdge { .. }
+        | ErrorCode::DuplicateWrite
+        | ErrorCode::BalanceViolation { .. }
+        | ErrorCode::TypeGuardViolation { .. }
+        | ErrorCode::TypeMismatch { .. }
+        | ErrorCode::CounterFault { .. }
+        | ErrorCode::InsufficientBalance { .. }
+        | ErrorCode::RateExceeded { .. }
+        | ErrorCode::CollectionDraining { .. }
+        | ErrorCode::RecursionDepthExceeded { .. }
+        | ErrorCode::UndefinedColumn { .. }
+        | ErrorCode::Internal { .. }
+        | ErrorCode::Unsupported { .. }
+        | ErrorCode::RollbackFailed { .. }
+        | ErrorCode::OllpRetryRequired
+        | ErrorCode::TxnOverlayMemoryExceeded { .. }
+        | ErrorCode::DivisionByZero
+        | ErrorCode::UndefinedFunction { .. }
+        | ErrorCode::DataException { .. }
+        | ErrorCode::DispatchCapacity { .. }
+        | ErrorCode::ExpiredBeforeExecution
+        | ErrorCode::BadRequest { .. }) => crate::Error::DataPlane(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A verdict with no Control-Plane twin keeps its code instead of
+    /// becoming a storage error.
+    #[test]
+    fn an_unmapped_verdict_keeps_its_code() {
+        let code = ErrorCode::TypeGuardViolation {
+            collection: "orders".into(),
+            detail: "amount must be positive".into(),
+        };
+        match map_enforcement_error(code.clone()) {
+            crate::Error::DataPlane(kept) => assert_eq!(kept, code),
+            other => panic!("expected the typed verdict, got {other:?}"),
+        }
     }
 }

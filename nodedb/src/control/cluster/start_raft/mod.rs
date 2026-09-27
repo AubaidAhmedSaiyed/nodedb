@@ -22,6 +22,7 @@ mod group_setup;
 mod hooks;
 mod loop_build;
 mod observability;
+mod propose_error;
 mod proposer_wiring;
 
 pub use core::start_raft;

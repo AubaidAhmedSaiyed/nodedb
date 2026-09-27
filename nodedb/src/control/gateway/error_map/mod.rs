@@ -7,7 +7,7 @@
 //! to its SQLSTATE / HTTP / RESP / native codes is a one-file edit.
 
 #[cfg(test)]
-mod class_parity;
+pub(crate) mod class_parity;
 mod gateway_map;
 mod http;
 mod native;

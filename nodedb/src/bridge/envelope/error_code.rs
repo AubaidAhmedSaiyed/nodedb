@@ -305,8 +305,114 @@ impl From<crate::Error> for ErrorCode {
             // Already a Data-Plane verdict: hand back the same code rather
             // than re-wrapping it as `Internal` and losing its SQLSTATE.
             crate::Error::DataPlane(code) => code,
-            other => Self::Internal {
-                detail: other.to_string(),
+            // Class `22`, the class the Control Plane gives both.
+            e @ (crate::Error::OffsetRegression { .. }
+            | crate::Error::BackupTenantMismatch { .. }
+            | crate::Error::InvalidLimitValue { .. }) => Self::DataException {
+                detail: e.to_string(),
+            },
+            // Class `40`: the client retries the statement.
+            e @ (crate::Error::CalvinParticipantError
+            | crate::Error::RetryableSchemaChanged { .. }) => Self::RetryableRefusal {
+                reason: e.to_string(),
+            },
+            crate::Error::CrdtAdmissionRetriesExhausted { .. } => Self::ConflictRetry,
+            // Retryable refusals whose class (`55P03`) no Data-Plane code has.
+            // The retry contract survives: nothing was applied.
+            e @ (crate::Error::NoLeader { .. }
+            | crate::Error::GroupQuorumUnavailable { .. }
+            | crate::Error::GroupMarksUnavailable { .. }
+            | crate::Error::AuthorizationStateBehind { .. }
+            | crate::Error::StaleReadNotLeader { .. }) => Self::RetryableRefusal {
+                reason: e.to_string(),
+            },
+            // Class `57`: the client retries once the leader settles.
+            e @ crate::Error::NotLeader { .. } => Self::DispatchCapacity {
+                reason: e.to_string(),
+            },
+            crate::Error::CrdtAdmissionTimeout { .. } => Self::DeadlineExceeded,
+            e @ crate::Error::VShardAdmissionCapacityExceeded { .. } => Self::RateExceeded {
+                gate: e.to_string(),
+                retry_after_ms: 0,
+            },
+            // Class `53`: a configured resource ceiling.
+            crate::Error::QuotaOvercommit { .. }
+            | crate::Error::TenantVectorDimExceeded { .. }
+            | crate::Error::TenantGraphDepthExceeded { .. } => Self::ResourcesExhausted,
+            // Class `28` has no Data-Plane code. The nearest is the access
+            // refusal, which keeps it a client error the client cannot retry.
+            e @ (crate::Error::BackupKeyMismatch | crate::Error::SessionTokenExpired) => {
+                Self::RejectedAuthz {
+                    resource: e.to_string(),
+                }
+            }
+            // Client errors of class `42`, and client errors whose class
+            // (`25`, `2B`, `55`) no Data-Plane code has. `BadRequest` is the
+            // class their public code has.
+            e @ (crate::Error::CrdtAdmissionInvalidPlan { .. }
+            | crate::Error::CrdtAdmissionCallerFence
+            | crate::Error::CrdtApplyRequiresAdmission
+            | crate::Error::CrdtApplyForbiddenInTransaction
+            | crate::Error::NotInTransactionBlock { .. }
+            | crate::Error::CrossShardInExplicitTransaction
+            | crate::Error::CloneWriteRequiresMaterialize { .. }
+            | crate::Error::ObjectNotInPrerequisiteState { .. }
+            | crate::Error::MirrorReadOnly { .. }
+            | crate::Error::DependentObjectsExist { .. }
+            | crate::Error::UndefinedObject { .. }
+            | crate::Error::AmbiguousColumn { .. }
+            | crate::Error::ExecutionLimitExceeded { .. }
+            | crate::Error::LimitExceeded { .. }
+            | crate::Error::Promql(_)
+            | crate::Error::SequencerUnavailable
+            | crate::Error::SessionCapExceeded { .. }
+            | crate::Error::SessionIdleTimeout
+            | crate::Error::SessionKilledByAdmin
+            | crate::Error::SessionUserDropped
+            | crate::Error::OidcProviderTenantUnbound
+            | crate::Error::OidcProviderTenantUnavailable { .. }
+            | crate::Error::ExternalRoleUndefined { .. }
+            | crate::Error::OidcNoDefaultDatabase { .. }
+            | crate::Error::RoleInheritanceCycle { .. }
+            | crate::Error::RoleInheritanceDepthExceeded { .. }) => Self::BadRequest {
+                detail: e.to_string(),
+            },
+            // Retry exhaustion takes the code of its cause.
+            crate::Error::OllpExhausted { cause, .. } => match cause {
+                crate::OllpExhaustedCause::PredicateDrift => Self::ConflictRetry,
+                crate::OllpExhaustedCause::PreAdmission(inner) => Self::from(*inner),
+                crate::OllpExhaustedCause::AdmissionRefused { detail } => Self::RateExceeded {
+                    gate: detail,
+                    retry_after_ms: 0,
+                },
+            },
+            // Server-side faults and system defects. `Shaping` and
+            // `RemoteTyped` carry a public numeric code that has no
+            // Data-Plane twin, and neither is raised on the Data Plane.
+            e @ (crate::Error::MaterializedSumResolutionMissing { .. }
+            | crate::Error::RetryableLeaderChange { .. }
+            | crate::Error::MetadataLeaderUnavailable
+            | crate::Error::Wal(_)
+            | crate::Error::Dispatch { .. }
+            | crate::Error::Storage { .. }
+            | crate::Error::ColdStorage { .. }
+            | crate::Error::Serialization { .. }
+            | crate::Error::Codec { .. }
+            | crate::Error::SegmentCorrupted { .. }
+            | crate::Error::Crdt(_)
+            | crate::Error::Io(_)
+            | crate::Error::Config { .. }
+            | crate::Error::Encryption { .. }
+            | crate::Error::Bridge { .. }
+            | crate::Error::VersionCompat { .. }
+            | crate::Error::Internal { .. }
+            | crate::Error::Shaping(_)
+            | crate::Error::RemoteTyped { .. }
+            | crate::Error::DescriptorVersionAnomaly { .. }
+            | crate::Error::CollectionPurgeRowMissing { .. }
+            | crate::Error::CatalogIntegrityViolation { .. }
+            | crate::Error::CascadeCycle { .. }) => Self::Internal {
+                detail: e.to_string(),
             },
         }
     }

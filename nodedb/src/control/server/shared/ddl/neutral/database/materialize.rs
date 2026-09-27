@@ -55,9 +55,10 @@ pub fn alter_database_materialize(
     // per-engine bulk-copy implementation to land).
     force_materialize_blocking(db_id, state, catalog, Some(&handle)).map_err(|e| match e {
         crate::Error::BadRequest { detail } => ddl_err("0A000", detail),
-        other => ddl_err(
-            "XX000",
-            format!("clone materialization of '{name}' failed: {other}"),
+        // Any other error keeps the class the SQLSTATE table gives it.
+        other => DdlError::from_error_in_context(
+            &format!("clone materialization of '{name}' failed"),
+            &other,
         ),
     })?;
 

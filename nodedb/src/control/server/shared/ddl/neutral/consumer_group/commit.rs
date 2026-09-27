@@ -157,7 +157,8 @@ pub async fn commit_offset(
             )
             .map_err(|e| match e {
                 crate::Error::OffsetRegression { .. } => DdlError::new("22023", e.to_string()),
-                _ => DdlError::new("XX000", format!("offset commit: {e}")),
+                // Any other error keeps the class the SQLSTATE table gives it.
+                other => DdlError::from_error_in_context("offset commit", &other),
             })?;
 
         return Ok(status("COMMIT OFFSET"));

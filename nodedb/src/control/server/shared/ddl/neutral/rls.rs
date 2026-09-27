@@ -80,7 +80,8 @@ fn compile_rls_predicate(
         crate::Error::CollectionNotFound { .. } => {
             DdlError::new("42P01", format!("collection '{collection}' does not exist"))
         }
-        other => DdlError::new("XX000", format!("catalog read: {other}")),
+        // Any other error keeps the class the SQLSTATE table gives it.
+        other => DdlError::from_error_in_context("catalog read", &other),
     })?;
     let compiled = compile_policy_predicate(predicate_str, &columns)
         .map_err(|e| DdlError::new("42601", e.to_string()))?;

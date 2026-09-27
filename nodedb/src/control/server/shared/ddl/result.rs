@@ -215,6 +215,9 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         sqlstate::UNDEFINED_COLUMN => ErrorCode::UNDEFINED_COLUMN,
         sqlstate::AMBIGUOUS_COLUMN => ErrorCode::AMBIGUOUS_COLUMN,
         sqlstate::DATA_EXCEPTION => ErrorCode::DATA_EXCEPTION,
+        sqlstate::DIVISION_BY_ZERO => ErrorCode::DIVISION_BY_ZERO,
+        sqlstate::INVALID_LIMIT_VALUE => ErrorCode::INVALID_LIMIT_VALUE,
+        sqlstate::PROGRAM_LIMIT_EXCEEDED => ErrorCode::PROGRAM_LIMIT_EXCEEDED,
         // A malformed request and a plan that cannot be built both render as
         // `42601`; both are non-retriable client errors, so one code covers
         // both without losing anything a client acts on.
@@ -274,6 +277,23 @@ mod tests {
         assert_eq!(code_for_sqlstate("42710"), ErrorCode::ALREADY_EXISTS);
         assert_eq!(code_for_sqlstate("55006"), ErrorCode::OBJECT_NOT_READY);
         assert_eq!(code_for_sqlstate("02000"), ErrorCode::NOT_FOUND);
+    }
+
+    /// A statement-class SQLSTATE derives its own code, never `INTERNAL`.
+    #[test]
+    fn statement_class_sqlstates_derive_their_code() {
+        assert_eq!(
+            code_for_sqlstate(sqlstate::DIVISION_BY_ZERO),
+            ErrorCode::DIVISION_BY_ZERO
+        );
+        assert_eq!(
+            code_for_sqlstate(sqlstate::INVALID_LIMIT_VALUE),
+            ErrorCode::INVALID_LIMIT_VALUE
+        );
+        assert_eq!(
+            code_for_sqlstate(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+            ErrorCode::PROGRAM_LIMIT_EXCEEDED
+        );
     }
 
     #[test]

@@ -125,14 +125,7 @@ impl CoreLoop {
             )
         } else {
             strict_format::bytes_to_binary_tuple(&value, schema, collection)
-        }
-        .map_err(|e| match e {
-            crate::Error::UnknownStrictField { .. } => e,
-            other => crate::Error::Serialization {
-                format: "binary_tuple".into(),
-                detail: other.to_string(),
-            },
-        })?;
+        }?;
 
         Ok(StoredBody { value, stored })
     }

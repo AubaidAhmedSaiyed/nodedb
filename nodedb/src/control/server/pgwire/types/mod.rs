@@ -7,6 +7,7 @@
 
 pub mod error_map;
 pub mod field;
+pub mod numeric_sqlstate;
 pub mod parse;
 pub mod privilege;
 

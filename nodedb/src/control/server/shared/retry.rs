@@ -63,7 +63,113 @@ impl RetryableSchemaChange for Error {
         // re-run statements whose failure is real.
         match self {
             Error::RetryableSchemaChanged { descriptor } => Some(descriptor.as_str()),
-            _ => None,
+            Error::RejectedConstraint { .. }
+            | Error::TxnOverlayMemoryExceeded { .. }
+            | Error::RejectedAuthz { .. }
+            | Error::OffsetRegression { .. }
+            | Error::DeadlineExceeded { .. }
+            | Error::ConflictRetry { .. }
+            | Error::CalvinSerializationConflict
+            | Error::CalvinParticipantError
+            | Error::RejectedPrevalidation { .. }
+            | Error::RetryableRefusal { .. }
+            | Error::AppendOnlyViolation { .. }
+            | Error::BalanceViolation { .. }
+            | Error::MaterializedSumTargetNotFound { .. }
+            | Error::MaterializedSumResolutionMissing { .. }
+            | Error::PeriodLocked { .. }
+            | Error::PeriodLockMisconfigured { .. }
+            | Error::RetentionViolation { .. }
+            | Error::LegalHoldActive { .. }
+            | Error::StateTransitionViolation { .. }
+            | Error::TransitionCheckViolation { .. }
+            | Error::TypeGuardViolation { .. }
+            | Error::TypeMismatch { .. }
+            | Error::InsufficientBalance { .. }
+            | Error::RateExceeded { .. }
+            | Error::CollectionNotFound { .. }
+            | Error::DocumentNotFound { .. }
+            | Error::CollectionDeactivated { .. }
+            | Error::VShardAdmissionCapacityExceeded { .. }
+            | Error::CrdtAdmissionRetriesExhausted { .. }
+            | Error::CrdtAdmissionInvalidPlan { .. }
+            | Error::CrdtAdmissionCallerFence
+            | Error::CrdtApplyRequiresAdmission
+            | Error::CrdtApplyForbiddenInTransaction
+            | Error::NotInTransactionBlock { .. }
+            | Error::CrdtAdmissionTimeout { .. }
+            | Error::NoLeader { .. }
+            | Error::NotLeader { .. }
+            | Error::FanOutExceeded { .. }
+            | Error::CrossCollectionNotColocated { .. }
+            | Error::SourceFrozen { .. }
+            | Error::CloneWriteRequiresMaterialize { .. }
+            | Error::BadRequest { .. }
+            | Error::BackupTenantMismatch { .. }
+            | Error::BackupKeyMismatch
+            | Error::QuotaOvercommit { .. }
+            | Error::PlanError { .. }
+            | Error::FeatureNotSupported { .. }
+            | Error::UndefinedFunction { .. }
+            | Error::UndefinedObject { .. }
+            | Error::ObjectNotInPrerequisiteState { .. }
+            | Error::UndefinedColumn { .. }
+            | Error::AmbiguousColumn { .. }
+            | Error::UnknownStrictField { .. }
+            | Error::DivisionByZero
+            | Error::DataException { .. }
+            | Error::InvalidLimitValue { .. }
+            | Error::RetryableLeaderChange { .. }
+            | Error::GroupQuorumUnavailable { .. }
+            | Error::GroupMarksUnavailable { .. }
+            | Error::MetadataLeaderUnavailable
+            | Error::AuthorizationStateBehind { .. }
+            | Error::ExecutionLimitExceeded { .. }
+            | Error::LimitExceeded { .. }
+            | Error::Wal(_)
+            | Error::Dispatch { .. }
+            | Error::DispatchCapacity { .. }
+            | Error::Storage { .. }
+            | Error::ColdStorage { .. }
+            | Error::Serialization { .. }
+            | Error::Codec { .. }
+            | Error::SegmentCorrupted { .. }
+            | Error::MemoryExhausted { .. }
+            | Error::Backpressure { .. }
+            | Error::Crdt(_)
+            | Error::Io(_)
+            | Error::Config { .. }
+            | Error::Encryption { .. }
+            | Error::Bridge { .. }
+            | Error::VersionCompat { .. }
+            | Error::Internal { .. }
+            | Error::Shaping(_)
+            | Error::RemoteTyped { .. }
+            | Error::DescriptorVersionAnomaly { .. }
+            | Error::CollectionPurgeRowMissing { .. }
+            | Error::CatalogIntegrityViolation { .. }
+            | Error::DataPlane(_)
+            | Error::Promql(_)
+            | Error::DependentObjectsExist { .. }
+            | Error::CascadeCycle { .. }
+            | Error::CrossShardInExplicitTransaction
+            | Error::SequencerUnavailable
+            | Error::SessionCapExceeded { .. }
+            | Error::SessionIdleTimeout
+            | Error::SessionTokenExpired
+            | Error::SessionKilledByAdmin
+            | Error::SessionUserDropped
+            | Error::OidcProviderTenantUnbound
+            | Error::OidcProviderTenantUnavailable { .. }
+            | Error::ExternalRoleUndefined { .. }
+            | Error::OidcNoDefaultDatabase { .. }
+            | Error::TenantVectorDimExceeded { .. }
+            | Error::TenantGraphDepthExceeded { .. }
+            | Error::RoleInheritanceCycle { .. }
+            | Error::RoleInheritanceDepthExceeded { .. }
+            | Error::OllpExhausted { .. }
+            | Error::MirrorReadOnly { .. }
+            | Error::StaleReadNotLeader { .. } => None,
         }
     }
 }

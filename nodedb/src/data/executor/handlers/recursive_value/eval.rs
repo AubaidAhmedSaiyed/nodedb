@@ -38,8 +38,16 @@ impl From<EvalError> for ErrorCode {
         match err {
             EvalError::UndefinedColumn { column } => ErrorCode::UndefinedColumn { column },
             EvalError::DivisionByZero => ErrorCode::DivisionByZero,
-            other => ErrorCode::Unsupported {
-                detail: other.to_string(),
+            EvalError::Unsupported { detail } => ErrorCode::Unsupported { detail },
+            // A result out of range is a data exception (class `22`), not an
+            // unsupported feature.
+            overflow @ EvalError::Overflow { .. } => ErrorCode::DataException {
+                detail: overflow.to_string(),
+            },
+            // A non-boolean condition is a datatype error in the statement
+            // (class `42`), not an unsupported feature.
+            condition @ EvalError::NonBooleanCondition => ErrorCode::BadRequest {
+                detail: condition.to_string(),
             },
         }
     }
@@ -304,5 +312,35 @@ fn finite(result: f64, op: &'static str) -> EvalResult<nodedb_types::Value> {
         Ok(nodedb_types::Value::Float(result))
     } else {
         Err(EvalError::Overflow { op })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each evaluation failure takes the Data-Plane code of its own class.
+    #[test]
+    fn eval_errors_take_the_code_of_their_class() {
+        assert!(matches!(
+            ErrorCode::from(EvalError::Overflow { op: "addition" }),
+            ErrorCode::DataException { .. }
+        ));
+        assert!(matches!(
+            ErrorCode::from(EvalError::NonBooleanCondition),
+            ErrorCode::BadRequest { .. }
+        ));
+        assert_eq!(
+            ErrorCode::from(EvalError::Unsupported {
+                detail: "lateral".into()
+            }),
+            ErrorCode::Unsupported {
+                detail: "lateral".into()
+            }
+        );
+        assert_eq!(
+            ErrorCode::from(EvalError::DivisionByZero),
+            ErrorCode::DivisionByZero
+        );
     }
 }

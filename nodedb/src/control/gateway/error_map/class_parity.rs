@@ -383,7 +383,7 @@ const ERROR_VARIANT_COUNT: usize = 108;
 /// fails to compile here until it gets an index, and
 /// [`every_error_variant_has_a_sample`] then fails until
 /// [`error_samples`] carries it.
-fn error_variant_index(err: &crate::Error) -> usize {
+pub(crate) fn error_variant_index(err: &crate::Error) -> usize {
     use crate::Error as E;
     match err {
         E::RejectedConstraint { .. } => 0,
@@ -498,7 +498,7 @@ fn error_variant_index(err: &crate::Error) -> usize {
 }
 
 /// One sample per `crate::Error` variant.
-fn error_samples() -> Vec<crate::Error> {
+pub(crate) fn error_samples() -> Vec<crate::Error> {
     use crate::Error as E;
     use crate::types::{DatabaseId, RequestId, TenantId, VShardId};
 
@@ -864,4 +864,120 @@ fn every_error_variant_has_the_http_status_of_its_sqlstate() {
             "{err:?} is {pg_state} on pgwire but HTTP {status}"
         );
     }
+}
+
+/// Variants whose pgwire SQLSTATE class has no public numeric code: `25`
+/// (`CrdtApplyForbiddenInTransaction`, `NotInTransactionBlock`,
+/// `CrossShardInExplicitTransaction`), `2B` (`DependentObjectsExist`), and
+/// `40000` (`CalvinParticipantError`, whose code is deliberately not a write
+/// conflict). The numeric wire form cannot carry their class.
+const NUMERIC_CLASS_GAPS: [usize; 5] = [7, 32, 33, 88, 90];
+
+/// Every `crate::Error` variant renders the SQLSTATE class it renders locally
+/// after it crosses a node hop, through both wire encoders and the decoder.
+#[test]
+fn every_error_variant_keeps_its_class_across_a_node_hop() {
+    use nodedb_cluster::rpc_codec::TypedClusterError;
+
+    use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
+
+    let encoders: [(&str, fn(crate::Error) -> TypedClusterError); 2] = [
+        ("execution_error_to_typed", execution_error_to_typed),
+        ("From<Error>", TypedClusterError::from),
+    ];
+    for (name, encode) in encoders {
+        for (err, twin) in error_samples().into_iter().zip(error_samples()) {
+            if NUMERIC_CLASS_GAPS.contains(&error_variant_index(&err)) {
+                continue;
+            }
+            let (_, local, _) = error_to_sqlstate(&err);
+            let rebuilt = crate::Error::from(encode(twin));
+            let (_, remote, _) = error_to_sqlstate(&rebuilt);
+            assert_eq!(
+                class(remote),
+                class(local),
+                "{name}: {err:?} is {local} locally but {remote} after the hop as {rebuilt:?}"
+            );
+        }
+    }
+}
+
+/// The SQLSTATE each Control-Plane variant renders where it has a class of
+/// its own, pinned by variant index.
+fn classified_sqlstates() -> Vec<(usize, &'static str)> {
+    vec![
+        (3, sqlstate::INVALID_PARAMETER_VALUE),
+        (27, sqlstate::TOO_MANY_CONNECTIONS),
+        (28, sqlstate::SERIALIZATION_FAILURE),
+        (29, sqlstate::SYNTAX_ERROR),
+        (30, sqlstate::SYNTAX_ERROR),
+        (31, sqlstate::SYNTAX_ERROR),
+        (32, sqlstate::ACTIVE_SQL_TRANSACTION),
+        (34, sqlstate::QUERY_CANCELED),
+        (44, sqlstate::QUOTA_OVERCOMMIT),
+        (62, sqlstate::SYNTAX_ERROR),
+        (63, sqlstate::SYNTAX_ERROR),
+        (87, sqlstate::SYNTAX_ERROR),
+        (88, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
+        (90, sqlstate::ACTIVE_SQL_TRANSACTION),
+        (91, sqlstate::SYNTAX_ERROR),
+        (92, sqlstate::SYNTAX_ERROR),
+        (93, sqlstate::SYNTAX_ERROR),
+        (95, sqlstate::SYNTAX_ERROR),
+        (96, sqlstate::SYNTAX_ERROR),
+        (97, sqlstate::SYNTAX_ERROR),
+        (98, sqlstate::SYNTAX_ERROR),
+        (99, sqlstate::SYNTAX_ERROR),
+        (100, sqlstate::SYNTAX_ERROR),
+        (101, sqlstate::QUOTA_EXCEEDED),
+        (102, sqlstate::QUOTA_EXCEEDED),
+        (103, sqlstate::SYNTAX_ERROR),
+        (104, sqlstate::SYNTAX_ERROR),
+        (106, sqlstate::READ_ONLY_SQL_TRANSACTION),
+        (107, sqlstate::STALE_READ_NOT_LEADER),
+    ]
+}
+
+/// A client-facing Control-Plane variant renders its own SQLSTATE, never the
+/// internal-error default.
+#[test]
+fn client_facing_variants_render_their_own_sqlstate() {
+    let expected = classified_sqlstates();
+    let mut seen = 0;
+    for err in error_samples() {
+        let index = error_variant_index(&err);
+        if let Some((_, state)) = expected.iter().find(|(i, _)| *i == index) {
+            assert_eq!(error_to_sqlstate(&err).1, *state, "{err:?}");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, expected.len(), "a pinned variant has no sample");
+}
+
+/// A variant with a dedicated public code renders that code's class on the
+/// numeric table too, so native and remote renderings agree with pgwire.
+#[test]
+fn dedicated_codes_render_the_class_of_their_variant() {
+    use nodedb_types::error::ErrorCode as Ec;
+
+    assert_eq!(
+        numeric_code_to_sqlstate(Ec::QUOTA_OVERCOMMIT),
+        sqlstate::QUOTA_OVERCOMMIT
+    );
+    assert_eq!(
+        numeric_code_to_sqlstate(Ec::TENANT_VECTOR_DIM_EXCEEDED),
+        sqlstate::QUOTA_EXCEEDED
+    );
+    assert_eq!(
+        numeric_code_to_sqlstate(Ec::TENANT_GRAPH_DEPTH_EXCEEDED),
+        sqlstate::QUOTA_EXCEEDED
+    );
+    assert_eq!(
+        numeric_code_to_sqlstate(Ec::MIRROR_READ_ONLY),
+        sqlstate::READ_ONLY_SQL_TRANSACTION
+    );
+    assert_eq!(
+        numeric_code_to_sqlstate(Ec::STALE_READ_NOT_LEADER),
+        sqlstate::STALE_READ_NOT_LEADER
+    );
 }

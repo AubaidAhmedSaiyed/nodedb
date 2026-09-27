@@ -233,4 +233,15 @@ pub enum ClusterError {
     /// `detail` is that error's message.
     #[error("remote error: {detail}")]
     RemoteUntyped { detail: String },
+
+    /// A shard's local execution failed with a classified error.
+    ///
+    /// `error` is the typed wire form of that error, so the coordinator
+    /// rebuilds the error and renders the SQLSTATE a single-node execution
+    /// renders. `detail` is the message with the shard's context, for logs.
+    #[error("shard execution error: {detail}")]
+    ShardExecution {
+        error: Box<crate::rpc_codec::TypedClusterError>,
+        detail: String,
+    },
 }

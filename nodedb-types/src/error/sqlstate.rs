@@ -131,6 +131,16 @@ pub const INVALID_AUTHORIZATION: &str = "28000";
 /// block.
 pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
 
+/// `25006` — `read_only_sql_transaction`: a write targeted a read-only
+/// database, such as an unpromoted mirror.
+pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
+
+// ── Class 2B — Dependent Privilege Descriptors Still Exist ───────────────────
+
+/// `2BP01` — `dependent_objects_still_exist`: a DROP names an object that
+/// other objects depend on.
+pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
+
 // ── Class 3D — Invalid Catalog Name ──────────────────────────────────────────
 
 /// `3D000` — `invalid_catalog_name` (the selected database does not exist)
@@ -381,6 +391,9 @@ mod tests {
             LEGAL_HOLD_ACTIVE,
             TYPE_GUARD_VIOLATION,
             INVALID_AUTHORIZATION,
+            ACTIVE_SQL_TRANSACTION,
+            READ_ONLY_SQL_TRANSACTION,
+            DEPENDENT_OBJECTS_STILL_EXIST,
             SERIALIZATION_FAILURE,
             INSUFFICIENT_PRIVILEGE,
             SYNTAX_ERROR,

@@ -164,12 +164,14 @@ pub fn drop_database(
                     // Gated until per-engine row copy lands — surface `0A000`
                     // (`feature_not_supported`) so clients know not to retry.
                     crate::Error::BadRequest { detail } => ddl_err("0A000", detail),
-                    other => ddl_err(
-                        "XX000",
-                        format!(
-                            "force materialization of dependent clone {} failed: {other}",
+                    // Any other error keeps the class the SQLSTATE table
+                    // gives it.
+                    other => DdlError::from_error_in_context(
+                        &format!(
+                            "force materialization of dependent clone {} failed",
                             dep_id.as_u64()
                         ),
+                        &other,
                     ),
                 },
             )?;

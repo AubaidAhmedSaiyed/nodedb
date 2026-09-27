@@ -4,6 +4,9 @@
 
 use std::sync::{Arc, Weak};
 
+use nodedb_cluster::ClusterError;
+use nodedb_raft::RaftError;
+
 use crate::error::Error;
 
 /// Type-erased handle for proposing to the metadata raft group.
@@ -70,18 +73,77 @@ impl MetadataRaftHandle for RaftLoopProposerHandle {
             tokio::runtime::Handle::current()
                 .block_on(raft_loop.propose_to_metadata_group_via_leader(bytes))
         })
-        .map_err(|e| match e {
-            // An election in progress is transient, not a failure of this
-            // proposal. Keep it typed rather than flattening it into a generic
-            // config error, so callers can wait the election out instead of
-            // failing the statement — a node that has just restarted answers
-            // every metadata proposal this way for a moment.
-            nodedb_cluster::ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
-                leader_hint: None,
-            }) => Error::MetadataLeaderUnavailable,
-            other => Error::Config {
-                detail: format!("metadata propose: {other}"),
-            },
-        })
+        .map_err(metadata_propose_error)
+    }
+}
+
+/// The error a metadata proposal returns for a cluster error.
+fn metadata_propose_error(error: ClusterError) -> Error {
+    match error {
+        // An election in progress is transient, not a failure of this
+        // proposal. Keep it typed rather than flattening it into a generic
+        // config error, so callers can wait the election out instead of
+        // failing the statement — a node that has just restarted answers
+        // every metadata proposal this way for a moment.
+        ClusterError::Raft(RaftError::NotLeader { leader_hint: None }) => {
+            Error::MetadataLeaderUnavailable
+        }
+        // A typed verdict keeps its class.
+        ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
+        ClusterError::ShardExecution { error, .. } | ClusterError::StreamTerminal { error, .. } => {
+            Error::from(*error)
+        }
+        other @ (ClusterError::Raft(
+            RaftError::NotLeader {
+                leader_hint: Some(_),
+            }
+            | RaftError::LogCompacted { .. }
+            | RaftError::CompactionAheadOfApplied { .. }
+            | RaftError::ProposalRejected { .. }
+            | RaftError::InvalidTransferTarget { .. }
+            | RaftError::LeadershipTransferInProgress
+            | RaftError::GroupNotFound { .. }
+            | RaftError::Transport { .. }
+            | RaftError::Storage { .. }
+            | RaftError::Serialization { .. }
+            | RaftError::SnapshotFormat { .. }
+            | RaftError::Shutdown,
+        )
+        | ClusterError::VShardNotMapped { .. }
+        | ClusterError::GroupNotFound { .. }
+        | ClusterError::LearnerNotCaughtUp { .. }
+        | ClusterError::MigrationInProgress { .. }
+        | ClusterError::MigrationPauseBudgetExceeded { .. }
+        | ClusterError::NodeUnreachable { .. }
+        | ClusterError::GhostNotFound { .. }
+        | ClusterError::Transport { .. }
+        | ClusterError::ShardTimeout { .. }
+        | ClusterError::Storage { .. }
+        | ClusterError::Codec { .. }
+        | ClusterError::UnsupportedWireVersion { .. }
+        | ClusterError::CircuitOpen { .. }
+        | ClusterError::JoinGroupDisappeared { .. }
+        | ClusterError::JoinCommitTimeout { .. }
+        | ClusterError::ReadIndexNotLeader { .. }
+        | ClusterError::ReadIndexTimeout { .. }
+        | ClusterError::Config { .. }
+        | ClusterError::MigrationCheckpoint(_)
+        | ClusterError::MigrationRecovery(_)
+        | ClusterError::WrongOwner { .. }
+        | ClusterError::Calvin(_)
+        | ClusterError::SnapshotCrcMismatch { .. }
+        | ClusterError::SnapshotOffsetRegression { .. }
+        | ClusterError::PartialSnapshotCorrupt { .. }
+        | ClusterError::PartialSnapshotCleanupFailed { .. }
+        | ClusterError::SnapshotApplyFailed { .. }
+        | ClusterError::Mirror(_)
+        | ClusterError::BspBarrier(_)
+        | ClusterError::VectorGather(_)
+        | ClusterError::SpatialGather(_)
+        | ClusterError::Bm25Gather(_)
+        | ClusterError::TsGather(_)
+        | ClusterError::RemoteUntyped { .. }) => Error::Config {
+            detail: format!("metadata propose: {other}"),
+        },
     }
 }

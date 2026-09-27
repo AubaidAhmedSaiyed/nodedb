@@ -76,7 +76,57 @@ impl DataProposeResponse {
             ClusterError::Raft(nodedb_raft::RaftError::LeadershipTransferInProgress) => {
                 (ForwardedProposeRefusal::LeadershipTransferInProgress, None)
             }
-            _ => (ForwardedProposeRefusal::Failed, None),
+            // A refusal with no retry contract. The forwarding node reads it
+            // as a transport error carrying the leader's message.
+            ClusterError::Raft(
+                nodedb_raft::RaftError::LogCompacted { .. }
+                | nodedb_raft::RaftError::CompactionAheadOfApplied { .. }
+                | nodedb_raft::RaftError::ProposalRejected { .. }
+                | nodedb_raft::RaftError::InvalidTransferTarget { .. }
+                | nodedb_raft::RaftError::GroupNotFound { .. }
+                | nodedb_raft::RaftError::Transport { .. }
+                | nodedb_raft::RaftError::Storage { .. }
+                | nodedb_raft::RaftError::Serialization { .. }
+                | nodedb_raft::RaftError::SnapshotFormat { .. }
+                | nodedb_raft::RaftError::Shutdown,
+            )
+            | ClusterError::VShardNotMapped { .. }
+            | ClusterError::GroupNotFound { .. }
+            | ClusterError::LearnerNotCaughtUp { .. }
+            | ClusterError::MigrationInProgress { .. }
+            | ClusterError::MigrationPauseBudgetExceeded { .. }
+            | ClusterError::NodeUnreachable { .. }
+            | ClusterError::GhostNotFound { .. }
+            | ClusterError::Transport { .. }
+            | ClusterError::ShardTimeout { .. }
+            | ClusterError::StreamTerminal { .. }
+            | ClusterError::Storage { .. }
+            | ClusterError::DataPlane { .. }
+            | ClusterError::Codec { .. }
+            | ClusterError::UnsupportedWireVersion { .. }
+            | ClusterError::CircuitOpen { .. }
+            | ClusterError::JoinGroupDisappeared { .. }
+            | ClusterError::JoinCommitTimeout { .. }
+            | ClusterError::ReadIndexNotLeader { .. }
+            | ClusterError::ReadIndexTimeout { .. }
+            | ClusterError::Config { .. }
+            | ClusterError::MigrationCheckpoint(_)
+            | ClusterError::MigrationRecovery(_)
+            | ClusterError::WrongOwner { .. }
+            | ClusterError::Calvin(_)
+            | ClusterError::SnapshotCrcMismatch { .. }
+            | ClusterError::SnapshotOffsetRegression { .. }
+            | ClusterError::PartialSnapshotCorrupt { .. }
+            | ClusterError::PartialSnapshotCleanupFailed { .. }
+            | ClusterError::SnapshotApplyFailed { .. }
+            | ClusterError::Mirror(_)
+            | ClusterError::BspBarrier(_)
+            | ClusterError::VectorGather(_)
+            | ClusterError::SpatialGather(_)
+            | ClusterError::Bm25Gather(_)
+            | ClusterError::TsGather(_)
+            | ClusterError::RemoteUntyped { .. }
+            | ClusterError::ShardExecution { .. } => (ForwardedProposeRefusal::Failed, None),
         };
         Self {
             success: false,

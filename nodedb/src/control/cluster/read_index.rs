@@ -85,8 +85,45 @@ fn refusal_of(error: ClusterError) -> ReadIndexRefusal {
     match error {
         ClusterError::ReadIndexTimeout { waited_ms, .. } => ReadIndexRefusal::Timeout { waited_ms },
         // Not hosted here, not leading, leadership lost mid-probe, or the
-        // leader unreachable: the caller asks again later.
-        _ => ReadIndexRefusal::NotLeader,
+        // leader unreachable: the caller asks again later. Every other error
+        // also leaves this node unable to prove its leadership now.
+        ClusterError::Raft(_)
+        | ClusterError::VShardNotMapped { .. }
+        | ClusterError::GroupNotFound { .. }
+        | ClusterError::LearnerNotCaughtUp { .. }
+        | ClusterError::MigrationInProgress { .. }
+        | ClusterError::MigrationPauseBudgetExceeded { .. }
+        | ClusterError::NodeUnreachable { .. }
+        | ClusterError::GhostNotFound { .. }
+        | ClusterError::Transport { .. }
+        | ClusterError::ShardTimeout { .. }
+        | ClusterError::StreamTerminal { .. }
+        | ClusterError::Storage { .. }
+        | ClusterError::DataPlane { .. }
+        | ClusterError::Codec { .. }
+        | ClusterError::UnsupportedWireVersion { .. }
+        | ClusterError::CircuitOpen { .. }
+        | ClusterError::JoinGroupDisappeared { .. }
+        | ClusterError::JoinCommitTimeout { .. }
+        | ClusterError::ReadIndexNotLeader { .. }
+        | ClusterError::Config { .. }
+        | ClusterError::MigrationCheckpoint(_)
+        | ClusterError::MigrationRecovery(_)
+        | ClusterError::WrongOwner { .. }
+        | ClusterError::Calvin(_)
+        | ClusterError::SnapshotCrcMismatch { .. }
+        | ClusterError::SnapshotOffsetRegression { .. }
+        | ClusterError::PartialSnapshotCorrupt { .. }
+        | ClusterError::PartialSnapshotCleanupFailed { .. }
+        | ClusterError::SnapshotApplyFailed { .. }
+        | ClusterError::Mirror(_)
+        | ClusterError::BspBarrier(_)
+        | ClusterError::VectorGather(_)
+        | ClusterError::SpatialGather(_)
+        | ClusterError::Bm25Gather(_)
+        | ClusterError::TsGather(_)
+        | ClusterError::RemoteUntyped { .. }
+        | ClusterError::ShardExecution { .. } => ReadIndexRefusal::NotLeader,
     }
 }
 

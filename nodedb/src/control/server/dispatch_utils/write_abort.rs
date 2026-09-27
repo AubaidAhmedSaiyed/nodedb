@@ -40,19 +40,55 @@ use crate::bridge::envelope::ErrorCode;
 /// which a committed-redo apply answers with after it rolled a failed
 /// install back.
 pub(crate) fn refusal_is_final(code: &ErrorCode) -> bool {
-    write_definitely_not_applied(code)
-        && !matches!(
-            code,
-            ErrorCode::RetryableRefusal { .. }
-                | ErrorCode::SyncNotApplied { .. }
-                | ErrorCode::RateExceeded { .. }
-                | ErrorCode::CollectionDraining { .. }
-                | ErrorCode::DispatchCapacity { .. }
-                | ErrorCode::ExpiredBeforeExecution
-                | ErrorCode::ConflictRetry
-                | ErrorCode::OllpRetryRequired
-                | ErrorCode::TxnOverlayMemoryExceeded { .. }
-        )
+    write_definitely_not_applied(code) && !is_transient_verdict(code)
+}
+
+/// Whether `code` depends on this node's momentary load or on a transient
+/// precondition, so a redelivery of the same entry can apply it.
+fn is_transient_verdict(code: &ErrorCode) -> bool {
+    match code {
+        ErrorCode::RetryableRefusal { .. }
+        | ErrorCode::SyncNotApplied { .. }
+        | ErrorCode::RateExceeded { .. }
+        | ErrorCode::CollectionDraining { .. }
+        | ErrorCode::DispatchCapacity { .. }
+        | ErrorCode::ExpiredBeforeExecution
+        | ErrorCode::ConflictRetry
+        | ErrorCode::OllpRetryRequired
+        | ErrorCode::TxnOverlayMemoryExceeded { .. } => true,
+        ErrorCode::DeadlineExceeded
+        | ErrorCode::RejectedConstraint { .. }
+        | ErrorCode::RejectedPrevalidation { .. }
+        | ErrorCode::SyncRejected { .. }
+        | ErrorCode::NotFound
+        | ErrorCode::RejectedAuthz { .. }
+        | ErrorCode::CrdtFrontierMismatch { .. }
+        | ErrorCode::FanOutExceeded
+        | ErrorCode::ResourcesExhausted
+        | ErrorCode::RejectedDanglingEdge { .. }
+        | ErrorCode::DuplicateWrite
+        | ErrorCode::AppendOnlyViolation { .. }
+        | ErrorCode::BalanceViolation { .. }
+        | ErrorCode::PeriodLocked { .. }
+        | ErrorCode::PeriodLockMisconfigured { .. }
+        | ErrorCode::RetentionViolation { .. }
+        | ErrorCode::LegalHoldActive { .. }
+        | ErrorCode::StateTransitionViolation { .. }
+        | ErrorCode::TransitionCheckViolation { .. }
+        | ErrorCode::TypeGuardViolation { .. }
+        | ErrorCode::TypeMismatch { .. }
+        | ErrorCode::CounterFault { .. }
+        | ErrorCode::InsufficientBalance { .. }
+        | ErrorCode::RecursionDepthExceeded { .. }
+        | ErrorCode::UndefinedColumn { .. }
+        | ErrorCode::Internal { .. }
+        | ErrorCode::Unsupported { .. }
+        | ErrorCode::RollbackFailed { .. }
+        | ErrorCode::DivisionByZero
+        | ErrorCode::UndefinedFunction { .. }
+        | ErrorCode::DataException { .. }
+        | ErrorCode::BadRequest { .. } => false,
+    }
 }
 
 /// Whether a committed proposal's apply `error` is a final refusal: the

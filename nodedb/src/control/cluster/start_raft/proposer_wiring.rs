@@ -15,6 +15,7 @@ use crate::control::distributed_applier::{ApplyBatch, ProposeTracker, run_apply_
 use crate::control::state::SharedState;
 
 use super::loop_build::RaftLoopType;
+use super::propose_error::async_propose_error;
 
 /// Install the sync `raft_proposer` / `raft_compactor` /
 /// `raft_applied_index_sink`, the async `async_raft_proposer`, and spawn the
@@ -292,28 +293,6 @@ fn apply_progress(state: Option<&SharedState>, group_id: u64) -> String {
             group.commit_index, group.last_applied, group.role, group.leader_id
         ),
         None => format!("group not hosted here, applied={applied}"),
-    }
-}
-
-/// The error an async propose that reached no leader returns.
-///
-/// A group with no leader to take the proposal right now accepts the same
-/// proposal once it has one, so the proposal is retried:
-/// [`crate::Error::NoLeader`]. That covers an election, a leadership transfer
-/// in flight, and a leader that stepped down after this node or a forwarding
-/// node chose it; a forwarded refusal arrives here with its typed Raft error
-/// (`DataProposeResponse::refusal_error`). Every other failure is final here.
-fn async_propose_error(vshard_id: u32, error: nodedb_cluster::ClusterError) -> crate::Error {
-    match error {
-        nodedb_cluster::ClusterError::Raft(
-            nodedb_raft::RaftError::LeadershipTransferInProgress
-            | nodedb_raft::RaftError::NotLeader { .. },
-        ) => crate::Error::NoLeader {
-            vshard_id: crate::types::VShardId::new(vshard_id),
-        },
-        other => crate::Error::Internal {
-            detail: format!("raft propose (async): {other}"),
-        },
     }
 }
 

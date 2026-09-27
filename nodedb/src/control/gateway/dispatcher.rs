@@ -467,7 +467,10 @@ pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) ->
             constraint,
             detail,
         },
-        TypedClusterError::Internal { message, .. } => Error::Internal { detail: message },
+        // A numeric class crosses as `Error::RemoteTyped`, so the client sees
+        // the SQLSTATE the executing node gave it. Only a code of 0 (no class)
+        // decodes as `Error::Internal`.
+        internal @ TypedClusterError::Internal { .. } => Error::from(internal),
     }
 }
 
@@ -512,6 +515,21 @@ mod tests {
         match map_typed_cluster_error(err, 0) {
             Error::RetryableSchemaChanged { descriptor } => assert_eq!(descriptor, "orders"),
             other => panic!("expected RetryableSchemaChanged, got {other:?}"),
+        }
+    }
+
+    /// A remote error with a numeric class keeps it, never `Internal`.
+    #[test]
+    fn map_internal_keeps_its_numeric_class() {
+        let err = TypedClusterError::Internal {
+            code: u32::from(nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED.0),
+            message: "permission denied on orders".into(),
+        };
+        match map_typed_cluster_error(err, 0) {
+            Error::RemoteTyped { code, .. } => {
+                assert_eq!(code, nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED);
+            }
+            other => panic!("expected RemoteTyped, got {other:?}"),
         }
     }
 

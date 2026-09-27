@@ -164,12 +164,15 @@ impl<'a> CollectionReadGate<'a> {
             &self.state.rls,
             self.scope.auth(),
         )
-        .map_err(|error| {
-            let sqlstate = match &error {
-                crate::Error::RejectedAuthz { .. } => INSUFFICIENT_PRIVILEGE,
-                _ => FEATURE_NOT_SUPPORTED,
-            };
-            gate_err(sqlstate, error.to_string())
+        .map_err(|error| match &error {
+            crate::Error::RejectedAuthz { .. } => {
+                gate_err(INSUFFICIENT_PRIVILEGE, error.to_string())
+            }
+            // The injection pass refuses a plan shape it cannot cover. A
+            // hand-built read of that shape is a feature this door lacks.
+            crate::Error::PlanError { .. } => gate_err(FEATURE_NOT_SUPPORTED, error.to_string()),
+            // Any other error keeps the class the SQLSTATE table gives it.
+            other => DdlError::from_error(other),
         })
     }
 

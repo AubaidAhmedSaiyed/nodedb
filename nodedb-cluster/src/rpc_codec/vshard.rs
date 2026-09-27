@@ -144,4 +144,27 @@ mod tests {
             other => panic!("expected the untyped error, got {other:?}"),
         }
     }
+
+    /// A shard's typed execution error crosses the wire with its typed form.
+    #[test]
+    fn a_shard_execution_error_survives_the_wire() {
+        let typed = crate::rpc_codec::TypedClusterError::Internal {
+            code: 2000,
+            message: "permission denied on orders".into(),
+        };
+        let error = ClusterError::ShardExecution {
+            error: Box::new(typed),
+            detail: "array put: permission denied on orders".into(),
+        };
+        match round_trip(error) {
+            ClusterError::ShardExecution { error, detail } => {
+                assert!(matches!(
+                    *error,
+                    crate::rpc_codec::TypedClusterError::Internal { code: 2000, .. }
+                ));
+                assert_eq!(detail, "array put: permission denied on orders");
+            }
+            other => panic!("expected the shard execution error, got {other:?}"),
+        }
+    }
 }

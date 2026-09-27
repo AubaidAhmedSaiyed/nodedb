@@ -118,4 +118,9 @@ pub enum ShardErrorWire {
     Untyped {
         detail: String,
     },
+    /// A shard's classified local-execution error, in its typed wire form.
+    ShardExecution {
+        error: TypedClusterError,
+        detail: String,
+    },
 }
