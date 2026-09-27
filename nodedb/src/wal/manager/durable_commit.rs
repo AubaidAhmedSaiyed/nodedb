@@ -63,18 +63,21 @@ impl WalManager {
                     // advances to exactly what the fsync made durable, never past
                     // it.
                     let wal = std::sync::Arc::clone(&self.wal);
-                    let join = tokio::task::spawn_blocking(move || -> crate::Result<u64> {
+                    let join = tokio::task::spawn_blocking(move || -> crate::Result<(u64, u64)> {
+                        let start = std::time::Instant::now();
                         let mut guard = wal.lock().unwrap_or_else(|p| p.into_inner());
                         guard.sync().map_err(crate::Error::Wal)?;
+                        let elapsed_us = start.elapsed().as_micros() as u64;
                         // `next_lsn()` is the next LSN to assign; the highest LSN
                         // this sync made durable is one below it.
-                        Ok(guard.next_lsn().saturating_sub(1))
+                        Ok((guard.next_lsn().saturating_sub(1), elapsed_us))
                     })
                     .await;
 
                     let outcome = match join {
-                        Ok(Ok(durable_through)) => {
+                        Ok(Ok((durable_through, elapsed_us))) => {
                             self.durable_lsn.fetch_max(durable_through, AcqRel);
+                            self.commit_latency.observe(elapsed_us);
                             Ok(())
                         }
                         // fsync error: do NOT advance `durable_lsn`.
@@ -85,6 +88,7 @@ impl WalManager {
                             ),
                         }),
                     };
+
 
                     // Wake followers on every leader-exit path so a failed or
                     // panicked fsync never strands them on `notified.await`. On
@@ -146,9 +150,11 @@ mod tests {
             )
             .expect("append");
         wal.wait_durable(lsn).await.expect("first");
+        assert!(wal.commit_latency.count() >= 1);
         // Second call is the fast path — no further fsync required.
         wal.wait_durable(lsn).await.expect("second");
     }
+
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_waiters_coalesce() {

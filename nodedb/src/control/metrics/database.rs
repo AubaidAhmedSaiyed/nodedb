@@ -135,7 +135,14 @@ impl DatabaseMetricsRegistry {
     /// Converts to integer microseconds (rounded) to avoid `AtomicF64` complexity.
     /// Negative or non-finite inputs are clamped to zero so accidental underflow
     /// in upstream timing arithmetic cannot subtract from the cumulative counter.
+    ///
+    /// NOTE: Intentionally unfilled by `database_metrics_sampler`. Unlike the five
+    /// gauge metrics (connections, memory, storage, bridge queue depth, and WAL
+    /// latency P99) which represent point-in-time state, this is a cumulative
+    /// counter tracking task execution time. It remains wired for callers
+    /// pending a dedicated per-task maintenance completion accounting source.
     pub fn add_maintenance_cpu_secs(&self, db_name: &str, secs: f64) {
+
         let us = if secs.is_finite() && secs > 0.0 {
             (secs * 1_000_000.0).round() as u64
         } else {
@@ -326,4 +333,31 @@ mod tests {
         };
         assert!(m.is_over_quota());
     }
+
+    #[test]
+    fn gauge_setters_update_counters() {
+        let reg = DatabaseMetricsRegistry::new();
+        reg.set_connections("db1", 42);
+        reg.set_memory_bytes("db1", 1024 * 1024);
+        reg.set_storage_bytes("db1", 10 * 1024 * 1024);
+        reg.set_bridge_queue_depth("db1", 7);
+        reg.set_wal_latency_p99("db1", 1500);
+
+        let c = reg.get_or_create("db1");
+        assert_eq!(c.connections.load(Ordering::Relaxed), 42);
+        assert_eq!(c.memory_bytes.load(Ordering::Relaxed), 1024 * 1024);
+        assert_eq!(c.storage_bytes.load(Ordering::Relaxed), 10 * 1024 * 1024);
+        assert_eq!(c.bridge_queue_depth.load(Ordering::Relaxed), 7);
+        assert_eq!(c.wal_commit_latency_p99_us.load(Ordering::Relaxed), 1500);
+    }
+
+    #[test]
+    fn add_maintenance_cpu_secs_accumulates() {
+        let reg = DatabaseMetricsRegistry::new();
+        reg.add_maintenance_cpu_secs("db1", 1.5);
+        reg.add_maintenance_cpu_secs("db1", 0.5);
+        let c = reg.get_or_create("db1");
+        assert_eq!(c.maintenance_cpu_seconds_total.load(Ordering::Relaxed), 2_000_000);
+    }
 }
+

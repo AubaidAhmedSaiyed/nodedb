@@ -336,6 +336,15 @@ impl Dispatcher {
             .unwrap_or(PressureState::Normal)
     }
 
+    /// Sum of bridge virtual-queue depths for a database across all cores.
+    pub fn virtual_queue_depth(&self, database_id: u64) -> u64 {
+        self.cores
+            .iter()
+            .map(|c| c.wfq.depth_for(database_id) as u64)
+            .sum()
+    }
+
+
     /// Poll responses from all Data Plane cores.
     ///
     /// A core whose channel has been observed dead contributes a synthesized
@@ -835,4 +844,11 @@ mod tests {
             assert!(r.error_code.is_some());
         }
     }
+
+    #[test]
+    fn virtual_queue_depth_reporting() {
+        let (dispatcher, _data_sides) = Dispatcher::new(2, 8);
+        assert_eq!(dispatcher.virtual_queue_depth(1), 0);
+    }
 }
+

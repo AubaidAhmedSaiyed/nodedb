@@ -45,6 +45,8 @@ pub struct WalManager {
     /// Wakes `wait_durable` followers when `durable_lsn` advances (or a leader's
     /// fsync fails, so they re-attempt and observe the same error).
     pub(super) durable_notify: tokio::sync::Notify,
+    /// WAL group-commit fsync latency distribution.
+    pub(super) commit_latency: crate::control::metrics::AtomicHistogram,
 }
 
 impl WalManager {
@@ -62,6 +64,12 @@ impl WalManager {
     pub fn durable_through(&self) -> u64 {
         self.durable_lsn.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// WAL group-commit fsync latency P99 in microseconds.
+    pub fn commit_latency_p99_us(&self) -> u64 {
+        self.commit_latency.percentile(99.0)
+    }
+
 
     /// Return the stable in-memory root for per-user CRDT signing keys.
     /// The root is persisted only as WAL-key-wrapped ciphertext and is
@@ -172,8 +180,12 @@ impl WalManager {
             durable_lsn: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
             durable_notify: tokio::sync::Notify::new(),
+            commit_latency: crate::control::metrics::AtomicHistogram::with_buckets(
+                crate::control::metrics::histogram::WAL_FSYNC_BUCKETS_US,
+            ),
         })
     }
+
 
     /// Open without `O_DIRECT`.
     ///
