@@ -6,6 +6,7 @@ pub mod index;
 pub mod local_node_id;
 pub mod memory;
 pub mod persist;
+pub mod rebuild;
 pub mod slice_accessors;
 pub mod statistics;
 pub mod weights;

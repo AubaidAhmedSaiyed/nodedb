@@ -11,6 +11,7 @@
 mod catalog;
 mod crdt;
 mod data_plane;
+mod index_rebuild;
 mod ingest;
 mod outcome_floor;
 mod quota;
@@ -30,6 +31,7 @@ pub use data_plane::{
     calvin_apply_halted, calvin_completion_timeout, data_plane_core_fail_stopped,
     data_plane_response_lost, data_plane_responses_lost,
 };
+pub use index_rebuild::{IndexRebuildTarget, index_rebuild_not_installed};
 pub use ingest::{ilp_invalid_utf8_drop, ilp_line_read_drop};
 pub use outcome_floor::{write_window_held, write_window_leaked};
 pub use quota::{

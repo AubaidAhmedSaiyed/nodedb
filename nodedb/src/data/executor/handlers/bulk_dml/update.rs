@@ -270,15 +270,10 @@ impl CoreLoop {
                 },
             );
             let (touched, target_writes) = match persisted {
-                // The row's own reindex failed and it is skipped, as it
-                // always was — the helper logged which row and why.
-                Ok(None) => continue,
-                Ok(Some(persisted)) => (persisted.touched, persisted.target_writes),
-                // A rejected materialized sum is NOT a skippable row:
-                // skipping it would report a smaller affected count as
-                // the truth while the rest of the predicate's matches
-                // were rewritten, and leave the stored total short of the
-                // `SUM(...)` over the rows that did land. The row's own
+                Ok(persisted) => (persisted.touched, persisted.target_writes),
+                // A row that fails is NOT skipped: skipping it would report
+                // a smaller affected count as the truth while the rest of
+                // the predicate's matches were rewritten. The row's own
                 // transaction did not commit, but earlier rows did.
                 Err(e) if affected > 0 => {
                     return self

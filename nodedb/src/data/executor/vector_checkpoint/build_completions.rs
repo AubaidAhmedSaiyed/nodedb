@@ -115,6 +115,7 @@ impl CoreLoop {
                 tracing::info!(
                     target: "nodedb::reindex",
                     core = self.core_id,
+                    index = "hnsw",
                     key = %key,
                     base_id,
                     len,

@@ -291,6 +291,7 @@ impl CsrIndex {
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
             memory,
+            rebuild_journal: None,
         })
     }
 
@@ -394,6 +395,7 @@ impl CsrIndex {
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
             memory,
+            rebuild_journal: None,
         }
     }
 }

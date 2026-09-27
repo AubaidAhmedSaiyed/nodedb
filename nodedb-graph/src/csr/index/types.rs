@@ -147,6 +147,10 @@ pub struct CsrIndex {
     /// reserve bytes against the bound database, tenant, and `EngineId::Graph`
     /// before allocating and release them on drop via `ReservationToken`.
     pub(crate) memory: ScopedMemory,
+
+    /// Mutations recorded while a rebuild of this index runs. `None` when
+    /// no rebuild runs. See [`crate::csr::rebuild`].
+    pub(crate) rebuild_journal: Option<crate::csr::rebuild::CsrJournal>,
 }
 
 impl CsrIndex {
@@ -191,6 +195,7 @@ impl CsrIndex {
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
             memory,
+            rebuild_journal: None,
         }
     }
 

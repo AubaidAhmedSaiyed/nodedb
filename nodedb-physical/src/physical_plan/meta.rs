@@ -396,22 +396,23 @@ pub enum MetaOp {
         is_group_leader: bool,
     },
 
-    /// Rebuild all indexes (HNSW, FTS LSM, graph CSR) for a collection
-    /// on this core in a shadow-build + atomic-swap manner.
+    /// Rebuild a collection's indexes (HNSW, full-text, graph CSR) on
+    /// this core.
     ///
-    /// When `concurrent = true`, the build proceeds without blocking query
-    /// handling: a background OS thread performs the rebuild and the Data
-    /// Plane polls for completion on subsequent ticks, only swapping the
-    /// live index in at cutover.  When `concurrent = false` the rebuild
-    /// runs inline (same semantics as the legacy Checkpoint path).
+    /// `index_name` narrows the rebuild to one kind: `hnsw`, `fts` or
+    /// `csr`. `None` rebuilds every kind the collection has.
     ///
-    /// `index_name` narrows the rebuild to a single named index when set;
-    /// `None` rebuilds all index types for the collection.
+    /// Each rebuild runs off the core while the core keeps serving reads
+    /// and writes. Writes made during the build are replayed onto the
+    /// rebuilt index at cutover, and the core swaps it in on a later tick.
+    /// With `concurrent = true` the core answers once the rebuilds have
+    /// started. With `concurrent = false` it answers once they have cut
+    /// over, or `DeadlineExceeded` at the request deadline; the rebuilds
+    /// still complete.
     ///
-    /// Returns `Response::Ok` on successful cutover, or a typed error if:
-    /// - another rebuild is already in progress for this collection
-    ///   (`ErrorCode::Conflict`), or
-    /// - the shadow build fails (`ErrorCode::Internal`).
+    /// Errors when a rebuild of the collection already runs
+    /// (`ObjectNotInPrerequisiteState`), when a rebuild cannot start, or,
+    /// with `concurrent = false`, when a rebuild is discarded.
     RebuildIndex {
         collection: QualifiedCollection,
         index_name: Option<String>,

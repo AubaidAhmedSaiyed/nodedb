@@ -58,7 +58,10 @@ impl CoreLoop {
         self.io_metrics.record_wait(tier, wait_ns);
 
         // A write to a row a staged Calvin transaction owns waits for it.
-        if let Some(task) = self.park_if_calvin_owned(qt.task) {
+        // A plain REINDEX starts its rebuilds and waits for their cutovers.
+        if let Some(task) = self.park_if_calvin_owned(qt.task)
+            && let Some(task) = self.hold_plain_reindex(task)
+        {
             self.run_task(task);
         }
         self.release_resolved_calvin_owners();
@@ -164,6 +167,7 @@ impl CoreLoop {
     pub fn tick(&mut self) -> usize {
         self.poll_build_completions();
         self.poll_pending_reindex();
+        self.answer_reindex_waiters();
         // Adjust SPSC read depth based on current memory pressure.
         self.apply_spsc_pressure();
         self.drain_requests();

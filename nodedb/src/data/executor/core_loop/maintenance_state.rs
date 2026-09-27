@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::data::executor::handlers::control::reindex::PendingReindex;
+use crate::data::executor::handlers::control::reindex::{PendingReindex, ReindexWaiter};
 
 /// Compaction pacing, the maintenance CPU budget, and in-flight index
 /// rebuilds.
@@ -28,13 +28,17 @@ pub(in crate::data::executor) struct MaintenanceState {
     pub(in crate::data::executor) maintenance_budget:
         Option<Arc<crate::control::maintenance::MaintenanceBudgetTracker>>,
 
-    /// In-flight concurrent index rebuilds, polled each tick.
+    /// In-flight full-text and CSR rebuilds, polled each tick.
     ///
-    /// Each entry yields a `RebuildResult` once its background OS thread
-    /// finishes the shadow build. Only one rebuild per collection runs at a
-    /// time. `execute_rebuild_index` returns `ErrorCode::Conflict` for a
-    /// second one.
+    /// Each entry yields its rebuilt index once its OS thread finishes the
+    /// build; the poll cuts it over on this core. One collection runs one
+    /// concurrent REINDEX at a time; `execute_rebuild_index` refuses a
+    /// second one with `ObjectNotInPrerequisiteState`.
     pub(in crate::data::executor) pending_reindex: Vec<PendingReindex>,
+
+    /// Plain REINDEX requests waiting for their rebuilds to cut over. The
+    /// tick answers each one when they have, or at its deadline.
+    pub(in crate::data::executor) reindex_waiters: Vec<ReindexWaiter>,
 }
 
 impl MaintenanceState {
@@ -46,6 +50,7 @@ impl MaintenanceState {
             segment_compaction_config: crate::storage::compaction::CompactionConfig::default(),
             maintenance_budget: None,
             pending_reindex: Vec::new(),
+            reindex_waiters: Vec::new(),
         }
     }
 }

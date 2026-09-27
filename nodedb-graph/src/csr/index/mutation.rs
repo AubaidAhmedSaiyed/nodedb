@@ -3,6 +3,7 @@
 //! Edge insert / remove paths and node-edge cleanup.
 
 use super::types::CsrIndex;
+use crate::csr::rebuild::journal::{CsrWriteOp, OpOutcome};
 
 impl CsrIndex {
     /// Incrementally add an unweighted edge (goes into mutable buffer).
@@ -62,6 +63,31 @@ impl CsrIndex {
     }
 
     fn add_edge_internal(
+        &mut self,
+        src: &str,
+        label: &str,
+        dst: &str,
+        collection: &str,
+        weight: f64,
+        force_weights: bool,
+    ) -> Result<(), crate::GraphError> {
+        let result = self.apply_add_edge(src, label, dst, collection, weight, force_weights);
+        self.journal_record(
+            || CsrWriteOp::AddEdge {
+                src: src.to_string(),
+                label: label.to_string(),
+                dst: dst.to_string(),
+                collection: collection.to_string(),
+                weight,
+                force_weights,
+            },
+            OpOutcome::of(&result),
+        );
+        result
+    }
+
+    /// The edge insert itself, unjournaled.
+    pub(crate) fn apply_add_edge(
         &mut self,
         src: &str,
         label: &str,
@@ -137,6 +163,26 @@ impl CsrIndex {
         dst: &str,
         collection: &str,
     ) {
+        self.apply_remove_edge(src, label, dst, collection);
+        self.journal_record(
+            || CsrWriteOp::RemoveEdge {
+                src: src.to_string(),
+                label: label.to_string(),
+                dst: dst.to_string(),
+                collection: collection.to_string(),
+            },
+            OpOutcome::Applied,
+        );
+    }
+
+    /// The edge removal itself, unjournaled.
+    pub(crate) fn apply_remove_edge(
+        &mut self,
+        src: &str,
+        label: &str,
+        dst: &str,
+        collection: &str,
+    ) {
         let (Some(&src_id), Some(&dst_id)) = (self.node_to_id.get(src), self.node_to_id.get(dst))
         else {
             return;
@@ -185,6 +231,18 @@ impl CsrIndex {
 
     /// Remove ALL edges touching a node. Returns the number of edges removed.
     pub fn remove_node_edges(&mut self, node: &str) -> usize {
+        let removed = self.apply_remove_node_edges(node);
+        self.journal_record(
+            || CsrWriteOp::RemoveNodeEdges {
+                node: node.to_string(),
+            },
+            OpOutcome::Applied,
+        );
+        removed
+    }
+
+    /// The node-edge removal itself, unjournaled.
+    pub(crate) fn apply_remove_node_edges(&mut self, node: &str) -> usize {
         let Some(&node_id) = self.node_to_id.get(node) else {
             return 0;
         };

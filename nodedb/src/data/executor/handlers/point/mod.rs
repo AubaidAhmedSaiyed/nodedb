@@ -18,4 +18,5 @@ pub mod update;
 pub mod update_reindex;
 pub mod update_reindex_secondary;
 pub mod update_reindex_sparse;
+pub mod update_reindex_text;
 pub mod update_reindex_vector;

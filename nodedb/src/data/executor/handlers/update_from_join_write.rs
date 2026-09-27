@@ -13,6 +13,7 @@ use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::partial_refusal::{
     refusal_after_partial_apply, refusal_after_rows,
 };
+use crate::data::executor::handlers::point::update_reindex_text::UpdateTextReindex;
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::transaction::stage_write::stored_row_identity;
@@ -126,15 +127,35 @@ impl CoreLoop {
                 Ok(txn) => txn,
                 Err(e) => return Err(self.response_error(task, refusal_after_rows(affected, e))),
             };
-            let stored = self.sparse.put_in_txn(
-                &row_txn,
-                database_id,
-                tid,
-                target_collection,
-                &storage_key,
-                &updated_bytes,
-            );
-            if stored.is_ok() {
+            // The body and the row's full-text postings land together; a row
+            // whose write fails refuses the statement rather than drop out of
+            // its affected count.
+            let stored = self
+                .sparse
+                .put_in_txn(
+                    &row_txn,
+                    database_id,
+                    tid,
+                    target_collection,
+                    &storage_key,
+                    &updated_bytes,
+                )
+                .and_then(|_prior| {
+                    self.update_reindex_text(
+                        &row_txn,
+                        UpdateTextReindex {
+                            database_id,
+                            tid,
+                            collection: target_collection,
+                            surrogate: storage_key.surrogate(),
+                            new_doc: &doc,
+                        },
+                    )
+                });
+            if let Err(e) = stored {
+                return Err(self.response_error(task, refusal_after_rows(affected, e)));
+            }
+            {
                 let enforcement = write_hook::run(
                     self,
                     &row_txn,

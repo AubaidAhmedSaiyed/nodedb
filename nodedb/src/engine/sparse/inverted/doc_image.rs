@@ -26,6 +26,13 @@ pub struct FtsDocImage {
     tokens: Vec<String>,
 }
 
+impl FtsDocImage {
+    /// The analyzed token stream, in document order.
+    pub(super) fn tokens(&self) -> &[String] {
+        &self.tokens
+    }
+}
+
 impl InvertedIndex {
     /// The index footprint of `surrogate` in `collection`, or `None` when the
     /// document is not indexed. Reads only: the write transaction it opens to
@@ -78,7 +85,7 @@ impl InvertedIndex {
         Ok(())
     }
 
-    fn read_document_image(
+    pub(super) fn read_document_image(
         txn: &redb::WriteTransaction,
         scope: IndexDocScope<'_>,
     ) -> crate::Result<Option<FtsDocImage>> {

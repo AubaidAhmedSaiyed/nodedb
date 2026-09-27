@@ -153,6 +153,7 @@ impl InvertedIndex {
             surrogate,
         } = scope;
         let t = tid.as_u64();
+        self.note_doc_write(scope);
 
         let mut term_postings: HashMap<&str, (u32, Vec<u32>)> = HashMap::new();
         for (pos, token) in tokens.iter().enumerate() {

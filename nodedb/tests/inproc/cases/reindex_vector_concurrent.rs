@@ -12,7 +12,7 @@
 //!   4. the query p99 stayed a small share of the rebuild window — the
 //!      signature of a rebuild that took an exclusive lock instead of
 //!      running concurrently
-//!   5. exactly one `atomic_cutover` tracing event was emitted by the
+//!   5. exactly one HNSW `atomic_cutover` tracing event was emitted by the
 //!      `nodedb::reindex` target during the rebuild phase. REINDEX rebuilds
 //!      each sealed segment and swaps it in on its own, one event per
 //!      segment, so the test force-seals its rows into one segment first.
@@ -42,29 +42,36 @@ use nodedb_test_support::pgwire_harness::TestServer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-// ── Tracing layer that counts `atomic_cutover` events ────────────────────────
+// ── Tracing layer that counts HNSW `atomic_cutover` events ─────────────────
 
 struct CutoverCounter(Arc<AtomicU64>);
 
-/// Visitor that checks whether the `message` field equals "atomic_cutover".
-struct MessageVisitor(bool);
+/// Visitor that reads the `message` and `index` fields of an event.
+#[derive(Default)]
+struct CutoverVisitor {
+    is_cutover: bool,
+    index: Option<String>,
+}
 
-impl tracing::field::Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            let s = format!("{value:?}");
-            // Debug formatting wraps strings in quotes; strip them.
-            let trimmed = s.trim_matches('"');
-            if trimmed == "atomic_cutover" {
-                self.0 = true;
-            }
+impl CutoverVisitor {
+    fn record_text(&mut self, field: &tracing::field::Field, text: &str) {
+        match field.name() {
+            "message" => self.is_cutover |= text == "atomic_cutover",
+            "index" => self.index = Some(text.to_string()),
+            _ => {}
         }
+    }
+}
+
+impl tracing::field::Visit for CutoverVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let s = format!("{value:?}");
+        // Debug formatting wraps strings in quotes; strip them.
+        self.record_text(field, s.trim_matches('"'));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" && value == "atomic_cutover" {
-            self.0 = true;
-        }
+        self.record_text(field, value);
     }
 }
 
@@ -79,9 +86,11 @@ where
     ) {
         let meta = event.metadata();
         if meta.target().contains("reindex") {
-            let mut visitor = MessageVisitor(false);
+            let mut visitor = CutoverVisitor::default();
             event.record(&mut visitor);
-            if visitor.0 {
+            // REINDEX without an index name also rebuilds any full-text or
+            // CSR index the collection has; only HNSW cutovers count here.
+            if visitor.is_cutover && visitor.index.as_deref() == Some("hnsw") {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }

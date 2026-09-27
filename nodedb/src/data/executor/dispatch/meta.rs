@@ -218,17 +218,14 @@ impl CoreLoop {
                 injected_reads,
             ),
 
+            // Both forms start the same rebuilds here. A plain REINDEX is
+            // held by the core loop's reindex waiter before it reaches this
+            // arm, and answered at cutover.
             MetaOp::RebuildIndex {
                 collection,
                 index_name,
-                concurrent,
-            } => self.execute_rebuild_index(
-                task,
-                tid,
-                collection.as_str(),
-                index_name.as_deref(),
-                *concurrent,
-            ),
+                concurrent: _,
+            } => self.execute_rebuild_index(task, tid, collection.as_str(), index_name.as_deref()),
 
             MetaOp::PutSynonymGroup {
                 tenant_id,

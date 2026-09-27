@@ -23,7 +23,6 @@ pub mod crdt_preview;
 pub mod move_tenant;
 mod range_scan_versioned;
 pub mod reindex;
-mod reindex_apply;
 pub mod snapshot;
 pub mod synonym_group;
 

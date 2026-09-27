@@ -83,6 +83,15 @@ impl CoreLoop {
                 );
             }
         };
+        // The snapshot carries no postings: index the restored rows' text.
+        if let Err(e) = self.restore_text_index(&snap) {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("restore: full-text reindex failed: {e}"),
+                },
+            );
+        }
 
         let mut edges_written = 0u64;
         let mut vectors_written = 0u64;

@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use sonic_rs;
 
-use crate::bridge::envelope::PhysicalPlan;
+use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::types::error_to_sqlstate;
 use crate::control::server::shared::ddl::sync_dispatch::{
-    SystemReason, SystemTask, dispatch_system,
+    SystemReason, SystemTask, dispatch_system_response_with_source,
 };
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::MetaOp;
@@ -96,7 +97,8 @@ pub async fn convert_collection(
         source_storage_mode,
     });
 
-    dispatch_system(
+    let event_source = SystemReason::DdlApply.event_source();
+    let resp = dispatch_system_response_with_source(
         state,
         SystemTask::new(
             SystemReason::DdlApply,
@@ -106,9 +108,28 @@ pub async fn convert_collection(
             plan,
         ),
         Duration::from_secs(60),
+        event_source,
     )
     .await
-    .map_err(|e| err("XX000", format!("conversion failed: {e}")))?;
+    .map_err(|e| {
+        let (_, code, message) = error_to_sqlstate(&e);
+        err(code, format!("conversion failed: {message}"))
+    })?;
+
+    // A Data-Plane verdict (a row breaking the target schema, say) keeps its
+    // own typed SQLSTATE instead of collapsing to a generic internal error.
+    if resp.status != Status::Ok {
+        let verdict = match resp.error_code {
+            Some(code) => crate::Error::DataPlane(*code),
+            None => crate::Error::Internal {
+                detail: "conversion failed: data plane returned an error status with no error \
+                         code"
+                    .into(),
+            },
+        };
+        let (_, code, message) = error_to_sqlstate(&verdict);
+        return Err(err(code, message));
+    }
 
     // Update catalog collection type.
     let new_type = match target_type.as_str() {

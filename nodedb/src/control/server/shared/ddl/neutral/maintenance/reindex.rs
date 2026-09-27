@@ -5,9 +5,17 @@
 //! Grammar:
 //!   REINDEX [INDEX <name>] [CONCURRENTLY] <collection>
 //!
-//! Non-concurrent path: dispatches `MetaOp::Checkpoint` (existing semantics).
-//! Concurrent path: dispatches `MetaOp::RebuildIndex { concurrent: true }` to
-//! every core and awaits the cross-core ACK barrier before returning.
+//! Both forms dispatch `MetaOp::RebuildIndex` to every core and await the
+//! cross-core ACK barrier. Without `INDEX <name>` every index the
+//! collection has is rebuilt: HNSW, full-text and CSR.
+//!
+//! Both forms rebuild the same way: off the core, with the core serving
+//! reads and writes meanwhile and swapping each rebuilt index in on a later
+//! tick. They differ only in when a core answers:
+//!
+//! - Non-concurrent: once its cutovers are done. Past the statement
+//!   deadline it answers `DeadlineExceeded`; the rebuilds still complete.
+//! - Concurrent: once its rebuilds have started.
 //!
 //! The grammar is parsed once by `nodedb_sql::ddl_ast::parse` into
 //! `NodedbStatement::Reindex { .. }`; this handler receives the already-parsed
@@ -53,39 +61,26 @@ pub async fn handle_reindex(
         ));
     }
 
-    if concurrent {
-        // Concurrent path: broadcast to all cores and await per-core ACK.
-        let plan = crate::bridge::envelope::PhysicalPlan::Meta(MetaOp::RebuildIndex {
-            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
-            index_name,
-            concurrent: true,
-        });
-        let trace_id = TraceId::generate();
-        crate::control::server::broadcast::broadcast_register_to_all_cores(
-            state,
-            tenant_id,
-            database_id,
-            plan,
-            trace_id,
-        )
-        .await
-        .map_err(|e| ddl_err("XX000", format!("REINDEX CONCURRENTLY failed: {e}")))?;
+    // Every core rebuilds the indexes it holds for the collection. A core
+    // answers the plain form after its cutovers, the concurrent form after
+    // its rebuilds start.
+    let plan = crate::bridge::envelope::PhysicalPlan::Meta(MetaOp::RebuildIndex {
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
+        index_name,
+        concurrent,
+    });
+    let trace_id = TraceId::generate();
+    crate::control::server::broadcast::broadcast_register_to_all_cores(
+        state,
+        tenant_id,
+        database_id,
+        plan,
+        trace_id,
+    )
+    .await
+    .map_err(|e| ddl_err("XX000", format!("REINDEX failed: {e}")))?;
 
-        tracing::info!(
-            %collection,
-            concurrent = true,
-            "REINDEX CONCURRENTLY dispatched and acknowledged by all cores"
-        );
-    } else {
-        // Non-concurrent path: fire-and-forget (same as legacy Checkpoint).
-        super::distributed::dispatch_maintenance_to_all_cores(
-            state,
-            tenant_id,
-            database_id,
-            MetaOp::Checkpoint,
-        );
-        tracing::info!(%collection, concurrent = false, "REINDEX dispatched");
-    }
+    tracing::info!(%collection, concurrent, "REINDEX acknowledged by all cores");
 
     Ok(vec![DdlResult::Status {
         command: "REINDEX".to_string(),

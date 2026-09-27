@@ -10,6 +10,7 @@
 
 use super::types::CsrIndex;
 use crate::GraphError;
+use crate::csr::rebuild::journal::{CsrWriteOp, OpOutcome};
 
 impl CsrIndex {
     /// Weight of the live `(src, label, dst)` edge in `collection`, `None`
@@ -80,10 +81,33 @@ impl CsrIndex {
         collection: &str,
         weight: f64,
     ) -> Result<Option<f64>, GraphError> {
+        let result = self.apply_put_edge(src, label, dst, collection, weight);
+        self.journal_record(
+            || CsrWriteOp::PutEdge {
+                src: src.to_string(),
+                label: label.to_string(),
+                dst: dst.to_string(),
+                collection: collection.to_string(),
+                weight,
+            },
+            OpOutcome::of(&result),
+        );
+        result
+    }
+
+    /// The edge put itself, unjournaled.
+    pub(crate) fn apply_put_edge(
+        &mut self,
+        src: &str,
+        label: &str,
+        dst: &str,
+        collection: &str,
+        weight: f64,
+    ) -> Result<Option<f64>, GraphError> {
         let prior = self.edge_weight_in_collection(src, label, dst, collection);
         match prior {
             Some(current) if current == weight => return Ok(prior),
-            Some(_) => self.remove_edge_in_collection(src, label, dst, collection),
+            Some(_) => self.apply_remove_edge(src, label, dst, collection),
             None => {}
         }
         let src_id = self.ensure_node(src)?;
@@ -133,6 +157,18 @@ impl CsrIndex {
 
     /// Put `node`'s surrogate back to `prior`, `0` for none.
     pub fn restore_node_surrogate(&mut self, node: &str, prior: u32) {
+        self.apply_restore_node_surrogate(node, prior);
+        self.journal_record(
+            || CsrWriteOp::RestoreNodeSurrogate {
+                node: node.to_string(),
+                prior,
+            },
+            OpOutcome::Applied,
+        );
+    }
+
+    /// The surrogate restore itself, unjournaled.
+    pub(crate) fn apply_restore_node_surrogate(&mut self, node: &str, prior: u32) {
         let Some(&id) = self.node_to_id.get(node) else {
             return;
         };
@@ -163,6 +199,18 @@ impl CsrIndex {
     /// edge and no label: withdrawing any other would renumber or orphan live
     /// state, so that is refused.
     pub fn withdraw_newest_node(&mut self, node: &str) -> Result<(), GraphError> {
+        let result = self.apply_withdraw_newest_node(node);
+        self.journal_record(
+            || CsrWriteOp::WithdrawNewestNode {
+                node: node.to_string(),
+            },
+            OpOutcome::of(&result),
+        );
+        result
+    }
+
+    /// The node withdraw itself, unjournaled.
+    pub(crate) fn apply_withdraw_newest_node(&mut self, node: &str) -> Result<(), GraphError> {
         let Some(&id) = self.node_to_id.get(node) else {
             return Ok(());
         };
@@ -214,6 +262,21 @@ impl CsrIndex {
     /// An absent label is a no-op. The label must be the newest one and no
     /// node may carry it, or the withdraw is refused.
     pub fn withdraw_newest_node_label(&mut self, label: &str) -> Result<(), GraphError> {
+        let result = self.apply_withdraw_newest_node_label(label);
+        self.journal_record(
+            || CsrWriteOp::WithdrawNewestNodeLabel {
+                label: label.to_string(),
+            },
+            OpOutcome::of(&result),
+        );
+        result
+    }
+
+    /// The node-label withdraw itself, unjournaled.
+    pub(crate) fn apply_withdraw_newest_node_label(
+        &mut self,
+        label: &str,
+    ) -> Result<(), GraphError> {
         let Some(&id) = self.node_label_to_id.get(label) else {
             return Ok(());
         };

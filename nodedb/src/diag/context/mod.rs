@@ -9,6 +9,7 @@
 mod catalog;
 mod crdt;
 mod data_plane;
+mod index_rebuild;
 mod ingest;
 mod outcome_floor;
 mod quota;
@@ -28,6 +29,7 @@ pub use data_plane::LostResponseWrite;
 pub(in crate::diag) use data_plane::{
     CalvinApplyHalted, CalvinCompletionTimeout, CoreFailStopped, DataPlaneResponseLost,
 };
+pub(in crate::diag) use index_rebuild::IndexRebuildNotInstalled;
 pub(in crate::diag) use ingest::IlpAcceptedLinesDropped;
 pub use ingest::IlpFlushOutcome;
 pub(in crate::diag) use outcome_floor::{WriteWindowHeld, WriteWindowLeaked};
