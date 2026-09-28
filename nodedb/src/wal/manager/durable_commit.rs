@@ -63,21 +63,24 @@ impl WalManager {
                     // advances to exactly what the fsync made durable, never past
                     // it.
                     let wal = std::sync::Arc::clone(&self.wal);
-                    let join = tokio::task::spawn_blocking(move || -> crate::Result<(u64, u64)> {
-                        let start = std::time::Instant::now();
+                    let metrics = self.metrics();
+                    let join = tokio::task::spawn_blocking(move || -> crate::Result<u64> {
                         let mut guard = wal.lock().unwrap_or_else(|p| p.into_inner());
+                        let start = std::time::Instant::now();
                         guard.sync().map_err(crate::Error::Wal)?;
                         let elapsed_us = start.elapsed().as_micros() as u64;
+                        if let Some(m) = &metrics {
+                            m.record_wal_fsync(elapsed_us);
+                        }
                         // `next_lsn()` is the next LSN to assign; the highest LSN
                         // this sync made durable is one below it.
-                        Ok((guard.next_lsn().saturating_sub(1), elapsed_us))
+                        Ok(guard.next_lsn().saturating_sub(1))
                     })
                     .await;
 
                     let outcome = match join {
-                        Ok(Ok((durable_through, elapsed_us))) => {
+                        Ok(Ok(durable_through)) => {
                             self.durable_lsn.fetch_max(durable_through, AcqRel);
-                            self.commit_latency.observe(elapsed_us);
                             Ok(())
                         }
                         // fsync error: do NOT advance `durable_lsn`.
@@ -88,7 +91,6 @@ impl WalManager {
                             ),
                         }),
                     };
-
 
                     // Wake followers on every leader-exit path so a failed or
                     // panicked fsync never strands them on `notified.await`. On
@@ -116,6 +118,8 @@ impl WalManager {
 mod tests {
     use super::*;
     use crate::types::{DatabaseId, TenantId, VShardId};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     fn open_wal(dir: &std::path::Path) -> WalManager {
         WalManager::open_for_testing(&dir.join("test.wal")).expect("open wal")
@@ -141,6 +145,8 @@ mod tests {
     async fn wait_durable_fast_path_when_already_durable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
+        let metrics = Arc::new(crate::control::metrics::SystemMetrics::new());
+        wal.set_metrics(Arc::clone(&metrics));
         let lsn = wal
             .append_put(
                 TenantId::new(1),
@@ -150,11 +156,12 @@ mod tests {
             )
             .expect("append");
         wal.wait_durable(lsn).await.expect("first");
-        assert!(wal.commit_latency.count() >= 1);
+        assert_eq!(metrics.wal_fsync_count.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.wal_fsync_seconds.count(), 1);
         // Second call is the fast path — no further fsync required.
         wal.wait_durable(lsn).await.expect("second");
+        assert_eq!(metrics.wal_fsync_count.load(Ordering::Relaxed), 1);
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_waiters_coalesce() {

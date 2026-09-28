@@ -33,6 +33,9 @@ pub(super) fn hydrate_caches(state: &Arc<SharedState>) {
             "boot: failed to populate idle_timeout_cache from catalog"
         );
     }
+    if let Some(metrics) = &state.system_metrics {
+        state.wal.set_metrics(Arc::clone(metrics));
+    }
     state
         .maintenance_budget
         .set_metrics(Arc::clone(&state.database_metrics));

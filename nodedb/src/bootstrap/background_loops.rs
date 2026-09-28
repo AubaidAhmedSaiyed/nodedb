@@ -145,40 +145,7 @@ pub fn spawn_background_loops(
     // Database metrics sampler (10-second interval).
     // Samples live per-database metrics across subsystems and updates
     // `DatabaseMetricsRegistry` gauges for Prometheus scraping.
-    {
-        let shared_sampler = Arc::clone(shared);
-        crate::control::shutdown::spawn_loop(
-            &shared.loop_registry,
-            &shared.shutdown,
-            "database_metrics_sampler",
-            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
-            move |mut shutdown| async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(10));
-                loop {
-                    tokio::select! {
-                        _ = shutdown.wait_cancelled() => break,
-                        _ = tick.tick() => {}
-                    }
-                    if shutdown.is_cancelled() {
-                        break;
-                    }
-                    let catalog = shared_sampler.credentials.catalog();
-                    let databases = match catalog.list_databases() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "database_metrics_sampler: catalog list error");
-                            continue;
-                        }
-                    };
-                    for db in databases {
-                        sample_database_metrics(&shared_sampler, db.id, &db.name);
-                    }
-                }
-            },
-        );
-        info!("database metrics sampler running");
-    }
-
+    crate::bootstrap::database_metrics_sampler::spawn_database_metrics_sampler(shared);
 
     // Wire stream delivery managers before Event Plane creation can admit
     // CREATE CHANGE STREAM delivery tasks.
@@ -461,68 +428,3 @@ pub fn spawn_response_poller(
         },
     );
 }
-
-/// Sample live metrics for a single database and update its gauges in `shared.database_metrics`.
-pub fn sample_database_metrics(
-    shared: &SharedState,
-    db_id: nodedb_types::DatabaseId,
-    db_name: &str,
-) {
-    // 1. connections: active connections holding an admission permit for this database
-    // in `shared.admission_registry`.
-    let connections = shared
-        .admission_registry
-        .database_live_connections(db_id)
-        .map(u64::from)
-        .unwrap_or(0);
-    shared
-        .database_metrics
-        .set_connections(db_name, connections);
-
-    // 2. memory: resident memory in bytes allocated by this database, read directly
-    // from the `database_budgets` map in `shared.governor`.
-    let memory_bytes = shared.governor.database_usage_bytes(db_id) as u64;
-    shared
-        .database_metrics
-        .set_memory_bytes(db_name, memory_bytes);
-
-    // 3. storage: per-database storage usage in bytes from `shared.system_metrics`
-    // (the same source read by `SHOW DATABASE USAGE`).
-    let storage_bytes = shared
-        .system_metrics
-        .as_ref()
-        .map(|m| m.database_storage_bytes(db_name))
-        .unwrap_or(0);
-    shared
-        .database_metrics
-        .set_storage_bytes(db_name, storage_bytes);
-
-    // 4. bridge_queue_depth: sum of SPSC bridge virtual-queue depths for this database
-    // across all Data Plane cores in `shared.dispatcher`.
-    let bridge_queue_depth = match shared.dispatcher.lock() {
-        Ok(d) => d.virtual_queue_depth(db_id.as_u64()),
-        Err(p) => p.into_inner().virtual_queue_depth(db_id.as_u64()),
-    };
-    shared
-        .database_metrics
-        .set_bridge_queue_depth(db_name, bridge_queue_depth);
-
-    // 5. wal_latency_p99: P99 WAL group-commit fsync latency in microseconds from
-    // `shared.wal`'s commit latency histogram (falling back to `system_metrics`).
-    let wal_latency_p99 = {
-        let from_wal = shared.wal.commit_latency_p99_us();
-        if from_wal > 0 {
-            from_wal
-        } else {
-            shared
-                .system_metrics
-                .as_ref()
-                .map(|s| s.wal_fsync_seconds.percentile(99.0))
-                .unwrap_or(0)
-        }
-    };
-    shared
-        .database_metrics
-        .set_wal_latency_p99(db_name, wal_latency_p99);
-}
-

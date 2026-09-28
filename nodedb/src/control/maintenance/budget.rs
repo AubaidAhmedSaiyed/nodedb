@@ -446,4 +446,3 @@ mod tests {
         assert!(out.contains("nodedb_database_maintenance_cpu_us_total"));
     }
 }
-

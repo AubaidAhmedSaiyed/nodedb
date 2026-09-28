@@ -344,7 +344,6 @@ impl Dispatcher {
             .sum()
     }
 
-
     /// Poll responses from all Data Plane cores.
     ///
     /// A core whose channel has been observed dead contributes a synthesized
@@ -847,8 +846,47 @@ mod tests {
 
     #[test]
     fn virtual_queue_depth_reporting() {
-        let (dispatcher, _data_sides) = Dispatcher::new(2, 8);
+        let (mut dispatcher, data_sides) = Dispatcher::new(2, 2);
         assert_eq!(dispatcher.virtual_queue_depth(1), 0);
+
+        // Fill physical rings on core 0 and core 1 so subsequent requests park in WFQ.
+        dispatcher
+            .dispatch_to_core(0, make_request_for_db(0, 1, 1))
+            .unwrap();
+        dispatcher
+            .dispatch_to_core(0, make_request_for_db(0, 1, 2))
+            .unwrap();
+        assert_eq!(data_sides[0].request_rx.len(), 2);
+
+        dispatcher
+            .dispatch_to_core(1, make_request_for_db(1, 1, 10))
+            .unwrap();
+        dispatcher
+            .dispatch_to_core(1, make_request_for_db(1, 1, 11))
+            .unwrap();
+        assert_eq!(data_sides[1].request_rx.len(), 2);
+
+        // Park 2 requests in core 0's WFQ for db 1.
+        dispatcher
+            .dispatch_to_core(0, make_request_for_db(0, 1, 3))
+            .unwrap();
+        dispatcher
+            .dispatch_to_core(0, make_request_for_db(0, 1, 4))
+            .unwrap();
+
+        // Park 3 requests in core 1's WFQ for db 1.
+        dispatcher
+            .dispatch_to_core(1, make_request_for_db(1, 1, 12))
+            .unwrap();
+        dispatcher
+            .dispatch_to_core(1, make_request_for_db(1, 1, 13))
+            .unwrap();
+        dispatcher
+            .dispatch_to_core(1, make_request_for_db(1, 1, 14))
+            .unwrap();
+
+        // Virtual queue depth must sum across all cores.
+        assert_eq!(dispatcher.virtual_queue_depth(1), 5);
+        assert_eq!(dispatcher.virtual_queue_depth(2), 0);
     }
 }
-

@@ -521,6 +521,9 @@ impl SharedState {
             startup: Arc::clone(&startup_gate),
         });
         Self::wire_session_handle_audit(&state);
+        if let Some(metrics) = &state.system_metrics {
+            state.wal.set_metrics(Arc::clone(metrics));
+        }
         state
             .maintenance_budget
             .set_metrics(Arc::clone(&state.database_metrics));

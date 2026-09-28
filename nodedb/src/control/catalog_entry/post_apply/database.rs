@@ -21,12 +21,16 @@ pub fn put(descriptor: DatabaseDescriptor, shared: Arc<SharedState>) {
 }
 
 /// Post-apply for `DeleteDatabase` — release the quota caps of the dropped
-/// scope, its tenants' caps included, and unregister from maintenance budget.
+/// scope, its tenants' caps included, unregister from maintenance budget,
+/// and remove any metrics handles from `DatabaseMetricsRegistry`.
 pub fn delete(db_id: u64, shared: Arc<SharedState>) {
-    shared
-        .maintenance_budget
-        .remove_database(DatabaseId::new(db_id));
-    super::quota::release_database_scope(DatabaseId::new(db_id), &shared);
+    let db = DatabaseId::new(db_id);
+    if let Ok(Some(name)) = shared.credentials.catalog().get_database_name_by_id(db) {
+        shared.database_metrics.remove(&name);
+    }
+    shared.database_metrics.remove(&format!("db-{}", db_id));
+    shared.maintenance_budget.remove_database(db);
+    super::quota::release_database_scope(db, &shared);
 }
 
 /// Post-apply for `PutDatabaseGrant`.

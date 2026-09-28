@@ -191,4 +191,3 @@ mod tests {
         assert_eq!(gov.database_usage_bytes(db()), 512);
     }
 }
-
