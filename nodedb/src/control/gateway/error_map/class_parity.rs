@@ -21,6 +21,19 @@ use crate::control::server::pgwire::types::error_to_sqlstate;
 
 use super::gateway_map::GatewayErrorMap;
 
+/// A named encoder that turns an `Error` into its node-hop wire form.
+type HopEncoder = (
+    &'static str,
+    fn(crate::Error) -> nodedb_cluster::rpc_codec::TypedClusterError,
+);
+
+/// An error builder, with the SQLSTATE and public code it must answer.
+type ClassCase = (
+    fn() -> crate::Error,
+    &'static str,
+    nodedb_types::error::ErrorCode,
+);
+
 /// The number of `ErrorCode` variants [`variant_index`] numbers.
 const VARIANT_COUNT: usize = 44;
 
@@ -897,7 +910,7 @@ fn every_error_variant_keeps_its_class_across_a_node_hop() {
 
     use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
 
-    let encoders: [(&str, fn(crate::Error) -> TypedClusterError); 2] = [
+    let encoders: [HopEncoder; 2] = [
         ("execution_error_to_typed", execution_error_to_typed),
         ("From<Error>", TypedClusterError::from),
     ];
@@ -1019,7 +1032,7 @@ fn transaction_and_dependency_variants_keep_their_sqlstate_across_a_hop() {
 
     use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
 
-    let cases: [(fn() -> crate::Error, &str, Ec); 6] = [
+    let cases: [ClassCase; 6] = [
         (
             || crate::Error::CalvinParticipantError,
             sqlstate::TRANSACTION_ROLLBACK,
@@ -1064,7 +1077,7 @@ fn transaction_and_dependency_variants_keep_their_sqlstate_across_a_hop() {
             Ec::DEPENDENT_OBJECTS_EXIST,
         ),
     ];
-    let encoders: [(&str, fn(crate::Error) -> TypedClusterError); 2] = [
+    let encoders: [HopEncoder; 2] = [
         ("execution_error_to_typed", execution_error_to_typed),
         ("From<Error>", TypedClusterError::from),
     ];
