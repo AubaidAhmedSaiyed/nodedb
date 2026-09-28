@@ -30,15 +30,15 @@ const ALLOWED: &[&str] = &[
     "engine/timeseries/retention_policy/autowire.rs",
     "engine/timeseries/retention_policy/enforcement.rs",
     "engine/bitemporal/enforcement.rs",
-    // Backup capture and restore reissue. The COPY handler authorizes the
-    // statement once, against the tenant's BACKUP permission. The rows it then
-    // captures or re-issues are the whole tenant, not one user's view: a
-    // per-collection grant or an RLS write policy must not drop a restored
-    // row. `durable.rs` is the single-node re-issue of every non-redo engine.
-    "control/backup/orchestrator.rs",
+    // Restore reissue. The COPY handler authorizes the statement once,
+    // against the tenant's BACKUP permission. The rows it re-issues are the
+    // whole tenant, not one user's view: a per-collection grant or an RLS
+    // write policy must not drop a restored row. `durable.rs` is the
+    // single-node re-issue of every non-redo engine. Backup capture, the
+    // cluster snapshot builder, PURGE TENANT and the MOVE TENANT snapshot
+    // fan out to every core through the all-cores exchange, not a SystemTask.
     "control/backup/restore/durable.rs",
-    // Cluster snapshot transfer.
-    "control/cluster/snapshot_builder.rs",
+    // Cluster snapshot install.
     "control/cluster/snapshot_applier.rs",
     // Committed DDL applied to engine state, and catalog maintenance.
     "control/server/shared/ddl/engine_apply.rs",
@@ -57,9 +57,7 @@ const ALLOWED: &[&str] = &[
     // entry, and each node's post-apply lane dispatches the compaction.
     "control/server/shared/ddl/neutral/version_history/checkpoint.rs",
     // Tenant lifecycle.
-    "control/server/shared/ddl/neutral/tenant/purge.rs",
     "control/server/shared/ddl/neutral/tenant/move_tenant/cutover.rs",
-    "control/server/shared/ddl/neutral/tenant/move_tenant/snapshot.rs",
     // Event Plane rules dispatched back through the Control Plane.
     "event/alert/executor.rs",
     // Legs of a request whose capability was consumed at the entry point.
