@@ -40,4 +40,3 @@ mod shuffle_aggregate;
 
 pub use capture::DistributedReadCapture;
 pub use exchange::{Resolved, resolve_and_materialize, resolve_exchange_in_plan};
-pub(crate) use peers::register_peers_from_topology;

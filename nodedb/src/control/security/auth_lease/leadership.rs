@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use nodedb_cluster::{METADATA_GROUP_ID, RaftRpc};
 
-use crate::control::server::exchange::resolve::register_peers_from_topology;
+use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::state::SharedState;
 
 /// The metadata group's leader and term, as this node sees them. A leader

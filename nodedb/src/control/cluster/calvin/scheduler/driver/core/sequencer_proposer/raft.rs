@@ -19,7 +19,7 @@ use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use nodedb_cluster::rpc_codec::{DataProposeRequest, ProposeTarget, RaftRpc};
 
 use super::seam::{ProposeDispatch, SequencerProposeError, SequencerProposer};
-use crate::control::server::exchange::resolve::register_peers_from_topology;
+use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::state::SharedState;
 
 /// Most forward RPCs one proposer keeps in flight. A proposal past this

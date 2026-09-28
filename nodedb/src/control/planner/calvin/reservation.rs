@@ -27,7 +27,7 @@ use nodedb_cluster::{
 };
 
 use crate::Error;
-use crate::control::server::exchange::resolve::register_peers_from_topology;
+use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::state::SharedState;
 
 /// Submit a reserve-read to THIS node's reservation inbox and await the

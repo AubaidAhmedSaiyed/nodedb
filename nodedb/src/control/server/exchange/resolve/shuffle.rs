@@ -38,6 +38,7 @@ use nodedb_cluster::{
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
 
+use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
 use crate::control::server::exchange::gather::outcome_to_response;
 use crate::control::server::payload_merge::merge_msgpack_arrays;
@@ -46,9 +47,7 @@ use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 
 use super::capture::DistributedReadCapture;
 use super::exchange::Resolved;
-use super::peers::{
-    distinct_data_node_count, producer_nodes, register_peers_from_topology, send_produce,
-};
+use super::peers::{distinct_data_node_count, producer_nodes, send_produce};
 
 /// Orchestrate a distributed shuffle hash join.
 ///

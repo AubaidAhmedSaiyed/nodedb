@@ -13,7 +13,7 @@ use nodedb_cluster::calvin::types::TxClass;
 use nodedb_cluster::{RaftRpc, SubmitCalvinInboxRequest, SubmitCalvinInboxResponse};
 
 use crate::Error;
-use crate::control::server::exchange::resolve::register_peers_from_topology;
+use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::state::SharedState;
 
 /// The sequencer ASSIGNMENT for a submitted dependent (OLLP) `TxClass`.

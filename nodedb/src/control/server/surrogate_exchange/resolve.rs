@@ -38,7 +38,7 @@ use nodedb_cluster::{
 };
 use nodedb_types::{CollectionKey, Surrogate};
 
-use crate::control::server::exchange::resolve::register_peers_from_topology;
+use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::state::SharedState;
 use crate::types::{TenantId, TraceId, VShardId};
 
