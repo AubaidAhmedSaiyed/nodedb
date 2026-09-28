@@ -156,7 +156,7 @@ pub async fn run_preexec_scan(
 /// `reject_data_plane_error` passes only a `NotFound` refusal. Its payload is
 /// empty, so it decodes as no matches, the answer the gateway path gives.
 fn scan_from_response(response: &crate::bridge::envelope::Response) -> crate::Result<PreexecScan> {
-    crate::control::server::dispatch_utils::reject_data_plane_error(response)?;
+    crate::control::local_dispatch::reject_data_plane_error(response)?;
     Ok(decode_scan(&response.payload))
 }
 

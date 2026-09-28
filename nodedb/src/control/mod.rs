@@ -27,6 +27,7 @@ pub(crate) mod fail_gate;
 pub mod gateway;
 pub mod insert_select;
 pub mod lease;
+pub mod local_dispatch;
 pub mod lock_utils;
 pub mod maintenance;
 pub mod merge_orchestrator;

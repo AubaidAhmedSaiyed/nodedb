@@ -189,6 +189,6 @@ async fn dispatch_counter(
     plan: PhysicalPlan,
 ) -> crate::Result<crate::bridge::envelope::Response> {
     let resp = dispatch_kv_write(state, session, plan).await?;
-    crate::control::server::dispatch_utils::reject_data_plane_error(&resp)?;
+    crate::control::local_dispatch::reject_data_plane_error(&resp)?;
     Ok(resp)
 }

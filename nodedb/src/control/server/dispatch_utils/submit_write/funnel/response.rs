@@ -9,10 +9,8 @@ use std::time::Instant;
 
 use crate::bridge::envelope::Status;
 use crate::control::array_catalog::ddl::AuthorizedDdlTransition;
+use crate::control::local_dispatch::{DispatchCollectError, collect_bounded_response};
 use crate::control::server::dispatch_utils::change_events::{WriteChangeSet, publish_change_set};
-use crate::control::server::dispatch_utils::collect::{
-    DispatchCollectError, collect_bounded_response,
-};
 use crate::control::server::dispatch_utils::durability_barrier::assert_durable_before_ack;
 use crate::control::server::dispatch_utils::minted::{
     Collect, MintedRecords, OwnedResponse, OwnedWait, RecordOwner, await_response_owned,

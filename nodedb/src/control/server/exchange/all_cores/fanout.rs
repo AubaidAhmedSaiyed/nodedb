@@ -170,9 +170,9 @@ async fn dispatch_all_cores(
         .into_iter()
         .map(|(core_id, request_id, mut rx)| async move {
             let context = format!("{label} gather on core {core_id}");
-            crate::control::server::dispatch_utils::collect_under_deadline(
+            crate::control::local_dispatch::collect_under_deadline(
                 &mut rx,
-                crate::control::server::dispatch_utils::DeadlineCollect {
+                crate::control::local_dispatch::DeadlineCollect {
                     request_id,
                     deadline,
                     max_result_bytes,
@@ -190,7 +190,7 @@ async fn dispatch_all_cores(
             let resp = result?;
             if resp.status == Status::Error {
                 // `NotFound` is an empty slice on this core, not an error.
-                crate::control::server::dispatch_utils::reject_data_plane_error(&resp)?;
+                crate::control::local_dispatch::reject_data_plane_error(&resp)?;
                 return Ok(None);
             }
             Ok(Some(resp))

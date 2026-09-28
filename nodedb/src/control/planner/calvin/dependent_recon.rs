@@ -430,7 +430,7 @@ async fn dispatch_dependent_edge_recon_inner(
         Some(CalvinApplyResult::Single { response, .. }) => {
             // An installed txn whose reply failed to render deposits it as an
             // error for the statement.
-            crate::control::server::dispatch_utils::reject_data_plane_error(&response)?;
+            crate::control::local_dispatch::reject_data_plane_error(&response)?;
             Some(response)
         }
         Some(CalvinApplyResult::Conflict) => {

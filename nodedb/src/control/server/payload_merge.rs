@@ -9,7 +9,7 @@
 //! a separate trailing array that the decoder silently ignores (truncating the
 //! result to the first chunk).
 //!
-//! Used by both `dispatch_utils::collect_bounded_response` (the per-request
+//! Used by both `local_dispatch::collect_bounded_response` (the per-request
 //! bounded collector) and `exchange::gather` (the cross-core/vShard gather).
 
 use nodedb_query::msgpack_scan;

@@ -3,12 +3,9 @@
 //! Shared dispatch utilities used by both the pgwire and native endpoints.
 
 mod change_events;
-mod collect;
 mod dispatch;
 mod durability_barrier;
 mod durable_write;
-mod error_status;
-mod local_read;
 mod minted;
 mod submit_write;
 mod types;
@@ -17,9 +14,6 @@ mod write_abort;
 pub(crate) use change_events::{
     WriteChangeSet, extract_write_change_set, publish_change_set_with_lsn,
     publish_cluster_array_change_events, publish_origin_change_events,
-};
-pub(crate) use collect::{
-    DeadlineCollect, DispatchCollectError, collect_bounded_response, collect_under_deadline,
 };
 pub use dispatch::{dispatch_authorized_autocommit_write, dispatch_authorized_to_data_plane};
 pub(crate) use dispatch::{
@@ -32,8 +26,6 @@ pub(crate) use durable_write::{
     dispatch_authorized_durable_write, dispatch_authorized_durable_write_with_source,
     dispatch_authorized_task_by_class, dispatch_durable_autocommit_write,
 };
-pub(crate) use error_status::reject_data_plane_error;
-pub(crate) use local_read::{LocalRead, dispatch_local_read};
 pub(crate) use minted::{
     Collect, MintedRecords, OwnedResponse, OwnedWait, RecordOwner, await_response_owned,
 };

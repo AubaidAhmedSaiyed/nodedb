@@ -197,7 +197,7 @@ async fn execute_read(
 fn read_from_response(
     response: &crate::bridge::envelope::Response,
 ) -> crate::Result<ReconRead<Vec<Vec<u8>>>> {
-    crate::control::server::dispatch_utils::reject_data_plane_error(response)?;
+    crate::control::local_dispatch::reject_data_plane_error(response)?;
     Ok(ReconRead {
         read_version_lsn: response.read_version_lsn,
         rows: vec![response.payload.to_vec()],

@@ -17,9 +17,7 @@ use std::collections::HashMap;
 
 use nodedb_types::{QualifiedCollection, TenantId};
 
-use crate::control::server::dispatch_utils::{
-    LocalRead, dispatch_local_read, reject_data_plane_error,
-};
+use crate::control::local_dispatch::{LocalRead, dispatch_local_read, reject_data_plane_error};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 

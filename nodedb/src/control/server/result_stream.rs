@@ -16,7 +16,7 @@
 //! fully-collected result.
 
 use crate::bridge::envelope::Status;
-use crate::control::server::dispatch_utils::reject_data_plane_error;
+use crate::control::local_dispatch::reject_data_plane_error;
 use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::types::Lsn;
 

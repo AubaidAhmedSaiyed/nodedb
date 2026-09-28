@@ -224,9 +224,9 @@ pub async fn broadcast_match_to_all_cores(
         .into_iter()
         .map(|(core_id, request_id, mut rx)| async move {
             let context = format!("match gather on core {core_id}");
-            crate::control::server::dispatch_utils::collect_under_deadline(
+            crate::control::local_dispatch::collect_under_deadline(
                 &mut rx,
-                crate::control::server::dispatch_utils::DeadlineCollect {
+                crate::control::local_dispatch::DeadlineCollect {
                     request_id,
                     deadline,
                     max_result_bytes,
@@ -260,8 +260,7 @@ pub async fn broadcast_match_to_all_cores(
 
         if resp.status == Status::Error {
             // `NotFound` is an empty CSR slice on this core, not an error.
-            if let Err(error) =
-                crate::control::server::dispatch_utils::reject_data_plane_error(&resp)
+            if let Err(error) = crate::control::local_dispatch::reject_data_plane_error(&resp)
                 && first_error.is_none()
             {
                 first_error = Some(error);

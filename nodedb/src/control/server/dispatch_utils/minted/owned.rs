@@ -16,9 +16,9 @@ use tokio::sync::oneshot;
 
 use crate::bridge::envelope::Response;
 use crate::control::ResponseReceiver;
+use crate::control::local_dispatch::{DispatchCollectError, collect_bounded_response};
 use crate::wal::WalManager;
 
-use super::super::collect::{DispatchCollectError, collect_bounded_response};
 use super::records::{MintedRecords, RecordOwner};
 use super::resolve::{resolve_at_final, resolve_on_response};
 

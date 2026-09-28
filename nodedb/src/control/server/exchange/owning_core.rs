@@ -15,9 +15,8 @@
 //! minus the empty cores' spurious contributions.
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::dispatch_utils::{
-    dispatch_to_data_plane_with_txn, reject_data_plane_error,
-};
+use crate::control::local_dispatch::reject_data_plane_error;
+use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};

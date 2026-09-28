@@ -13,9 +13,10 @@ use nodedb_cluster::rpc_codec::TypedClusterError;
 
 use crate::Error;
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
+use crate::control::local_dispatch::reject_data_plane_error;
 use crate::control::server::dispatch_utils::{
     AutocommitWrite, dispatch_autocommit_write, dispatch_to_data_plane_with_txn,
-    extract_write_change_set, publish_change_set_with_lsn, reject_data_plane_error,
+    extract_write_change_set, publish_change_set_with_lsn,
 };
 use crate::control::server::result_stream::ResultStream;
 use crate::control::server::shared::write_admission::plan_is_write;

@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use crate::control::lease::QueryLeaseScope;
+use crate::control::local_dispatch;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::identity::{Permission, required_permission};
 use crate::control::server::dispatch_utils;
@@ -282,7 +283,7 @@ async fn dispatch_read(state: &SharedState, task: PhysicalTask) -> crate::Result
         task.txn_id,
     )
     .await?;
-    dispatch_utils::reject_data_plane_error(&response)
+    local_dispatch::reject_data_plane_error(&response)
 }
 
 /// Flatten a staging-gate refusal into the crate error type.
