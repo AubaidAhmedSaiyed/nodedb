@@ -8,7 +8,8 @@
 //!   is determined by the `StartupPhase` passed to `register_gate`.
 //! - Firing a later-phase gate before an earlier-phase gate does not advance
 //!   past the earlier phase until all earlier gates also fire.
-//! - `GatewayEnable` is only reached after all prior phases complete.
+//! - `Serving`, the final phase, is only reached after all prior phases
+//!   complete.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +47,7 @@ async fn phases_advance_in_order_when_gates_fire() {
     let peers_gate = seq.register_gate(StartupPhase::WarmPeers, "peers");
     let health_gate = seq.register_gate(StartupPhase::HealthLoopStart, "health");
     let gw_gate = seq.register_gate(StartupPhase::GatewayEnable, "gateway");
+    let serving_gate = seq.register_gate(StartupPhase::Serving, "serving");
 
     // Initial phase is Boot.
     assert_eq!(gate.current_phase(), StartupPhase::Boot);
@@ -80,6 +82,14 @@ async fn phases_advance_in_order_when_gates_fire() {
 
     gw_gate.fire();
     assert_phase_reaches(&gate, StartupPhase::GatewayEnable).await;
+    assert_eq!(
+        gate.current_phase(),
+        StartupPhase::GatewayEnable,
+        "the pending serving gate holds the sequencer at GatewayEnable"
+    );
+
+    serving_gate.fire();
+    assert_phase_reaches(&gate, StartupPhase::Serving).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -87,10 +97,10 @@ async fn later_phase_gate_fires_first_does_not_advance_past_earlier_phase() {
     let (seq, gate) = StartupSequencer::new();
 
     let wal_gate = seq.register_gate(StartupPhase::WalRecovery, "wal");
-    let gw_gate = seq.register_gate(StartupPhase::GatewayEnable, "gateway");
+    let serving_gate = seq.register_gate(StartupPhase::Serving, "serving");
 
-    // Fire GatewayEnable first — phase must not advance past Boot until WalRecovery fires.
-    gw_gate.fire();
+    // Fire Serving first — phase must not advance past Boot until WalRecovery fires.
+    serving_gate.fire();
 
     // Wait a bit and confirm we're still at Boot.
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -100,10 +110,10 @@ async fn later_phase_gate_fires_first_does_not_advance_past_earlier_phase() {
         "phase advanced past Boot even though WalRecovery gate has not fired"
     );
 
-    // Now fire WalRecovery — phase should advance all the way to GatewayEnable
-    // since the GatewayEnable gate already fired.
+    // Now fire WalRecovery — phase should advance all the way to Serving
+    // since the Serving gate already fired.
     wal_gate.fire();
-    assert_phase_reaches(&gate, StartupPhase::GatewayEnable).await;
+    assert_phase_reaches(&gate, StartupPhase::Serving).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -141,6 +151,6 @@ async fn gate_fire_is_idempotent() {
 
     // Firing three times must succeed and advance the phase at least to WalRecovery.
     // With no later gates registered, the sequencer may advance all the way to
-    // GatewayEnable — that is expected and correct.
+    // Serving — that is expected and correct.
     assert_phase_reaches(&gate, StartupPhase::WalRecovery).await;
 }

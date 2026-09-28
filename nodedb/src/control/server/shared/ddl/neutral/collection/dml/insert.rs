@@ -15,6 +15,7 @@ use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::{DmlTxnCtx, PendingFieldInference};
 use crate::control::state::SharedState;
 
+use super::indexed_vector_fields::indexed_vector_fields;
 use super::parse::{
     authorize_write_target, dispatch_plan, extract_vector_fields, fields_to_insert_sql,
     parse_write_statement, plan_and_dispatch,
@@ -100,9 +101,10 @@ pub async fn insert_document(
                         fields.insert(field_def.name.clone(), typed_val);
                     }
                     Err(e) => {
-                        return Some(Err(ddl_err(
-                            "XX000",
-                            format!("sequence '{seq_name}' error: {e}"),
+                        return Some(Err(DdlError::from_error(
+                            &crate::control::sequence::error_map::sequence_error_to_error(
+                                seq_name, e,
+                            ),
                         )));
                     }
                 }
@@ -224,9 +226,9 @@ pub async fn insert_document(
                 &pending.fields,
             )
         {
-            return Some(Err(ddl_err(
-                "XX000",
-                format!("record inferred schema fields: {e}"),
+            return Some(Err(DdlError::from_error_in_context(
+                "record inferred schema fields",
+                &e,
             )));
         }
     }
@@ -245,10 +247,25 @@ pub async fn insert_document(
         return Some(err);
     }
 
-    // Dispatch VectorInsert for vector fields.
+    // Dispatch VectorInsert for the numeric-array fields no vector index
+    // covers. The document write above already indexed the covered ones, and
+    // a second insert would append a second HNSW node for the same row.
+    let indexed = match indexed_vector_fields(
+        state,
+        database_id,
+        tenant_id.as_u64(),
+        &parsed.coll_name,
+        parsed.collection_type.as_ref(),
+    ) {
+        Ok(indexed) => indexed,
+        Err(e) => return Some(Err(e)),
+    };
     let vec_vshard =
-        crate::types::VShardId::from_collection_in_database(database_id, &parsed.coll_name);
+        nodedb_types::CollectionKey::from_bare(database_id, &parsed.coll_name).vshard();
     for (field_name, vector) in extract_vector_fields(&fields) {
+        if indexed.contains(&field_name) {
+            continue;
+        }
         let dim = vector.len();
 
         {
@@ -276,14 +293,13 @@ pub async fn insert_document(
             }
         }
         let surrogate = match state.surrogate_assigner.assign(
-            database_id,
+            nodedb_types::CollectionKey::from_bare(database_id, &parsed.coll_name),
             tenant_id,
-            &parsed.coll_name,
             parsed.doc_id.as_bytes(),
         ) {
             Ok(s) => s,
             Err(e) => {
-                return Some(Err(ddl_err("XX000", format!("surrogate assign: {e}"))));
+                return Some(Err(DdlError::from_error_in_context("surrogate assign", &e)));
             }
         };
         let vec_plan = crate::bridge::envelope::PhysicalPlan::Vector(VectorOp::Insert {

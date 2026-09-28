@@ -15,7 +15,6 @@ use nodedb_physical::physical_plan::*;
 use crate::control::planner::sql_plan_convert::convert::ConvertContext;
 use crate::control::planner::sql_plan_convert::filter::serialize_filters;
 use crate::control::planner::sql_plan_convert::value::assignments_to_update_values_qualified;
-use crate::types::VShardId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 /// Parameters for [`convert_update_from`], bundled to avoid an unwieldy
@@ -47,6 +46,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update_from(
         tenant_id,
         ctx,
     } = params;
+    let collection_key = ctx.collection_key(collection);
     let coll_qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
         ctx.database_id,
         collection,
@@ -78,7 +78,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update_from(
 
     let updates = assignments_to_update_values_qualified(assignments)?;
     let target_filter_bytes = serialize_filters(target_filters)?;
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = collection_key.vshard();
     // A declared PRIMARY KEY implies NOT NULL; the Data Plane checks the
     // post-image against this name once the SET expressions are evaluated.
     let declared_primary_key = super::super::declared_primary_key_name(ctx, collection)?;

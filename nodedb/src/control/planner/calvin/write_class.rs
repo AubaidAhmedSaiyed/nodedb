@@ -139,13 +139,14 @@ fn kv_is_write(op: &KvOp) -> bool {
         | KvOp::BatchGet { .. }
         | KvOp::FieldGet { .. }
         | KvOp::MaterializeScan { .. }
-        // `SortedIndexRank`/`TopK`/`Range`/`Count`/`Score` are `Permission::Read`
-        // (query-only) despite the `SortedIndex*` naming.
+        // `SortedIndexRank`/`TopK`/`Range`/`Count`/`Score`/`TxnRead` are
+        // `Permission::Read` (query-only) despite the `SortedIndex*` naming.
         | KvOp::SortedIndexRank { .. }
         | KvOp::SortedIndexTopK { .. }
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
+        | KvOp::SortedIndexTxnRead { .. }
         // Read-only: reports what a governed write would apply, mutates
         // nothing, and is `NotAWrite` in `plan_vshard`.
         | KvOp::ResolveWrite(_)
@@ -481,6 +482,7 @@ mod tests {
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         });
         assert!(is_write_plan(&plan), "KvOp::Incr must be a write");
     }
@@ -490,9 +492,10 @@ mod tests {
         let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
             key: b"k".to_vec(),
-            delta: 1.5,
+            delta: "1.5".into(),
             surrogate: Surrogate::new(1),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         });
         assert!(is_write_plan(&plan), "KvOp::IncrFloat must be a write");
     }

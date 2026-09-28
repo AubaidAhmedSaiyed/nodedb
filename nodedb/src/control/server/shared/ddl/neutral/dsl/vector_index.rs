@@ -20,6 +20,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::index_registry::{
     IndexRegistration, propose_index_record,
 };
+use crate::control::server::shared::session::ddl_buffer;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::VectorOp;
@@ -119,7 +120,7 @@ pub async fn create_vector_index(
             collection,
             &field_name,
         )
-        .map_err(|e| ddl_err("XX000", format!("read vector index params: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("read vector index params", &e))?;
     if existing.is_some() {
         if stmt.header.if_not_exists {
             return Ok(vec![status()]);
@@ -140,7 +141,7 @@ pub async fn create_vector_index(
         .credentials
         .catalog()
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), index_name)
-        .map_err(|e| ddl_err("XX000", format!("read index registry: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("read index registry", &e))?
     {
         if stmt.header.if_not_exists && taken.kind == IndexKind::Vector {
             return Ok(vec![status()]);
@@ -183,16 +184,31 @@ pub async fn create_vector_index(
     // client — this pre-flight is the only place the statement can fail
     // closed. The post-apply dispatch that follows re-installs the same
     // parameters on this node, which is a no-op on an unmaterialized index.
-    crate::control::server::shared::ddl::engine_apply::apply_in_engine(
-        state,
-        tenant_id,
-        database_id,
-        collection,
-        set_params_plan.clone(),
-        "42P16",
-        CONTEXT,
-    )
-    .await?;
+    //
+    // Inside an explicit transaction the parameters install at COMMIT from
+    // the buffered catalog row, so the pre-flight changes nothing: it probes
+    // for a materialized index and refuses the same way.
+    if ddl_buffer::is_active() {
+        crate::control::server::shared::ddl::engine_apply::refuse_materialized_vector_index(
+            state,
+            tenant_id,
+            database_id,
+            collection,
+            &field_name,
+            CONTEXT,
+        )
+        .await?;
+    } else {
+        crate::control::server::shared::ddl::engine_apply::apply_in_engine(
+            state,
+            tenant_id,
+            database_id,
+            collection,
+            set_params_plan,
+            CONTEXT,
+        )
+        .await?;
+    }
 
     // Only now make it durable. The replicated catalog row re-registers the
     // index at boot via `seed_vector_index_params`, and each node's post-apply
@@ -219,7 +235,11 @@ pub async fn create_vector_index(
     // record plus the fan-out that reaches every core, not just the one the
     // pre-flight dispatched to.
     if outcome.needs_local_apply() {
-        crate::control::catalog_entry::post_apply::install_vector_index_params(stored, state).await;
+        let shared = state
+            .self_arc()
+            .map_err(|e| DdlError::from_error_in_context("install vector index params", &e))?;
+        crate::control::catalog_entry::post_apply::install_vector_index_params(stored, shared)
+            .await;
     }
 
     propose_index_record(
@@ -317,10 +337,16 @@ fn validate(options: &ParsedOptions) -> Result<VectorIndexParams, DdlError> {
         ));
     }
 
-    if uses_pq && pq_m > 0 && !dim.is_multiple_of(pq_m) {
+    // An omitted PQ_M takes the engine default, which must divide dim too.
+    let effective_pq_m = if pq_m > 0 {
+        pq_m
+    } else {
+        nodedb_vector::index_config::DEFAULT_PQ_M
+    };
+    if uses_pq && !dim.is_multiple_of(effective_pq_m) {
         return Err(ddl_err(
             "22023",
-            format!("{CONTEXT}: pq_m ({pq_m}) must divide dim ({dim}) evenly"),
+            format!("{CONTEXT}: pq_m ({effective_pq_m}) must divide dim ({dim}) evenly"),
         ));
     }
 

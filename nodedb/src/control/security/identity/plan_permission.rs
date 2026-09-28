@@ -272,6 +272,9 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         // Mirrors `ResolveTxn`: Calvin scheduler's commit path, treated as Write though it doesn't mutate base state.
         PhysicalPlan::Meta(MetaOp::CalvinResolve { .. }) => Permission::Write,
 
+        // Installs a committed transaction's post-images into base state.
+        PhysicalPlan::Meta(MetaOp::ApplyTransactionRedo { .. }) => Permission::Write,
+
         // KV engine: read operations.
         PhysicalPlan::Kv(
             KvOp::Get { .. }
@@ -285,6 +288,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | KvOp::SortedIndexRange { .. }
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. }
+            | KvOp::SortedIndexTxnRead { .. }
             // Read-only: reports what a governed write would apply; that write is authorized separately.
             | KvOp::ResolveWrite(_),
         ) => Permission::Read,

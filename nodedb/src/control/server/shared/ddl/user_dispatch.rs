@@ -22,7 +22,7 @@ use crate::control::server::shared::metering::{
 };
 use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::sync_dispatch::dispatch_authorized;
@@ -210,7 +210,7 @@ async fn authorize_for_identity(
 
     let task = PhysicalTask {
         tenant_id: identity.tenant_id,
-        vshard_id: VShardId::from_collection_in_database(scope.database_id(), collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(scope.database_id(), collection).vshard(),
         database_id: scope.database_id(),
         plan,
         post_set_op: PostSetOp::None,

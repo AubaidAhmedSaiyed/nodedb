@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use nodedb_sql::types::SqlValue;
-use nodedb_types::Surrogate;
+use nodedb_types::{CollectionKey, Surrogate};
 
 use super::super::super::convert::ConvertContext;
 use super::super::super::value::sql_value_to_string;
@@ -38,9 +38,13 @@ pub(in super::super::super) fn declared_primary_key_name(
     let Some(credentials) = ctx.credentials.as_ref() else {
         return Ok(None);
     };
+    // `collection` may be bare or db-qualified. The catalog keys collections
+    // by the bare name.
+    let bare =
+        crate::control::target_identity::naming::bare_collection_name(ctx.database_id, collection);
     credentials
         .catalog()
-        .declared_primary_key(ctx.database_id, ctx.tenant_id.as_u64(), collection)
+        .declared_primary_key(ctx.database_id, ctx.tenant_id.as_u64(), &bare)
 }
 
 /// Resolve a row's document id and surrogate, refusing a NULL or omitted
@@ -61,7 +65,7 @@ pub(in super::super::super) fn declared_primary_key_name(
 /// so no caller mints an identity without the NOT NULL check running first.
 pub(in super::super) fn resolve_doc_identity_with_declared(
     ctx: &ConvertContext,
-    collection: &str,
+    key: CollectionKey<'_>,
     primary_key: &str,
     declared: Option<&str>,
     row: &[(String, SqlValue)],
@@ -71,7 +75,7 @@ pub(in super::super) fn resolve_doc_identity_with_declared(
             DocId::Present(_) => {}
             DocId::ExplicitNull | DocId::Absent => {
                 return Err(crate::Error::RejectedConstraint {
-                    collection: collection.to_string(),
+                    collection: key.name().to_string(),
                     constraint: "not_null".to_string(),
                     detail: format!("primary key '{declared}' cannot be NULL or omitted"),
                 });
@@ -80,17 +84,17 @@ pub(in super::super) fn resolve_doc_identity_with_declared(
     }
 
     if is_auto_rowid_pk(primary_key) {
-        let (s, pk) = assign_fresh(ctx, collection)?;
+        let (s, pk) = assign_fresh(ctx, key)?;
         return Ok((pk, s));
     }
     let mint_key: &str = declared.unwrap_or(primary_key);
     match extract_doc_id(row, mint_key) {
         DocId::Present(id) => {
-            let s = assign_for_pk(ctx, collection, id.as_bytes())?;
+            let s = assign_for_pk(ctx, key, id.as_bytes())?;
             Ok((id, s))
         }
         DocId::ExplicitNull | DocId::Absent => {
-            let (s, pk) = assign_fresh(ctx, collection)?;
+            let (s, pk) = assign_fresh(ctx, key)?;
             Ok((pk, s))
         }
     }
@@ -98,10 +102,10 @@ pub(in super::super) fn resolve_doc_identity_with_declared(
 
 pub(in super::super) fn assign_for_pk(
     ctx: &ConvertContext,
-    collection: &str,
+    key: CollectionKey<'_>,
     pk_bytes: &[u8],
 ) -> crate::Result<Surrogate> {
-    ctx.surrogate_for_pk(collection, pk_bytes)
+    ctx.surrogate_for_pk(key, pk_bytes)
 }
 
 /// Allocate a fresh, unique surrogate for a row whose primary key is the
@@ -114,9 +118,9 @@ pub(in super::super) fn assign_for_pk(
 /// Returns the bound identity string. The caller uses it verbatim.
 pub(super) fn assign_fresh(
     ctx: &ConvertContext,
-    collection: &str,
+    key: CollectionKey<'_>,
 ) -> crate::Result<(Surrogate, String)> {
-    ctx.fresh_surrogate(collection)
+    ctx.fresh_surrogate(key)
 }
 
 /// Whether a collection's declared primary key is the auto-generated `_rowid`
@@ -137,7 +141,7 @@ pub(in super::super) fn is_auto_rowid_pk(primary_key: &str) -> bool {
 /// caller for the whole statement — not re-read here per row.
 pub(in super::super) fn columnar_row_surrogates(
     ctx: &ConvertContext,
-    collection: &str,
+    key: CollectionKey<'_>,
     columnar_rows: &[&Vec<(String, SqlValue)>],
     primary_key: &str,
     declared_pk: Option<&str>,
@@ -151,7 +155,7 @@ pub(in super::super) fn columnar_row_surrogates(
     let mut out = Vec::with_capacity(columnar_rows.len());
     for row in columnar_rows {
         let (_, surrogate) =
-            resolve_doc_identity_with_declared(ctx, collection, primary_key, declared, row)?;
+            resolve_doc_identity_with_declared(ctx, key, primary_key, declared, row)?;
         out.push(surrogate);
     }
     Ok(out)

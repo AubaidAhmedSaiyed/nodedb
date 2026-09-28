@@ -51,7 +51,7 @@ pub async fn estimate_count(
             gate.refuse_if_read_policy(&coll, "ESTIMATE_COUNT")?;
             gate.refuse_if_field_redacted(&coll, &field, "the estimated count")?;
 
-            let vshard = crate::types::VShardId::from_collection_in_database(database_id, &coll);
+            let vshard = nodedb_types::CollectionKey::from_bare(database_id, &coll).vshard();
             let plan = PhysicalPlan::Document(DocumentOp::EstimateCount {
                 collection: nodedb_types::QualifiedCollection::new(database_id, &coll),
                 field,
@@ -83,7 +83,7 @@ pub async fn estimate_count(
                     ))]);
                 }
                 Err(e) => {
-                    return Err(DdlError::new("XX000", e.to_string()));
+                    return Err(DdlError::from_error(&e));
                 }
             }
         }

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Deferred trigger event collection during transaction batches.
+//! Deferred trigger events of a committed transaction.
 //!
-//! Accumulates write metadata during `execute_transaction_batch()`.
-//! After successful commit, emits these as WriteEvents with
-//! `EventSource::Deferred` so the Event Plane fires DEFERRED-mode triggers.
+//! The redo install collects the document writes of a committed record and,
+//! once the record settled, emits them as WriteEvents. A client transaction's
+//! rows carry `EventSource::Deferred`, so the Event Plane fires DEFERRED-mode
+//! triggers. Rows of any other source keep that source, so a trigger's own
+//! transaction and a restore fire no DEFERRED trigger (see
+//! [`EventSource::committed_row_source`]).
 
 use std::sync::Arc;
 
@@ -22,19 +25,20 @@ pub(in crate::data::executor) struct DeferredWrite {
 }
 
 impl CoreLoop {
-    /// Emit deferred trigger events for a completed transaction batch.
+    /// Emit the document-row events of a committed transaction.
     ///
-    /// Called after `execute_transaction_batch()` commits successfully.
-    /// Each write in the transaction is emitted as a WriteEvent with
-    /// `EventSource::Deferred`, which the Event Plane consumer routes
-    /// to DEFERRED-mode triggers.
+    /// Called after a committed redo record installed and settled. Each
+    /// write is emitted as a WriteEvent whose source is the
+    /// [`EventSource::committed_row_source`] of the record's `record_source`.
     pub(in crate::data::executor) fn emit_deferred_events(
         &mut self,
         writes: Vec<DeferredWrite>,
+        record_source: EventSource,
         database_id: crate::types::DatabaseId,
         tenant_id: crate::types::TenantId,
         vshard_id: crate::types::VShardId,
     ) {
+        let source = record_source.committed_row_source();
         let producer = match self.event_producer.as_mut() {
             Some(p) => p,
             None => return,
@@ -52,10 +56,13 @@ impl CoreLoop {
                 op: write.op,
                 row_id: RowId::row(write.identity),
                 lsn: self.watermark,
+                // A deferred trigger event repeats a write whose own event
+                // already carries the record; catch-up never rebuilds it.
+                record: None,
                 database_id,
                 tenant_id,
                 vshard_id,
-                source: EventSource::Deferred,
+                source,
                 new_value: write.new_value.map(|v| Arc::from(v.as_slice())),
                 old_value: write.old_value.map(|v| Arc::from(v.as_slice())),
                 system_time_ms,

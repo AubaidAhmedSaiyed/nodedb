@@ -6,12 +6,17 @@
 //! One module per protocol surface owns that surface's mapping, so a change
 //! to its SQLSTATE / HTTP / RESP / native codes is a one-file edit.
 
+#[cfg(test)]
+pub(crate) mod class_parity;
 mod gateway_map;
 mod http;
 mod native;
 mod pgwire;
 mod remote_code;
 mod resp;
+mod sqlstate_status;
+#[cfg(test)]
+mod system_dispatch_refusal;
 #[cfg(test)]
 mod test_fixtures;
 

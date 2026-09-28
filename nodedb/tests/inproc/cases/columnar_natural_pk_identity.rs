@@ -68,7 +68,10 @@ async fn columnar_natural_pk_rows_get_distinct_surrogates() {
     // the time the INSERT returns.
     let catalog = server.shared.credentials.catalog();
     let bindings = catalog
-        .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), "parts")
+        .scan_surrogates_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "parts"),
+            TenantId::new(1),
+        )
         .expect("scan persisted surrogate bindings for parts");
 
     assert_eq!(

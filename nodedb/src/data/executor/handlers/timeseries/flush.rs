@@ -5,12 +5,10 @@
 //! The boot-side counterpart — rebuilding `ts_registries` from the partitions
 //! this writes — lives in `data::executor::timeseries_checkpoint`.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::transaction::undo::UndoEntry;
-use crate::data::executor::task::ExecutionTask;
+use crate::data::executor::timeseries_checkpoint::stamp::write_ts_stamp;
 use crate::engine::timeseries::columnar_segment::ColumnarSegmentWriter;
 use crate::engine::timeseries::partition_registry::PartitionRegistry;
 use crate::types::{DatabaseId, TenantId};
@@ -30,17 +28,28 @@ impl CoreLoop {
     ///
     /// These rows have no durable copy but the WAL, and the coordinated
     /// checkpoint calls this flush and then reports the LSN that authorises
-    /// deleting it. Draining first — as this did while its only callers were the
-    /// ingest-path thresholds and the idle timer — meant an encode or write
-    /// failure took the rows out of memory without putting them anywhere: the
-    /// scan stopped returning them for the rest of the process's life, and only
-    /// a restart's WAL replay brought them back. The partition is therefore
+    /// deleting it. An encode or write failure must not take the rows out of
+    /// memory without putting them anywhere. The partition is therefore
     /// written from a BORROW (`ColumnarMemtable::flush_view`) and the drain
     /// happens only once `write_partition` has returned `Ok` — its
-    /// `partition.meta` write being the commit point. Every failure path now
+    /// `partition.meta` write being the commit point. Every failure path
     /// leaves the memtable exactly as it was, so a failed flush costs a retry
     /// while the caller's clamped checkpoint LSN keeps the WAL records behind
     /// it.
+    ///
+    /// ## What the partition's stamp names
+    ///
+    /// The partition carries the collection's replay stamp as of this flush
+    /// (`timeseries_checkpoint::stamp`): the collection stamp plus every
+    /// record this core applied. Every row in the view belongs to one of
+    /// those records, and every one of those records has its rows here or in
+    /// an earlier partition. Restart replay skips exactly the named records.
+    ///
+    /// The ingest path resolves everything that could stop it mid-record
+    /// before the first row of a record goes in (its record-boundary admission
+    /// gate), and notes a record applied only once its rows all landed. A
+    /// flush from between two rows of a record would break the stamp in
+    /// either direction, so no caller may introduce one.
     pub(in crate::data::executor) fn flush_ts_collection(
         &mut self,
         tid: TenantId,
@@ -66,28 +75,20 @@ impl CoreLoop {
         let writer = ColumnarSegmentWriter::new(&segment_dir);
         let view = mt.flush_view();
 
-        // Use the max ingested WAL LSN for this collection so the partition
-        // records which WAL records have been flushed. Read before the write and
-        // never advanced by it.
-        //
-        // This is a collection-wide SCALAR, so the only state it can express is
-        // "every record at or below N is WHOLLY on disk" — and boot replay reads
-        // it exactly that way, skipping every record at or below the highest
-        // stamp it finds. "All of <= L-1 plus part of L" has no representation
-        // here, which is why the ingest path resolves everything that could stop
-        // it mid-record BEFORE the first row of a record goes in (its
-        // record-boundary admission gate) and stamps a record's LSN only once
-        // the record is fully ingested. Those two together are what make the
-        // claim this stamp rests on true by construction: every row in the view
-        // belongs to a record at or below it.
-        //
-        // A flush fired from between two rows of a record would break it in
-        // whichever direction it stamped — the predecessor's LSN duplicates the
-        // record on replay, the record's own LSN loses the rows not yet
-        // flushed — so no caller may introduce one.
-        let flush_wal_lsn = self.ts_max_ingested_lsn.get(&key).copied().unwrap_or(0);
+        let stamp = self.ts_flush_stamp(&key)?;
+        // Informational: `PartitionMeta` is shared with Lite, and replay reads
+        // the stamp file, never this LSN.
+        let flush_wal_lsn = stamp.rows.highest();
         let partition_name =
             unique_partition_name(&segment_dir, view.min_ts, view.max_ts, flush_wal_lsn)?;
+        // The stamp lands before `partition.meta`, the partition's commit
+        // point, so a committed partition always carries it.
+        let partition_dir = segment_dir.join(&partition_name);
+        std::fs::create_dir_all(&partition_dir).map_err(|e| crate::Error::Storage {
+            engine: "timeseries".into(),
+            detail: format!("create partition dir {}: {e}", partition_dir.display()),
+        })?;
+        write_ts_stamp(&partition_dir, &stamp)?;
         let ts_kek = self.segment_keks.ts_segment_kek.as_ref();
         let meta = writer
             .write_partition(&partition_name, &view, 0, flush_wal_lsn, ts_kek)
@@ -107,6 +108,9 @@ impl CoreLoop {
             });
         };
         let drain = mt.drain();
+        let replay_prefix = stamp.rows.prefix;
+        let applied_ranges = stamp.rows.applied_above.len();
+        self.ts_replay_stamps.insert(key.clone(), stamp);
 
         // The memtable is empty, so drop its memory reservation. The
         // reservation tracks the full resident footprint, kept current by
@@ -117,6 +121,8 @@ impl CoreLoop {
         tracing::info!(
             collection,
             rows = meta.row_count,
+            replay_prefix,
+            applied_ranges,
             "timeseries columnar flush complete"
         );
 
@@ -160,82 +166,6 @@ impl CoreLoop {
         }
 
         Ok(())
-    }
-
-    /// Finalize the metadata deliberately deferred by transaction-batch
-    /// timeseries ingestion. At this point all sub-plans, constraints and CRDT
-    /// application succeeded, so publication is safe. A maintenance flush is
-    /// post-commit: failure leaves the committed memtable/WAL intact and is
-    /// logged as retryable backlog. It cannot set `Response::partial`, which
-    /// means a further stream frame is coming and would strand a COMMIT waiter.
-    pub(in crate::data::executor) fn finalize_deferred_timeseries_ingests(
-        &mut self,
-        task: &ExecutionTask,
-        undo_log: &[UndoEntry],
-    ) {
-        let mut collections = HashMap::new();
-        for entry in undo_log {
-            if let UndoEntry::TimeseriesIngest(token) = entry {
-                let prior_rows = token
-                    .memtable_before
-                    .as_ref()
-                    .map(|snapshot| snapshot.row_count)
-                    .unwrap_or(0);
-                collections
-                    .entry(token.collection_key.clone())
-                    .and_modify(|prior: &mut u64| *prior = (*prior).min(prior_rows))
-                    .or_insert(prior_rows);
-            }
-        }
-
-        if collections.is_empty() {
-            return;
-        }
-
-        let mut accepted_any = false;
-        let mut flush_backlog = false;
-        for ((database_id, tenant_id, collection), prior_rows) in collections {
-            let accepted = self
-                .columnar_memtables
-                .get(&(database_id, tenant_id, collection.clone()))
-                .map(|memtable| memtable.row_count().saturating_sub(prior_rows) as usize)
-                .unwrap_or(0);
-            accepted_any |= accepted > 0;
-            self.checkpoint_coordinator
-                .mark_dirty("timeseries", accepted);
-            self.note_collection_write_lsn(task, &collection);
-            self.recharge_ts_memtable_budget(tenant_id, database_id, &collection);
-            let needs_flush = self
-                .columnar_memtables
-                .get(&(database_id, tenant_id, collection.clone()))
-                .is_some_and(|memtable| {
-                    memtable.memory_bytes() >= self.ts_tuning.memtable_budget_bytes
-                });
-            if needs_flush
-                && let Err(error) = self.flush_ts_collection(
-                    tenant_id,
-                    database_id,
-                    &collection,
-                    self.epoch_system_ms.unwrap_or(0),
-                )
-            {
-                flush_backlog = true;
-                tracing::error!(
-                    collection,
-                    error = %error,
-                    "committed timeseries flush deferred as retryable backlog"
-                );
-            }
-        }
-        if accepted_any {
-            self.last_ts_ingest = Some(std::time::Instant::now());
-        }
-        if flush_backlog {
-            tracing::warn!(
-                core = self.core_id,
-                "committed timeseries rows remain in the retryable flush backlog"
-            );
-        }
     }
 
     /// Charge the memtable's current resident footprint, replacing the

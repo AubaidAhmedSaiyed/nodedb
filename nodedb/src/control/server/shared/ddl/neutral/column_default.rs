@@ -105,8 +105,8 @@ pub(super) fn validate_column_default(
 /// The expression is classified and parsed, never evaluated, so a
 /// `DEFAULT nextval('s')` column never advances its sequence at DDL time.
 ///
-/// An unregistered function name raises SQLSTATE `42883`; every other
-/// rejection raises SQLSTATE `42601`.
+/// An unregistered function name raises SQLSTATE `42883`, a type error
+/// `42804`, a value out of range `22003`, and a statement error `42601`.
 pub(super) fn validate_clause_expr(clause: &str, owner: &str, expr: &str) -> Result<(), DdlError> {
     nodedb_sql::planner::defaults::validate_default_expr(expr, owner)
         .map_err(|error| clause_error(clause, owner, &error))
@@ -117,10 +117,41 @@ fn clause_error(clause: &str, owner: &str, error: &SqlError) -> DdlError {
     let sqlstate = match error {
         SqlError::UndefinedFunction { .. } => sqlstate::UNDEFINED_FUNCTION,
         SqlError::TypeMismatch { .. } => sqlstate::DATATYPE_MISMATCH,
-        SqlError::IntegerOutOfRange { .. } | SqlError::FloatOutOfRange { .. } => {
-            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE
+        SqlError::IntegerOutOfRange { .. }
+        | SqlError::FloatOutOfRange { .. }
+        | SqlError::ConstantOverflow { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+        SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
+        SqlError::DataException { .. } => sqlstate::DATA_EXCEPTION,
+        SqlError::InvalidLimitValue { .. } => sqlstate::INVALID_LIMIT_VALUE,
+        SqlError::UnknownTable { .. } | SqlError::CollectionDeactivated { .. } => {
+            sqlstate::UNDEFINED_TABLE
         }
-        _ => sqlstate::SYNTAX_ERROR,
+        SqlError::UnknownColumn { .. } => sqlstate::UNDEFINED_COLUMN,
+        SqlError::AmbiguousColumn { .. } => sqlstate::AMBIGUOUS_COLUMN,
+        SqlError::UndefinedObject { .. } => sqlstate::UNDEFINED_OBJECT,
+        SqlError::ObjectNotInPrerequisiteState { .. } => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+        SqlError::SequencePerRowUnsupported { .. }
+        | SqlError::SearchFunctionOutsideSearch { .. }
+        | SqlError::UnsupportedConstraint { .. }
+        | SqlError::ConflictingEngineClause { .. } => sqlstate::FEATURE_NOT_SUPPORTED,
+        SqlError::RetryableSchemaChanged { .. } => sqlstate::SERIALIZATION_FAILURE,
+        SqlError::RecursionDepthExceeded { .. } => sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        SqlError::Parse { .. }
+        | SqlError::Arity { .. }
+        | SqlError::Unsupported { .. }
+        | SqlError::UnevaluableDefault { .. }
+        | SqlError::SetvalInColumnDefault { .. }
+        | SqlError::InvalidFunction { .. }
+        | SqlError::InvalidWindowFrame { .. }
+        | SqlError::MissingField { .. }
+        | SqlError::InsertColumnArityMismatch { .. }
+        | SqlError::PositionalKvInsertUnsupported { .. }
+        | SqlError::InvalidIdentifier { .. }
+        | SqlError::ReservedIdentifier { .. }
+        | SqlError::InvalidRecursiveSetOp { .. }
+        | SqlError::InvalidRecursiveSelfRef { .. }
+        | SqlError::RecursiveColumnMismatch { .. }
+        | SqlError::DuplicateRecursiveColumn { .. } => sqlstate::SYNTAX_ERROR,
     };
     DdlError::new(
         sqlstate,

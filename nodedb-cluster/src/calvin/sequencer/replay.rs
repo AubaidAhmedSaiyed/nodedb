@@ -56,6 +56,7 @@ impl SequencerStateMachine {
     ///   computed identically to the live [`SequencerStateMachine::apply`] path.
     /// * `ReserveRead`  targeting `vshard_id` → [`SchedulerInput::Reserve`].
     /// * `ReleaseReservation` targeting `vshard_id` → [`SchedulerInput::Release`].
+    /// * `CutMarker` → [`SchedulerInput::CutMarker`], for every vShard.
     /// * All other variants carry no per-vShard scheduler input.
     ///
     /// Entries are emitted in Raft-log order (and, within an epoch batch, in
@@ -81,6 +82,11 @@ impl SequencerStateMachine {
                 // No-op entry (newly elected leader heartbeat).
                 continue;
             }
+            if crate::conf_change::ConfChange::is_conf_change(&entry.data) {
+                // A membership change of the sequencer group, applied by the
+                // Raft layer; it carries no sequencer input.
+                continue;
+            }
             let seq_entry: SequencerEntry = match zerompk::from_msgpack(&entry.data) {
                 Ok(e) => e,
                 Err(err) => {
@@ -98,9 +104,25 @@ impl SequencerStateMachine {
                         continue;
                     }
                     // Re-derive participating_vshards (skipped during serialization)
-                    // exactly as the live apply path does before fan-out.
+                    // exactly as the live apply path does before fan-out. The live
+                    // path skips an entry whose participants cannot be derived and
+                    // files the report, so replay skips it too.
+                    let mut underivable = None;
                     for txn in &mut batch.txns {
-                        txn.tx_class.restore_derived();
+                        if let Err(err) = txn.tx_class.restore_derived() {
+                            underivable = Some(err);
+                            break;
+                        }
+                    }
+                    if let Some(err) = underivable {
+                        tracing::warn!(
+                            raft_index = entry.index,
+                            epoch = batch.epoch,
+                            error = %err,
+                            "calvin replay: epoch batch carries a transaction with \
+                             underivable participants; skipping"
+                        );
+                        continue;
                     }
 
                     // Shared with the live `apply` EpochBatch arm via
@@ -140,6 +162,11 @@ impl SequencerStateMachine {
                 } if vshard == vshard_id => {
                     result.push(SchedulerInput::Release { owner, reason });
                 }
+                // A cut marker reaches every vShard, exactly as the live
+                // `CutMarker` arm fans it out.
+                SequencerEntry::CutMarker { hlc } => {
+                    result.push(SchedulerInput::CutMarker { hlc });
+                }
                 // Reservation entries for a different vShard carry nothing for us.
                 SequencerEntry::ReserveRead { .. } => {}
                 SequencerEntry::ReleaseReservation { .. } => {}
@@ -170,7 +197,7 @@ mod tests {
     };
     use nodedb_types::{
         TenantId,
-        id::{DatabaseId, VShardId},
+        id::{CollectionKey, DatabaseId},
     };
     use std::collections::HashMap;
     use tokio::sync::mpsc;
@@ -179,7 +206,9 @@ mod tests {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..512 {
             let name = format!("col_{i}");
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             if let Some((ref fname, fv)) = first {
                 if fv != vshard {
                     return (fname.clone(), name);
@@ -193,8 +222,12 @@ mod tests {
 
     fn make_batch_with_two_vshards() -> (EpochBatch, u32, u32) {
         let (col_a, col_b) = find_two_distinct_collections();
-        let real_va = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_a).as_u32();
-        let real_vb = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_b).as_u32();
+        let real_va = CollectionKey::from_bare(DatabaseId::DEFAULT, &col_a)
+            .vshard()
+            .as_u32();
+        let real_vb = CollectionKey::from_bare(DatabaseId::DEFAULT, &col_b)
+            .vshard()
+            .as_u32();
         let write_set = ReadWriteSet::new(vec![
             EngineKeySet::Document {
                 collection: col_a,

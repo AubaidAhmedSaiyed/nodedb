@@ -71,7 +71,7 @@ pub async fn verify_audit_chain(
     let audit_entries = state
         .wal
         .recover_audit_entries()
-        .map_err(|e| err("XX000", &format!("audit WAL recovery failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("audit WAL recovery failed", &e))?;
 
     let mut valid = true;
     let mut checked = 0u64;

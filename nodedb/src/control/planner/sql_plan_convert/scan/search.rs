@@ -4,7 +4,7 @@
 //! builder shared across them.
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 
 use super::super::filter::serialize_filters;
@@ -17,11 +17,10 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 pub(in crate::control::planner::sql_plan_convert) fn convert_vector_search(
     p: VectorSearchParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let coll_qualified = super::super::convert::db_qualified(p.ctx.database_id, p.collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(p.ctx.database_id, p.collection);
     let qualified_collection =
         nodedb_types::QualifiedCollection::new(p.ctx.database_id, p.collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(p.ctx.database_id, collection);
+    let vshard = collection_key.vshard();
     let filter_bytes = serialize_filters(p.filters)?;
     let inline_prefilter_plan = match p.array_prefilter {
         Some(pref) => Some(Box::new(build_array_prefilter_plan(
@@ -63,10 +62,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_vector_search(
 pub(in crate::control::planner::sql_plan_convert) fn convert_sparse_search(
     p: SparseSearchParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let coll_qualified = super::super::convert::db_qualified(p.database_id, p.collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(p.database_id, p.collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(p.database_id, p.collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(p.database_id, collection);
+    let vshard = collection_key.vshard();
     Ok(vec![PhysicalTask {
         tenant_id: p.tenant_id,
         vshard_id: vshard,
@@ -184,10 +182,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_text_search(
 ) -> crate::Result<Vec<PhysicalTask>> {
     use nodedb_sql::fts_types::FtsQuery;
 
-    let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    let vshard = collection_key.vshard();
 
     // Phrase queries emit a dedicated PhraseSearch op rather than going
     // through the BM25 plain-string path. Score alias is not meaningful
@@ -285,10 +282,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_hybrid_search(
         tenant_id,
         database_id,
     } = p;
-    let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    let vshard = collection_key.vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,
@@ -328,10 +324,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_hybrid_search_tripl
         tenant_id,
         database_id,
     } = p;
-    let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    let vshard = collection_key.vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,

@@ -11,7 +11,7 @@ use super::types::{HEADER_LEN, MAGIC, SECTION_OVERHEAD, TRAILER_LEN, VERSION};
 
 /// Parse and fully validate a plaintext backup envelope.
 ///
-/// Rejects bytes that do not carry version 1 in the header.
+/// Rejects bytes that do not carry [`VERSION`] in the header.
 /// Use [`crate::backup_envelope::parse_encrypted`] for encrypted envelopes.
 pub fn parse(bytes: &[u8], max_total: u64) -> Result<Envelope, EnvelopeError> {
     if bytes.len() as u64 > max_total {
@@ -308,7 +308,7 @@ mod tests {
         assert!(parse(truncated, DEFAULT_MAX_TOTAL_BYTES).is_err());
     }
 
-    /// Asserts `NDBB` magic at [0..4], VERSION == 1 at [4], and that the
+    /// Asserts `NDBB` magic at [0..4], VERSION == 2 at [4], and that the
     /// header CRC at [48..52] covers header bytes [0..48].
     #[test]
     fn golden_backup_envelope_format() {
@@ -319,9 +319,9 @@ mod tests {
         // Magic at [0..4].
         assert_eq!(&bytes[0..4], MAGIC.as_slice(), "magic mismatch");
 
-        // VERSION == 1 at [4].
+        // VERSION == 2 at [4].
         assert_eq!(bytes[4], VERSION, "version mismatch");
-        assert_eq!(bytes[4], 1u8, "expected VERSION == 1");
+        assert_eq!(bytes[4], 2u8, "expected VERSION == 2");
 
         // Header CRC at [48..52] covers [0..48].
         assert!(bytes.len() >= HEADER_LEN, "envelope too short for header");

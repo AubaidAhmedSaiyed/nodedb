@@ -4,6 +4,7 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::wal_replay::kv_put::KvReplayRecord;
 
 impl CoreLoop {
@@ -19,7 +20,7 @@ impl CoreLoop {
         record_lsn: u64,
     ) -> bool {
         tombstones.is_tombstoned(tenant_id, collection, record_lsn)
-            || self.floors.replay_floors.kv.covers(record_lsn)
+            || self.replay_watermark_skips(self.floors.replay_floors.kv.covers(record_lsn))
     }
 
     /// Replay WAL KV records to rebuild in-memory hash tables after crash.
@@ -79,6 +80,39 @@ impl CoreLoop {
 
                 if let Some(applied) = self.try_replay_kv_put(&kv_record, tombstones) {
                     puts += applied;
+                    continue;
+                }
+                // kv_expire / kv_persist change only the expiry of the value
+                // the key holds when the record applies — see
+                // `wal_replay_kv_expiry.rs`. A committed redo record carries
+                // them for a transaction's TTL-only writes.
+                if let Some(applied) = self.try_replay_kv_expire(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
+                if let Some(applied) = self.try_replay_kv_persist(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
+                // A committed redo record carries only absolute `kv_put`
+                // post-images and TTL changes. Every other shape is left
+                // unclaimed, so the validate pass refuses the record before
+                // any arm writes.
+                if self.applying_committed_redo() {
                     continue;
                 }
 
@@ -183,30 +217,6 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_expire — see `wal_replay_kv_expiry.rs`.
-                if let Some(applied) = self.try_replay_kv_expire(
-                    &record.payload,
-                    tenant_id,
-                    database_id,
-                    record_lsn,
-                    tombstones,
-                ) {
-                    puts += applied;
-                    continue;
-                }
-
-                // kv_persist — see `wal_replay_kv_expiry.rs`.
-                if let Some(applied) = self.try_replay_kv_persist(
-                    &record.payload,
-                    tenant_id,
-                    database_id,
-                    record_lsn,
-                    tombstones,
-                ) {
-                    puts += applied;
-                    continue;
-                }
-
                 // kv_incr (delta): re-runs the same integer increment
                 // against current state.
                 if let Some(applied) = self.try_replay_kv_incr(
@@ -245,6 +255,29 @@ impl CoreLoop {
                     if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
                         continue;
                     }
+                    if self.claim_for_validation() {
+                        continue;
+                    }
+                    if self.recording_redo_undo() {
+                        let undo: Vec<UndoEntry> = keys
+                            .iter()
+                            .filter_map(|key| {
+                                let prior = self.kv_engine.entry_image(
+                                    database_id,
+                                    tenant_id,
+                                    &collection,
+                                    key,
+                                    now_ms,
+                                )?;
+                                Some(UndoEntry::KvDelete {
+                                    collection: collection.clone(),
+                                    key: key.clone(),
+                                    prior,
+                                })
+                            })
+                            .collect();
+                        self.record_redo_undo(undo);
+                    }
                     self.kv_engine
                         .delete(database_id, tenant_id, &collection, &keys, now_ms);
                     for deleted_key in &keys {
@@ -268,6 +301,18 @@ impl CoreLoop {
                     if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
                         continue;
                     }
+                    if self.claim_for_validation() {
+                        continue;
+                    }
+                    if self.recording_redo_undo() {
+                        let rows =
+                            self.kv_engine
+                                .export_collection(database_id, tenant_id, &collection);
+                        self.record_redo_undo([UndoEntry::KvTruncate {
+                            collection: collection.clone(),
+                            rows,
+                        }]);
+                    }
                     self.kv_engine.truncate(database_id, tenant_id, &collection);
                     self.note_replay_write_lsn(
                         database_id,
@@ -277,6 +322,9 @@ impl CoreLoop {
                         record_lsn,
                     );
                     deletes += 1;
+                    continue;
+                }
+                if self.applying_committed_redo() {
                     continue;
                 }
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+mod applied_prefix;
 pub(crate) mod array_checkpoint;
 pub(crate) mod checkpoint_decode_error;
 pub(crate) mod checkpoint_encoding;
@@ -18,6 +19,8 @@ pub(crate) mod kv_checkpoint;
 pub(super) mod msgpack_utils;
 pub(crate) mod replay_abort;
 pub(crate) mod replay_floors;
+mod replay_policy;
+mod replay_task;
 pub mod response_codec;
 mod row_shape;
 mod scan_normalize;
@@ -37,6 +40,7 @@ pub(crate) mod vector_string;
 mod wal_replay;
 mod wal_replay_all;
 mod wal_replay_columnar_dml;
+mod wal_replay_columnar_image;
 mod wal_replay_columnar_truncate;
 mod wal_replay_document_vector;
 mod wal_replay_fts;
@@ -55,8 +59,12 @@ mod wal_replay_redo_document;
 mod wal_replay_redo_graph;
 mod wal_replay_spatial;
 mod wal_replay_vector;
+mod wal_replay_vector_delete;
 mod wal_replay_vector_direct;
 mod wal_replay_vector_extended;
 mod wal_replay_vector_index_drop;
 mod wal_replay_vector_params;
+mod wal_replay_vector_redo;
 mod wal_replay_vector_resolved;
+mod wal_replay_vector_sparse;
+mod wal_replay_vector_task;

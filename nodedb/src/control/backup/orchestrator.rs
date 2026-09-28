@@ -7,33 +7,34 @@
 //! (local SPSC for self, `RaftRpc::ExecuteRequest` for remotes),
 //! and packs the gathered per-node snapshots into a `BackupEnvelope`.
 //!
+//! The backup covers every database the tenant has a collection in. Each
+//! source node snapshots each of those databases after one consistent cut,
+//! and each snapshot becomes one data section that names its database.
+//!
 //! Single-node mode is the degenerate case: routing table absent
-//! (or 1 node) → 1 section, origin = self.
+//! (or 1 node) → one source, origin = self.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use nodedb_cluster::routing::VSHARD_COUNT;
-use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, RaftRpc, TypedClusterError};
-use nodedb_types::backup_envelope::{EnvelopeMeta, EnvelopeWriter};
+use nodedb_types::backup_envelope::{DatabaseDataSection, EnvelopeMeta, EnvelopeWriter};
 
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId};
-use nodedb_physical::physical_plan::{MetaOp, wire as plan_wire};
+use crate::types::DatabaseId;
+use nodedb_physical::physical_plan::MetaOp;
 
-/// Default per-node snapshot dispatch timeout.
-const NODE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
+use super::metadata::{TenantDatabase, encode_section_part};
+use super::node_snapshot::{is_self, snapshot_remote, snapshot_self};
 
 /// Build a complete tenant backup envelope by fanning out across the
 /// cluster, gathering each node's slice, and framing the result.
 ///
 /// Single-node and cluster paths converge here — a single-node server
-/// produces a one-section envelope with origin = self.
+/// produces one data section per database with origin = self.
 pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<Bytes, Error> {
     // Assign every vshard to exactly ONE source node (the leader of its Raft
     // group, or — when no leader is elected yet — the lowest-id member), and
@@ -43,36 +44,37 @@ pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<B
     // replication factor. Filtering each source node's snapshot to the vshards
     // it owns makes the union cover each vshard exactly once.
     let assignment = source_assignment(state);
-    let snapshot_plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot { tenant_id });
 
-    // Collect per-node sections first. The orchestrator's own
-    // dispatches advance the tenant write-HLC high-water via
-    // `dispatch_system`; capturing the envelope watermark AFTER the
-    // fan-out guarantees `envelope.watermark ≥ tenant_write_hlc`
-    // at backup time, so a subsequent restore of this envelope into
-    // the same (unchanged) cluster passes the staleness gate.
-    let mut sections = Vec::with_capacity(assignment.len());
-    for (node_id, source_vshards) in assignment {
-        let body = if is_self(state, node_id) {
-            snapshot_self(state, tenant_id, &snapshot_plan).await?
-        } else {
-            snapshot_remote(state, node_id, tenant_id, &snapshot_plan).await?
-        };
-        // Single-node / single-replica: the node owns every vshard it leads, so
-        // the filter retains everything (no-op). Under RF>1: keep only the
-        // vshards this node is the assigned source for; the other replicas'
-        // copies are dropped here so the restore merge sums disjoint sections.
-        let body = filter_node_snapshot(body, tenant_id, &source_vshards)?;
-        sections.push((node_id, body));
-    }
+    // The envelope watermark is the consistent cut: every user write
+    // committed below it has applied before the snapshots below, and every
+    // write committed at or above it refuses a restore of this envelope.
+    let snapshot_watermark = super::cut::consistent_cut(state, tenant_id).await?;
 
-    // Capture a cluster-wide logical instant for the envelope via the
-    // HLC. `hlc_clock.now()` advances past any previously observed
-    // local or remote HLC — the wall-ns component is the scalar
-    // watermark we stamp into the header. Restore compares this
-    // against the destination's `tenant_write_hlc` to detect stale
-    // envelopes.
-    let snapshot_watermark = state.hlc_clock.now().wall_ns;
+    // Every database the tenant has a collection in. Read after the cut, so
+    // a collection created before the cut is in the list.
+    let databases = super::metadata::tenant_databases(state, tenant_id)?;
+
+    // Each source node snapshots its databases in order. The nodes run
+    // concurrently.
+    let per_node =
+        futures::future::join_all(assignment.into_iter().map(|(node_id, source_vshards)| {
+            let databases = &databases;
+            async move {
+                snapshot_node(
+                    state,
+                    NodeSnapshot {
+                        node_id,
+                        tenant_id,
+                        snapshot_watermark,
+                        source_vshards: &source_vshards,
+                        databases,
+                    },
+                )
+                .await
+            }
+        }))
+        .await;
+
     let meta = EnvelopeMeta {
         tenant_id,
         source_vshard_count: VSHARD_COUNT as u16,
@@ -81,109 +83,24 @@ pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<B
     };
     let mut writer = EnvelopeWriter::new(meta);
 
-    for (node_id, body) in sections {
-        writer
-            .push_section(node_id, body)
-            .map_err(|e| Error::Internal {
-                detail: format!("backup envelope: {e}"),
-            })?;
-    }
-
-    // Metadata sections: catalog rows + source-side tombstones. These
-    // live in dedicated sections with sentinel origin_node_ids so the
-    // restore path can distinguish them from per-node engine data.
-    // Without these, a backup taken during a collection's retention
-    // window loses its soft-deleted row (UNDROP can't work after
-    // restore), and a restore whose source has already purged a
-    // collection can resurrect rows that were properly reaped.
-    {
-        let catalog = state.credentials.catalog();
-        if let Ok(all) = catalog.load_all_collections(DatabaseId::DEFAULT) {
-            let mut blobs: Vec<nodedb_types::backup_envelope::StoredCollectionBlob> = Vec::new();
-            for coll in all.iter().filter(|c| c.tenant_id == tenant_id) {
-                if let Ok(bytes) = zerompk::to_msgpack_vec(coll) {
-                    blobs.push(nodedb_types::backup_envelope::StoredCollectionBlob {
-                        name: coll.name.clone(),
-                        bytes,
-                    });
-                }
-            }
-            if !blobs.is_empty()
-                && let Ok(body) = zerompk::to_msgpack_vec(&blobs)
-            {
-                writer
-                    .push_section(
-                        nodedb_types::backup_envelope::SECTION_ORIGIN_CATALOG_ROWS,
-                        body,
-                    )
-                    .map_err(|e| Error::Internal {
-                        detail: format!("backup envelope (catalog rows): {e}"),
-                    })?;
-            }
-        }
-
-        // PK→surrogate identity map for the tenant's collections. This is
-        // DATA-derived per-node state that the per-node engine sections do NOT
-        // carry (the Data-Plane snapshot handler has no catalog access). Without
-        // it a restored node has documents but cannot resolve PK point-lookups
-        // (`WHERE id=<pk>`) — full scans work, point-lookups silently miss. The
-        // restore path rebinds these into the destination catalog.
-        if let Ok(all) = catalog.load_all_collections(DatabaseId::DEFAULT) {
-            let mut binds: Vec<nodedb_types::backup_envelope::SurrogateBindBlob> = Vec::new();
-            for coll in all.iter().filter(|c| c.tenant_id == tenant_id) {
-                if let Ok(rows) = catalog.scan_surrogates_for_collection(
-                    DatabaseId::DEFAULT,
-                    TenantId::new(tenant_id),
-                    &coll.name,
-                ) {
-                    for (pk, surrogate) in rows {
-                        binds.push(nodedb_types::backup_envelope::SurrogateBindBlob {
-                            tenant_id,
-                            collection: coll.name.clone(),
-                            pk,
-                            surrogate: surrogate.as_u32(),
-                        });
-                    }
-                }
-            }
-            if !binds.is_empty()
-                && let Ok(body) = zerompk::to_msgpack_vec(&binds)
-            {
-                writer
-                    .push_section(
-                        nodedb_types::backup_envelope::SECTION_ORIGIN_SURROGATE_PK,
-                        body,
-                    )
-                    .map_err(|e| Error::Internal {
-                        detail: format!("backup envelope (surrogate pk): {e}"),
-                    })?;
-            }
-        }
-
-        if let Ok(tset) = catalog.load_wal_tombstones() {
-            let mut tombs: Vec<nodedb_types::backup_envelope::SourceTombstoneEntry> = Vec::new();
-            for (database_id, tid, name, purge_lsn) in tset.iter() {
-                if database_id == DatabaseId::DEFAULT.as_u64() && tid == tenant_id {
-                    tombs.push(nodedb_types::backup_envelope::SourceTombstoneEntry {
-                        collection: name.to_string(),
-                        purge_lsn,
-                    });
-                }
-            }
-            if !tombs.is_empty()
-                && let Ok(body) = zerompk::to_msgpack_vec(&tombs)
-            {
-                writer
-                    .push_section(
-                        nodedb_types::backup_envelope::SECTION_ORIGIN_SOURCE_TOMBSTONES,
-                        body,
-                    )
-                    .map_err(|e| Error::Internal {
-                        detail: format!("backup envelope (source tombstones): {e}"),
-                    })?;
-            }
+    for node_sections in per_node {
+        for (node_id, body) in node_sections? {
+            writer
+                .push_section(node_id, body)
+                .map_err(|e| Error::Internal {
+                    detail: format!("backup envelope: {e}"),
+                })?;
         }
     }
+
+    // Metadata sections: databases, catalog rows, surrogate binds and
+    // source-side tombstones. These live in dedicated sections with sentinel
+    // origin_node_ids so the restore path can distinguish them from per-node
+    // engine data. Without these, a backup taken during a collection's
+    // retention window loses its soft-deleted row (UNDROP can't work after
+    // restore), and a restore whose source has already purged a collection
+    // can resurrect rows that were properly reaped.
+    super::metadata::push_metadata_sections(state, tenant_id, &databases, &mut writer)?;
 
     // A backup KEK must be configured; plaintext backup envelopes are no
     // longer supported.
@@ -202,6 +119,53 @@ pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<B
         }
     };
     Ok(Bytes::from(envelope_bytes))
+}
+
+/// One source node's share of a backup.
+struct NodeSnapshot<'a> {
+    node_id: u64,
+    tenant_id: u64,
+    snapshot_watermark: u64,
+    /// The vShards this node is the assigned source for.
+    source_vshards: &'a HashSet<u32>,
+    databases: &'a [TenantDatabase],
+}
+
+/// Snapshot every database of the tenant on one source node. Returns one
+/// `(origin_node_id, section_body)` per database.
+///
+/// This node took the cut already. A remote node takes the cut at the same
+/// watermark before its first snapshot. Its later snapshots follow that cut.
+async fn snapshot_node(
+    state: &Arc<SharedState>,
+    job: NodeSnapshot<'_>,
+) -> Result<Vec<(u64, Vec<u8>)>, Error> {
+    let local = is_self(state, job.node_id);
+    let mut sections = Vec::with_capacity(job.databases.len());
+    for (index, database) in job.databases.iter().enumerate() {
+        let database_id = database.id();
+        let body = if local {
+            snapshot_self(state, job.tenant_id, database_id).await?
+        } else {
+            // A remote node takes the cut before its first snapshot.
+            let plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
+                tenant_id: job.tenant_id,
+                cut_watermark: (index == 0).then_some(job.snapshot_watermark),
+            });
+            snapshot_remote(state, job.node_id, job.tenant_id, database_id, &plan).await?
+        };
+        // Single-node / single-replica: the node owns every vshard it leads,
+        // so the filter retains everything (no-op). Under RF>1: keep only the
+        // vshards this node is the assigned source for; the other replicas'
+        // copies are dropped here so the restore merge sums disjoint sections.
+        let snapshot = filter_node_snapshot(body, job.tenant_id, database_id, job.source_vshards)?;
+        let section = DatabaseDataSection {
+            database_id: database_id.as_u64(),
+            snapshot,
+        };
+        sections.push((job.node_id, encode_section_part("data section", &section)?));
+    }
+    Ok(sections)
 }
 
 /// Assign every vshard to exactly ONE source node, returning the per-source
@@ -249,16 +213,18 @@ fn source_assignment(state: &SharedState) -> Vec<(u64, HashSet<u32>)> {
     by_node.into_iter().collect()
 }
 
-/// Decode a gathered per-node `TenantDataSnapshot`, filter it in place to the
-/// vshards this node is the assigned source for, and re-encode it.
+/// Decode a gathered per-node `TenantDataSnapshot` of `database_id`, filter
+/// it in place to the vshards this node is the assigned source for, and
+/// re-encode it.
 ///
 /// The per-section vshard classification is shared with the Raft snapshot SEND
 /// builder via `snapshot_keys::retain_tenant_data_for_vshards`. The vshard-of
-/// closure is the canonical routing function, matching both the snapshot
-/// builder and the restore topology splitter.
+/// closure routes each stored name in `database_id`, matching the snapshot
+/// builder.
 fn filter_node_snapshot(
     body: Vec<u8>,
     tenant_id: u64,
+    database_id: DatabaseId,
     source_vshards: &HashSet<u32>,
 ) -> Result<Vec<u8>, Error> {
     let mut snap: crate::types::TenantDataSnapshot =
@@ -269,132 +235,9 @@ fn filter_node_snapshot(
         &mut snap,
         tenant_id,
         source_vshards,
-        |collection| {
-            nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, collection)
-        },
+        |collection| super::snapshot_keys::vshard_of_stored(database_id, collection),
     );
     zerompk::to_msgpack_vec(&snap).map_err(|e| Error::Internal {
         detail: format!("backup: re-encode filtered snapshot: {e}"),
     })
-}
-
-fn is_self(state: &SharedState, node_id: u64) -> bool {
-    node_id == state.node_id || node_id == 0 || state.cluster_transport.is_none()
-}
-
-async fn snapshot_self(
-    state: &Arc<SharedState>,
-    tenant_id: u64,
-    plan: &PhysicalPlan,
-) -> Result<Vec<u8>, Error> {
-    sync_dispatch::dispatch_system(
-        state,
-        sync_dispatch::SystemTask::new(
-            sync_dispatch::SystemReason::BackupRestore,
-            TenantId::new(tenant_id),
-            // TODO(A8-followup): backup/restore not yet multi-database.
-            DatabaseId::DEFAULT,
-            "__system",
-            plan.clone(),
-        ),
-        NODE_SNAPSHOT_TIMEOUT,
-    )
-    .await
-}
-
-async fn snapshot_remote(
-    state: &Arc<SharedState>,
-    node_id: u64,
-    tenant_id: u64,
-    plan: &PhysicalPlan,
-) -> Result<Vec<u8>, Error> {
-    let transport = state
-        .cluster_transport
-        .as_ref()
-        .ok_or_else(|| Error::Internal {
-            detail: format!("backup: cluster_transport unavailable but node {node_id} is remote"),
-        })?;
-
-    let plan_bytes = plan_wire::encode(plan).map_err(|e| Error::Internal {
-        detail: format!("backup: plan encode failed: {e}"),
-    })?;
-    let req = RaftRpc::ExecuteRequest(ExecuteRequest {
-        plan_bytes,
-        tenant_id,
-        database_id: DatabaseId::DEFAULT.as_u64(),
-        deadline_remaining_ms: NODE_SNAPSHOT_TIMEOUT.as_millis() as u64,
-        trace_id: TraceId::generate().0,
-        descriptor_versions: Vec::new(),
-        // Backup snapshot dispatch is not session-transaction-scoped.
-        txn_id: None,
-    });
-
-    let resp = transport
-        .send_rpc(node_id, req)
-        .await
-        .map_err(|e| Error::Internal {
-            detail: format!("backup: snapshot RPC to node {node_id} failed: {e}"),
-        })?;
-    match resp {
-        RaftRpc::ExecuteResponse(ExecuteResponse {
-            success: true,
-            mut payloads,
-            ..
-        }) => {
-            // CreateTenantSnapshot returns exactly one payload.
-            if payloads.len() != 1 {
-                return Err(Error::Internal {
-                    detail: format!(
-                        "backup: expected 1 payload from node {node_id}, got {}",
-                        payloads.len()
-                    ),
-                });
-            }
-            Ok(payloads.remove(0))
-        }
-        RaftRpc::ExecuteResponse(ExecuteResponse {
-            error: Some(err), ..
-        }) => Err(map_typed_error(err, node_id)),
-        RaftRpc::ExecuteResponse(_) => Err(Error::Internal {
-            detail: format!("backup: empty error response from node {node_id}"),
-        }),
-        other => Err(Error::Internal {
-            detail: format!(
-                "backup: unexpected RPC response variant from node {node_id}: {other:?}"
-            ),
-        }),
-    }
-}
-
-fn map_typed_error(err: TypedClusterError, node_id: u64) -> Error {
-    match err {
-        TypedClusterError::Internal { message, .. } => Error::Internal {
-            detail: format!("backup node {node_id}: {message}"),
-        },
-        TypedClusterError::DeadlineExceeded { elapsed_ms } => Error::Internal {
-            detail: format!("backup node {node_id}: deadline exceeded after {elapsed_ms}ms"),
-        },
-        TypedClusterError::NotLeader { .. } => Error::Internal {
-            detail: format!("backup node {node_id}: snapshot RPC routed to non-leader"),
-        },
-        TypedClusterError::DescriptorMismatch { collection, .. } => Error::Internal {
-            detail: format!(
-                "backup node {node_id}: descriptor mismatch on collection {collection}"
-            ),
-        },
-        // Keep the shard's verdict typed: a backup snapshot refused by the
-        // Data Plane must not read as a generic internal backup fault.
-        TypedClusterError::DataPlane { code } => Error::DataPlane(code.into()),
-        // A constraint verdict keeps its collection and kind, so the client
-        // reads the SQLSTATE the refusing shard meant.
-        TypedClusterError::RejectedConstraint {
-            collection,
-            constraint,
-            detail,
-        } => Error::RejectedConstraint {
-            collection,
-            constraint,
-            detail,
-        },
-    }
 }

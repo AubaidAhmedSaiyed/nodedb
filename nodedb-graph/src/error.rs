@@ -55,4 +55,39 @@ pub enum GraphError {
     /// Callers should apply backpressure and retry after memory is released.
     #[error("graph memory budget rejected: {0}")]
     MemoryBudget(#[from] MemError),
+
+    /// A rollback asked to withdraw an interned node or node label that is
+    /// not the newest one, or that something still refers to. Withdrawing it
+    /// would renumber or orphan live state.
+    #[error("cannot withdraw {kind} '{name}': it is not the newest {kind} or it is still in use")]
+    WithdrawRefused { kind: &'static str, name: String },
+
+    /// A rebuild of this index is already running. The partition holds one
+    /// write journal at a time.
+    #[error("a rebuild of this CSR index is already running")]
+    RebuildInProgress,
+
+    /// The index a rebuild started from is no longer the live one: it was
+    /// dropped, replaced, or its rebuild was aborted. The rebuilt copy is
+    /// discarded and the live index stays as it is.
+    #[error("the CSR index this rebuild started from is no longer live; rebuild discarded")]
+    RebuildSuperseded,
+
+    /// The writes made during a rebuild exceeded the journal bound. The
+    /// rebuilt copy is discarded, the live index keeps every write, and a
+    /// new rebuild can run.
+    #[error(
+        "CSR writes during the rebuild exceeded the {cap_bytes}-byte journal bound; \
+         rebuild discarded, live index unchanged; run REINDEX again"
+    )]
+    RebuildJournalOverflow { cap_bytes: usize },
+
+    /// A journaled write returned a different outcome on the rebuilt index
+    /// than on the live one. The rebuilt copy is discarded.
+    #[error("CSR rebuild replay of '{op}' diverged from the live index; rebuild discarded")]
+    RebuildReplayDiverged { op: &'static str },
+
+    /// The snapshot a rebuild carries does not decode into an index.
+    #[error("CSR rebuild snapshot is invalid: {detail}")]
+    RebuildSnapshotInvalid { detail: String },
 }

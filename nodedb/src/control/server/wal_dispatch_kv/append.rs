@@ -3,13 +3,13 @@
 //! Dispatch of `KvOp` variants to WAL append calls.
 
 use crate::types::{DatabaseId, TenantId, VShardId};
-use crate::wal::manager::WalManager;
+use crate::wal::manager::WalAppender;
 use nodedb_physical::physical_plan::KvOp;
 
 use super::encode::{
-    KvRegisterSortedIndexFields, KvTransferFields, encode_kv_batch_put, encode_kv_cas,
-    encode_kv_delete, encode_kv_drop_index, encode_kv_drop_sorted_index, encode_kv_expire,
-    encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float,
+    KvIncrRecord, KvRegisterSortedIndexFields, KvTransferFields, encode_kv_batch_put,
+    encode_kv_cas, encode_kv_delete, encode_kv_drop_index, encode_kv_drop_sorted_index,
+    encode_kv_expire, encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float,
     encode_kv_insert_on_conflict_update, encode_kv_persist, encode_kv_predicate_delete,
     encode_kv_predicate_update, encode_kv_put, encode_kv_register_index,
     encode_kv_register_sorted_index, encode_kv_transfer, encode_kv_transfer_item,
@@ -41,11 +41,25 @@ fn resolve_expiry(ttl_ms: u64, now_override: Option<u64>) -> (Option<u64>, Optio
     }
 }
 
+/// Append the `SyncSeqAdvance` record of a Lite KV push, ahead of the
+/// write's own record.
+///
+/// Both records land in the write's outcome-floor window. A frame the gate
+/// holds back cancels both, so the mark never moves for a write that did not
+/// apply. The write's record is the higher LSN, so the durable-at-ack wait
+/// on it covers the mark too.
+fn append_sync_mark(
+    wal: WalAppender<'_>,
+    prov: &nodedb_types::sync::wire::SyncProvenance,
+) -> crate::Result<crate::types::Lsn> {
+    wal.append_sync_seq_advance(prov.producer_id, prov.epoch, prov.stream_id, prov.seq)
+}
+
 /// Serialize a KV operation and append to the WAL — see [`KvAppendOutcome`].
 /// `now_override` pins `expire_at_ms` to an instant decided elsewhere (e.g. a
 /// Raft-committed entry), so every replica's redo installs it verbatim.
 pub fn wal_append_kv_op(
-    wal: &WalManager,
+    wal: WalAppender<'_>,
     tenant_id: TenantId,
     vshard_id: VShardId,
     database_id: DatabaseId,
@@ -60,9 +74,25 @@ pub fn wal_append_kv_op(
             value,
             ttl_ms,
             surrogate,
+            provenance,
             ..
+        } => {
+            if let Some(prov) = provenance {
+                append_sync_mark(wal, prov)?;
+            }
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
+            resolved_now_ms = now_ms;
+            let entry = encode_kv_put(
+                collection.as_str(),
+                key,
+                value,
+                *ttl_ms,
+                expire_at_ms,
+                surrogate.as_u32(),
+            )?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
-        | KvOp::Insert {
+        KvOp::Insert {
             collection,
             key,
             value,
@@ -116,8 +146,14 @@ pub fn wal_append_kv_op(
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Delete {
-            collection, keys, ..
+            collection,
+            keys,
+            provenance,
+            ..
         } => {
+            if let Some(prov) = provenance {
+                append_sync_mark(wal, prov)?;
+            }
             let entry = encode_kv_delete(collection.as_str(), keys)?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
@@ -192,18 +228,20 @@ pub fn wal_append_kv_op(
             delta,
             ttl_ms,
             surrogate,
+            shape,
             ..
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
-            let entry = encode_kv_incr(
-                collection.as_str(),
+            let entry = encode_kv_incr(KvIncrRecord {
+                collection: collection.as_str(),
                 key,
-                *delta,
-                *ttl_ms,
-                surrogate.as_u32(),
+                delta: *delta,
+                ttl_ms: *ttl_ms,
+                surrogate: surrogate.as_u32(),
+                shape,
                 expire_at_ms,
-            )?;
+            })?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::IncrFloat {
@@ -211,9 +249,11 @@ pub fn wal_append_kv_op(
             key,
             delta,
             surrogate,
+            shape,
             ..
         } => {
-            let entry = encode_kv_incr_float(collection.as_str(), key, *delta, surrogate.as_u32())?;
+            let entry =
+                encode_kv_incr_float(collection.as_str(), key, delta, surrogate.as_u32(), shape)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Cas {
@@ -368,6 +408,7 @@ pub fn wal_append_kv_op(
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
         | KvOp::SortedIndexTopK { .. }
+        | KvOp::SortedIndexTxnRead { .. }
         | KvOp::MaterializeScan { .. } => None,
     };
     Ok(KvAppendOutcome {
@@ -379,7 +420,7 @@ pub fn wal_append_kv_op(
 /// Append one mutation of a resolved KV write and return its LSN. Uses the
 /// absolute expiry already resolved — no clock read here, so redo matches apply.
 fn append_kv_resolved_mutation(
-    wal: &WalManager,
+    wal: WalAppender<'_>,
     tenant_id: TenantId,
     vshard_id: VShardId,
     database_id: DatabaseId,

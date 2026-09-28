@@ -126,6 +126,10 @@ pub struct HttpError {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// The typed error that caused this one, as its message and code. Absent
+    /// when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Box<HttpError>>,
 }
 
 impl HttpError {
@@ -133,6 +137,7 @@ impl HttpError {
         Self {
             error: error.into(),
             code: None,
+            cause: None,
         }
     }
 
@@ -140,7 +145,17 @@ impl HttpError {
         Self {
             error: error.into(),
             code: Some(code.into()),
+            cause: None,
         }
+    }
+
+    /// Carry `cause` as this error's cause, with its own message and code.
+    pub fn caused_by(mut self, cause: &nodedb_types::NodeDbError) -> Self {
+        self.cause = Some(Box::new(Self::with_code(
+            cause.message(),
+            cause.code().to_string(),
+        )));
+        self
     }
 }
 

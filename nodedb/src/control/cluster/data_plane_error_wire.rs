@@ -8,9 +8,11 @@
 //! fails to compile here until it is mirrored on the wire instead of silently
 //! degrading to `Internal` and losing its SQLSTATE at the coordinator.
 
-use nodedb_cluster::rpc_codec::{DataPlaneErrorCode, TypedClusterError};
+use nodedb_cluster::rpc_codec::{
+    DataPlaneCounterFault, DataPlaneErrorCode, DataPlaneSyncHold, TypedClusterError,
+};
 
-use crate::bridge::envelope::ErrorCode;
+use crate::bridge::envelope::{CounterFault, ErrorCode, SyncHold};
 
 /// Map a local-execution [`crate::Error`] to the wire error a remote caller
 /// receives.
@@ -42,12 +44,131 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
             constraint,
             detail,
         },
-        other => {
-            let message = other.to_string();
-            let code = u32::from(nodedb_types::error::NodeDbError::from(other).code().0);
-            TypedClusterError::Internal { code, message }
-        }
+        // A capacity refusal crosses as its own verdict, so the coordinator
+        // answers the retryable overload class.
+        capacity @ crate::Error::DispatchCapacity { .. } => TypedClusterError::DataPlane {
+            code: DataPlaneErrorCode::DispatchCapacity {
+                reason: capacity.to_string(),
+            },
+        },
+        // Every other error crosses as its public numeric code and message.
+        // The coordinator renders the SQLSTATE that code maps to.
+        other @ (crate::Error::TxnOverlayMemoryExceeded { .. }
+        | crate::Error::RejectedAuthz { .. }
+        | crate::Error::OffsetRegression { .. }
+        | crate::Error::ConflictRetry { .. }
+        | crate::Error::CalvinSerializationConflict
+        | crate::Error::CalvinParticipantError
+        | crate::Error::RejectedPrevalidation { .. }
+        | crate::Error::RetryableRefusal { .. }
+        | crate::Error::AppendOnlyViolation { .. }
+        | crate::Error::BalanceViolation { .. }
+        | crate::Error::MaterializedSumTargetNotFound { .. }
+        | crate::Error::MaterializedSumResolutionMissing { .. }
+        | crate::Error::PeriodLocked { .. }
+        | crate::Error::PeriodLockMisconfigured { .. }
+        | crate::Error::RetentionViolation { .. }
+        | crate::Error::LegalHoldActive { .. }
+        | crate::Error::StateTransitionViolation { .. }
+        | crate::Error::TransitionCheckViolation { .. }
+        | crate::Error::TypeGuardViolation { .. }
+        | crate::Error::TypeMismatch { .. }
+        | crate::Error::InsufficientBalance { .. }
+        | crate::Error::RateExceeded { .. }
+        | crate::Error::CollectionNotFound { .. }
+        | crate::Error::DocumentNotFound { .. }
+        | crate::Error::CollectionDeactivated { .. }
+        | crate::Error::VShardAdmissionCapacityExceeded { .. }
+        | crate::Error::CrdtAdmissionRetriesExhausted { .. }
+        | crate::Error::CrdtAdmissionInvalidPlan { .. }
+        | crate::Error::CrdtAdmissionCallerFence
+        | crate::Error::CrdtApplyRequiresAdmission
+        | crate::Error::CrdtApplyForbiddenInTransaction
+        | crate::Error::NotInTransactionBlock { .. }
+        | crate::Error::CrdtAdmissionTimeout { .. }
+        | crate::Error::NoLeader { .. }
+        | crate::Error::NotLeader { .. }
+        | crate::Error::FanOutExceeded { .. }
+        | crate::Error::CrossCollectionNotColocated { .. }
+        | crate::Error::SourceFrozen { .. }
+        | crate::Error::CloneWriteRequiresMaterialize { .. }
+        | crate::Error::BadRequest { .. }
+        | crate::Error::BackupTenantMismatch { .. }
+        | crate::Error::BackupKeyMismatch
+        | crate::Error::QuotaOvercommit { .. }
+        | crate::Error::PlanError { .. }
+        | crate::Error::FeatureNotSupported { .. }
+        | crate::Error::UndefinedFunction { .. }
+        | crate::Error::UndefinedObject { .. }
+        | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::UndefinedColumn { .. }
+        | crate::Error::AmbiguousColumn { .. }
+        | crate::Error::UnknownStrictField { .. }
+        | crate::Error::DivisionByZero
+        | crate::Error::DataException { .. }
+        | crate::Error::InvalidLimitValue { .. }
+        | crate::Error::RetryableSchemaChanged { .. }
+        | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::GroupQuorumUnavailable { .. }
+        | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::ExecutionLimitExceeded { .. }
+        | crate::Error::LimitExceeded { .. }
+        | crate::Error::Wal(_)
+        | crate::Error::Dispatch { .. }
+        | crate::Error::Storage { .. }
+        | crate::Error::ColdStorage { .. }
+        | crate::Error::Serialization { .. }
+        | crate::Error::Codec { .. }
+        | crate::Error::SegmentCorrupted { .. }
+        | crate::Error::MemoryExhausted { .. }
+        | crate::Error::Backpressure { .. }
+        | crate::Error::Crdt(_)
+        | crate::Error::Io(_)
+        | crate::Error::Config { .. }
+        | crate::Error::Encryption { .. }
+        | crate::Error::Bridge { .. }
+        | crate::Error::VersionCompat { .. }
+        | crate::Error::Internal { .. }
+        | crate::Error::Shaping(_)
+        | crate::Error::RemoteTyped { .. }
+        | crate::Error::Ddl(_)
+        | crate::Error::DescriptorVersionAnomaly { .. }
+        | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CatalogIntegrityViolation { .. }
+        | crate::Error::Promql(_)
+        | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
+        | crate::Error::CascadeCycle { .. }
+        | crate::Error::CrossShardInExplicitTransaction
+        | crate::Error::SequencerUnavailable
+        | crate::Error::SessionCapExceeded { .. }
+        | crate::Error::SessionIdleTimeout
+        | crate::Error::SessionTokenExpired
+        | crate::Error::SessionKilledByAdmin
+        | crate::Error::SessionUserDropped
+        | crate::Error::OidcProviderTenantUnbound
+        | crate::Error::OidcProviderTenantUnavailable { .. }
+        | crate::Error::ExternalRoleUndefined { .. }
+        | crate::Error::OidcNoDefaultDatabase { .. }
+        | crate::Error::TenantVectorDimExceeded { .. }
+        | crate::Error::TenantGraphDepthExceeded { .. }
+        | crate::Error::RoleInheritanceCycle { .. }
+        | crate::Error::RoleInheritanceDepthExceeded { .. }
+        | crate::Error::OllpExhausted { .. }
+        | crate::Error::MirrorReadOnly { .. }
+        | crate::Error::StaleReadNotLeader { .. }) => numeric_typed(other),
     }
+}
+
+/// The wire error for a local error with no typed wire carrier: its public
+/// numeric code from `NodeDbError::from(err).code()`, and its message. The
+/// coordinator rebuilds it as `Error::RemoteTyped`.
+pub(crate) fn numeric_typed(err: crate::Error) -> TypedClusterError {
+    let message = err.to_string();
+    let code = u32::from(nodedb_types::error::NodeDbError::from(err).code().0);
+    TypedClusterError::Internal { code, message }
 }
 
 /// Widen a pointer-width count to the wire's fixed `u64`.
@@ -70,6 +191,22 @@ impl From<ErrorCode> for DataPlaneErrorCode {
             }
             ErrorCode::RejectedPrevalidation { reason } => Self::RejectedPrevalidation { reason },
             ErrorCode::RetryableRefusal { reason } => Self::RetryableRefusal { reason },
+            ErrorCode::SyncRejected {
+                violation,
+                applied_seq,
+                provenance,
+            } => Self::SyncRejected {
+                violation,
+                applied_seq,
+                producer_id: provenance.producer_id,
+                epoch: provenance.epoch,
+                stream_id: provenance.stream_id,
+                seq: provenance.seq,
+            },
+            ErrorCode::SyncNotApplied { hold, applied_seq } => Self::SyncNotApplied {
+                hold: sync_hold_to_wire(hold),
+                applied_seq,
+            },
             ErrorCode::NotFound => Self::NotFound,
             ErrorCode::RejectedAuthz { resource } => Self::RejectedAuthz { resource },
             ErrorCode::ConflictRetry => Self::ConflictRetry,
@@ -114,7 +251,10 @@ impl From<ErrorCode> for DataPlaneErrorCode {
             ErrorCode::TypeMismatch { collection, detail } => {
                 Self::TypeMismatch { collection, detail }
             }
-            ErrorCode::OverflowError { collection } => Self::OverflowError { collection },
+            ErrorCode::CounterFault { collection, fault } => Self::CounterFault {
+                collection,
+                fault: counter_fault_to_wire(fault),
+            },
             ErrorCode::InsufficientBalance { collection, detail } => {
                 Self::InsufficientBalance { collection, detail }
             }
@@ -148,6 +288,16 @@ impl From<ErrorCode> for DataPlaneErrorCode {
                 limit: to_wire_count(limit),
             },
             ErrorCode::DivisionByZero => Self::DivisionByZero,
+            ErrorCode::UndefinedFunction { name } => Self::UndefinedFunction { name },
+            ErrorCode::DataException { detail } => Self::DataException { detail },
+            ErrorCode::DispatchCapacity { reason } => Self::DispatchCapacity { reason },
+            ErrorCode::ExpiredBeforeExecution => Self::ExpiredBeforeExecution,
+            ErrorCode::BadRequest { detail } => Self::BadRequest { detail },
+            ErrorCode::TransactionRollback { detail } => Self::TransactionRollback { detail },
+            ErrorCode::ActiveSqlTransaction { detail } => Self::ActiveSqlTransaction { detail },
+            ErrorCode::DependentObjectsExist { object, detail } => {
+                Self::DependentObjectsExist { object, detail }
+            }
         }
     }
 }
@@ -163,6 +313,27 @@ impl From<DataPlaneErrorCode> for ErrorCode {
                 Self::RejectedPrevalidation { reason }
             }
             DataPlaneErrorCode::RetryableRefusal { reason } => Self::RetryableRefusal { reason },
+            DataPlaneErrorCode::SyncRejected {
+                violation,
+                applied_seq,
+                producer_id,
+                epoch,
+                stream_id,
+                seq,
+            } => Self::SyncRejected {
+                violation,
+                applied_seq,
+                provenance: nodedb_types::sync::wire::SyncProvenance {
+                    producer_id,
+                    epoch,
+                    stream_id,
+                    seq,
+                },
+            },
+            DataPlaneErrorCode::SyncNotApplied { hold, applied_seq } => Self::SyncNotApplied {
+                hold: sync_hold_from_wire(hold),
+                applied_seq,
+            },
             DataPlaneErrorCode::NotFound => Self::NotFound,
             DataPlaneErrorCode::RejectedAuthz { resource } => Self::RejectedAuthz { resource },
             DataPlaneErrorCode::ConflictRetry => Self::ConflictRetry,
@@ -211,7 +382,10 @@ impl From<DataPlaneErrorCode> for ErrorCode {
             DataPlaneErrorCode::TypeMismatch { collection, detail } => {
                 Self::TypeMismatch { collection, detail }
             }
-            DataPlaneErrorCode::OverflowError { collection } => Self::OverflowError { collection },
+            DataPlaneErrorCode::CounterFault { collection, fault } => Self::CounterFault {
+                collection,
+                fault: counter_fault_from_wire(fault),
+            },
             DataPlaneErrorCode::InsufficientBalance { collection, detail } => {
                 Self::InsufficientBalance { collection, detail }
             }
@@ -249,7 +423,60 @@ impl From<DataPlaneErrorCode> for ErrorCode {
                 }
             }
             DataPlaneErrorCode::DivisionByZero => Self::DivisionByZero,
+            DataPlaneErrorCode::UndefinedFunction { name } => Self::UndefinedFunction { name },
+            DataPlaneErrorCode::DataException { detail } => Self::DataException { detail },
+            DataPlaneErrorCode::DispatchCapacity { reason } => Self::DispatchCapacity { reason },
+            DataPlaneErrorCode::ExpiredBeforeExecution => Self::ExpiredBeforeExecution,
+            DataPlaneErrorCode::BadRequest { detail } => Self::BadRequest { detail },
+            DataPlaneErrorCode::TransactionRollback { detail } => {
+                Self::TransactionRollback { detail }
+            }
+            DataPlaneErrorCode::ActiveSqlTransaction { detail } => {
+                Self::ActiveSqlTransaction { detail }
+            }
+            DataPlaneErrorCode::DependentObjectsExist { object, detail } => {
+                Self::DependentObjectsExist { object, detail }
+            }
         }
+    }
+}
+
+/// The wire form of a sync hold.
+fn sync_hold_to_wire(hold: SyncHold) -> DataPlaneSyncHold {
+    match hold {
+        SyncHold::Duplicate => DataPlaneSyncHold::Duplicate,
+        SyncHold::Fenced => DataPlaneSyncHold::Fenced,
+        SyncHold::Gap { expected } => DataPlaneSyncHold::Gap { expected },
+    }
+}
+
+/// The sync hold a wire form names.
+fn sync_hold_from_wire(hold: DataPlaneSyncHold) -> SyncHold {
+    match hold {
+        DataPlaneSyncHold::Duplicate => SyncHold::Duplicate,
+        DataPlaneSyncHold::Fenced => SyncHold::Fenced,
+        DataPlaneSyncHold::Gap { expected } => SyncHold::Gap { expected },
+    }
+}
+
+/// The wire form of a counter fault. Both types live in other crates, so the
+/// mapping is a function, not a `From` impl.
+fn counter_fault_to_wire(fault: CounterFault) -> DataPlaneCounterFault {
+    match fault {
+        CounterFault::NotAnInteger => DataPlaneCounterFault::NotAnInteger,
+        CounterFault::NotAFloat => DataPlaneCounterFault::NotAFloat,
+        CounterFault::IntegerOverflow => DataPlaneCounterFault::IntegerOverflow,
+        CounterFault::NonFinite => DataPlaneCounterFault::NonFinite,
+    }
+}
+
+/// The counter fault a wire form carries.
+fn counter_fault_from_wire(fault: DataPlaneCounterFault) -> CounterFault {
+    match fault {
+        DataPlaneCounterFault::NotAnInteger => CounterFault::NotAnInteger,
+        DataPlaneCounterFault::NotAFloat => CounterFault::NotAFloat,
+        DataPlaneCounterFault::IntegerOverflow => CounterFault::IntegerOverflow,
+        DataPlaneCounterFault::NonFinite => CounterFault::NonFinite,
     }
 }
 
@@ -297,6 +524,61 @@ mod tests {
                 assert!(message.contains("unresolved exchange"));
             }
             other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_capacity_code_roundtrips_verbatim() {
+        let original = ErrorCode::DispatchCapacity {
+            reason: "tenant 1 holds 64/64 in-flight requests".into(),
+        };
+        let wire = DataPlaneErrorCode::from(original.clone());
+        assert_eq!(
+            wire,
+            DataPlaneErrorCode::DispatchCapacity {
+                reason: "tenant 1 holds 64/64 in-flight requests".into(),
+            }
+        );
+        assert_eq!(ErrorCode::from(wire), original);
+    }
+
+    #[test]
+    fn sync_not_applied_roundtrips_verbatim() {
+        for hold in [
+            SyncHold::Duplicate,
+            SyncHold::Fenced,
+            SyncHold::Gap { expected: 7 },
+        ] {
+            let original = ErrorCode::SyncNotApplied {
+                hold,
+                applied_seq: 6,
+            };
+            let wire = DataPlaneErrorCode::from(original.clone());
+            assert_eq!(ErrorCode::from(wire), original);
+        }
+    }
+
+    #[test]
+    fn expired_before_execution_roundtrips_verbatim() {
+        let wire = DataPlaneErrorCode::from(ErrorCode::ExpiredBeforeExecution);
+        assert_eq!(wire, DataPlaneErrorCode::ExpiredBeforeExecution);
+        assert_eq!(ErrorCode::from(wire), ErrorCode::ExpiredBeforeExecution);
+    }
+
+    #[test]
+    fn counter_fault_roundtrips_verbatim() {
+        for fault in [
+            CounterFault::NotAnInteger,
+            CounterFault::NotAFloat,
+            CounterFault::IntegerOverflow,
+            CounterFault::NonFinite,
+        ] {
+            let original = ErrorCode::CounterFault {
+                collection: "counters".into(),
+                fault,
+            };
+            let wire = DataPlaneErrorCode::from(original.clone());
+            assert_eq!(ErrorCode::from(wire), original);
         }
     }
 

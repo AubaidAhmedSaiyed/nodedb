@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::VectorError;
+use crate::error::{VectorError, check_dim};
 
 /// Magic bytes identifying a serialized [`Sq8Codec`] blob.
 ///
@@ -47,15 +47,29 @@ impl Sq8Codec {
     /// At least 1000 vectors recommended for stable calibration;
     /// for fewer vectors the bounds may be tight, causing clipping
     /// on future inserts outside the calibration range.
-    pub fn calibrate(vectors: &[&[f32]], dim: usize) -> Self {
-        assert!(!vectors.is_empty(), "cannot calibrate on empty set");
-        assert!(dim > 0);
+    ///
+    /// An empty set or a zero `dim` fails with [`VectorError::InvalidInput`];
+    /// a vector without `dim` components fails with
+    /// [`VectorError::DimensionMismatch`].
+    pub fn calibrate(vectors: &[&[f32]], dim: usize) -> Result<Self, VectorError> {
+        if vectors.is_empty() {
+            return Err(VectorError::InvalidInput {
+                detail: "SQ8 calibration needs at least one vector".into(),
+            });
+        }
+        if dim == 0 {
+            return Err(VectorError::InvalidInput {
+                detail: "SQ8 calibration needs a non-zero dimension".into(),
+            });
+        }
+        for v in vectors {
+            check_dim(dim, v.len())?;
+        }
 
         let mut mins = vec![f32::MAX; dim];
         let mut maxs = vec![f32::MIN; dim];
 
         for v in vectors {
-            debug_assert_eq!(v.len(), dim);
             for d in 0..dim {
                 if v[d] < mins[d] {
                     mins[d] = v[d];
@@ -76,12 +90,24 @@ impl Sq8Codec {
             }
         }
 
-        Self {
+        Ok(Self {
             dim,
             mins,
             maxs,
             scales,
             inv_scales,
+        })
+    }
+
+    /// A codec over the unit range `[0, 1]` on every dimension, for
+    /// normalized embeddings before any calibration data exists.
+    pub fn unit_range(dim: usize) -> Self {
+        Self {
+            dim,
+            mins: vec![0.0; dim],
+            maxs: vec![1.0; dim],
+            scales: vec![1.0 / 255.0; dim],
+            inv_scales: vec![255.0; dim],
         }
     }
 
@@ -223,7 +249,7 @@ mod tests {
             .map(|i| vec![i as f32 * 0.1, (i as f32).sin(), (i as f32).cos()])
             .collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        Sq8Codec::calibrate(&refs, 3)
+        Sq8Codec::calibrate(&refs, 3).unwrap()
     }
 
     #[test]
@@ -284,7 +310,7 @@ mod tests {
     fn quantize_dequantize_roundtrip() {
         let vecs = make_vectors();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = Sq8Codec::calibrate(&refs, 3);
+        let codec = Sq8Codec::calibrate(&refs, 3).unwrap();
 
         for v in &vecs {
             let q = codec.quantize(v);
@@ -306,7 +332,7 @@ mod tests {
     fn asymmetric_l2_close_to_exact() {
         let vecs = make_vectors();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = Sq8Codec::calibrate(&refs, 3);
+        let codec = Sq8Codec::calibrate(&refs, 3).unwrap();
 
         let query = &[5.0, 0.5, -0.5];
         for v in &vecs {
@@ -330,7 +356,7 @@ mod tests {
     fn batch_quantize() {
         let vecs = make_vectors();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = Sq8Codec::calibrate(&refs, 3);
+        let codec = Sq8Codec::calibrate(&refs, 3).unwrap();
 
         let batch = codec.quantize_batch(&refs);
         assert_eq!(batch.len(), 3 * 100);
@@ -345,10 +371,31 @@ mod tests {
         // All vectors have the same value in dimension 0.
         let vecs: Vec<Vec<f32>> = (0..10).map(|i| vec![5.0, i as f32]).collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = Sq8Codec::calibrate(&refs, 2);
+        let codec = Sq8Codec::calibrate(&refs, 2).unwrap();
 
         // Constant dimension should quantize to 0 without NaN/inf.
         let q = codec.quantize(&[5.0, 3.0]);
         assert_eq!(q[0], 0); // constant dim
+    }
+
+    #[test]
+    fn calibrate_rejects_bad_input_with_typed_errors() {
+        use crate::error::VectorError;
+        assert!(matches!(
+            Sq8Codec::calibrate(&[], 3),
+            Err(VectorError::InvalidInput { .. })
+        ));
+        let v = [1.0_f32, 2.0];
+        assert!(matches!(
+            Sq8Codec::calibrate(&[&v], 0),
+            Err(VectorError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            Sq8Codec::calibrate(&[&v], 3),
+            Err(VectorError::DimensionMismatch {
+                expected: 3,
+                got: 2
+            })
+        ));
     }
 }

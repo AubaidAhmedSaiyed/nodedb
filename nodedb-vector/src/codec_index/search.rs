@@ -13,6 +13,7 @@ use std::collections::{BinaryHeap, HashSet};
 use nodedb_codec::vector_quant::codec::VectorCodec;
 
 use super::graph::HnswCodecIndex;
+use crate::error::{VectorError, check_dim};
 
 /// A single result from a codec-index search.
 #[derive(Debug, Clone)]
@@ -54,13 +55,21 @@ impl<C: VectorCodec> HnswCodecIndex<C> {
     /// `ef_search` controls the beam width at layer 0 (must be >= k).
     ///
     /// The returned results are sorted ascending by `exact_asymmetric_distance`.
-    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<CodecSearchResult> {
+    /// A query without the index dimension fails with
+    /// [`VectorError::DimensionMismatch`].
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<CodecSearchResult>, VectorError> {
+        check_dim(self.dim, query.len())?;
         if self.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let Some(ep) = self.entry_point else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let ef = ef_search.max(k);
@@ -93,10 +102,10 @@ impl<C: VectorCodec> HnswCodecIndex<C> {
         reranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         reranked.truncate(k);
 
-        reranked
+        Ok(reranked
             .into_iter()
             .map(|(distance, id)| CodecSearchResult { id, distance })
-            .collect()
+            .collect())
     }
 
     /// Greedy single-nearest descent at `layer` using the pre-encoded query.
@@ -229,14 +238,14 @@ mod tests {
         let mut state = 0xDEAD_BEEF_u64;
         let vecs: Vec<Vec<f32>> = (0..n).map(|_| rand_vec(&mut state, dim)).collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = Sq8Codec::calibrate(&refs, dim);
+        let codec = Sq8Codec::calibrate(&refs, dim).unwrap();
         let mut idx: HnswCodecIndex<Sq8Codec> = HnswCodecIndex::new(dim, 8, 100, codec, 7);
         for (i, v) in vecs.iter().enumerate() {
-            idx.insert(i as u32, v);
+            idx.insert(i as u32, v).unwrap();
         }
         // Query with vector 17 — top-1 should return id 17.
         let query = vecs[17].clone();
-        let results = idx.search(&query, 1, 50);
+        let results = idx.search(&query, 1, 50).unwrap();
         assert_eq!(results.len(), 1, "expected 1 result");
         assert_eq!(
             results[0].id, 17,
@@ -262,7 +271,7 @@ mod tests {
         let codec = RaBitQCodec::calibrate(&refs, dim, 0xABCD_1234);
         let mut idx: HnswCodecIndex<RaBitQCodec> = HnswCodecIndex::new(dim, 8, 150, codec, 99);
         for (i, v) in vecs.iter().enumerate() {
-            idx.insert(i as u32, v);
+            idx.insert(i as u32, v).unwrap();
         }
 
         let n_queries = 10usize;
@@ -272,7 +281,7 @@ mod tests {
             let query = rand_vec(&mut state, dim);
             let truth: std::collections::HashSet<u32> =
                 ground_truth(&vecs, &query, k).into_iter().collect();
-            let results = idx.search(&query, k, k * 4);
+            let results = idx.search(&query, k, k * 4).unwrap();
             let found: std::collections::HashSet<u32> = results.iter().map(|r| r.id).collect();
             total_hits += found.intersection(&truth).count();
             total += k;
@@ -300,7 +309,7 @@ mod tests {
         let codec = BbqCodec::calibrate(&refs, dim, 3);
         let mut idx: HnswCodecIndex<BbqCodec> = HnswCodecIndex::new(dim, 8, 150, codec, 42);
         for (i, v) in vecs.iter().enumerate() {
-            idx.insert(i as u32, v);
+            idx.insert(i as u32, v).unwrap();
         }
 
         let n_queries = 10usize;
@@ -310,7 +319,7 @@ mod tests {
             let query = rand_vec(&mut state, dim);
             let truth: std::collections::HashSet<u32> =
                 ground_truth(&vecs, &query, k).into_iter().collect();
-            let results = idx.search(&query, k, k * 4);
+            let results = idx.search(&query, k, k * 4).unwrap();
             let found: std::collections::HashSet<u32> = results.iter().map(|r| r.id).collect();
             total_hits += found.intersection(&truth).count();
             total += k;
@@ -332,10 +341,10 @@ mod tests {
         let codec = {
             let vecs: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32; 4]).collect();
             let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-            Sq8Codec::calibrate(&refs, 4)
+            Sq8Codec::calibrate(&refs, 4).unwrap()
         };
         let idx: HnswCodecIndex<Sq8Codec> = HnswCodecIndex::new(4, 8, 50, codec, 1);
-        let results = idx.search(&[0.0, 0.0, 0.0, 0.0], 5, 20);
+        let results = idx.search(&[0.0, 0.0, 0.0, 0.0], 5, 20).unwrap();
         assert!(results.is_empty(), "empty index must return no results");
     }
 
@@ -344,12 +353,43 @@ mod tests {
         let dim = 4;
         let vecs = [vec![1.0f32, 2.0, 3.0, 4.0]];
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = Sq8Codec::calibrate(&refs, dim);
+        let codec = Sq8Codec::calibrate(&refs, dim).unwrap();
         let mut idx: HnswCodecIndex<Sq8Codec> = HnswCodecIndex::new(dim, 8, 50, codec, 5);
-        idx.insert(0, &vecs[0]);
+        idx.insert(0, &vecs[0]).unwrap();
         // Query with a completely different vector.
-        let results = idx.search(&[10.0, 20.0, 30.0, 40.0], 1, 10);
+        let results = idx.search(&[10.0, 20.0, 30.0, 40.0], 1, 10).unwrap();
         assert_eq!(results.len(), 1, "single-node index must return 1 result");
         assert_eq!(results[0].id, 0, "the only node must be returned");
+    }
+
+    #[test]
+    fn wrong_dimension_is_a_typed_error() {
+        use crate::error::VectorError;
+        let vecs: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32; 4]).collect();
+        let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
+        let codec = Sq8Codec::calibrate(&refs, 4).unwrap();
+        let mut idx: HnswCodecIndex<Sq8Codec> = HnswCodecIndex::new(4, 8, 50, codec, 1);
+        assert!(matches!(
+            idx.search(&[0.0; 3], 5, 20),
+            Err(VectorError::DimensionMismatch {
+                expected: 4,
+                got: 3
+            })
+        ));
+        idx.insert(0, &vecs[0]).unwrap();
+        assert!(matches!(
+            idx.search(&[0.0; 5], 5, 20),
+            Err(VectorError::DimensionMismatch {
+                expected: 4,
+                got: 5
+            })
+        ));
+        assert!(matches!(
+            idx.insert(1, &[0.0; 2]),
+            Err(VectorError::DimensionMismatch {
+                expected: 4,
+                got: 2
+            })
+        ));
     }
 }

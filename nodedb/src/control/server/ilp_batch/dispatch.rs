@@ -19,7 +19,7 @@ use crate::control::server::ilp_auth::AuthenticatedIlpContext;
 use crate::control::server::shared::authorization::authorize_task_set;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::TimeseriesOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_types::Surrogate;
@@ -297,7 +297,8 @@ fn build_ilp_calvin_tasks(
             Ok(PhysicalTask {
                 tenant_id,
                 database_id,
-                vshard_id: VShardId::from_collection_in_database(database_id, &group.measurement),
+                vshard_id: nodedb_types::CollectionKey::from_bare(database_id, &group.measurement)
+                    .vshard(),
                 plan: PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                     collection: nodedb_types::QualifiedCollection::new(
                         database_id,
@@ -338,7 +339,7 @@ mod tests {
     use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet};
     use crate::control::security::permission::PermissionStore;
     use crate::control::security::role::RoleStore;
-    use crate::types::{DatabaseId, TenantId, VShardId};
+    use crate::types::{DatabaseId, TenantId};
     use crate::wal::WalManager;
     use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
     use nodedb_types::Surrogate;
@@ -636,7 +637,7 @@ mod tests {
         assert_eq!(tasks[0].database_id, database_id);
         assert_eq!(
             tasks[0].vshard_id,
-            VShardId::from_collection_in_database(database_id, "cpu")
+            nodedb_types::CollectionKey::from_bare(database_id, "cpu").vshard()
         );
     }
 }

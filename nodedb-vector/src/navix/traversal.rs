@@ -15,6 +15,7 @@ use std::collections::{BinaryHeap, HashSet};
 use roaring::RoaringBitmap;
 
 use crate::distance::distance;
+use crate::error::{VectorError, check_dim};
 use crate::hnsw::graph::{Candidate, HnswIndex};
 use crate::navix::selectivity::{NavixHeuristic, local_selectivity_at, pick_heuristic};
 
@@ -59,28 +60,38 @@ impl Default for NavixSearchOptions {
 /// Returns up to `options.k` nearest vectors from `index` to `query`, where
 /// candidate IDs must be present in `options.allowed`.
 ///
+/// Returns an empty Vec when the index is empty or `options.allowed` is empty.
+///
 /// # Errors
 ///
-/// Returns an empty Vec when the index is empty or `options.allowed` is empty.
+/// [`VectorError::DimensionMismatch`] when `query` does not have the index
+/// dimension.
 pub fn navix_search(
     index: &HnswIndex,
     query: &[f32],
     options: &NavixSearchOptions,
     metric: nodedb_types::vector_distance::DistanceMetric,
-) -> Vec<SearchResult> {
+) -> Result<Vec<SearchResult>, VectorError> {
+    check_dim(index.dim(), query.len())?;
     if index.is_empty() || options.allowed.is_empty() || options.k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let total = index.len();
     let global_sel = options.allowed.len() as f64 / total as f64;
 
     if global_sel < options.brute_force_threshold {
-        return brute_force_on_allowed(index, query, options.k, &options.allowed, metric);
+        return Ok(brute_force_on_allowed(
+            index,
+            query,
+            options.k,
+            &options.allowed,
+            metric,
+        ));
     }
 
     let Some(ep) = index.entry_point() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     // Phase 1: greedy descent from max_layer to layer 1 (unfiltered, as in
@@ -97,14 +108,14 @@ pub fn navix_search(
     let ef = options.ef_search.max(options.k);
     let results = navix_search_layer_0(index, query, current_ep, ef, &options.allowed, metric);
 
-    results
+    Ok(results
         .into_iter()
         .take(options.k)
         .map(|c| SearchResult {
             id: c.id,
             distance: c.dist,
         })
-        .collect()
+        .collect())
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -513,8 +524,8 @@ mod tests {
             brute_force_threshold: 0.001,
         };
 
-        let navix_res = navix_search(&idx, &query, &opts, DistanceMetric::L2);
-        let hnsw_res = idx.search(&query, 5, 64);
+        let navix_res = navix_search(&idx, &query, &opts, DistanceMetric::L2).unwrap();
+        let hnsw_res = idx.search(&query, 5, 64).unwrap();
 
         assert!(!navix_res.is_empty());
         // The best result should be id=10 (exact match) in both cases.
@@ -536,7 +547,7 @@ mod tests {
             brute_force_threshold: 0.001,
         };
 
-        let res = navix_search(&idx, &query, &opts, DistanceMetric::L2);
+        let res = navix_search(&idx, &query, &opts, DistanceMetric::L2).unwrap();
         // With only one allowed ID, we get at most 1 result.
         assert!(res.len() <= 1);
         if let Some(r) = res.first() {
@@ -562,7 +573,7 @@ mod tests {
             brute_force_threshold: 0.001,
         };
 
-        let res = navix_search(&idx, &query, &opts, DistanceMetric::L2);
+        let res = navix_search(&idx, &query, &opts, DistanceMetric::L2).unwrap();
         assert!(!res.is_empty());
         for r in &res {
             assert!(
@@ -593,7 +604,7 @@ mod tests {
             brute_force_threshold: 0.5,
         };
 
-        let res = navix_search(&idx, &query, &opts, DistanceMetric::L2);
+        let res = navix_search(&idx, &query, &opts, DistanceMetric::L2).unwrap();
 
         // Manual brute-force reference.
         let mut manual: Vec<(u32, f32)> = allowed
@@ -634,7 +645,7 @@ mod tests {
             allowed,
             brute_force_threshold: 0.001,
         };
-        let res = navix_search(&idx, &[1.0, 0.0, 0.0], &opts, DistanceMetric::L2);
+        let res = navix_search(&idx, &[1.0, 0.0, 0.0], &opts, DistanceMetric::L2).unwrap();
         assert!(res.is_empty());
     }
 
@@ -648,7 +659,28 @@ mod tests {
             allowed: RoaringBitmap::new(),
             brute_force_threshold: 0.001,
         };
-        let res = navix_search(&idx, &[5.0, 0.0, 0.0], &opts, DistanceMetric::L2);
+        let res = navix_search(&idx, &[5.0, 0.0, 0.0], &opts, DistanceMetric::L2).unwrap();
         assert!(res.is_empty());
+    }
+
+    #[test]
+    fn wrong_dimension_query_is_a_typed_error() {
+        let idx = build_index(20);
+        let opts = NavixSearchOptions {
+            k: 3,
+            allowed: (0..20u32).collect(),
+            ..NavixSearchOptions::default()
+        };
+        let result = navix_search(&idx, &[1.0, 0.0], &opts, DistanceMetric::L2);
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::VectorError::DimensionMismatch {
+                    expected: 3,
+                    got: 2
+                })
+            ),
+            "{result:?}"
+        );
     }
 }

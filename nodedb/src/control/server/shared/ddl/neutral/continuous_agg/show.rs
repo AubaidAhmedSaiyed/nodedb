@@ -77,8 +77,7 @@ pub async fn show_continuous_aggregates(
         sync_dispatch::SystemTask::new(
             sync_dispatch::SystemReason::CatalogMaintenance,
             tenant_id,
-            database_id,
-            "__system",
+            nodedb_types::CollectionKey::from_bare(database_id, "__system"),
             PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
         ),
         Duration::from_secs(5),
@@ -87,7 +86,7 @@ pub async fn show_continuous_aggregates(
     {
         Ok(payload) => {
             crate::data::executor::response_codec::decode_payload(&payload).map_err(|e| {
-                DdlError::new("XX000", format!("continuous aggregate runtime stats: {e}"))
+                DdlError::from_error_in_context("continuous aggregate runtime stats", &e)
             })?
         }
         Err(_) => Vec::new(),

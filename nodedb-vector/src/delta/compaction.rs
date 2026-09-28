@@ -199,7 +199,7 @@ mod tests {
         let mut delta = DeltaIndex::new(3, 32);
         for i in 10u32..15 {
             let v = vec![i as f32, 1.0, 0.0];
-            delta.insert(i, v);
+            delta.insert(i, v).unwrap();
         }
         assert_eq!(delta.fresh_len(), 5);
 

@@ -21,10 +21,9 @@ use crate::SurrogateAssigner;
 /// implementations wrap it (Origin adds catalog/WAL handles, Lite passes
 /// it through unchanged).
 pub struct SharedConvertContext {
-    /// Database scope for vShard computation. All
-    /// `VShardId::from_collection_in_database` calls inside the converter
-    /// must use this value so collections in different databases route to
-    /// distinct shards.
+    /// Database scope for vShard computation. Every `CollectionKey` the
+    /// converter builds uses this value, so collections in different
+    /// databases route to distinct shards.
     pub database_id: DatabaseId,
 
     /// Per-tenant maximum vector dimension (0 = unlimited). Checked during

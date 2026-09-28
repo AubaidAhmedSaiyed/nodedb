@@ -251,6 +251,7 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | KvOp::SortedIndexRange { .. }
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. }
+            | KvOp::SortedIndexTxnRead { .. }
             | KvOp::MaterializeScan { .. }
             | KvOp::ResolveWrite(_)
             | KvOp::ResolvedWrite { .. },
@@ -412,7 +413,8 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | MetaOp::CalvinFlush { .. }
             | MetaOp::CalvinDrop { .. }
             | MetaOp::ResolveTxn { .. }
-            | MetaOp::CalvinResolve { .. },
+            | MetaOp::CalvinResolve { .. }
+            | MetaOp::ApplyTransactionRedo { .. },
         )
         | PhysicalPlan::Array(
             ArrayOp::OpenArray { .. }
@@ -436,7 +438,9 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | ClusterArrayOp::Delete { .. },
         )
         | PhysicalPlan::ClusterEvent(
-            ClusterEventOp::ConsumeStream { .. } | ClusterEventOp::PublishTopic { .. },
+            ClusterEventOp::ConsumeStream { .. }
+            | ClusterEventOp::PublishTopic { .. }
+            | ClusterEventOp::TenantWriteMarks { .. },
         ) => {}
     }
 }

@@ -116,12 +116,11 @@ impl CoreLoop {
                     Some(_) => crate::event::WriteOp::Update,
                     None => crate::event::WriteOp::Insert,
                 };
-                let key_str = String::from_utf8_lossy(key);
-                self.emit_write_event(
+                self.emit_kv_write_event(
                     task,
                     collection.as_str(),
                     op,
-                    crate::engine::document::store::RowIdentity::from_user_key(key_str.as_ref()),
+                    key,
                     Some(value),
                     precondition.as_deref(),
                 );
@@ -137,12 +136,11 @@ impl CoreLoop {
                 if let Some(ref m) = self.metrics {
                     m.record_kv_delete();
                 }
-                let key_str = String::from_utf8_lossy(key);
-                self.emit_write_event(
+                self.emit_kv_write_event(
                     task,
                     collection.as_str(),
                     crate::event::WriteOp::Delete,
-                    crate::engine::document::store::RowIdentity::from_user_key(key_str.as_ref()),
+                    key,
                     None,
                     precondition.as_deref(),
                 );
@@ -261,8 +259,9 @@ mod tests {
             .get(did(), TID, collection, key, crate::engine::kv::current_ms())
     }
 
+    /// A raw counter body: the decimal text of `v`.
     fn i64_bytes(v: i64) -> Vec<u8> {
-        zerompk::to_msgpack_vec(&v).expect("encode i64")
+        v.to_string().into_bytes()
     }
 
     /// Run the resolve handler and decode its outcome.
@@ -299,6 +298,7 @@ mod tests {
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+            shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         }
     }
 

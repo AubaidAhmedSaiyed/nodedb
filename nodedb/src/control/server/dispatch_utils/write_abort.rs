@@ -22,86 +22,82 @@
 //! The match is exhaustive on purpose. A new [`ErrorCode`] must be classified by
 //! whoever adds it, not silently inherit either answer.
 //!
-//! [`abort_refused_write`] is the one place that acts on that verdict, and the
-//! write funnel is its only caller — every `AppendHere` write in every engine,
-//! including the Raft apply loop, passes through there.
+//! `minted::resolve_on_response` is the one place that acts on that
+//! verdict. Every write that mints a record for a Data-Plane dispatch
+//! resolves its records there.
 
-use crate::bridge::envelope::{ErrorCode, Response};
-use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
+use crate::bridge::envelope::ErrorCode;
 
-/// Identity of the forward record an abort marker would name.
-pub(crate) struct AbortTarget {
-    pub tenant_id: TenantId,
-    pub database_id: DatabaseId,
-    pub vshard_id: VShardId,
-    /// The forward write's redo LSN, if one was minted at all.
-    pub wal_lsn: Option<Lsn>,
-    /// Whether the write funnel appended the forward record. A caller that
-    /// recorded durability elsewhere owns the undo semantics of its own record.
-    pub appends_here: bool,
+/// Whether a replicated proposal refused with `code` is refused for good: a
+/// redelivery of the same entry against the same state refuses it again.
+///
+/// A verdict that depends on this node's momentary load or on a transient
+/// precondition is not final: another replica can apply the same entry, and
+/// a redelivery here can too. That covers admission and capacity verdicts,
+/// a task that expired before it started, concurrency retries, the staging
+/// byte budget, a sync hold, which depends on the core's own stream mark,
+/// and `RetryableRefusal`,
+/// which a committed-redo apply answers with after it rolled a failed
+/// install back.
+pub(crate) fn refusal_is_final(code: &ErrorCode) -> bool {
+    write_definitely_not_applied(code) && !is_transient_verdict(code)
 }
 
-/// Cancel a forward write record the Data Plane refused.
-///
-/// The write funnel appends the redo record before the Data Plane has decided,
-/// so a refusal arrives with the record already in the log and restart replay
-/// would re-apply the very write the client was told was rejected. This writes a
-/// `WriteAborted` marker naming that record, then waits for it to be fsynced
-/// BEFORE the error is returned: the refusal path performs no fsync of its own,
-/// so an abort left buffered is volatile while the forward record may already be
-/// durable via a concurrent writer's group commit.
-///
-/// Cost: a rejected write now pays a WAL append plus an fsync wait it did not
-/// pay before. That is a deliberate trade of refusal latency for the guarantee
-/// that a refusal, once acknowledged, stays refused.
-///
-/// **Known residual, not closed:** a crash BEFORE the abort record is durable
-/// can still resurrect the write, because the forward record's durability is not
-/// gated on the verdict. Closing that window means holding the per-key order
-/// guard across the whole Data-Plane round trip, which would serialize same-key
-/// writes on every engine's common path. What this guarantees is the ACKED case:
-/// once the client has been told the write was refused, a restart cannot make it
-/// appear.
-///
-/// An append or fsync failure here is propagated, not logged: continuing would
-/// return the refusal while leaving the forward record replayable, which is
-/// exactly the bug this exists to prevent.
-pub(crate) async fn abort_refused_write(
-    shared: &SharedState,
-    target: AbortTarget,
-    response: &Response,
-) -> crate::Result<()> {
-    if !target.appends_here {
-        return Ok(());
+/// Whether `code` depends on this node's momentary load or on a transient
+/// precondition, so a redelivery of the same entry can apply it.
+fn is_transient_verdict(code: &ErrorCode) -> bool {
+    match code {
+        ErrorCode::RetryableRefusal { .. }
+        | ErrorCode::SyncNotApplied { .. }
+        | ErrorCode::RateExceeded { .. }
+        | ErrorCode::CollectionDraining { .. }
+        | ErrorCode::DispatchCapacity { .. }
+        | ErrorCode::ExpiredBeforeExecution
+        | ErrorCode::ConflictRetry
+        | ErrorCode::OllpRetryRequired
+        | ErrorCode::TxnOverlayMemoryExceeded { .. }
+        | ErrorCode::TransactionRollback { .. } => true,
+        ErrorCode::DeadlineExceeded
+        | ErrorCode::ActiveSqlTransaction { .. }
+        | ErrorCode::DependentObjectsExist { .. }
+        | ErrorCode::RejectedConstraint { .. }
+        | ErrorCode::RejectedPrevalidation { .. }
+        | ErrorCode::SyncRejected { .. }
+        | ErrorCode::NotFound
+        | ErrorCode::RejectedAuthz { .. }
+        | ErrorCode::CrdtFrontierMismatch { .. }
+        | ErrorCode::FanOutExceeded
+        | ErrorCode::ResourcesExhausted
+        | ErrorCode::RejectedDanglingEdge { .. }
+        | ErrorCode::DuplicateWrite
+        | ErrorCode::AppendOnlyViolation { .. }
+        | ErrorCode::BalanceViolation { .. }
+        | ErrorCode::PeriodLocked { .. }
+        | ErrorCode::PeriodLockMisconfigured { .. }
+        | ErrorCode::RetentionViolation { .. }
+        | ErrorCode::LegalHoldActive { .. }
+        | ErrorCode::StateTransitionViolation { .. }
+        | ErrorCode::TransitionCheckViolation { .. }
+        | ErrorCode::TypeGuardViolation { .. }
+        | ErrorCode::TypeMismatch { .. }
+        | ErrorCode::CounterFault { .. }
+        | ErrorCode::InsufficientBalance { .. }
+        | ErrorCode::RecursionDepthExceeded { .. }
+        | ErrorCode::UndefinedColumn { .. }
+        | ErrorCode::Internal { .. }
+        | ErrorCode::Unsupported { .. }
+        | ErrorCode::RollbackFailed { .. }
+        | ErrorCode::DivisionByZero
+        | ErrorCode::UndefinedFunction { .. }
+        | ErrorCode::DataException { .. }
+        | ErrorCode::BadRequest { .. } => false,
     }
-    let Some(wal_lsn) = target.wal_lsn else {
-        return Ok(());
-    };
-    // A rejection is only cancellable when the verdict itself proves nothing
-    // was installed. An ambiguous failure keeps its forward record, because
-    // erasing a write that actually landed is worse than replaying one that
-    // did not.
-    let Some(code) = response.error_code.as_deref() else {
-        return Ok(());
-    };
-    if !write_definitely_not_applied(code) {
-        return Ok(());
-    }
+}
 
-    let abort_lsn = shared.wal.append_write_aborted(
-        target.tenant_id,
-        target.vshard_id,
-        target.database_id,
-        wal_lsn,
-    )?;
-    shared.wal.wait_durable(abort_lsn).await?;
-    tracing::debug!(
-        aborted_lsn = wal_lsn.as_u64(),
-        abort_lsn = abort_lsn.as_u64(),
-        "refused write cancelled in the WAL"
-    );
-    Ok(())
+/// Whether a committed proposal's apply `error` is a final refusal: the
+/// entry's outcome, which a redelivery must answer with and never apply.
+pub(crate) fn error_is_final_refusal(error: &crate::Error) -> bool {
+    matches!(error, crate::Error::DataPlane(code) if refusal_is_final(code))
 }
 
 /// Whether `code` proves the write was refused without applying anything.
@@ -114,6 +110,10 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         // refusal instead of installing the write.
         ErrorCode::RejectedConstraint { .. }
         | ErrorCode::RejectedPrevalidation { .. }
+        // The sync gate refused the frame before its delta installed.
+        | ErrorCode::SyncRejected { .. }
+        // The sync gate held the frame back before anything installed.
+        | ErrorCode::SyncNotApplied { .. }
         | ErrorCode::RejectedAuthz { .. }
         | ErrorCode::RejectedDanglingEdge { .. }
         | ErrorCode::AppendOnlyViolation { .. }
@@ -126,12 +126,15 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         | ErrorCode::TransitionCheckViolation { .. }
         | ErrorCode::TypeGuardViolation { .. }
         | ErrorCode::TypeMismatch { .. }
-        | ErrorCode::OverflowError { .. }
+        | ErrorCode::CounterFault { .. }
         | ErrorCode::InsufficientBalance { .. }
         // Admission verdicts: the request never reached the mutation at all.
         | ErrorCode::RateExceeded { .. }
         | ErrorCode::CollectionDraining { .. }
+        | ErrorCode::DispatchCapacity { .. }
         | ErrorCode::Unsupported { .. }
+        // The deadline passed before the core started the task.
+        | ErrorCode::ExpiredBeforeExecution
         // The target row or collection did not exist, so the write had nothing
         // to mutate.
         | ErrorCode::NotFound
@@ -141,11 +144,19 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         // Concurrency verdicts that abort the whole attempt before install.
         | ErrorCode::ConflictRetry
         | ErrorCode::OllpRetryRequired
+        // The whole transaction aborted before any read-set was validated.
+        | ErrorCode::TransactionRollback { .. }
+        // Refused by the transaction state, or by the target's dependents,
+        // before the statement ran.
+        | ErrorCode::ActiveSqlTransaction { .. }
+        | ErrorCode::DependentObjectsExist { .. }
         // The staging overlay hit its byte budget, so the transaction's writes
         // were discarded from the overlay and never installed.
         | ErrorCode::TxnOverlayMemoryExceeded { .. }
         // Expression evaluation failed before producing a value to write.
         | ErrorCode::DivisionByZero
+        | ErrorCode::UndefinedFunction { .. }
+        | ErrorCode::DataException { .. }
         | ErrorCode::UndefinedColumn { .. } => true,
 
         // NOT established — every one of these can be reported by a request
@@ -166,7 +177,10 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         // * `DuplicateWrite` — the idempotency gate fired because the write
         //   ALREADY applied under the original request; nothing to undo, and
         //   the duplicate record replays to the same state.
+        // * `BadRequest` — raised by many engine paths, some of them after a
+        //   multi-row plan already wrote rows.
         ErrorCode::DeadlineExceeded
+        | ErrorCode::BadRequest { .. }
         | ErrorCode::RollbackFailed { .. }
         | ErrorCode::ResourcesExhausted
         | ErrorCode::Internal { .. }
@@ -205,6 +219,25 @@ mod tests {
         ));
     }
 
+    /// A dispatcher capacity refusal enqueued nothing, so the record aborts.
+    #[test]
+    fn dispatch_capacity_refusal_aborts_the_record() {
+        assert!(write_definitely_not_applied(&ErrorCode::DispatchCapacity {
+            reason: "core 0 queue is full at 64 requests".into(),
+        }));
+    }
+
+    /// A task that expired before its core started it ran nothing, so the
+    /// record aborts. A redelivery can still run it, so the refusal is not
+    /// final.
+    #[test]
+    fn a_task_that_never_started_aborts_the_record_but_is_not_final() {
+        assert!(write_definitely_not_applied(
+            &ErrorCode::ExpiredBeforeExecution
+        ));
+        assert!(!refusal_is_final(&ErrorCode::ExpiredBeforeExecution));
+    }
+
     /// The asymmetry that keeps this safe: an ambiguous outcome must never
     /// produce an abort, because the write it would erase may have landed.
     #[test]
@@ -221,5 +254,21 @@ mod tests {
             detail: "io_uring".into(),
         }));
         assert!(!write_definitely_not_applied(&ErrorCode::DuplicateWrite));
+    }
+
+    #[test]
+    fn a_constraint_verdict_is_final_and_a_retryable_one_is_not() {
+        assert!(refusal_is_final(&ErrorCode::RejectedPrevalidation {
+            reason: "sub-record does not decode".into(),
+        }));
+        assert!(!refusal_is_final(&ErrorCode::RetryableRefusal {
+            reason: "install rolled back".into(),
+        }));
+        assert!(!refusal_is_final(&ErrorCode::DispatchCapacity {
+            reason: "core 0 queue is full".into(),
+        }));
+        assert!(!refusal_is_final(&ErrorCode::Internal {
+            detail: "io_uring".into(),
+        }));
     }
 }

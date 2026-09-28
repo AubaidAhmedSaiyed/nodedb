@@ -60,7 +60,7 @@ pub fn show_versions(
             ),
             if limit > 0 { limit } else { 1000 },
         )
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let columns = vec![
         "checkpoint_name".to_string(),

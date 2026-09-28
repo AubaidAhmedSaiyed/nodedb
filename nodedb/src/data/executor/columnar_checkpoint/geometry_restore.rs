@@ -51,7 +51,7 @@ use tracing::warn;
 use super::super::core_loop::CoreLoop;
 use super::super::scan_normalize::decoded_col_to_value;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
 use nodedb_types::RlsWriteCheck;
 use nodedb_types::columnar::ColumnType;
@@ -115,10 +115,23 @@ impl CoreLoop {
         // rows that are already durable, and is not itself a write. Noting an
         // LSN here would raise the core watermark during boot from a path that
         // applied no record.
+        // The checkpoint key carries the stored, database-qualified name.
+        let vshard = match nodedb_types::CollectionKey::from_qualified_str(*db_id, collection) {
+            Ok(key) => key.vshard(),
+            Err(e) => {
+                warn!(
+                    %collection,
+                    error = %e,
+                    "columnar checkpoint restore: collection name does not de-qualify; its \
+                     geometry rows are absent from the rebuilt R-tree"
+                );
+                return 0;
+            }
+        };
         let task = Self::replay_task(
             *tenant_id,
             *db_id,
-            VShardId::from_collection_in_database(*db_id, collection),
+            vshard,
             PhysicalPlan::Columnar(ColumnarOp::Insert {
                 collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                 payload: Vec::new(),

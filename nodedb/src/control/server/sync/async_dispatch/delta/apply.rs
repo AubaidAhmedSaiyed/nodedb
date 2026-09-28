@@ -263,9 +263,8 @@ pub(crate) async fn apply_delta_and_finalize(
     }
 
     let surrogate = match shared.surrogate_assigner.assign(
-        database_id,
+        nodedb_types::CollectionKey::from_bare(database_id, &delta_msg.collection),
         tenant_id,
-        &delta_msg.collection,
         delta_msg.document_id.as_bytes(),
     ) {
         Ok(s) => s,
@@ -333,7 +332,7 @@ pub(crate) async fn apply_delta_and_finalize(
     });
 
     let vshard_id =
-        crate::types::VShardId::from_collection_in_database(database_id, &delta_msg.collection);
+        nodedb_types::CollectionKey::from_bare(database_id, &delta_msg.collection).vshard();
     let authorized = super::super::super::raft_dispatch::authorize_sync_task(
         shared,
         Some(identity),

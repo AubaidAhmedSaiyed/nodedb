@@ -77,7 +77,7 @@ pub(in crate::data::executor) fn resolve_update_rows(
             match row_matches_filters(&row, schema, filter_predicates) {
                 Ok(true) => {}
                 Ok(false) => continue,
-                Err(_) => return Err(crate::Error::DivisionByZero),
+                Err(e) => return Err(crate::Error::from(e)),
             }
         }
 
@@ -121,7 +121,7 @@ pub(in crate::data::executor) fn resolve_delete_rows(
             match row_matches_filters(&row, schema, filter_predicates) {
                 Ok(true) => {}
                 Ok(false) => continue,
-                Err(_) => return Err(crate::Error::DivisionByZero),
+                Err(e) => return Err(crate::Error::from(e)),
             }
         }
         admit_columnar_row(rls_write_check, &row, schema, tid, collection)?;

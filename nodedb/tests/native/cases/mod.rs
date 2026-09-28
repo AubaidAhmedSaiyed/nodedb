@@ -3,11 +3,15 @@
 mod native_clone_read_intercept;
 mod native_clone_write_intercept;
 mod native_create_then_dml;
+mod native_database_collection_key_placement;
 mod native_direct_op_txn_overlay;
 mod native_dml_affected_counts;
 mod native_dml_outcome_conformance;
 mod native_error_code_classification;
 mod native_gateway_txn_overlay;
+mod native_index_ddl_opcodes;
+mod native_kv_atomic_autocommit_wal;
+mod native_kv_counter_faults;
 mod native_primary_key_nullability;
 mod native_protocol;
 mod native_result_projection;

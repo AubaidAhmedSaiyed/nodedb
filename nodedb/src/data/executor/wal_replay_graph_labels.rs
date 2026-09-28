@@ -36,8 +36,6 @@
 //! `Err`. `remove_node_label` never vivifies (it no-ops on an unknown node or
 //! unknown label), so it was already identical to live and needs no change.
 
-use tracing::warn;
-
 use nodedb_wal::WalRecord;
 use nodedb_wal::record::RecordType;
 
@@ -69,15 +67,23 @@ impl CoreLoop {
 
         let Ok((node_id, labels)) = zerompk::from_msgpack::<(String, Vec<String>)>(&record.payload)
         else {
-            warn!(
-                core = self.core_id,
-                lsn = record_lsn,
-                "WAL graph node-label replay: malformed payload; skipping"
+            self.replay_record_rejected(
+                "graph",
+                record_lsn,
+                None,
+                "malformed graph node-label WAL record",
             );
             return Some(0);
         };
+        if self.claim_for_validation() {
+            return Some(0);
+        }
+        if self.recording_redo_undo() {
+            let undo =
+                self.capture_node_labels_undo(database_id.as_u64(), tenant_id, &node_id, &labels);
+            self.record_redo_undo([undo]);
+        }
 
-        let partition = self.csr_partition_mut(database_id.as_u64(), tenant_id);
         if is_set {
             for label in &labels {
                 // `add_node_label` vivifies `node_id` via `ensure_node` exactly
@@ -85,18 +91,21 @@ impl CoreLoop {
                 // 64-distinct-label bitset limit) is discarded here, mirroring
                 // the live handler, which also never inspects the returned
                 // bool on `Ok`.
-                if let Err(e) = partition.add_node_label(&node_id, label) {
-                    warn!(
-                        core = self.core_id,
-                        %node_id,
-                        lsn = record_lsn,
-                        error = %e,
-                        "WAL graph node-label replay: set label failed; skipping"
+                let added = self
+                    .csr_partition_mut(database_id.as_u64(), tenant_id)
+                    .add_node_label(&node_id, label);
+                if let Err(e) = added {
+                    self.replay_record_rejected(
+                        "graph",
+                        record_lsn,
+                        None,
+                        &format!("setting label '{label}' on node '{node_id}' failed: {e}"),
                     );
                     return Some(0);
                 }
             }
         } else {
+            let partition = self.csr_partition_mut(database_id.as_u64(), tenant_id);
             // `remove_node_label` no-ops on an unknown node or unknown label —
             // it never vivifies, so calling it unconditionally is already
             // identical to the live `RemoveNodeLabels` handler.

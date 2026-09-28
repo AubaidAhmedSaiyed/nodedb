@@ -58,6 +58,7 @@ fn write_event(seq: u64) -> WriteEvent {
         op: WriteOp::Insert,
         row_id: RowId::row(nodedb_types::RowIdentity::from_user_key(format!("r-{seq}"))),
         lsn: Lsn::new(seq * 10),
+        record: None,
         database_id: DatabaseId::new(7),
         tenant_id: TenantId::new(1),
         vshard_id: VShardId::new(0),
@@ -126,6 +127,7 @@ fn buffer_composite_read_shares_event_allocation_across_polls() {
         field_diffs: None,
         system_time_ms: None,
         valid_time_ms: None,
+        source: nodedb::event::EventSource::User,
     };
     buf.push(ev);
 
@@ -172,6 +174,7 @@ fn buffer_partition_read_shares_event_allocation() {
         field_diffs: None,
         system_time_ms: None,
         valid_time_ms: None,
+        source: nodedb::event::EventSource::User,
     };
     buf.push(ev);
 

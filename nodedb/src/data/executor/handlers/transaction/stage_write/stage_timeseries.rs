@@ -5,10 +5,11 @@
 //! A timeseries INSERT issued inside a `BEGIN..COMMIT` block is staged here,
 //! one overlay `Put` per row, so a later same-transaction RAW timeseries
 //! SELECT observes the newly inserted rows (read-your-own-writes) before
-//! COMMIT. COMMIT durable replay is unchanged: the buffered
-//! `TimeseriesOp::Ingest` plan is still replayed through
-//! `execute_timeseries_ingest` inside the COMMIT `TransactionBatch`, which
-//! remains the sole durable apply.
+//! COMMIT. COMMIT resolves the buffered `TimeseriesOp::Ingest` plan into a
+//! redo sub-record, which is the sole durable apply. The staged batch records
+//! the instant it read as its default row timestamp, and resolve stamps the
+//! batch's untimed rows with that instant, so every replica stores the rows
+//! the statement decided.
 //!
 //! No memtable mutation at statement time: staging writes ONLY into the
 //! per-transaction overlay (`txn_overlays`), never into `columnar_memtables`.
@@ -72,14 +73,14 @@ pub(in crate::data::executor) struct StageTimeseriesInsertParams<'a> {
 /// Borrowed inputs for the canonical line-protocol staging path. Bundled
 /// because the raw parameter list exceeds the project's too-many-arguments
 /// bound.
-struct CanonicalIlpStage<'a> {
-    task: &'a ExecutionTask,
-    tid: u64,
-    txn_id: TxnId,
-    collection: &'a str,
-    payload: &'a [u8],
-    surrogates: &'a [Surrogate],
-    rls_write_check: &'a nodedb_types::RlsWriteCheck,
+pub(super) struct CanonicalIlpStage<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub txn_id: TxnId,
+    pub collection: &'a str,
+    pub payload: &'a [u8],
+    pub surrogates: &'a [Surrogate],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -102,16 +103,25 @@ impl CoreLoop {
             rls_write_check,
         } = params;
 
+        let stage = CanonicalIlpStage {
+            task,
+            tid,
+            txn_id,
+            collection,
+            payload,
+            surrogates,
+            rls_write_check,
+        };
+        // The canonical line list always travels with one token per line.
         if format == "ilp-msgpack" {
-            return self.stage_canonical_ilp_rows(CanonicalIlpStage {
-                task,
-                tid,
-                txn_id,
-                collection,
-                payload,
-                surrogates,
-                rls_write_check,
-            });
+            return self.stage_canonical_ilp_rows(stage);
+        }
+        // An ingest with no surrogates has no overlay key for its rows.
+        if surrogates.is_empty() {
+            return self.stage_unkeyed_timeseries(stage, format);
+        }
+        if format == "ilp" {
+            return self.stage_raw_ilp_rows(stage);
         }
 
         let rows: Vec<Value> = match nodedb_types::value_from_msgpack(payload) {
@@ -144,6 +154,11 @@ impl CoreLoop {
             );
         }
 
+        // The default timestamp of every untimed row in this batch. The write
+        // policy decides against it here, and COMMIT resolve stamps the rows
+        // with it, so the stored image is the one decided.
+        let now_ms = self.ingest_now_ms();
+
         // Decide the whole batch before the first staged put, so a refusal
         // leaves the overlay untouched and reports no affected count.
         //
@@ -166,7 +181,7 @@ impl CoreLoop {
                 crate::types::TenantId::new(tid),
                 collection,
             ),
-            self.ingest_now_ms(),
+            now_ms,
             tid,
             collection,
         ) {
@@ -216,11 +231,12 @@ impl CoreLoop {
             }
             staged += 1;
         }
+        self.note_staged_ingest_now(task, tid, txn_id, collection, surrogates, now_ms);
 
         self.stage_count_response(task, staged)
     }
 
-    fn stage_canonical_ilp_rows(&mut self, args: CanonicalIlpStage<'_>) -> Response {
+    pub(super) fn stage_canonical_ilp_rows(&mut self, args: CanonicalIlpStage<'_>) -> Response {
         let CanonicalIlpStage {
             task,
             tid,
@@ -307,6 +323,7 @@ impl CoreLoop {
                 },
             );
         }
+        let now_ms = self.ingest_now_ms();
         // The write policy decides the parsed lines, through the very same
         // helper the Data-Plane ingest gate uses, so the statement-time
         // decision and the COMMIT-time one are made on a byte-identical image.
@@ -320,7 +337,7 @@ impl CoreLoop {
                 crate::types::TenantId::new(tid),
                 collection,
             ),
-            self.ingest_now_ms(),
+            now_ms,
             tid,
             collection,
         ) {
@@ -436,6 +453,7 @@ impl CoreLoop {
                 return self.response_error(task, error);
             }
         }
+        self.note_staged_ingest_now(task, tid, txn_id, collection, surrogates, now_ms);
         self.stage_count_response(task, lines.len())
     }
 

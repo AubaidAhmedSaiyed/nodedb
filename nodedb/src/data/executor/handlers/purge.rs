@@ -111,7 +111,6 @@ impl CoreLoop {
             self.vector_collections.retain(|(_, t, _), _| *t != tid_key);
             self.vector_params.retain(|(_, t, _), _| *t != tid_key);
             self.index_configs.retain(|(_, t, _), _| *t != tid_key);
-            self.ivf_indexes.retain(|(_, t, _), _| *t != tid_key);
             before - self.vector_collections.len()
         };
 
@@ -125,12 +124,10 @@ impl CoreLoop {
             self.columnar_memtable_mem
                 .retain(|(_, t, _), _| *t != tid_key);
             self.ts_registries.retain(|(_, t, _), _| *t != tid_key);
-            self.ts_max_ingested_lsn
-                .retain(|(_, t, _), _| *t != tid_key);
+            self.ts_replay_stamps.retain(|(_, t, _), _| *t != tid_key);
             self.ts_last_value_caches
                 .retain(|(_, t, _), _| *t != tid_key);
             self.ts_series_catalogs.retain(|(_, t, _), _| *t != tid_key);
-            self.ts_truncate_floors.retain(|(_, t, _), _| *t != tid_key);
             before - self.columnar_memtables.len()
         };
 
@@ -172,6 +169,18 @@ impl CoreLoop {
                 task,
                 ErrorCode::Internal {
                     detail: format!("sparse chain-head purge: {e}"),
+                },
+            );
+        }
+
+        // Stored CRDT dead-letter entries: a tenant recreated under the same
+        // id must not restore them.
+        if let Err(e) = self.sparse.delete_crdt_dead_letters_for_tenant(tenant_id) {
+            warn!(tenant_id, error = %e, "sparse crdt dead-letter purge failed");
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("sparse crdt dead-letter purge: {e}"),
                 },
             );
         }

@@ -36,7 +36,7 @@ pub fn drop_function(
     // Check if function exists.
     let func_exists = catalog
         .get_function_in_database(database_id, tenant_id, &name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .is_some();
 
     if !func_exists && !if_exists {
@@ -54,7 +54,7 @@ pub fn drop_function(
     // Check dependencies: block DROP if other objects depend on this function.
     let dependents = catalog
         .find_dependents(database_id, tenant_id, "function", &name)
-        .map_err(|e| DdlError::new("XX000", format!("dependency check: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("dependency check", &e))?;
     if !dependents.is_empty() {
         let dep_list: Vec<String> = dependents
             .iter()
@@ -79,7 +79,7 @@ pub fn drop_function(
         name: name.clone(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, outcome);
 
     // Broadcast deletion to connected Lite sessions.

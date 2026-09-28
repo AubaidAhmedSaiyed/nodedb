@@ -22,7 +22,7 @@ use crate::control::server::shared::clone_write::{
 use crate::control::server::shared::ddl::sync_dispatch::dispatch_authorized;
 use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 
 use super::super::super::result::DdlError;
 
@@ -45,7 +45,7 @@ pub(super) async fn dispatch_authorized_read(
     let task = PhysicalTask {
         tenant_id: identity.tenant_id,
         database_id,
-        vshard_id: VShardId::from_collection_in_database(database_id, collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
         plan,
         post_set_op: PostSetOp::None,
         txn_id: None,
@@ -70,12 +70,12 @@ pub(super) async fn dispatch_authorized_read(
         // answer itself; the payload is flattened the same way the Data Plane's
         // own response is, so the two are indistinguishable to the caller.
         CloneCheckedOutcome::Handled(response) => {
-            payload_or_typed_error(response).map_err(|e| DdlError::new("XX000", format!("{e}")))
+            payload_or_typed_error(response).map_err(|e| DdlError::from_error(&e))
         }
         CloneCheckedOutcome::Proceed(checked) => {
             dispatch_authorized(state, checked, collection, timeout)
                 .await
-                .map_err(|e| DdlError::new("XX000", format!("dispatch: {e}")))
+                .map_err(|e| DdlError::from_error_in_context("dispatch", &e))
         }
     }
 }
@@ -87,15 +87,14 @@ pub(super) async fn dispatch_authorized_read(
 /// into [`crate::Error::RejectedAuthz`], so the client-visible SQLSTATE stays
 /// the same with clone interception running ahead of it. Everything else the gate
 /// can raise (a clone read shape with no sound rewrite, a catalog read failure)
-/// is an internal-error class the client cannot act on by SQLSTATE alone, so it
-/// carries its own message under `XX000`. Both SQLSTATEs have exactly one
-/// `ErrorCode` meaning, so `DdlError::new` derives the right code for each.
+/// keeps the SQLSTATE, code and details the SQLSTATE table gives it, with the
+/// read named before its message.
 fn gate_error(error: crate::Error) -> DdlError {
     match error {
         crate::Error::RejectedAuthz { resource, .. } => {
             DdlError::new("42501", format!("permission denied: {resource}"))
         }
-        other => DdlError::new("XX000", format!("version-history read: {other}")),
+        other => DdlError::from_error_in_context("version-history read", &other),
     }
 }
 

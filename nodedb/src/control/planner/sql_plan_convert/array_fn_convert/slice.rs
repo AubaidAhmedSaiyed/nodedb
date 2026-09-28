@@ -11,7 +11,7 @@ use nodedb_sql::temporal::TemporalScope;
 use nodedb_sql::types_array::ArraySliceAst;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::{ArrayOp, ClusterArrayOp};
 
 use super::super::convert::ConvertContext;
@@ -59,7 +59,7 @@ pub(crate) fn convert_slice(
         super::helpers::resolve_array_temporal_scope(temporal, "ARRAY_SLICE")?;
     let attr_indices = resolve_attr_indices(name, attr_projection, &schema)?;
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
 
     let plan = if ctx.cluster_enabled {
         // In cluster mode emit a ClusterArray variant. The routing loop

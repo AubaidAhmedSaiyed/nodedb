@@ -12,7 +12,6 @@ mod encrypted_replay;
 mod faultbox_corruption_report;
 #[cfg(not(feature = "diagnostics"))]
 mod faultbox_disabled;
-#[cfg(not(target_arch = "wasm32"))]
 mod mmap_reader_madvise;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 mod o_direct_alignment;

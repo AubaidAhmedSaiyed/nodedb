@@ -82,26 +82,14 @@ pub async fn append_implicit_edge_tasks(
         let vsrc = VShardId::from_key(edge.src.as_bytes());
         let vdst = VShardId::from_key(edge.dst.as_bytes());
 
-        let src_surrogate = assign_surrogate_routed(
-            state,
-            vsrc,
-            database_id,
-            tenant_id,
-            &edge.collection,
-            edge.src.as_bytes(),
-            trace_id,
-        )
-        .await?;
-        let dst_surrogate = assign_surrogate_routed(
-            state,
-            vdst,
-            database_id,
-            tenant_id,
-            &edge.collection,
-            edge.dst.as_bytes(),
-            trace_id,
-        )
-        .await?;
+        // `edge.collection` is the plan's database-qualified name.
+        let key = nodedb_types::CollectionKey::from_qualified_str(database_id, &edge.collection)?;
+        let src_surrogate =
+            assign_surrogate_routed(state, vsrc, key, tenant_id, edge.src.as_bytes(), trace_id)
+                .await?;
+        let dst_surrogate =
+            assign_surrogate_routed(state, vdst, key, tenant_id, edge.dst.as_bytes(), trace_id)
+                .await?;
 
         let properties = match edge.weight {
             Some(w) => weight_properties(w),

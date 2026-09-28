@@ -12,7 +12,9 @@ use crate::control::server::shared::authorization::authorize_database;
 
 use super::NativeSession;
 use super::dispatch;
-use crate::control::server::native::dispatch::error_to_native_with_sqlstate;
+use crate::control::server::native::dispatch::{
+    error_to_native_in_context, error_to_native_with_sqlstate,
+};
 use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 impl NativeSession {
@@ -88,8 +90,12 @@ impl NativeSession {
                                 "selected database does not exist",
                             );
                         }
-                        Err(_) => {
-                            return sqlstate_error(seq, "XX000", "database catalog lookup failed");
+                        Err(e) => {
+                            return error_to_native_in_context(
+                                seq,
+                                "database catalog lookup failed",
+                                &e,
+                            );
                         }
                     },
                     None => identity
@@ -105,8 +111,12 @@ impl NativeSession {
                     Ok(None) => {
                         return sqlstate_error(seq, "3D000", "selected database does not exist");
                     }
-                    Err(_) => {
-                        return sqlstate_error(seq, "XX000", "database catalog lookup failed");
+                    Err(e) => {
+                        return error_to_native_in_context(
+                            seq,
+                            "database catalog lookup failed",
+                            &e,
+                        );
                     }
                 }
 
@@ -150,7 +160,7 @@ impl NativeSession {
                     drop(scoped);
                     return sqlstate_error(
                         seq,
-                        "XX000",
+                        nodedb_types::error::sqlstate::INTERNAL_ERROR,
                         "internal error: global admission permit missing during auth assembly",
                     );
                 };

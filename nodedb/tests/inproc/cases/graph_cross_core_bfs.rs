@@ -20,7 +20,7 @@ use nodedb::control::server::broadcast::broadcast_call_count;
 use nodedb::control::server::shared::clone_write::{
     CloneCheckedOutcome, InterceptAndAuthorizeParams, intercept_and_authorize,
 };
-use nodedb::types::{DatabaseId, TenantId, TraceId, VShardId};
+use nodedb::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_test_support::pgwire_harness::TestServer;
@@ -31,7 +31,7 @@ async fn seed_star(server: &TestServer, collection: &str, leaf_prefix: &str, cou
     let database_id = DatabaseId::DEFAULT;
     let task = PhysicalTask {
         tenant_id,
-        vshard_id: VShardId::from_collection_in_database(database_id, collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
         database_id,
         plan: PhysicalPlan::Graph(GraphOp::EdgePutBatch {
             edges: (0..count)

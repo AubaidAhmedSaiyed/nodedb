@@ -17,7 +17,7 @@ use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::gate::require_tenant_admin;
-use super::support::{ddl_err, text_rows};
+use super::support::text_rows;
 
 /// Handle `SHOW DATABASES`.
 pub fn show_databases(
@@ -30,7 +30,7 @@ pub fn show_databases(
 
     let databases = catalog
         .list_databases()
-        .map_err(|e| ddl_err("XX000", format!("catalog list failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog list failed", &e))?;
 
     let columns = vec![
         "name".to_string(),

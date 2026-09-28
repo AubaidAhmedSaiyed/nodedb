@@ -4,10 +4,10 @@
 //! resolvers (`shuffle` = shuffle-join, `shuffle_aggregate` = shuffle GROUP BY).
 //!
 //! Both resolvers fan producer/consumer RPCs across the cluster and need the
-//! same primitives: resolve a collection's owner nodes, register peer addresses
-//! from the live topology before dispatch, and count the cluster's data nodes
-//! for the default partition count. They live here (rather than duplicated in
-//! each resolver) so the two paths share one implementation.
+//! same primitives: resolve a collection's owner nodes, count the cluster's
+//! data nodes for the default partition count, and send a produce request.
+//! They live here (rather than duplicated in each resolver) so the two paths
+//! share one implementation.
 
 use std::collections::BTreeSet;
 
@@ -15,10 +15,10 @@ use nodedb_cluster::{
     METADATA_GROUP_ID, RaftRpc, RoutingTable, ShuffleProduceRequest, ShuffleProduceResponse,
 };
 
-use crate::control::state::SharedState;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 
-/// Producer nodes that own `collection`'s data: resolve its vShard → owning
+/// Producer nodes that own `collection`'s data. `collection` is the plan's
+/// database-qualified name. Resolve its canonical key's vShard → owning
 /// group → leader. A user collection is single-vShard-homed, so this is one
 /// node; returned as a deduped sorted vec for generality.
 pub(super) fn producer_nodes(
@@ -26,7 +26,9 @@ pub(super) fn producer_nodes(
     database_id: DatabaseId,
     collection: &str,
 ) -> crate::Result<Vec<u64>> {
-    let vshard = VShardId::from_collection_in_database(database_id, collection).as_u32();
+    let vshard = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?
+        .vshard()
+        .as_u32();
     let group = routing
         .group_for_vshard(vshard)
         .map_err(|e| crate::Error::Internal {
@@ -57,34 +59,6 @@ pub(super) fn distinct_data_node_count(routing: &RoutingTable) -> usize {
         }
     }
     nodes.len()
-}
-
-/// Register each target node's address with the transport from the live cluster
-/// topology (idempotent). Makes the shuffle fan-out robust to a peer the
-/// transport has not warmed yet — without it `send_rpc` to an unregistered (but
-/// topology-known) node fails with `NodeUnreachable`. Self IS registered too:
-/// when this coordinator also owns one of the sides it dispatches that
-/// producer/consumer to itself via `send_rpc`, which loops back through the local
-/// QUIC endpoint and runs the same handler (an extra local hop, functionally
-/// correct). Missing topology / address for a node is left alone so the
-/// subsequent `send_rpc` surfaces the typed `NodeUnreachable` rather than this
-/// silently masking it.
-pub(crate) fn register_peers_from_topology(
-    state: &SharedState,
-    transport: &nodedb_cluster::NexarTransport,
-    nodes: &BTreeSet<u64>,
-) {
-    let Some(topology) = state.cluster_topology.as_ref() else {
-        return;
-    };
-    let topo = topology.read().unwrap_or_else(|p| p.into_inner());
-    for &node in nodes {
-        if let Some(info) = topo.get_node(node)
-            && let Some(addr) = info.socket_addr()
-        {
-            transport.register_peer(node, addr);
-        }
-    }
 }
 
 /// Send one `ShuffleProduceRequest` and map the reply / RPC error to a typed

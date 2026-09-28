@@ -78,16 +78,21 @@ impl CoreLoop {
                 None => continue,
             };
 
+            // A trained IVF-PQ index holds its own tombstones beside the
+            // sealed segments', and `compact` removes both.
+            let ivf = collection.ivf_index();
             let total_tombstones: usize = collection
                 .sealed_segments()
                 .iter()
                 .map(|seg| seg.index.tombstone_count())
-                .sum();
+                .sum::<usize>()
+                + ivf.map_or(0, |ivf| ivf.tombstone_count());
             let total_nodes: usize = collection
                 .sealed_segments()
                 .iter()
                 .map(|seg| seg.index.len())
-                .sum();
+                .sum::<usize>()
+                + ivf.map_or(0, |ivf| ivf.len());
 
             if total_tombstones == 0 {
                 continue;
@@ -99,7 +104,7 @@ impl CoreLoop {
                 0.0
             };
 
-            if !force && ratio < self.compaction_tombstone_threshold {
+            if !force && ratio < self.maintenance.compaction_tombstone_threshold {
                 continue;
             }
 

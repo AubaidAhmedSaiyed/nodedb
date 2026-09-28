@@ -23,7 +23,9 @@ pub enum IndexType {
     Hnsw,
     /// HNSW graph with PQ-compressed storage for traversal.
     HnswPq,
-    /// IVF-PQ flat index. Lowest memory (~16 bytes/vector), best for >10M vectors.
+    /// IVF-PQ: vectors buffer, searched exactly, until `max(ivf_cells, pq_k)`
+    /// are held, then train k-means cells and PQ codebooks. A search probes
+    /// `ivf_nprobe` cells by PQ distance and reranks by exact distance.
     IvfPq,
 }
 

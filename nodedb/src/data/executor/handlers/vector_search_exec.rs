@@ -14,19 +14,6 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
-/// Parameters for [`CoreLoop::search_ivf`].
-struct SearchIvfParams<'a> {
-    task: &'a ExecutionTask,
-    tid: u64,
-    collection: &'a str,
-    index_key: &'a (nodedb_types::DatabaseId, crate::types::TenantId, String),
-    ivf: &'a crate::engine::vector::ivf::IvfPqIndex,
-    query_vector: &'a [f32],
-    top_k: usize,
-    filter_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
-    rls_filters: &'a [u8],
-}
-
 impl CoreLoop {
     /// Fetch the document body via the sparse engine (keyed by
     /// surrogate-hex) and attach it to the hit. Used both by the RLS path
@@ -34,7 +21,8 @@ impl CoreLoop {
     /// the slow-path SELECT (the Control Plane response translator flattens
     /// the body's fields into the hit JSON so payload columns surface to
     /// the client). When `attach == false`, or the hit carries no surrogate
-    /// binding, the hit is returned unchanged.
+    /// binding, the hit is returned unchanged. A storage read error fails
+    /// the call: a hit without its body would skip the RLS predicate check.
     ///
     /// The bytes are normalized to a standard msgpack map through the shared
     /// sparse-body normalizer, resolved from the collection's registered kind.
@@ -50,14 +38,14 @@ impl CoreLoop {
         collection: &str,
         attach: bool,
         mut hit: super::super::response_codec::VectorSearchHit,
-    ) -> super::super::response_codec::VectorSearchHit {
+    ) -> crate::Result<super::super::response_codec::VectorSearchHit> {
         if !attach {
-            return hit;
+            return Ok(hit);
         }
         let Some(key) = hit.id.storage_key() else {
-            return hit;
+            return Ok(hit);
         };
-        if let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, &key) {
+        if let Some(bytes) = self.sparse.get(database_id, tid, collection, &key)? {
             let format = self.sparse_body_format(
                 crate::types::DatabaseId::new(database_id),
                 crate::types::TenantId::new(tid),
@@ -73,7 +61,7 @@ impl CoreLoop {
                 .into_owned(),
             );
         }
-        hit
+        Ok(hit)
     }
 
     pub(in crate::data::executor) fn execute_vector_search(
@@ -144,22 +132,8 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
-        // Check for IVF-PQ index first.
-        if let Some(ivf) = self.ivf_indexes.get(&index_key) {
-            return self.search_ivf(SearchIvfParams {
-                task,
-                tid,
-                collection,
-                index_key: &index_key,
-                ivf,
-                query_vector,
-                top_k,
-                filter_bitmap,
-                rls_filters,
-            });
-        }
-
-        // Default: HNSW collection.
+        // Every index type is one `VectorCollection`: an IVF-PQ collection
+        // answers from its exact buffer or its trained IVF-PQ index.
         // If the specific field-named index does not exist, fall back to the
         // empty-field index. This handles data synced from NodeDB-Lite (which
         // uses collection-level storage, not named-field storage) being
@@ -200,6 +174,14 @@ impl CoreLoop {
             }
             return self.response_error(task, ErrorCode::NotFound);
         };
+        // The index width is fixed even while it holds no vector, so a
+        // query of another width fails here too.
+        if collection_ref.dim() != query_vector.len() {
+            return self.response_error(
+                task,
+                super::vector::dimension_mismatch(collection_ref.dim(), query_vector.len()),
+            );
+        }
         if collection_ref.is_empty() {
             if let Some(txn_id) = task.request.txn_id {
                 return staged_only(self, txn_id);
@@ -289,22 +271,34 @@ impl CoreLoop {
             (None, None) => None,
         };
 
-        let results = match combined_bm {
+        // A filter that cannot be serialized fails the search: searching
+        // without it would return rows the filter excludes.
+        let searched = match combined_bm {
             Some(local_bm) => {
                 let mut buf = Vec::with_capacity(local_bm.serialized_size());
-                if local_bm.serialize_into(&mut buf).is_ok() {
-                    collection_ref.search_with_bitmap_bytes_and_metric(
-                        query_vector,
-                        fetch_k,
-                        ef,
-                        &buf,
-                        metric,
-                    )
-                } else {
-                    collection_ref.search_with_metric(query_vector, fetch_k, ef, metric)
+                if let Err(e) = local_bm.serialize_into(&mut buf) {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("vector search filter bitmap serialization: {e}"),
+                        },
+                    );
                 }
+                collection_ref.search_with_bitmap_bytes_and_metric(
+                    query_vector,
+                    fetch_k,
+                    ef,
+                    &buf,
+                    metric,
+                )
             }
             None => collection_ref.search_with_metric(query_vector, fetch_k, ef, metric),
+        };
+        // A query of the wrong dimension is the caller's data error (22000);
+        // the core keeps serving.
+        let results = match searched {
+            Ok(results) => results,
+            Err(e) => return self.response_error(task, crate::Error::from(e)),
         };
 
         // Pure-vector fast path: projection contains only id/distance.
@@ -355,7 +349,7 @@ impl CoreLoop {
         // OR when RLS filters need them; the CP response translator flattens
         // the bytes' fields into the hit JSON for client column projection.
         let attach = !skip_payload_fetch || !rls_filters.is_empty();
-        let mut hits: Vec<_> = results
+        let hits: crate::Result<Vec<_>> = results
             .iter()
             .map(|r| build_search_hit(Some(collection_ref), r.id, r.distance))
             .map(|hit| {
@@ -368,6 +362,10 @@ impl CoreLoop {
                 )
             })
             .collect();
+        let mut hits = match hits {
+            Ok(hits) => hits,
+            Err(e) => return self.response_error(task, e),
+        };
         let truncate_to = if rls_filters.is_empty() {
             top_k
         } else {
@@ -416,63 +414,6 @@ impl CoreLoop {
         if let Err(e) = self.merge_vector_overlay_into_search(params, &mut hits) {
             return self.response_error(task, e);
         }
-        if let Some(ref m) = self.metrics {
-            m.record_vector_search(0);
-            m.record_query_by_engine("vector");
-        }
-        encode_hits_response(self, task, &hits)
-    }
-
-    /// Search an IVF-PQ index with optional bitmap post-filtering.
-    fn search_ivf(&self, params: SearchIvfParams<'_>) -> Response {
-        let SearchIvfParams {
-            task,
-            tid,
-            collection,
-            index_key,
-            ivf,
-            query_vector,
-            top_k,
-            filter_bitmap,
-            rls_filters,
-        } = params;
-        if ivf.is_empty() {
-            return super::vector_search::empty_hits_response(self, task);
-        }
-        let fetch_k = if filter_bitmap.is_some() || !rls_filters.is_empty() {
-            top_k * self.query_tuning.bitmap_over_fetch_factor.max(2)
-        } else {
-            top_k
-        };
-        let results = ivf.search(query_vector, fetch_k);
-        let surrogate_source = self.vector_collections.get(index_key);
-
-        let mut hits: Vec<_> = results
-            .iter()
-            .map(|r| build_search_hit(surrogate_source, r.id, r.distance))
-            .collect();
-
-        if let Some(surrogate_bm) = filter_bitmap {
-            // Bitmap is a set of surrogates: keep only bound hits whose
-            // surrogate is in the bitmap. A headless hit has none, so it
-            // never survives a surrogate-bitmap filter.
-            hits.retain(|h| {
-                h.id.storage_key()
-                    .is_some_and(|key| surrogate_bm.contains(key.surrogate()))
-            });
-        }
-        if !rls_filters.is_empty() {
-            // CP-side translator runs the predicate; DP only attaches body.
-            hits = hits
-                .into_iter()
-                .map(|h| {
-                    self.attach_body(task.request.database_id.as_u64(), tid, collection, true, h)
-                })
-                .collect();
-        } else {
-            hits.truncate(top_k);
-        }
-
         if let Some(ref m) = self.metrics {
             m.record_vector_search(0);
             m.record_query_by_engine("vector");

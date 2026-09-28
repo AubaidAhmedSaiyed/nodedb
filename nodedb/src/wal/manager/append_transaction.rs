@@ -4,10 +4,10 @@
 
 use nodedb_wal::record::RecordType;
 
-use super::core::WalManager;
+use super::appender::WalAppender;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
-impl WalManager {
+impl WalAppender<'_> {
     pub fn append_transaction(
         &self,
         tid: TenantId,
@@ -32,7 +32,20 @@ impl WalManager {
         record: &crate::wal::RedoRecord,
     ) -> crate::Result<Lsn> {
         let payload = record.to_bytes()?;
-        self.append_record(RecordType::TransactionRedo, tid, vs, db, &payload)
+        self.append_row_record(RecordType::TransactionRedo, tid, vs, db, &payload)
+    }
+
+    /// Append a `TransactionRedo` record whose payload is an already-encoded
+    /// redo record. Used by the committed-redo apply path, which carries the
+    /// record encoded on the plan it dispatches.
+    pub fn append_transaction_redo_bytes(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        payload: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_row_record(RecordType::TransactionRedo, tid, vs, db, payload)
     }
 
     pub fn append_crdt_delta(

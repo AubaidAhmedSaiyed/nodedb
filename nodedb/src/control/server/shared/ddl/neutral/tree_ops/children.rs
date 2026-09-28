@@ -76,7 +76,7 @@ pub async fn tree_children(
         },
     )
     .await
-    .map_err(|e| ddl_err("XX000", format!("BFS failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("BFS failed", &e))?;
 
     let bfs_json =
         crate::data::executor::response_codec::decode_payload_to_json(&bfs_result.payload);

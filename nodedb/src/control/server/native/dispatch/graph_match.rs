@@ -31,8 +31,6 @@ pub(crate) async fn handle_graph_match(
         .as_deref()
         .unwrap_or("default")
         .to_lowercase();
-    let vshard_key = fields.document_id.as_deref().unwrap_or(&collection);
-    let vshard_id = ctx.vshard_for_key(vshard_key);
     let tenant_id = ctx.tenant_id();
 
     if let Err(error) = super::limits::check_op_limits(ctx.state, fields) {
@@ -47,6 +45,7 @@ pub(crate) async fn handle_graph_match(
             Ok(plan) => plan,
             Err(error) => return error_to_native_with_sqlstate(seq, "42601", &error),
         };
+    let vshard_id = ctx.task_vshard(&plan, fields.document_id.as_deref(), &collection);
     if let Err(error) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),
         ctx.database_id(),

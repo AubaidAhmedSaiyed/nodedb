@@ -20,6 +20,7 @@ pub mod meta;
 pub mod meta_calvin;
 pub mod plan;
 pub mod query;
+pub mod redo_origin;
 pub mod rls_write_check_accessor;
 pub mod routing;
 pub mod set_op;
@@ -40,18 +41,21 @@ pub use crdt::{CrdtOp, CrdtWriteVerb};
 pub use document::{
     BalancedDef, DocumentOp, DocumentResolveOutcome, DocumentResolvedMutation, EnforcementOptions,
     GeneratedColumnSpec, MaterializedSumBinding, OllpPredictedEdge, PeriodLockConfig,
-    RegisteredIndex, RegisteredIndexState, ResolvedSumTarget, ReturningColumns, ReturningItem,
-    ReturningSpec, StorageMode, SumTargetKey, TimeseriesSchema, UpdateValue,
+    RedoSumTargets, RegisteredIndex, RegisteredIndexState, ResolvedSumTarget, ReturningColumns,
+    ReturningItem, ReturningSpec, StorageMode, SumTargetKey, TimeseriesSchema, UpdateValue,
     resolved_sum_surrogate,
 };
 pub use exchange::{ExchangeMode, ExchangeOp};
 pub use graph::{
     BatchEdge, BspSuperstepPlan, BspSuperstepResult, GraphOp, WccSuperstepPlan, WccSuperstepResult,
 };
-pub use kv::{KvOp, KvResolveOutcome, KvResolvedMutation};
+pub use kv::{
+    KvCounterShape, KvOp, KvResolveOutcome, KvResolvedMutation, SortedIndexRead, SortedIndexSpec,
+};
 pub use meta::{MetaOp, SAVEPOINT_MARKER_BYTES};
 pub use plan::PhysicalPlan;
 pub use query::{AggregateSpec, GroupKeySpec, JoinProjection, QueryOp};
+pub use redo_origin::RedoOrigin;
 pub use routing::plan_contains_cluster_partitioned_leaf;
 pub use set_op::SetOpKind;
 pub use sort_key::SortKeySpec;

@@ -8,15 +8,16 @@
 //! (single-quoted optional), parallel to `CREATE TENANT <name>` and
 //! `SHOW TENANT <name|id>`.
 //!
-//! Ported verbatim from the pgwire `ddl::tenant::purge` handler, including
-//! the `PhysicalPlan::Meta(MetaOp::PurgeTenant)` Data Plane dispatch (300s
-//! timeout via `sync_dispatch::dispatch_system`).
+//! The `PhysicalPlan::Meta(MetaOp::PurgeTenant)` plan runs on every local
+//! Data Plane core with a 300s timeout. Each core purges only the state its
+//! own vShards home to, so a purge on one core leaves the tenant's data on
+//! every other core.
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch;
+use crate::control::server::exchange::gather_all_cores;
 use crate::control::state::SharedState;
-use crate::types::DatabaseId;
+use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::support::{ddl_err, resolve_tenant_ref, status, tenant_exists};
@@ -74,19 +75,26 @@ pub async fn purge_tenant(
         nodedb_physical::physical_plan::MetaOp::PurgeTenant { tenant_id: tid },
     );
 
-    match sync_dispatch::dispatch_system(
-        state,
-        sync_dispatch::SystemTask::new(
-            sync_dispatch::SystemReason::TenantLifecycle,
+    let timeout = std::time::Duration::from_secs(300);
+    let purged = match tokio::time::timeout(
+        timeout,
+        gather_all_cores(
+            state,
             tenant_id,
             database_id,
-            "__system",
             plan,
+            TraceId::generate(),
+            None,
         ),
-        std::time::Duration::from_secs(300),
     )
     .await
     {
+        Ok(result) => result.map(|_| ()),
+        Err(_) => Err(crate::Error::Dispatch {
+            detail: format!("PURGE TENANT {tid} did not finish on every core within {timeout:?}"),
+        }),
+    };
+    match purged {
         Ok(_) => {
             state.audit_record(
                 AuditEvent::AdminAction,
@@ -96,6 +104,6 @@ pub async fn purge_tenant(
             );
             Ok(status("PURGE TENANT"))
         }
-        Err(e) => Err(ddl_err("XX000", format!("purge failed: {e}"))),
+        Err(e) => Err(DdlError::from_error_in_context("purge failed", &e)),
     }
 }

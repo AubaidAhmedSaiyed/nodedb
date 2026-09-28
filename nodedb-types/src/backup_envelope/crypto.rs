@@ -2,7 +2,7 @@
 
 //! Per-backup DEK + KEK wrapping for encrypted backup envelopes.
 //!
-//! ## Wire layout after the 52-byte HEADER (version byte = 1):
+//! ## Wire layout after the 52-byte HEADER (version byte = [`VERSION`]):
 //!
 //! ```text
 //! ┌─ CRYPTO BLOCK (68 bytes) ──────────────────────────────────────────────┐
@@ -56,7 +56,7 @@ use super::types::{Envelope, EnvelopeError, EnvelopeMeta, Section, read2, read4,
 use super::types::{HEADER_LEN, MAGIC, TRAILER_LEN, VERSION};
 use super::write::{EnvelopeWriter, write_header};
 
-/// Size of the crypto block inserted after the header in version-2 envelopes.
+/// Size of the crypto block inserted after the header in encrypted envelopes.
 ///
 /// Layout: kek_fingerprint(8) + dek_nonce(12) + wrapped_dek(48) = 68 bytes.
 const CRYPTO_BLOCK_LEN: usize = 68;
@@ -117,7 +117,7 @@ fn aes_decrypt(
 // ── EnvelopeWriter extension ─────────────────────────────────────────────────
 
 impl EnvelopeWriter {
-    /// Finalize with encryption. Produces a version-1 encrypted envelope.
+    /// Finalize with encryption. Produces an encrypted envelope of [`VERSION`].
     ///
     /// - Generates a random 32-byte DEK via `getrandom`.
     /// - Wraps the DEK with the KEK using AES-256-GCM (random 12-byte nonce).
@@ -180,7 +180,7 @@ impl EnvelopeWriter {
 
 // ── Decryption ────────────────────────────────────────────────────────────────
 
-/// Parse and decrypt an encrypted backup envelope (version 1 with crypto block).
+/// Parse and decrypt an encrypted backup envelope ([`VERSION`] with crypto block).
 ///
 /// Verifies the KEK fingerprint before attempting decryption, surfacing
 /// [`EnvelopeError::WrongBackupKek`] when the presented key does not match

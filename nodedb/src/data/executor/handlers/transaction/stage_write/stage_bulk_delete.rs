@@ -107,8 +107,8 @@ impl CoreLoop {
                 }
             };
             self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
-            if predicate_err.take().is_some() {
-                return self.response_error(task, ErrorCode::DivisionByZero);
+            if let Some(e) = predicate_err.take() {
+                return self.response_error(task, ErrorCode::from(e));
             }
         }
 

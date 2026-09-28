@@ -38,16 +38,14 @@
 //! state and must still replay. Without the gate the checkpoint would duplicate
 //! rows; without the replay above it the checkpoint would lose them.
 //!
-//! Note the gate is NOT the `last_flushed_wal_lsn` watermark of the timeseries
-//! profile: that field exists only on `nodedb_types::timeseries::PartitionMeta`,
-//! used by the separate `ts_registries` / bucketed-partition machinery, which
-//! this op pair never targets.
-
-use tracing::warn;
+//! Note the gate is NOT the timeseries collection stamp
+//! (`timeseries_checkpoint::stamp`): that stamp covers the separate
+//! `ts_registries` / bucketed-partition machinery, which this op pair never
+//! targets.
 
 use super::core_loop::CoreLoop;
 use crate::bridge::envelope::{PhysicalPlan, Status};
-use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId};
 use nodedb_physical::physical_plan::ColumnarOp;
 use nodedb_types::RlsWriteCheck;
 use nodedb_types::Value;
@@ -99,12 +97,18 @@ impl CoreLoop {
         // trying to detect the duplicate afterwards. Returns `Some(0)` and not
         // `None`: the record decoded as this shape, so the caller must not fall
         // through to its row-payload decoders and mis-classify it.
-        if self.floors.replay_floors.columnar.covers(record_lsn) {
+        if self.replay_watermark_skips(self.floors.replay_floors.columnar.covers(record_lsn)) {
             return Some(0);
         }
 
         let tid = TenantId::new(tenant_id);
-        let vshard_id = VShardId::from_collection_in_database(database_id, &record.collection);
+        // The record decoded as this shape, so a skip is `Some(0)`, never a
+        // fall-through to the row-payload decoders.
+        let Some(vshard_id) =
+            self.replay_vshard("columnar", record_lsn, database_id, &record.collection)
+        else {
+            return Some(0);
+        };
 
         // The task carries the real predicate even though today's handlers read
         // only `task.request.{database_id, tenant_id}`. A placeholder plan would
@@ -142,9 +146,10 @@ impl CoreLoop {
             Some(Lsn::new(record_lsn)),
         );
 
-        // Re-execute via the same live handlers the autocommit dispatch used —
-        // `undo_log: None` mirrors the autocommit path (no transaction batch
-        // to roll back).
+        // Re-execute via the same live handlers the autocommit dispatch used.
+        // Inside a committed-redo install the handlers capture the pre-image
+        // of every row they change, so a later sub-record's failure rolls the
+        // mutation back with the rest of the record.
         //
         // Replay carries no predicate. The policy decided these rows when the
         // record was written, and the identity that wrote it is not present at
@@ -152,6 +157,8 @@ impl CoreLoop {
         // replay: its record is cancelled by a `WriteAborted` marker before
         // the refusal is acknowledged.
         let replay_check = nodedb_types::RlsWriteCheck::already_decided_elsewhere();
+        let mut undo = Vec::new();
+        let recording = self.recording_redo_undo();
         let response = if record.is_update {
             self.execute_columnar_update(
                 &task,
@@ -159,7 +166,7 @@ impl CoreLoop {
                 &record.filters,
                 &record.updates,
                 &replay_check,
-                None,
+                recording.then_some(&mut undo),
             )
         } else {
             self.execute_columnar_delete(
@@ -167,18 +174,20 @@ impl CoreLoop {
                 &record.collection,
                 &record.filters,
                 &replay_check,
-                None,
+                recording.then_some(&mut undo),
             )
         };
+        self.record_redo_undo(undo);
 
         if response.status != Status::Ok {
-            warn!(
-                core = self.core_id,
-                collection = %record.collection,
-                lsn = record_lsn,
-                is_update = record.is_update,
-                error = ?response.error_code,
-                "columnar predicate DML WAL replay failed; skipping record"
+            self.replay_record_rejected(
+                "columnar",
+                record_lsn,
+                response.error_code,
+                &format!(
+                    "columnar predicate DML replay on '{}' failed (update: {})",
+                    record.collection, record.is_update
+                ),
             );
             return Some(0);
         }
@@ -252,12 +261,18 @@ impl CoreLoop {
             return Some(0);
         }
 
-        if self.floors.replay_floors.columnar.covers(record_lsn) {
+        if self.replay_watermark_skips(self.floors.replay_floors.columnar.covers(record_lsn)) {
             return Some(0);
         }
 
         let tid = TenantId::new(tenant_id);
-        let vshard_id = VShardId::from_collection_in_database(database_id, &record.collection);
+        // The record decoded as this shape, so a skip is `Some(0)`, never a
+        // fall-through to the row-payload decoders.
+        let Some(vshard_id) =
+            self.replay_vshard("columnar", record_lsn, database_id, &record.collection)
+        else {
+            return Some(0);
+        };
         let replay_check = RlsWriteCheck::already_decided_elsewhere();
 
         let response = if record.is_update {
@@ -266,12 +281,14 @@ impl CoreLoop {
                 let pk = match nodedb_types::value_from_msgpack(&wal_row.pk_msgpack) {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!(
-                            core = self.core_id,
-                            collection = %record.collection,
-                            lsn = record_lsn,
-                            error = %e,
-                            "columnar resolved-row-set DML WAL replay: malformed PK; skipping record"
+                        self.replay_record_rejected(
+                            "columnar",
+                            record_lsn,
+                            None,
+                            &format!(
+                                "columnar resolved-row-set DML on '{}': malformed PK: {e}",
+                                record.collection
+                            ),
                         );
                         return Some(0);
                     }
@@ -279,12 +296,14 @@ impl CoreLoop {
                 let new_row = match nodedb_types::value_from_msgpack(&wal_row.new_row_msgpack) {
                     Ok(Value::Array(arr)) => arr,
                     Ok(_) | Err(_) => {
-                        warn!(
-                            core = self.core_id,
-                            collection = %record.collection,
-                            lsn = record_lsn,
-                            "columnar resolved-row-set DML WAL replay: malformed post-image row; \
-                             skipping record"
+                        self.replay_record_rejected(
+                            "columnar",
+                            record_lsn,
+                            None,
+                            &format!(
+                                "columnar resolved-row-set DML on '{}': malformed post-image row",
+                                record.collection
+                            ),
                         );
                         return Some(0);
                     }
@@ -318,12 +337,14 @@ impl CoreLoop {
                 let pk = match nodedb_types::value_from_msgpack(&wal_row.pk_msgpack) {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!(
-                            core = self.core_id,
-                            collection = %record.collection,
-                            lsn = record_lsn,
-                            error = %e,
-                            "columnar resolved-row-set DML WAL replay: malformed PK; skipping record"
+                        self.replay_record_rejected(
+                            "columnar",
+                            record_lsn,
+                            None,
+                            &format!(
+                                "columnar resolved-row-set DML on '{}': malformed PK: {e}",
+                                record.collection
+                            ),
                         );
                         return Some(0);
                     }
@@ -354,13 +375,14 @@ impl CoreLoop {
         };
 
         if response.status != Status::Ok {
-            warn!(
-                core = self.core_id,
-                collection = %record.collection,
-                lsn = record_lsn,
-                is_update = record.is_update,
-                error = ?response.error_code,
-                "columnar resolved-row-set DML WAL replay failed; skipping record"
+            self.replay_record_rejected(
+                "columnar",
+                record_lsn,
+                response.error_code,
+                &format!(
+                    "columnar resolved-row-set DML replay on '{}' failed (update: {})",
+                    record.collection, record.is_update
+                ),
             );
             return Some(0);
         }

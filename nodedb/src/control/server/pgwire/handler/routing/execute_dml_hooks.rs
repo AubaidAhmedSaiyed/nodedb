@@ -129,14 +129,18 @@ impl NodeDbPgHandler {
         {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
-                "XX000".to_owned(),
+                nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
                 "internal error: failed to retain descriptor leases for buffered transaction tasks"
                     .to_owned(),
             ))));
         }
 
         match routed {
-            Ok(InTxnRoute::Read(routed_task)) => Ok(TxnRouteOutcome::Proceed(routed_task)),
+            // The pgwire dispatch proposes a write through Raft or appends its
+            // redo record in the funnel.
+            Ok(InTxnRoute::Read(routed_task) | InTxnRoute::Autocommit(routed_task)) => {
+                Ok(TxnRouteOutcome::Proceed(routed_task))
+            }
             Ok(InTxnRoute::Buffered) => Ok(TxnRouteOutcome::Handled(HandledWrite::Opaque)),
             Ok(InTxnRoute::Staged(outcome)) => Ok(TxnRouteOutcome::Handled(HandledWrite::Dml(
                 staged_dml_outcome(outcome.kind, outcome.affected),
@@ -154,7 +158,11 @@ impl NodeDbPgHandler {
                     Some(code) => {
                         crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code)
                     }
-                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+                    None => (
+                        "ERROR",
+                        nodedb_types::error::sqlstate::INTERNAL_ERROR,
+                        "unknown data plane error".to_owned(),
+                    ),
                 };
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     severity.to_owned(),

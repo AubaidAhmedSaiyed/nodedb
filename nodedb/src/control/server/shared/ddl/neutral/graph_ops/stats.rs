@@ -48,7 +48,6 @@ use nodedb_physical::physical_plan::GraphOp;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::refuse_gate::RefusingReadGate;
-use super::support::ddl_err;
 
 /// Names the collection-scoped stats read in the refusal a read policy raises.
 const STATS_WHAT: &str = "graph statistics, which are counters over the collection's edges";
@@ -120,10 +119,10 @@ pub async fn show_graph_stats(
 
     let resp = broadcast_to_all_cores(state, identity.tenant_id, database_id, plan, TraceId::ZERO)
         .await
-        .map_err(|e| ddl_err("58000", format!("graph stats dispatch failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("graph stats dispatch failed", &e))?;
 
     let merged: Vec<CollectionStats> = decode_merged_stats(resp.payload.as_bytes())
-        .map_err(|e| ddl_err("XX000", format!("graph stats decode failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("graph stats decode failed", &e))?;
 
     let aggregated = aggregate_by_collection(merged);
 

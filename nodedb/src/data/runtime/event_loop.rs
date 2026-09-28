@@ -100,7 +100,8 @@ pub(super) fn run_event_loop(
                 }
                 Err(panic_payload) => {
                     // Extract panic message for logging.
-                    let msg = panic_message(&panic_payload);
+                    let msg =
+                        crate::data::panic_payload::panic_payload_to_string(panic_payload.as_ref());
                     error!(
                         core_id,
                         panic_count = watchdog.consecutive_panics + 1,
@@ -148,7 +149,11 @@ pub(super) fn run_event_loop(
         // coordinated checkpoint clamps to. This one is an
         // opportunistic head start, so its only obligations are to make
         // the bytes durable and to say so when it cannot.
-        if last_checkpoint.elapsed() >= checkpoint_interval {
+        // A fail-stopped core publishes nothing: restart rebuilds its state
+        // from the WAL, and a checkpoint of the unknown state would stand in
+        // for that rebuild.
+        let stopped = core.is_fail_stopped();
+        if !stopped && last_checkpoint.elapsed() >= checkpoint_interval {
             if let Err(e) = core.checkpoint_vector_indexes() {
                 warn!(
                     core = core_id,
@@ -161,7 +166,9 @@ pub(super) fn run_event_loop(
         }
 
         // Periodic compaction + maintenance (tombstone cleanup, CSR compact, edge sweep).
-        core.maybe_run_maintenance();
+        if !stopped {
+            core.maybe_run_maintenance();
+        }
 
         // Heartbeat: if no user writes for ~1 second (±100ms jitter),
         // emit a heartbeat to advance the Event Plane's partition
@@ -229,15 +236,4 @@ fn heartbeat_interval_with_jitter() -> std::time::Duration {
     // Map to [0, 200] → offset by -100 → [-100, +100] ms.
     let jitter_ms = (x % 201) as i64 - 100;
     std::time::Duration::from_millis((1000 + jitter_ms) as u64)
-}
-
-/// Extract a human-readable message from a panic payload.
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
 }

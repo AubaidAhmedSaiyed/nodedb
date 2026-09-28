@@ -5,10 +5,10 @@
 
 use nodedb_wal::record::RecordType;
 
-use super::core::WalManager;
+use super::appender::WalAppender;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
-impl WalManager {
+impl WalAppender<'_> {
     /// Append an `FtsIndex` record. Payload is a length-prefixed `FtsIndexPayload`
     /// produced by `nodedb_wal::record::FtsIndexPayload::to_bytes()`.
     pub fn append_fts_index(
@@ -66,7 +66,7 @@ impl WalManager {
         db: DatabaseId,
         p: &[u8],
     ) -> crate::Result<Lsn> {
-        self.append_record(RecordType::GraphNodeLabelSet, tid, vs, db, p)
+        self.append_row_record(RecordType::GraphNodeLabelSet, tid, vs, db, p)
     }
 
     /// Append a `GraphNodeLabelRemove` record. Payload is produced by
@@ -78,7 +78,7 @@ impl WalManager {
         db: DatabaseId,
         p: &[u8],
     ) -> crate::Result<Lsn> {
-        self.append_record(RecordType::GraphNodeLabelRemove, tid, vs, db, p)
+        self.append_row_record(RecordType::GraphNodeLabelRemove, tid, vs, db, p)
     }
 
     /// Append a `WriteAborted` record naming `aborted_lsn`, the LSN of a
@@ -96,17 +96,25 @@ impl WalManager {
         db: DatabaseId,
         aborted_lsn: Lsn,
     ) -> crate::Result<Lsn> {
+        crate::fail_point_err!("wal::append_write_aborted", |detail: String| {
+            crate::Error::Internal {
+                detail: format!("write-aborted append failed (failpoint): {detail}"),
+            }
+        });
         let payload = nodedb_wal::WriteAbortedPayload::new(aborted_lsn.as_u64()).to_bytes();
         self.append_record(RecordType::WriteAborted, tid, vs, db, &payload)
     }
 
-    /// Append a `CollectionTombstoned` record. Any subsequent replay
-    /// that extracts this record will filter prior writes for
-    /// `(tid, collection)` whose LSN is less than `purge_lsn`.
+    /// Append a `CollectionTombstoned` record. Any later replay that
+    /// extracts this record skips every write to the collection in
+    /// `(database_id, tid)` whose LSN is less than `purge_lsn`.
     ///
-    /// `vshard_id` of `0` is conventional — tombstones are tenant-level
+    /// `collection` is the bare catalog name. Replay derives the storage
+    /// name that data records carry from it.
+    ///
+    /// `vshard_id` of `0` is conventional: tombstones are collection-level
     /// metadata, not sharded user data. Replay filters on
-    /// `(tenant_id, collection)` pair alone.
+    /// `(database_id, tenant_id, collection)` alone.
     pub fn append_collection_tombstone(
         &self,
         tid: TenantId,

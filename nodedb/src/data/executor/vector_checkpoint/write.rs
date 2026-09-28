@@ -10,6 +10,7 @@ use super::paths::{vector_ckpt_dir, vector_ckpt_gen_dir};
 use super::publish::publish_vector_generation;
 use crate::data::executor::checkpoint_outcome::CheckpointOutcome;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::types::Lsn;
 
 impl CoreLoop {
     /// Flush every vector index to disk and report the LSN they are now durable
@@ -28,7 +29,7 @@ impl CoreLoop {
     /// and nothing on that path puts a row in `sparse` for the rebuild to find.
     /// Those vectors exist in exactly two places — this checkpoint and the
     /// `VectorOp::Insert` WAL records — so a flush that fails while still
-    /// letting the core report its watermark deletes the only surviving copy.
+    /// letting the core report its floor deletes the only surviving copy.
     ///
     /// The failure is therefore all-or-nothing by construction: any index that
     /// cannot be published returns `Err`, and the caller clamps the reported
@@ -36,12 +37,18 @@ impl CoreLoop {
     /// partial success cannot be expressed, because the LSN it would justify
     /// does not exist.
     ///
-    /// Stamping with the core watermark mirrors `checkpoint_kv_engines`: this
-    /// runs on the core's own thread between tasks, and a vector write raises
-    /// the watermark only after the collection has already been mutated, so
-    /// every write with `lsn <= watermark` is in the bytes written below.
-    pub(crate) fn checkpoint_vector_indexes(&self) -> crate::Result<CheckpointOutcome> {
-        let durable_lsn = self.watermark;
+    /// The reported LSN is the checkpoint floor (`checkpoint_floor`): the
+    /// checkpoint runs on the core's own thread between tasks, so every record
+    /// at or below that outcome floor that this core applied is in the export
+    /// below.
+    ///
+    /// The manifest carries the core's replay stamp: the records every index
+    /// in the generation holds. Restart replay skips exactly those.
+    ///
+    /// `vector_durable_lsn` stays the caller's to raise.
+    pub(crate) fn checkpoint_vector_indexes(&mut self) -> crate::Result<CheckpointOutcome> {
+        let durable_lsn = self.checkpoint_floor();
+        let replay = self.floors.applied_prefix.stamp()?;
 
         let ckpt_dir = vector_ckpt_dir(&self.data_dir, self.core_id);
         std::fs::create_dir_all(&ckpt_dir).map_err(|e| storage_err(&ckpt_dir, "create dir", &e))?;
@@ -63,7 +70,9 @@ impl CoreLoop {
             .map_err(|e| storage_err(&gen_dir, "create generation dir", &e))?;
 
         let files_written = self.write_vector_generation(&gen_dir)?;
-        publish_vector_generation(&ckpt_dir, generation, durable_lsn)?;
+        let prefix = Lsn::new(replay.prefix);
+        let applied_ranges = replay.applied_above.len();
+        publish_vector_generation(&ckpt_dir, generation, replay)?;
 
         // The previous generation is now unreachable. Removing it reclaims disk
         // but is NOT required for correctness — the manifest alone decides what
@@ -90,6 +99,8 @@ impl CoreLoop {
             files_written,
             total = self.vector_collections.len(),
             durable_through_lsn = durable_lsn.as_u64(),
+            replay_prefix = prefix.as_u64(),
+            applied_ranges,
             "vector checkpoint published"
         );
         Ok(CheckpointOutcome {
@@ -155,18 +166,16 @@ mod tests {
 
     fn collection_with_one_vector() -> VectorCollection {
         let mut coll = VectorCollection::new(4, HnswParams::default());
-        coll.insert_with_surrogate(vec![0.1, 0.2, 0.3, 0.4], Surrogate::new(1));
+        coll.insert_with_surrogate(vec![0.1, 0.2, 0.3, 0.4], Surrogate::new(1))
+            .unwrap();
         coll
     }
 
     /// The resurrection guard. A collection checkpointed at generation N and
     /// then EMPTIED by deletes must not come back at boot: the deletes are
-    /// acknowledged and the checkpoint still reports the watermark, so the WAL
-    /// records that would have re-deleted the vectors are already gone.
-    ///
-    /// Before generations this failed — cycle N+1 skipped the empty collection,
-    /// the flat directory kept cycle N's populated file, and every deleted
-    /// vector reappeared on restart.
+    /// acknowledged and the checkpoint still reports its floor, so the WAL
+    /// records that would have re-deleted the vectors can be gone. Each cycle
+    /// therefore writes a new generation that omits the empty collection.
     #[test]
     fn emptied_collection_does_not_resurrect_the_previous_generation() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -242,6 +251,9 @@ mod tests {
         core.vector_collections
             .insert(collection_key(), collection_with_one_vector());
         core.advance_watermark(Lsn::new(4_242));
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(4_242));
         let outcome = core
             .checkpoint_vector_indexes()
             .expect("flush must publish");

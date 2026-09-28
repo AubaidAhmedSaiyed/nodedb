@@ -299,8 +299,8 @@ impl CoreLoop {
                     } {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => {
-                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        Err(e) => {
+                            return self.response_error(task, ErrorCode::from(e));
                         }
                     }
                     let payload = if let Some(ref schema) = strict_schema {

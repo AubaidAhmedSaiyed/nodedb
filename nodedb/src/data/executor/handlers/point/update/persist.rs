@@ -11,7 +11,8 @@
 //! collection with neither writes the body alone. Keeping the three side by
 //! side in one file is what makes it visible that only the last one is allowed
 //! to skip the diff, and that a body whose index diff cannot be computed must
-//! fail rather than write alone.
+//! fail rather than write alone. Every shape re-indexes the row's full-text
+//! postings from the new body in the same transaction.
 //!
 //! All three run inside ONE transaction this function owns, and image-folding
 //! enforcement runs inside that same transaction before it commits. That is why
@@ -222,6 +223,27 @@ impl CoreLoop {
             }
         };
         let touched = write_result?;
+
+        // The row's postings follow its new text in the same transaction.
+        // A registered collection's stored image must decode; an
+        // unregistered one indexes what `decode_document` reads, and a body
+        // it cannot read has no fields to index, as on the insert path.
+        let new_doc = match self.doc_configs.get(config_key) {
+            Some(cfg) => Some(self.decode_stored_document(cfg, updated_bytes)?),
+            None => crate::data::executor::doc_format::decode_document(updated_bytes).ok(),
+        };
+        if let Some(new_doc) = &new_doc {
+            self.update_reindex_text(
+                &txn,
+                super::super::update_reindex_text::UpdateTextReindex {
+                    database_id,
+                    tid,
+                    collection,
+                    surrogate: storage_key.surrogate(),
+                    new_doc,
+                },
+            )?;
+        }
 
         // Image-folding enforcement, inside the transaction the body just landed
         // in. Both images are STORED bytes: `current_bytes` came off the store

@@ -46,6 +46,11 @@ impl CoreLoop {
                 self.declared_dims.insert(key.clone(), e.dim);
             }
             self.vector_params.insert(key.clone(), params);
+            // A collection the checkpoint restored takes the catalog's index
+            // configuration, which is the source of truth for its type.
+            if let Some(coll) = self.vector_collections.get_mut(&key) {
+                coll.set_index_config(config.clone());
+            }
             self.index_configs.insert(key, config);
         }
     }

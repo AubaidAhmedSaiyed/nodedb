@@ -62,6 +62,14 @@ pub enum ErrorDetails {
     InsufficientBalance { collection: String },
     #[serde(rename = "rate_exceeded")]
     RateExceeded { gate: String },
+    /// A transaction rolled back for a reason other than a serialization
+    /// conflict. `detail` names the reason. The client retries it.
+    #[serde(rename = "transaction_rollback")]
+    TransactionRollback { detail: String },
+    /// The statement cannot run inside an explicit transaction block.
+    /// `detail` names the statement or the refused operation.
+    #[serde(rename = "active_sql_transaction")]
+    ActiveSqlTransaction { detail: String },
 
     // Read path
     #[serde(rename = "collection_not_found")]
@@ -89,6 +97,10 @@ pub enum ErrorDetails {
     /// collection/document shape of `DocumentNotFound`.
     #[serde(rename = "not_found")]
     NotFound { detail: String },
+    /// A drop or revoke refused because other objects still depend on
+    /// `object`. The message lists the dependents.
+    #[serde(rename = "dependent_objects_exist")]
+    DependentObjectsExist { object: String },
     #[serde(rename = "collection_draining")]
     CollectionDraining { collection: String },
     #[serde(rename = "collection_deactivated")]
@@ -123,6 +135,14 @@ pub enum ErrorDetails {
     /// Expression evaluation divided or took a modulus by zero.
     #[serde(rename = "division_by_zero")]
     DivisionByZero,
+    /// A function received a value it cannot compute on. `detail` names
+    /// the function and the offending value.
+    #[serde(rename = "data_exception")]
+    DataException { detail: String },
+    /// A statement exceeded a server limit on its own size or depth.
+    /// `detail` names the limit.
+    #[serde(rename = "program_limit_exceeded")]
+    ProgramLimitExceeded { detail: String },
     /// A LIMIT/OFFSET/FETCH bound resolved outside `[0, usize::MAX]`.
     #[serde(rename = "invalid_limit_value")]
     InvalidLimitValue { clause: String, value: String },
@@ -132,6 +152,10 @@ pub enum ErrorDetails {
     AuthorizationDenied { resource: String },
     #[serde(rename = "auth_expired")]
     AuthExpired,
+    /// Credentials were rejected. Carries nothing that tells a wrong
+    /// password from an unknown user.
+    #[serde(rename = "authentication_failed")]
+    AuthenticationFailed,
     /// Tenant quota: vector dimension exceeds `max_vector_dim`.
     #[serde(rename = "tenant_vector_dim_exceeded")]
     TenantVectorDimExceeded { dim: u32, limit: u32 },

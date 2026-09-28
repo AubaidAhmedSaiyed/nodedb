@@ -227,7 +227,8 @@ impl RerankCodec for PqRerank {
             self.k,
             self.max_iter,
             self.memory.clone(),
-        );
+        )
+        .map_err(|e| RerankError::BadInput(format!("pq train: {e}")))?;
         self.codec = Some(codec);
         Ok(())
     }

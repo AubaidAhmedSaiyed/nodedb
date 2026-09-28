@@ -17,8 +17,10 @@ use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::server::dispatch_utils::{AutocommitWrite, dispatch_autocommit_write};
 use crate::control::state::SharedState;
 use crate::event::EventSource;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::CrdtOp;
+
+use super::target::{DatabaseTarget, RestoredName};
 
 /// Per-import dispatch timeout. Generous: a collection's Loro snapshot may be
 /// large.
@@ -27,20 +29,20 @@ const REISSUE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Re-issue one collection's snapshot import to the data group owning its
 /// vshard.
 ///
-/// Branches identically to a normal write (and to `reissue_timeseries_durably`):
+/// Branches identically to a normal write (and to `durable::reissue_plan_durably`):
 /// - Cluster: `to_replicated_entry` + `propose_replicated_entry`.
-/// - Single-node: `wal_append_if_write` then `sync_dispatch::dispatch_system`.
+/// - Single-node: the autocommit funnel appends the redo and installs it.
 async fn reissue_crdt_collection(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
-    collection: &str,
+    name: RestoredName,
     bytes: Vec<u8>,
 ) -> crate::Result<()> {
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    let vshard = name.key(database_id).vshard();
     let plan = PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
         tenant_id: tenant_id.as_u64(),
-        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
+        collection: name.stored,
         bytes,
     });
 
@@ -53,7 +55,8 @@ async fn reissue_crdt_collection(
         )?
         .ok_or_else(|| Error::Internal {
             detail: "restore reissue: crdt import did not map to a replicated write".into(),
-        })?;
+        })?
+        .with_event_source(EventSource::Restore);
         crate::control::wal_replication::propose_replicated_entry(state, proposer, entry).await?;
         return Ok(());
     }
@@ -74,7 +77,7 @@ async fn reissue_crdt_collection(
                         vshard_id: vshard,
                         plan,
                         trace_id: crate::types::TraceId::ZERO,
-                        event_source: EventSource::CrdtSync,
+                        event_source: EventSource::Restore,
                         txn_id: None,
                     },
                 ),
@@ -101,26 +104,31 @@ async fn reissue_crdt_collection(
         .await
 }
 
-/// Durably re-issue every restored CRDT collection snapshot.
+/// Durably re-issue every restored CRDT collection snapshot of one database.
 ///
-/// `crdt_state` entries are `(tenant_id, collection, snapshot_bytes)`; each is
-/// routed to the single data group owning that collection's vshard. Returns the
-/// number of imports issued.
+/// `crdt_state` entries are `(database_id, tenant_id, collection,
+/// snapshot_bytes)`, the collection named as the source Data Plane stored it.
+/// Each is routed to the single data group owning its destination
+/// collection's vshard. Returns the number of imports issued.
 pub(crate) async fn reissue_crdt_snapshots(
     state: &SharedState,
+    target: DatabaseTarget,
     crdt_state: Vec<(u64, u64, String, Vec<u8>)>,
 ) -> crate::Result<usize> {
     let mut imported = 0usize;
 
     for (database_id, tid, collection, bytes) in crdt_state {
-        reissue_crdt_collection(
-            state,
-            TenantId::new(tid),
-            DatabaseId::new(database_id),
-            &collection,
-            bytes,
-        )
-        .await?;
+        if database_id != target.source.as_u64() {
+            return Err(Error::Internal {
+                detail: format!(
+                    "invalid backup format: CRDT state of '{collection}' names database \
+                     {database_id}, but sits with database {}",
+                    target.source.as_u64()
+                ),
+            });
+        }
+        let name = target.resolve(&collection)?;
+        reissue_crdt_collection(state, TenantId::new(tid), target.dest, name, bytes).await?;
         imported += 1;
     }
 

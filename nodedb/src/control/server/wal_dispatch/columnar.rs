@@ -7,7 +7,7 @@
 use nodedb_physical::physical_plan::ColumnarOp;
 
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
-use crate::wal::manager::WalManager;
+use crate::wal::manager::WalAppender;
 
 /// Append the WAL record for a single `ColumnarOp`, returning the allocated LSN
 /// for the write variants (`Some`) or `None` for the scan variants, which carry
@@ -16,7 +16,7 @@ use crate::wal::manager::WalManager;
 /// The match over [`ColumnarOp`] is **exhaustive** (`wildcard_enum_match_arm`
 /// is denied), so a future write variant cannot silently become non-durable.
 pub(super) fn wal_append_columnar_op(
-    wal: &WalManager,
+    wal: WalAppender<'_>,
     tenant_id: TenantId,
     vshard_id: VShardId,
     database_id: DatabaseId,
@@ -27,8 +27,8 @@ pub(super) fn wal_append_columnar_op(
             collection,
             payload,
             format: _,
-            intent: _,
-            on_conflict_updates: _,
+            intent,
+            on_conflict_updates,
             surrogates,
             schema_bytes: _,
             provenance,
@@ -44,16 +44,23 @@ pub(super) fn wal_append_columnar_op(
             rls_filters: _,
         } => {
             // Encode a map-shaped `ColumnarWalRecord` carrying the per-row
-            // cross-engine surrogates so replay restores the exact same
-            // identity after a restart. `surrogates` is index-aligned with the
+            // cross-engine surrogates and the insert's conflict policy, so
+            // replay restores the exact same identity and decides each
+            // existing key the way the live insert did. `surrogates` is index-aligned with the
             // rows in `payload`. The map shape is distinct from the legacy
             // 4-tuple array, so old on-disk records still decode via the
             // replay fallback path.
             let wal_payload = super::timeseries::encode_columnar_batch_payload(
-                collection.as_str(),
-                payload,
-                provenance.as_ref(),
-                surrogates,
+                super::timeseries::ColumnarBatchRecord {
+                    collection: collection.as_str(),
+                    payload,
+                    provenance: provenance.as_ref(),
+                    surrogates,
+                    conflict_policy: &crate::wal::ColumnarConflictPolicy {
+                        intent: *intent,
+                        on_conflict_updates: on_conflict_updates.clone(),
+                    },
+                },
             )?;
             Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
         }
@@ -148,6 +155,7 @@ pub(super) fn wal_append_columnar_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::{ColumnarInsertIntent, PhysicalPlan};
 
     fn open_wal(dir: &std::path::Path) -> WalManager {

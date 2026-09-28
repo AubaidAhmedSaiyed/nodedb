@@ -81,11 +81,11 @@ pub fn drop_change_stream(
         name: name.clone(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         let _ = catalog
             .delete_change_stream(database_id, tenant_id, &name)
-            .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
         state
             .stream_registry
             .unregister(database_id, tenant_id, &name);

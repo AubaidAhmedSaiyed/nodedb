@@ -81,14 +81,14 @@ pub fn drop_schedule(
         name: name.clone(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         let _ = catalog
             .delete_schedule_in_database(database_id, tenant_id, &name)
-            .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
         catalog
             .delete_owner("schedule", database_id.as_u64(), tenant_id, &name)
-            .map_err(|e| DdlError::new("XX000", format!("catalog owner delete: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog owner delete", &e))?;
         state
             .schedule_registry
             .unregister(database_id, tenant_id, &name);

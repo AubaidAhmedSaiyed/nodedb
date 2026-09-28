@@ -2,32 +2,10 @@
 
 use nodedb_wal::record::RecordType;
 
-use super::core::WalManager;
+use super::appender::WalAppender;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
-impl WalManager {
-    /// Internal: append a record of the given type to the WAL.
-    pub(super) fn append_record(
-        &self,
-        record_type: RecordType,
-        tenant_id: TenantId,
-        vshard_id: VShardId,
-        database_id: DatabaseId,
-        payload: &[u8],
-    ) -> crate::Result<Lsn> {
-        let mut wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
-        let lsn = wal
-            .append(
-                record_type as u32,
-                tenant_id.as_u64(),
-                vshard_id.as_u32(),
-                database_id.as_u64(),
-                payload,
-            )
-            .map_err(crate::Error::Wal)?;
-        Ok(Lsn::new(lsn))
-    }
-
+impl WalAppender<'_> {
     pub fn append_put(
         &self,
         tid: TenantId,
@@ -35,7 +13,7 @@ impl WalManager {
         db: DatabaseId,
         p: &[u8],
     ) -> crate::Result<Lsn> {
-        self.append_record(RecordType::Put, tid, vs, db, p)
+        self.append_row_record(RecordType::Put, tid, vs, db, p)
     }
 
     pub fn append_delete(
@@ -45,13 +23,14 @@ impl WalManager {
         db: DatabaseId,
         p: &[u8],
     ) -> crate::Result<Lsn> {
-        self.append_record(RecordType::Delete, tid, vs, db, p)
+        self.append_row_record(RecordType::Delete, tid, vs, db, p)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::manager::{NO_APPLY_KEY, WalManager};
     use nodedb_wal::record::{FtsIndexPayload, SyncSeqAdvancePayload};
 
     #[test]
@@ -62,6 +41,7 @@ mod tests {
         let wal = WalManager::open_for_testing(&path).unwrap();
 
         let lsn = wal
+            .appender(NO_APPLY_KEY)
             .append_sync_seq_advance(0xCAFE_BABE_DEAD_BEEF, 7, 42, 1_000_000)
             .unwrap();
         assert_eq!(lsn, Lsn::new(1));
@@ -92,9 +72,12 @@ mod tests {
         let v = VShardId::new(0);
         let db = DatabaseId::DEFAULT;
 
-        let lsn1 = wal.append_put(t, v, db, b"key1=value1").unwrap();
-        let lsn2 = wal.append_put(t, v, db, b"key2=value2").unwrap();
-        let lsn3 = wal.append_delete(t, v, db, b"key1").unwrap();
+        let appender = wal
+            .appender(NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User);
+        let lsn1 = appender.append_put(t, v, db, b"key1=value1").unwrap();
+        let lsn2 = appender.append_put(t, v, db, b"key2=value2").unwrap();
+        let lsn3 = appender.append_delete(t, v, db, b"key1").unwrap();
 
         assert_eq!(lsn1, Lsn::new(1));
         assert_eq!(lsn2, Lsn::new(2));
@@ -130,9 +113,12 @@ mod tests {
             calvin_stamp: None,
         };
 
-        let lsn1 = wal.append_transaction_redo(t, v, db, &record).unwrap();
-        let lsn2 = wal.append_transaction_redo(t, v, db, &record).unwrap();
-        let lsn3 = wal.append_transaction_redo(t, v, db, &record).unwrap();
+        let appender = wal
+            .appender(NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User);
+        let lsn1 = appender.append_transaction_redo(t, v, db, &record).unwrap();
+        let lsn2 = appender.append_transaction_redo(t, v, db, &record).unwrap();
+        let lsn3 = appender.append_transaction_redo(t, v, db, &record).unwrap();
 
         assert_eq!(lsn1, Lsn::new(1));
         assert_eq!(lsn2, Lsn::new(2));
@@ -164,6 +150,7 @@ mod tests {
         let db = DatabaseId::DEFAULT;
 
         let lsn = wal
+            .appender(NO_APPLY_KEY)
             .append_crdt_delta(t, v, db, b"loro-delta-bytes")
             .unwrap();
         assert_eq!(lsn, Lsn::new(1));
@@ -202,7 +189,10 @@ mod tests {
         let v = VShardId::new(7);
         let db = DatabaseId::DEFAULT;
 
-        let lsn = wal.append_fts_index(t, v, db, &bytes).unwrap();
+        let lsn = wal
+            .appender(NO_APPLY_KEY)
+            .append_fts_index(t, v, db, &bytes)
+            .unwrap();
         assert_eq!(lsn, Lsn::new(1));
 
         wal.sync().unwrap();

@@ -94,7 +94,7 @@ pub fn single_result(value: &str) -> Vec<DdlResult> {
 pub fn unwrap_scan_docs(docs: Vec<JsonValue>) -> Result<Vec<Map<String, JsonValue>>, DdlError> {
     let mut rows = Vec::with_capacity(docs.len());
     for doc in docs {
-        push_flat_rows(Value::from(doc), &mut rows).map_err(|e| err("XX000", &e.to_string()))?;
+        push_flat_rows(Value::from(doc), &mut rows).map_err(|e| DdlError::from_error(&e))?;
     }
     Ok(rows.iter().map(row_to_wire_json).collect())
 }

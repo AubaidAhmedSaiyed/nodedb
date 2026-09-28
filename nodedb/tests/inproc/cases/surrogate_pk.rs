@@ -37,25 +37,22 @@ fn assign_is_idempotent_for_same_pk() {
     let a = make_assigner(creds.clone(), wal);
     let s1 = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"alice",
         )
         .unwrap();
     let s2 = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"alice",
         )
         .unwrap();
     let s3 = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"alice",
         )
         .unwrap();
@@ -64,9 +61,8 @@ fn assign_is_idempotent_for_same_pk() {
     let cat = creds.catalog();
     assert_eq!(
         cat.get_surrogate_for_pk(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"alice"
         )
         .unwrap(),
@@ -74,9 +70,8 @@ fn assign_is_idempotent_for_same_pk() {
     );
     assert_eq!(
         cat.get_pk_for_surrogate(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             s1
         )
         .unwrap(),
@@ -91,25 +86,22 @@ fn assign_distinct_pks_returns_distinct_surrogates() {
     let a = make_assigner(creds, wal);
     let s1 = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"alice",
         )
         .unwrap();
     let s2 = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"bob",
         )
         .unwrap();
     let s3 = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"carol",
         )
         .unwrap();
@@ -127,34 +119,30 @@ fn drop_collection_wipes_surrogate_map() {
     let a = make_assigner(creds.clone(), wal);
     let _ = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"alice",
         )
         .unwrap();
     let _ = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"bob",
         )
         .unwrap();
     let s_other = a
         .assign(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "orders"),
             nodedb_types::TenantId::new(0),
-            "orders",
             b"o1",
         )
         .unwrap();
     let cat = creds.catalog();
     assert_eq!(
         cat.scan_surrogates_for_collection(
-            nodedb_types::DatabaseId::DEFAULT,
-            nodedb_types::TenantId::new(0),
-            "users"
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
+            nodedb_types::TenantId::new(0)
         )
         .unwrap()
         .len(),
@@ -162,25 +150,22 @@ fn drop_collection_wipes_surrogate_map() {
     );
 
     cat.delete_all_surrogates_for_collection(
-        nodedb_types::DatabaseId::DEFAULT,
+        nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
         nodedb_types::TenantId::new(0),
-        "users",
     )
     .unwrap();
     assert!(
         cat.scan_surrogates_for_collection(
-            nodedb_types::DatabaseId::DEFAULT,
-            nodedb_types::TenantId::new(0),
-            "users"
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
+            nodedb_types::TenantId::new(0)
         )
         .unwrap()
         .is_empty()
     );
     assert_eq!(
         cat.get_surrogate_for_pk(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "orders"),
             nodedb_types::TenantId::new(0),
-            "orders",
             b"o1"
         )
         .unwrap(),
@@ -214,10 +199,9 @@ impl SurrogateWalAppender for CountingAppender {
 
     fn record_bind_to_wal(
         &self,
-        _database_id: nodedb_types::DatabaseId,
+        _key: nodedb_types::CollectionKey<'_>,
         _tenant_id: nodedb_types::TenantId,
         _surrogate: u32,
-        _collection: &str,
         _pk_bytes: &[u8],
     ) -> nodedb::Result<()> {
         self.binds.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -237,9 +221,8 @@ fn flush_emits_wal_record_at_threshold() {
         let pk = format!("u{i:08}");
         let _ = a
             .assign(
-                nodedb_types::DatabaseId::DEFAULT,
+                nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
                 nodedb_types::TenantId::new(0),
-                "users",
                 pk.as_bytes(),
             )
             .unwrap();
@@ -278,9 +261,8 @@ fn assigns_persist_across_reopen() {
         let a = make_assigner(creds, wal);
         s_persisted = a
             .assign(
-                nodedb_types::DatabaseId::DEFAULT,
+                nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
                 nodedb_types::TenantId::new(0),
-                "users",
                 b"alice",
             )
             .unwrap();
@@ -290,9 +272,8 @@ fn assigns_persist_across_reopen() {
     let cat = creds.catalog();
     assert_eq!(
         cat.get_surrogate_for_pk(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             b"alice"
         )
         .unwrap(),
@@ -300,9 +281,8 @@ fn assigns_persist_across_reopen() {
     );
     assert_eq!(
         cat.get_pk_for_surrogate(
-            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "users"),
             nodedb_types::TenantId::new(0),
-            "users",
             s_persisted
         )
         .unwrap(),

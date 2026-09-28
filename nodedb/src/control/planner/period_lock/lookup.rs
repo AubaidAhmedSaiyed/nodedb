@@ -35,9 +35,8 @@ pub(super) async fn lookup_period_surrogate(
     lookup_surrogate_routed(
         state,
         vshard,
-        database_id,
+        nodedb_types::CollectionKey::from_bare(database_id, ref_table),
         tenant_id,
-        ref_table,
         period_key.as_bytes(),
         trace_id,
     )

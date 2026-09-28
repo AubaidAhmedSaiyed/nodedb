@@ -39,7 +39,7 @@ pub async fn create_synonym_group(
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| err("XX000", "system clock error".to_string()))?
+        .map_err(|_| DdlError::internal("system clock error"))?
         .as_secs();
 
     let stored = StoredSynonymGroup {
@@ -55,7 +55,7 @@ pub async fn create_synonym_group(
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutSynonymGroup(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
 
     // Single node: no applier runs, so post-apply never fires. Run the two
     // per-node effects the applier runs everywhere else — the catalog write,
@@ -63,7 +63,7 @@ pub async fn create_synonym_group(
     if outcome.needs_local_apply() {
         catalog
             .put_synonym_group(&stored)
-            .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         crate::control::catalog_entry::post_apply::install_synonym_group(stored.clone(), state)
             .await;
     }

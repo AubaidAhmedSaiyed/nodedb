@@ -272,3 +272,47 @@ async fn hybrid_search_id_is_user_primary_key_not_surrogate_hex() {
         );
     }
 }
+
+// ── A failing text leg fails the hybrid search ──────────────────────────────
+
+/// A NOT-only text query is refused by the FTS engine. The hybrid search
+/// returns that error instead of fusing the vector leg alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_search_returns_the_text_leg_error() {
+    let server = TestServer::start().await;
+    create_hybrid_collection(&server, "hs_text_err").await;
+
+    let err = server
+        .query_rows(
+            "SELECT id, \
+                    rrf_score(\
+                      vector_distance(embedding, ARRAY[0.1, 0.2, 0.3, 0.4]), \
+                      bm25_score(content, 'NOT consensus')\
+                    ) AS score \
+             FROM hs_text_err \
+             ORDER BY score DESC LIMIT 5",
+        )
+        .await
+        .expect_err("a hybrid search whose text leg fails must fail");
+    assert!(
+        err.contains("42601") && err.contains("at least one positive term"),
+        "the error must be the text leg's own error, as syntax_error; got: {err}"
+    );
+}
+
+/// A NOT-only text query on a plain full-text search is the caller's syntax
+/// error, SQLSTATE `42601`, as the Control Plane reports it; never `XX000`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_fts_query_is_a_syntax_error() {
+    let server = TestServer::start().await;
+    create_hybrid_collection(&server, "hs_fts_err").await;
+
+    let err = server
+        .query_rows("SELECT id FROM hs_fts_err WHERE text_match(content, 'NOT consensus')")
+        .await
+        .expect_err("a NOT-only text query must fail");
+    assert!(
+        err.contains("42601") && err.contains("at least one positive term"),
+        "an invalid FTS query must be syntax_error, not XX000; got: {err}"
+    );
+}

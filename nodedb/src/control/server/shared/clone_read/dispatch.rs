@@ -8,11 +8,12 @@
 //! filtered out.
 
 use crate::bridge::envelope::Response;
+use crate::control::local_dispatch::reject_data_plane_error;
 use crate::control::security::audit::AuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::permission::PermissionStore;
 use crate::control::security::role::RoleStore;
-use crate::control::server::dispatch_utils::{dispatch_to_data_plane, reject_data_plane_error};
+use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::server::response_shape::kv::apply_kv_wrap;
 use crate::control::server::response_shape::types::{PlanKind, describe_plan};
 use crate::control::server::shared::authorization::authorize_task_set;

@@ -3,52 +3,33 @@
 //! HTTP error shape: `(status_code, message)`.
 
 use super::gateway_map::GatewayErrorMap;
-use super::remote_code::remote_code_to_http_status;
+use super::sqlstate_status::sqlstate_to_http_status;
 use crate::Error;
 
 impl GatewayErrorMap {
+    /// Map a SQLSTATE into an HTTP status, for an error that reaches HTTP as
+    /// a SQLSTATE, such as a DDL error. [`Self::to_http`] reads the same
+    /// table, so a DDL error and a gateway error of one class answer one
+    /// status.
+    pub fn sqlstate_to_http(sqlstate: &str) -> u16 {
+        sqlstate_to_http_status(sqlstate)
+    }
+
     /// Map a gateway error into `(http_status_code, message)` for HTTP.
     ///
-    /// Uses standard HTTP status semantics:
-    /// - 400 Bad Request for client-side errors (bad SQL, not found)
-    /// - 403 Forbidden for authz errors
-    /// - 409 Conflict for write-conflict / constraint violations
-    /// - 503 Service Unavailable for routing/leader errors
-    /// - 504 Gateway Timeout for deadline exceeded
-    /// - 500 Internal Server Error as the default fallback
+    /// The status follows the SQLSTATE pgwire renders for the error, through
+    /// the one SQLSTATE status table. One error answers one class on pgwire,
+    /// native and HTTP. Only an `XX000` or `58` class error reads as a 500.
+    /// A Data-Plane verdict answers with its public message.
     pub fn to_http(err: &Error) -> (u16, String) {
-        match err {
-            Error::NotLeader { leader_addr, .. } => (
-                503,
-                format!("cluster in leader election; leader hint: {leader_addr}"),
-            ),
-            Error::DeadlineExceeded { .. } => (504, err.to_string()),
-            Error::RetryableSchemaChanged { .. } => (503, err.to_string()),
-            Error::CollectionNotFound { collection, .. } => {
-                (404, format!("collection \"{collection}\" does not exist"))
-            }
-            Error::RejectedAuthz { .. } => (403, err.to_string()),
-            Error::BadRequest { detail } => (400, detail.clone()),
-            Error::PlanError { detail } => (400, detail.clone()),
-            Error::RejectedConstraint { detail, .. } => (409, detail.clone()),
-            Error::NoLeader { .. } => (503, err.to_string()),
-            Error::Serialization { .. } | Error::Codec { .. } => (500, err.to_string()),
-            Error::Internal { .. } => (500, err.to_string()),
-            // 501 Not Implemented: a valid op refused because cross-core
-            // source-shipping is not yet supported (fail-closed safety floor).
-            Error::CrossCollectionNotColocated { .. } => (501, err.to_string()),
-            Error::RemoteTyped { code, message } => {
-                (remote_code_to_http_status(*code), message.clone())
-            }
-            Error::DataPlane(_) => {
-                let public = crate::error_classify::classify(err);
-                (
-                    remote_code_to_http_status(public.code()),
-                    public.message().to_owned(),
-                )
-            }
-            _ => (500, err.to_string()),
-        }
+        let (_severity, state, message) =
+            crate::control::server::pgwire::types::error_to_sqlstate(err);
+        let message = if let Error::DataPlane(_) = err {
+            crate::error_classify::classify(err).message().to_owned()
+        } else {
+            message
+        };
+        (sqlstate_to_http_status(state), message)
     }
 }
 
@@ -85,6 +66,40 @@ mod tests {
     fn http_internal() {
         let (status, _) = GatewayErrorMap::to_http(&internal());
         assert_eq!(status, 500);
+    }
+
+    #[test]
+    fn http_data_plane_not_found() {
+        let err = Error::DataPlane(crate::bridge::envelope::ErrorCode::NotFound);
+        assert_eq!(GatewayErrorMap::to_http(&err).0, 404);
+    }
+
+    #[test]
+    fn http_conflict_retry() {
+        let err = Error::ConflictRetry {
+            collection: "orders".into(),
+            document_id: "o1".into(),
+        };
+        assert_eq!(GatewayErrorMap::to_http(&err).0, 409);
+    }
+
+    #[test]
+    fn http_backup_key_mismatch_is_invalid_authorization() {
+        assert_eq!(GatewayErrorMap::to_http(&Error::BackupKeyMismatch).0, 401);
+    }
+
+    /// A remote rendering of an error keeps the status of the local one.
+    #[test]
+    fn http_backup_key_mismatch_keeps_its_status_across_nodes() {
+        use nodedb_types::error::ErrorCode;
+        let remote = Error::RemoteTyped {
+            code: ErrorCode::BACKUP_KEY_MISMATCH,
+            message: "wrong backup KEK".into(),
+        };
+        assert_eq!(
+            GatewayErrorMap::to_http(&remote).0,
+            GatewayErrorMap::to_http(&Error::BackupKeyMismatch).0
+        );
     }
 
     #[test]

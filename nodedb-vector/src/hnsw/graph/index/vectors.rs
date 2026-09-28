@@ -96,7 +96,7 @@ impl HnswIndex {
     ///   storage is empty and no backing provides the vector.
     /// - [`VectorError::VectorDecodeFailed`] if dtype-encoded bytes cannot be
     ///   decoded to f32.
-    /// - [`VectorError::DimensionMismatch`] if the materialized vector's length
+    /// - [`VectorError::StoredDimensionMismatch`] if the materialized vector's length
     ///   is not `self.dim`.
     pub fn materialize_vector(&self, id: u32) -> Result<Vec<f32>, VectorError> {
         let node = self
@@ -121,7 +121,7 @@ impl HnswIndex {
             None => self.backing_vector(id)?,
         };
         if vector.len() != self.dim {
-            return Err(VectorError::DimensionMismatch {
+            return Err(VectorError::StoredDimensionMismatch {
                 expected: self.dim,
                 got: vector.len(),
             });

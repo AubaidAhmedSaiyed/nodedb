@@ -3,7 +3,7 @@
 //! `DECLARE CURSOR` materialisation: plan a SELECT, dispatch it to the
 //! Data Plane, and collect JSON-encoded rows for cursor storage.
 
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::error::{PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::retry::retry_on_schema_change;
@@ -57,7 +57,10 @@ impl NodeDbPgHandler {
         // rejected cursor declaration consumes no descriptor lease. The scope
         // remains live while every cursor-materialization task is dispatched.
         let (tasks, _lease_scope) = retry_on_schema_change(move || async move {
-            let perm_cache = self.state.permission_cache.read().await;
+            let perm_cache =
+                crate::control::security::auth_fence::permission_view(&self.state, tenant_id)
+                    .await
+                    .map_err(StatementSetupError::from)?;
             let sec = crate::control::planner::context::PlanSecurityContext {
                 identity,
                 auth: auth_ctx,
@@ -109,13 +112,7 @@ impl NodeDbPgHandler {
                     TraceId::ZERO,
                 )
                 .await
-                .map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        e.to_string(),
-                    )))
-                })?;
+                .map_err(|e| super::super::types::error_to_pg(&e))?;
 
             if !resp.payload.is_empty() {
                 let json =

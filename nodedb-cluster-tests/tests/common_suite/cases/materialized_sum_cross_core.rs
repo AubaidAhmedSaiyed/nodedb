@@ -27,7 +27,7 @@ use common::cluster_harness::{TestClusterNode, wait_for};
 
 use std::time::Duration;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 
 const SOURCE: &str = "xc_entries";
@@ -50,8 +50,8 @@ fn pg_detail(e: &tokio_postgres::Error) -> String {
 #[test]
 fn source_and_target_home_to_different_vshards() {
     assert_ne!(
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, SOURCE),
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, TARGET),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE).vshard(),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, TARGET).vshard(),
         "this file tests the CROSS-SHARD path; '{SOURCE}' and '{TARGET}' must not be co-resident"
     );
 }

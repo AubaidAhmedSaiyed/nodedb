@@ -196,7 +196,7 @@ impl NodeDbPgHandler {
                 // invariant is ever broken by a future refactor.
                 PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
-                    "XX000".to_owned(),
+                    nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
                     "internal: static Calvin path reached the OLLP dispatch branch".to_owned(),
                 )))
             })?

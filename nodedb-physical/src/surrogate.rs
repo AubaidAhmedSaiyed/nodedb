@@ -8,7 +8,7 @@
 //! code paths. Origin's async surrogate-fetch work stays internal to its impl
 //! and is hidden behind this sync facade.
 
-use nodedb_types::{DatabaseId, Surrogate, TenantId};
+use nodedb_types::{CollectionKey, Surrogate, TenantId};
 
 /// Errors a [`SurrogateAssigner`] may return.
 ///
@@ -38,14 +38,14 @@ pub trait SurrogateAssigner: Send + Sync {
     /// allocator. Used by CLONE DATABASE to capture an AS-OF cutoff.
     fn current_hwm(&self) -> u32;
 
-    /// Resolve `(database_id, tenant_id, collection, pk_bytes)` to a stable
-    /// surrogate. Allocate on the first call; return the persisted value on
-    /// every subsequent call (UPSERT preserves the surrogate).
+    /// Resolve `(key, tenant_id, pk_bytes)` to a stable surrogate. Allocate
+    /// on the first call; return the persisted value on every subsequent
+    /// call (UPSERT preserves the surrogate). `key` carries the database and
+    /// the bare catalog name.
     fn assign(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
-        collection: &str,
         pk_bytes: &[u8],
     ) -> Result<Surrogate, SurrogateAssignError>;
 
@@ -62,8 +62,7 @@ pub trait SurrogateAssigner: Send + Sync {
     /// verbatim and never re-derives it.
     fn assign_fresh(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
-        collection: &str,
     ) -> Result<(Surrogate, String), SurrogateAssignError>;
 }

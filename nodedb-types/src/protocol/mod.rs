@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod batch;
+pub mod error_cause;
 pub mod frames;
 pub mod handshake;
 pub mod opcodes;
@@ -10,6 +11,7 @@ pub mod text_fields;
 
 pub use auth::{AuthMethod, AuthResponse};
 pub use batch::{BatchDocument, BatchVector};
+pub use error_cause::ErrorCausePayload;
 pub use frames::{ErrorPayload, NativeRequest, NativeResponse};
 pub use handshake::{
     CAP_COLUMNAR, CAP_CRDT, CAP_FTS, CAP_GRAPHRAG, CAP_MSGPACK, CAP_SPATIAL, CAP_STREAMING,

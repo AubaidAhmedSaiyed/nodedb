@@ -13,10 +13,9 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 pub(in crate::control::planner::sql_plan_convert) fn convert_recursive_scan(
     p: RecursiveScanParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let coll_qualified = super::super::convert::db_qualified(p.database_id, p.collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(p.database_id, p.collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(p.database_id, p.collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(p.database_id, collection);
+    let vshard = collection_key.vshard();
     Ok(vec![PhysicalTask {
         tenant_id: p.tenant_id,
         vshard_id: vshard,

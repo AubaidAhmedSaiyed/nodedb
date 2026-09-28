@@ -52,7 +52,7 @@ pub async fn dispatch_unregister_collection(
         // cannot resolve it, so the files are never orphaned.
         let homing_core = dispatcher
             .router()
-            .resolve(VShardId::from_collection_in_database(database, name))
+            .resolve(nodedb_types::CollectionKey::from_bare(database, name).vshard())
             .unwrap_or(0);
         for core_id in 0..num_cores {
             let request_id = state.next_request_id();
@@ -63,7 +63,11 @@ pub async fn dispatch_unregister_collection(
                 vshard_id: VShardId::new(core_id as u32),
                 plan: PhysicalPlan::Meta(MetaOp::UnregisterCollection {
                     tenant_id,
-                    name: name.to_string(),
+                    // The Data Plane keys the collection's state by its
+                    // database-qualified name outside the default database.
+                    name: nodedb_types::QualifiedCollection::new(database, name)
+                        .as_str()
+                        .to_string(),
                     purge_lsn,
                     reclaim_l1_files: core_id == homing_core,
                 }),
@@ -105,14 +109,17 @@ pub async fn dispatch_unregister_collection(
                 .ok_or_else(|| crate::Error::Dispatch {
                     detail: format!("collection reclaim channel closed on core {core_id}"),
                 })?;
+            // A coded refusal keeps its Data-Plane code.
             if response.status != Status::Ok {
-                return Err(crate::Error::Storage {
-                    engine: "collection-purge".into(),
-                    detail: format!(
-                        "UnregisterCollection for tenant {tenant_id} collection '{name}' \
-                         failed on core {core_id}: {:?}",
-                        response.error_code
-                    ),
+                return Err(match response.error_code {
+                    Some(code) => crate::Error::DataPlane(*code),
+                    None => crate::Error::Storage {
+                        engine: "collection-purge".into(),
+                        detail: format!(
+                            "UnregisterCollection for tenant {tenant_id} collection '{name}' \
+                             failed on core {core_id} with no error code"
+                        ),
+                    },
                 });
             }
             Ok(())

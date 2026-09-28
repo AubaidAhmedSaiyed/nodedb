@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::CrashHarness;
 
 /// Bounded retry budget for the `Error::RetryableSchemaChanged` condition
-/// (rendered over pgwire as `XX000: schema changed during execution
+/// (rendered over pgwire as `40001: schema changed during execution
 /// (<descriptor>); please retry`).
 ///
 /// The server already retries this condition server-side for ~750ms
@@ -32,9 +32,9 @@ const SCHEMA_CHANGE_RETRY_BACKOFF: Duration = Duration::from_millis(150);
 
 /// Substring of `Error::RetryableSchemaChanged`'s Display text
 /// (`#[error("schema changed during execution ({descriptor}); please retry")]`
-/// in `nodedb/src/error/types.rs`). The message is the durable signal: a code
-/// alone would blanket-retry unrelated internal errors, because the class this
-/// condition carries depends on the mapper in front of it.
+/// in `nodedb/src/error/types.rs`). The message is the durable signal: the
+/// code alone would also retry every other serialization failure, which
+/// shares `40001`.
 /// The server was still reporting `RetryableSchemaChanged` when the
 /// client-side retry budget ran out.
 ///
@@ -78,11 +78,20 @@ impl CrashHarness {
     ///   so does the harness, bounded, before writing.
     /// - `RetryableSchemaChanged` (see [`is_retryable_schema_change`]).
     async fn simple_query_ready(&self, sql: &str) -> Vec<tokio_postgres::SimpleQueryMessage> {
+        self.simple_query_ready_in("default", sql).await
+    }
+
+    /// [`Self::simple_query_ready`] over a connection to `database`.
+    async fn simple_query_ready_in(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Vec<tokio_postgres::SimpleQueryMessage> {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut schema_change_attempts = 0usize;
         loop {
             let (client, connection) =
-                tokio_postgres::connect(&self.pgwire_conn_str(), tokio_postgres::NoTls)
+                tokio_postgres::connect(&self.pgwire_conn_str_for(database), tokio_postgres::NoTls)
                     .await
                     .expect("connect for exec");
             let conn_handle = tokio::spawn(async move {
@@ -152,7 +161,7 @@ impl CrashHarness {
     /// reports ready.
     ///
     /// `/healthz` is a one-shot boot-phase latch (`control/startup/health.rs`)
-    /// that flips to OK at `GatewayEnable`; the Calvin sequencer is
+    /// that flips to OK at `Serving`; the Calvin sequencer is
     /// deliberately not a data group in that readiness gate, so a write can
     /// still hit `calvin-submit: no sequencer leader elected yet; cannot
     /// submit cross-shard transaction` after `/healthz` is already green.
@@ -169,10 +178,12 @@ impl CrashHarness {
     /// peeking at server-internal state. The probe write lands in
     /// `__crash_harness_calvin_probe`, a throwaway collection scoped to
     /// this call and never referenced by any caller's own assertions, so it
-    /// cannot perturb a row count a test checks elsewhere.
+    /// cannot perturb a row count a test checks elsewhere. The probe is
+    /// idempotent, so a test can call it again after a restart on the same
+    /// data directory.
     pub async fn wait_for_calvin_ready(&self, timeout: Duration) {
         self.exec(
-            "CREATE COLLECTION __crash_harness_calvin_probe \
+            "CREATE COLLECTION IF NOT EXISTS __crash_harness_calvin_probe \
              COLUMNS (id TEXT, ts BIGINT TIME_KEY, v FLOAT) \
              WITH (engine='timeseries')",
         )
@@ -243,6 +254,25 @@ impl CrashHarness {
             .filter_map(|m| match m {
                 tokio_postgres::SimpleQueryMessage::Row(row) => {
                     Some(row.get(col).unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// [`Self::exec`] over a connection to `database`.
+    pub async fn exec_in(&self, database: &str, sql: &str) {
+        let _ = self.simple_query_ready_in(database, sql).await;
+    }
+
+    /// [`Self::query_col_idx`] over a connection to `database`.
+    pub async fn query_col_idx_in(&self, database: &str, sql: &str, idx: usize) -> Vec<String> {
+        let messages = self.simple_query_ready_in(database, sql).await;
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(row) => {
+                    Some(row.get(idx).unwrap_or_default().to_string())
                 }
                 _ => None,
             })

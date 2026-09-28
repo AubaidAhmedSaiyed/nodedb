@@ -15,7 +15,7 @@ use crate::control::security::auth_context::AuthContext;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -271,22 +271,16 @@ pub async fn fetch_old_row(
         });
     }
 
-    // Catalog/permission/surrogate lookups key on the bare name plus a
-    // separate `database_id`, never the qualified string — recover it by
-    // stripping the same prefix `collection` was qualified with.
-    let bare_collection = if database_id == DatabaseId::DEFAULT {
-        collection.as_str()
-    } else {
-        collection
-            .as_str()
-            .strip_prefix(&format!("{}/", database_id.as_u64()))
-            .ok_or_else(|| crate::Error::RejectedAuthz {
+    // Catalog, permission, surrogate and vShard lookups use the canonical
+    // key: the bare name plus a separate `database_id`.
+    let key =
+        nodedb_types::CollectionKey::from_qualified(database_id, collection).map_err(|error| {
+            crate::Error::RejectedAuthz {
                 tenant_id,
-                resource: format!(
-                    "OLD-row fetch: '{collection}' is not qualified for database {database_id}"
-                ),
-            })?
-    };
+                resource: format!("OLD-row fetch: {error}"),
+            }
+        })?;
+    let bare_collection = key.name();
 
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
     authorize_collection(
@@ -300,11 +294,7 @@ pub async fn fetch_old_row(
     )?;
 
     let pk_bytes = document_id.as_bytes().to_vec();
-    let Some(surrogate) =
-        state
-            .surrogate_assigner
-            .lookup(database_id, tenant_id, bare_collection, &pk_bytes)?
-    else {
+    let Some(surrogate) = state.surrogate_assigner.lookup(key, tenant_id, &pk_bytes)? else {
         return Ok(HashMap::new());
     };
     let mut plan = crate::bridge::envelope::PhysicalPlan::Document(DocumentOp::PointGet {
@@ -334,7 +324,8 @@ pub async fn fetch_old_row(
     let task = PhysicalTask {
         tenant_id,
         database_id,
-        vshard_id: VShardId::from_key(document_id.as_bytes()),
+        // A document is homed by its collection, never by its own key.
+        vshard_id: key.vshard(),
         plan,
         post_set_op: PostSetOp::None,
         txn_id: None,
@@ -479,9 +470,8 @@ mod tests {
             state
                 .surrogate_assigner
                 .lookup(
-                    database_id,
+                    nodedb_types::CollectionKey::from_bare(database_id, collection),
                     identity.tenant_id,
-                    collection,
                     document_id.as_bytes()
                 )
                 .expect("inspect surrogate binding after denial"),

@@ -3,6 +3,7 @@
 //! String scalar functions.
 
 use super::shared::{num_arg, str_arg};
+use crate::scan_filter::like::{DEFAULT_LIKE_ESCAPE, sql_like_match_escaped};
 use crate::value_ops::value_to_display_string;
 use nodedb_types::Value;
 
@@ -48,7 +49,52 @@ pub(super) fn try_eval(name: &str, args: &[Value]) -> Option<Value> {
         "reverse" => {
             str_arg(args, 0).map_or(Value::Null, |s| Value::String(s.chars().rev().collect()))
         }
+        "like" => like(args, false),
+        "ilike" => like(args, true),
         _ => return None,
     };
     Some(v)
+}
+
+/// `like(input, pattern[, escape])` / `ilike(...)`: SQL `LIKE` / `ILIKE`.
+///
+/// - A NULL input or pattern gives NULL.
+/// - A non-text scalar operand matches as its display text.
+/// - `escape` defaults to `\`. An empty escape disables escaping. An escape
+///   longer than one character is invalid and gives NULL.
+///
+/// `NOT LIKE` is the negation of this call, so NULL stays NULL.
+fn like(args: &[Value], case_insensitive: bool) -> Value {
+    let (Some(input), Some(pattern)) = (like_text(args.first()), like_text(args.get(1))) else {
+        return Value::Null;
+    };
+    let escape = match args.get(2) {
+        None => Some(DEFAULT_LIKE_ESCAPE),
+        Some(v) => {
+            let Some(text) = like_text(Some(v)) else {
+                return Value::Null;
+            };
+            let mut chars = text.chars();
+            match (chars.next(), chars.next()) {
+                (None, _) => None,
+                (Some(c), None) => Some(c),
+                (Some(_), Some(_)) => return Value::Null,
+            }
+        }
+    };
+    Value::Bool(sql_like_match_escaped(
+        &input,
+        &pattern,
+        case_insensitive,
+        escape,
+    ))
+}
+
+/// The text a LIKE operand matches as. `None` for NULL or a missing operand.
+fn like_text(v: Option<&Value>) -> Option<String> {
+    match v? {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        other => Some(value_to_display_string(other)),
+    }
 }

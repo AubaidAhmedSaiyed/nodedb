@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! WAL record header: fixed 54-byte prefix + constants.
+//! WAL record header: fixed 55-byte prefix + constants.
 
 use crate::error::{Result, WalError};
 
@@ -22,7 +22,10 @@ pub const WAL_MAGIC: u32 = 0x5359_4E57; // "SYNW"
 ///
 /// v1 is the initial shipped format with 54-byte headers (u64 tenant_id,
 /// u16 vshard_id, u32 payload_len, u16 reserved, u32 crc32c).
-pub const WAL_FORMAT_VERSION: u16 = 1;
+///
+/// v2 adds the one-byte event source at offset 50 and grows the header to
+/// 55 bytes. A v1 record does not open.
+pub const WAL_FORMAT_VERSION: u16 = 2;
 
 /// Maximum WAL record payload size (64 MiB). Distinct from cluster RPC's limit.
 pub const MAX_WAL_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
@@ -31,13 +34,19 @@ pub const MAX_WAL_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
 ///
 /// Layout (all little-endian):
 ///   magic(4) | format_version(2) | record_type(4) | lsn(8) | tenant_id(8)
-///   | vshard_id(4) | payload_len(4) | database_id(8) | reserved(8) | crc32c(4)
+///   | vshard_id(4) | payload_len(4) | database_id(8) | apply_key(8)
+///   | event_source(1) | crc32c(4)
 ///
 /// `database_id` occupies bytes 34–41 (previously part of the 16-byte reserved
-/// field). `reserved` occupies bytes 42–49. Bytes 34–41 were zero-filled in
+/// field). `apply_key` occupies bytes 42–49. Bytes 34–41 were zero-filled in
 /// prior records, so `database_id == 0` maps to `DatabaseId(0)` (the default
 /// database), preserving backward compatibility without a format-version bump.
-pub const HEADER_SIZE: usize = 54;
+pub const HEADER_SIZE: usize = 55;
+
+/// The event source of a record that carries no row write. Replay rebuilds
+/// no write event from it. A write record carries the code of the source its
+/// write ran with; the WAL stores the code and does not interpret it.
+pub const NO_EVENT_SOURCE: u8 = 0;
 
 /// Bit 14 in `record_type` signals the payload is AES-256-GCM encrypted.
 /// Separate from bit 15 (required flag). Both bits keep their positions;
@@ -48,7 +57,7 @@ pub const ENCRYPTED_FLAG: u32 = 0x0000_4000;
 /// must not be silently skipped.
 pub const REQUIRED_FLAG: u32 = 0x0000_8000;
 
-/// WAL record header (fixed 54 bytes).
+/// WAL record header (fixed 55 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
     pub magic: u32,
@@ -64,9 +73,16 @@ pub struct RecordHeader {
     ///
     /// Occupies bytes 34–41 of the on-disk header (previously part of reserved).
     pub database_id: u64,
-    /// Reserved for future use; must be zero on write; ignored on read
-    /// (but covered by CRC32C). Occupies bytes 42–49.
-    pub reserved: [u8; 8],
+    /// The idempotency key of the replicated proposal whose apply appended
+    /// this record, `0` for a record no proposal apply appended. The record
+    /// and the key are durable together, so a node recovers which proposals
+    /// it applied from the records themselves. Covered by CRC32C. Occupies
+    /// bytes 42–49.
+    pub apply_key: u64,
+    /// The event source of the row write this record carries, as the writer's
+    /// code. [`NO_EVENT_SOURCE`] for a record that carries no row write.
+    /// Covered by CRC32C. Occupies byte 50.
+    pub event_source: u8,
     pub crc32c: u32,
 }
 
@@ -81,14 +97,13 @@ impl RecordHeader {
         buf[26..30].copy_from_slice(&self.vshard_id.to_le_bytes());
         buf[30..34].copy_from_slice(&self.payload_len.to_le_bytes());
         buf[34..42].copy_from_slice(&self.database_id.to_le_bytes());
-        buf[42..50].copy_from_slice(&self.reserved);
-        buf[50..54].copy_from_slice(&self.crc32c.to_le_bytes());
+        buf[42..50].copy_from_slice(&self.apply_key.to_le_bytes());
+        buf[50] = self.event_source;
+        buf[51..55].copy_from_slice(&self.crc32c.to_le_bytes());
         buf
     }
 
     pub fn from_bytes(buf: &[u8; HEADER_SIZE]) -> Self {
-        let mut reserved = [0u8; 8];
-        reserved.copy_from_slice(&buf[42..50]);
         Self {
             magic: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
             format_version: u16::from_le_bytes([buf[4], buf[5]]),
@@ -104,15 +119,18 @@ impl RecordHeader {
             database_id: u64::from_le_bytes([
                 buf[34], buf[35], buf[36], buf[37], buf[38], buf[39], buf[40], buf[41],
             ]),
-            reserved,
-            crc32c: u32::from_le_bytes([buf[50], buf[51], buf[52], buf[53]]),
+            apply_key: u64::from_le_bytes([
+                buf[42], buf[43], buf[44], buf[45], buf[46], buf[47], buf[48], buf[49],
+            ]),
+            event_source: buf[50],
+            crc32c: u32::from_le_bytes([buf[51], buf[52], buf[53], buf[54]]),
         }
     }
 
     /// CRC32C over header (excluding the crc32c field) + payload.
     ///
-    /// The 16 reserved bytes are included in the CRC so they cannot be
-    /// silently modified without detection.
+    /// The apply key is included in the CRC so it cannot be silently
+    /// modified without detection.
     pub fn compute_checksum(&self, payload: &[u8]) -> u32 {
         let header_bytes = self.to_bytes();
         let mut digest = crc32c::crc32c(&header_bytes[..HEADER_SIZE - 4]);
@@ -168,7 +186,8 @@ mod tests {
             vshard_id,
             payload_len: 100,
             database_id: 0,
-            reserved: [0u8; 8],
+            apply_key: 0,
+            event_source: NO_EVENT_SOURCE,
             crc32c: 0xDEAD_BEEF,
         }
     }
@@ -181,11 +200,11 @@ mod tests {
     }
 
     #[test]
-    fn header_golden_54_bytes_exact_offsets() {
+    fn header_golden_55_bytes_exact_offsets() {
         // magic at 0..4, format_version at 4..6, record_type at 6..10,
         // lsn at 10..18, tenant_id at 18..26, vshard_id at 26..30,
-        // payload_len at 30..34, database_id at 34..42, reserved at 42..50,
-        // crc32c at 50..54.
+        // payload_len at 30..34, database_id at 34..42, apply_key at 42..50,
+        // event_source at 50, crc32c at 51..55.
         let header = RecordHeader {
             magic: WAL_MAGIC,
             format_version: WAL_FORMAT_VERSION,
@@ -195,11 +214,12 @@ mod tests {
             vshard_id: 0xCAFE_BABE,
             payload_len: 256,
             database_id: 0xABCD_0000_1234_5678,
-            reserved: [0u8; 8],
+            apply_key: 0,
+            event_source: NO_EVENT_SOURCE,
             crc32c: 0x1234_5678,
         };
         let b = header.to_bytes();
-        assert_eq!(b.len(), 54);
+        assert_eq!(b.len(), 55);
         // magic
         assert_eq!(&b[0..4], &WAL_MAGIC.to_le_bytes());
         // format_version
@@ -216,10 +236,12 @@ mod tests {
         assert_eq!(&b[30..34], &256u32.to_le_bytes());
         // database_id
         assert_eq!(&b[34..42], &0xABCD_0000_1234_5678u64.to_le_bytes());
-        // reserved — all zero
+        // apply_key — zero
         assert_eq!(&b[42..50], &[0u8; 8]);
+        // event_source
+        assert_eq!(b[50], NO_EVENT_SOURCE);
         // crc32c
-        assert_eq!(&b[50..54], &0x1234_5678u32.to_le_bytes());
+        assert_eq!(&b[51..55], &0x1234_5678u32.to_le_bytes());
     }
 
     #[test]
@@ -234,7 +256,8 @@ mod tests {
             vshard_id: 0,
             payload_len: 0,
             database_id: 7,
-            reserved: [0u8; 8],
+            apply_key: 0,
+            event_source: NO_EVENT_SOURCE,
             crc32c: 0,
         };
         let bytes = header.to_bytes();
@@ -268,7 +291,8 @@ mod tests {
             vshard_id: 0,
             payload_len: 0,
             database_id: 0,
-            reserved: [0u8; 8],
+            apply_key: 0,
+            event_source: NO_EVENT_SOURCE,
             crc32c: 0,
         };
         let bytes = header.to_bytes();
@@ -352,5 +376,16 @@ mod tests {
             0x0001_0001 | ENCRYPTED_FLAG | REQUIRED_FLAG
         );
         assert_eq!(decoded2.logical_record_type(), 0x0001_0001 | REQUIRED_FLAG);
+    }
+
+    #[test]
+    fn every_event_source_code_roundtrips() {
+        for code in 0..=u8::MAX {
+            let mut header = make_header(1, 0);
+            header.event_source = code;
+            let decoded = RecordHeader::from_bytes(&header.to_bytes());
+            assert_eq!(decoded.event_source, code);
+            assert_eq!(decoded, header);
+        }
     }
 }

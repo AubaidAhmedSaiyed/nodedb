@@ -36,7 +36,8 @@ impl VectorCollection {
             .filter(|s| s.tier == StorageTier::L0Ram)
             .map(|s| s.index.len() * bytes_per_vector)
             .sum();
-        growing + building + sealed_ram
+        let ivf = self.ivf.as_ref().map_or(0, |ivf| ivf.memory_bytes());
+        growing + building + sealed_ram + ivf
     }
 
     /// Whether the RAM budget is exceeded.

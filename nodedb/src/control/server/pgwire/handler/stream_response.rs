@@ -22,7 +22,7 @@ use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{decode_payload_to_json, decode_payload_value};
 
 use super::super::ddl_encode::col_type_to_field_with_format;
-use super::super::types::{error_to_sqlstate, text_field};
+use super::super::types::{error_to_pg_in_context, error_to_sqlstate, text_field};
 use super::shape_encode::{encode_shaped_row, shaped_query_response};
 
 /// The per-request plumbing a lazily-streamed pgwire response owns for its
@@ -115,7 +115,7 @@ pub(crate) fn streaming_multirow_response(
                     encoder.encode_field(&item.to_string()).map_err(|e| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".to_owned(),
-                            "XX000".to_owned(),
+                            nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
                             format!("failed to encode streamed row: {e}"),
                         )))
                     })?;
@@ -214,13 +214,8 @@ pub(crate) fn streaming_shaped_response(
                 break;
             }
 
-            let value = decode_payload_value(&batch.payload).map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    format!("failed to decode streamed batch: {e}"),
-                )))
-            })?;
+            let value = decode_payload_value(&batch.payload)
+                .map_err(|e| error_to_pg_in_context("failed to decode streamed batch", &e))?;
             // Resolved once before the first batch was pulled; this only
             // re-borrows it, so no batch can slip out ahead of the policy.
             // A streamed plan never carries Control-Plane computed columns:
@@ -232,13 +227,7 @@ pub(crate) fn streaming_shaped_response(
                 redaction.as_ref().map(|r| r.ctx(&state.redaction)),
                 None,
             )
-            .map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    format!("failed to shape streamed batch: {e}"),
-                )))
-            })?;
+            .map_err(|e| error_to_pg_in_context("failed to shape streamed batch", &e))?;
             for row in &shaped.rows {
                 if emitted >= limit {
                     break;
@@ -313,16 +302,15 @@ pub(crate) async fn streaming_star_response(
             Ok(_) => {
                 return single_pgwire_error(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
-                    "XX000".to_owned(),
+                    nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
                     "streamed batch payload was not a row array".to_owned(),
                 ))));
             }
             Err(e) => {
-                return single_pgwire_error(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    format!("failed to decode streamed batch: {e}"),
-                ))));
+                return single_pgwire_error(error_to_pg_in_context(
+                    "failed to decode streamed batch",
+                    &e,
+                ));
             }
         }
     }
@@ -349,11 +337,10 @@ pub(crate) async fn streaming_star_response(
     ) {
         Ok(s) => s,
         Err(e) => {
-            return single_pgwire_error(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                format!("failed to shape streamed batch: {e}"),
-            ))));
+            return single_pgwire_error(error_to_pg_in_context(
+                "failed to shape streamed batch",
+                &e,
+            ));
         }
     };
     // `SELECT *` derives its columns from the rows and has no client-requested

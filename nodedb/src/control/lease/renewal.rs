@@ -38,7 +38,7 @@ use nodedb_cluster::LoopMetrics;
 use nodedb_types::config::tuning::ClusterTransportTuning;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::control::state::SharedState;
 
@@ -156,8 +156,9 @@ impl LeaseRenewalLoop {
     }
 
     /// One iteration: snapshot the near-expiry lease set under a
-    /// short read lock, then re-acquire each one. Errors are
-    /// logged at warn — the next tick retries automatically.
+    /// short read lock, then re-acquire each one. A failed step is
+    /// logged at error and recorded as a diagnostic capture. The
+    /// next tick retries it.
     ///
     /// **Why we use wall-clock nanoseconds, not `hlc_clock.peek()`**:
     /// `peek` returns the last HLC the clock observed, which may
@@ -193,21 +194,38 @@ impl LeaseRenewalLoop {
                         version,
                         self.config.full_duration,
                     ) {
-                        warn!(
+                        error!(
                             descriptor = ?id,
                             version,
                             error = %e,
-                            "descriptor lease renewal: re-acquire failed"
+                            "descriptor lease renewal: re-acquire failed; the lease \
+                             expires unless a later tick refreshes it"
+                        );
+                        crate::diag::descriptor_lease_not_renewed(
+                            &e,
+                            "renew",
+                            &id,
+                            version,
+                            shared.node_id,
                         );
                         self.loop_metrics.record_error("renew");
                     }
                 }
                 None => {
                     if let Err(e) = super::release::release_leases(&shared, vec![id.clone()]) {
-                        warn!(
+                        error!(
                             descriptor = ?id,
+                            held_version,
                             error = %e,
-                            "descriptor lease renewal: release after drop failed"
+                            "descriptor lease renewal: release after drop failed; the \
+                             lease blocks DDL drains on its descriptor until it expires"
+                        );
+                        crate::diag::descriptor_lease_not_renewed(
+                            &e,
+                            "release",
+                            &id,
+                            held_version,
+                            shared.node_id,
                         );
                         self.loop_metrics.record_error("release");
                     }

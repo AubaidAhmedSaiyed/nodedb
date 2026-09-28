@@ -46,6 +46,9 @@ pub(super) struct TuningOverrides {
     /// Overrides `[tuning.timeseries] memtable_budget_bytes` so a test can
     /// observe timeseries partition flushes on a handful of rows.
     pub(super) timeseries_memtable_budget_bytes: Option<usize>,
+    /// Overrides `[tuning.vector] seal_threshold` so a test can observe HNSW
+    /// segment builds on a few hundred vectors.
+    pub(super) vector_seal_threshold: Option<usize>,
     /// Sets `[server] single_node_calvin = false` so the server boots with no
     /// cluster topology. The planner then emits the single-node plan forms
     /// (`ArrayOp::{Put, Delete, Slice, ...}`) instead of the `ClusterArrayOp`
@@ -87,6 +90,14 @@ impl TuningOverrides {
     pub(super) fn timeseries_memtable_budget(bytes: usize) -> Self {
         Self {
             timeseries_memtable_budget_bytes: Some(bytes),
+            ..Self::default()
+        }
+    }
+
+    /// Boot with a lowered vector seal threshold.
+    pub(super) fn vector_seal_threshold(vectors: usize) -> Self {
+        Self {
+            vector_seal_threshold: Some(vectors),
             ..Self::default()
         }
     }
@@ -142,6 +153,9 @@ pub(super) fn write_config(dir: &Path, auth_mode: AuthMode, tuning: TuningOverri
         toml.push_str(&format!(
             "\n[tuning.timeseries]\nmemtable_budget_bytes = {bytes}\n"
         ));
+    }
+    if let Some(vectors) = tuning.vector_seal_threshold {
+        toml.push_str(&format!("\n[tuning.vector]\nseal_threshold = {vectors}\n"));
     }
     toml.push_str(&format!(
         "\n[backup_encryption]\nkey_path = {}\n",

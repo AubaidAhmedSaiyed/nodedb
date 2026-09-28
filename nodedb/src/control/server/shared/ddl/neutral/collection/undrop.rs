@@ -76,7 +76,7 @@ pub fn undrop_collection(
             ));
         }
         Err(e) => {
-            return Err(DdlError::new("XX000", e.to_string()));
+            return Err(DdlError::from_error(&e));
         }
     };
     if stored.is_active {
@@ -133,7 +133,7 @@ pub fn undrop_collection(
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     if outcome.needs_local_apply() {
         // Single-node fallback: run the same applier the replicated path runs
         // on every node, so the restore carries every invariant of a
@@ -141,7 +141,7 @@ pub fn undrop_collection(
         // visibility of the indexes the soft-delete hid. Writing the row
         // directly here restored a collection whose indexes stayed hidden.
         crate::control::catalog_entry::apply::collection::put(&stored, catalog)
-            .map_err(|e| DdlError::new("XX000", format!("catalog restore failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog restore failed", &e))?;
     }
 
     let completion = UndropAuditDetail::new(name, UndropStage::Completed, owner_user_missing)

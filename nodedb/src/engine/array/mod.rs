@@ -4,9 +4,9 @@
 //!
 //! Lives in the Data Plane: `!Send`, no tokio. Persistence routes through
 //! the [`wal::ArrayWalAppender`] trait, which Origin wires to the real
-//! group-committed WAL writer. Recovery replays WAL records past the
-//! last `ArrayFlush` watermark; flushed segments are durable on disk and
-//! mmap'd by the segment store on open.
+//! group-committed WAL writer. Recovery replays every WAL record the
+//! manifest's replay stamp does not name; flushed segments are durable on
+//! disk and mmap'd by the segment store on open.
 
 pub mod compact;
 pub mod compaction;
@@ -16,6 +16,7 @@ pub mod memtable;
 pub mod purge;
 pub mod read;
 pub mod recovery;
+pub mod rollback;
 pub mod store;
 #[cfg(test)]
 mod test_support;
@@ -23,4 +24,5 @@ pub mod wal;
 pub mod write;
 
 pub use engine::{ArrayEngine, ArrayEngineConfig};
+pub use rollback::ArrayTileSnapshot;
 pub use wal::{ArrayDeletePayload, ArrayFlushPayload, ArrayPutPayload};

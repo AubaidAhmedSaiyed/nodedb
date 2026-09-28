@@ -7,17 +7,10 @@
 //! re-issues each vector as a durable `VectorOp::Insert`: Raft-proposed on
 //! cluster, WAL-appended + dispatched on single-node.
 
-use std::time::Duration;
-
 use nodedb_types::surrogate::Surrogate;
 
-use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::shared::ddl::sync_dispatch;
-use crate::control::server::wal_dispatch::wal_append_if_write;
-use crate::control::state::SharedState;
 use crate::engine::vector::index_config::{IndexConfig, IndexType};
-use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::vector_distance::DistanceMetric;
 
@@ -107,55 +100,3 @@ pub fn build_vector_set_params_plan(
         ivf_nprobe: config.ivf_nprobe,
     })
 }
-
-/// Re-issue a restored vector insert durably.
-///
-/// Branches identically to a normal write:
-/// - Cluster: `to_replicated_entry` + `propose_replicated_entry`.
-/// - Single-node: `wal_append_if_write` then `sync_dispatch::dispatch_system`.
-pub async fn reissue_vector_durably(
-    state: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    collection: &str,
-    plan: PhysicalPlan,
-) -> crate::Result<()> {
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
-
-    if let Some(proposer) = state.async_raft_proposer() {
-        let entry = crate::control::wal_replication::to_replicated_entry(
-            tenant_id,
-            database_id,
-            vshard,
-            &crate::control::wal_replication::ReplicableWrite::decide_for_replication(&plan)?,
-        )?
-        .ok_or_else(|| Error::Internal {
-            detail: format!(
-                "restore reissue: vector plan for '{collection}' did not map to a \
-                     replicated write"
-            ),
-        })?;
-        crate::control::wal_replication::propose_replicated_entry(state, proposer, entry).await?;
-        return Ok(());
-    }
-
-    // Single-node: WAL first (durable for restart replay), then install live.
-    wal_append_if_write(&state.wal, tenant_id, vshard, database_id, &plan)?;
-    sync_dispatch::dispatch_system(
-        state,
-        sync_dispatch::SystemTask::new(
-            sync_dispatch::SystemReason::BackupRestore,
-            tenant_id,
-            database_id,
-            collection,
-            plan,
-        ),
-        REISSUE_TIMEOUT,
-    )
-    .await?;
-    Ok(())
-}
-
-/// Per-vector re-issue dispatch timeout. Mirrors the columnar/timeseries
-/// reissue timeout; a single-vector `Insert` completes far under this.
-const REISSUE_TIMEOUT: Duration = Duration::from_secs(120);

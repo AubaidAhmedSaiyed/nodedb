@@ -8,7 +8,8 @@
 //!
 //! The compound key is `(database_id, tenant_id, collection, pk_bytes)`
 //! (forward) and `(database_id, tenant_id, collection, surrogate)` (reverse),
-//! scoping the PK map to its database + tenant boundary.
+//! scoping the PK map to its database + tenant boundary. Every entry point
+//! takes a [`CollectionKey`], so `collection` is always the bare catalog name.
 //!
 //! ## Migration
 //!
@@ -20,7 +21,7 @@
 //! second key component. Both are idempotent: each skips if its target is
 //! already non-empty.
 
-use nodedb_types::{DatabaseId, Surrogate, TenantId};
+use nodedb_types::{CollectionKey, DatabaseId, Surrogate, TenantId};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 #[allow(unused_imports)] // SURROGATE_PK_REV_LEGACY is used only in #[cfg(test)] helpers
@@ -37,14 +38,14 @@ impl SystemCatalog {
     /// pk_bytes)` to the same surrogate is a no-op-on-disk overwrite.
     pub fn put_surrogate(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
-        collection: &str,
         pk_bytes: &[u8],
         surrogate: Surrogate,
     ) -> crate::Result<()> {
-        let db_id = database_id.as_u64();
+        let db_id = key.database_id().as_u64();
         let tid = tenant_id.as_u64();
+        let collection = key.name();
         let txn = self
             .db
             .begin_write()
@@ -69,13 +70,13 @@ impl SystemCatalog {
     /// collection, pk_bytes)`. Returns `None` if no binding exists.
     pub fn get_surrogate_for_pk(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
-        collection: &str,
         pk_bytes: &[u8],
     ) -> crate::Result<Option<Surrogate>> {
-        let db_id = database_id.as_u64();
+        let db_id = key.database_id().as_u64();
         let tid = tenant_id.as_u64();
+        let collection = key.name();
         let txn = self
             .db
             .begin_read()
@@ -96,13 +97,13 @@ impl SystemCatalog {
     /// surrogate)`. Returns `None` if no binding exists.
     pub fn get_pk_for_surrogate(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
-        collection: &str,
         surrogate: Surrogate,
     ) -> crate::Result<Option<Vec<u8>>> {
-        let db_id = database_id.as_u64();
+        let db_id = key.database_id().as_u64();
         let tid = tenant_id.as_u64();
+        let collection = key.name();
         let txn = self
             .db
             .begin_read()
@@ -122,13 +123,13 @@ impl SystemCatalog {
     /// Remove a surrogate ↔ PK binding atomically. Idempotent.
     pub fn delete_surrogate(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
-        collection: &str,
         pk_bytes: &[u8],
     ) -> crate::Result<()> {
-        let db_id = database_id.as_u64();
+        let db_id = key.database_id().as_u64();
         let tid = tenant_id.as_u64();
+        let collection = key.name();
         let txn = self
             .db
             .begin_write()
@@ -157,12 +158,12 @@ impl SystemCatalog {
     /// Returns `Vec<(pk_bytes, surrogate)>` in redb's natural key order.
     pub fn scan_surrogates_for_collection(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
-        collection: &str,
     ) -> crate::Result<Vec<(Vec<u8>, Surrogate)>> {
-        let db_id = database_id.as_u64();
+        let db_id = key.database_id().as_u64();
         let tid = tenant_id.as_u64();
+        let collection = key.name();
         let txn = self
             .db
             .begin_read()
@@ -233,16 +234,16 @@ impl SystemCatalog {
     /// collection)` triple. Drains both forward and reverse tables. Idempotent.
     pub fn delete_all_surrogates_for_collection(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
-        collection: &str,
     ) -> crate::Result<()> {
-        let to_remove = self.scan_surrogates_for_collection(database_id, tenant_id, collection)?;
+        let to_remove = self.scan_surrogates_for_collection(key, tenant_id)?;
         if to_remove.is_empty() {
             return Ok(());
         }
-        let db_id = database_id.as_u64();
+        let db_id = key.database_id().as_u64();
         let tid = tenant_id.as_u64();
+        let collection = key.name();
         let txn = self
             .db
             .begin_write()
@@ -444,25 +445,22 @@ mod max_bound_surrogate_tests {
     fn floor_is_the_global_maximum_across_every_scope() {
         let (_dir, cat) = open();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "zzz_last_in_key_order"),
             TenantId::new(1),
-            "zzz_last_in_key_order",
             b"a",
             Surrogate::new(3),
         )
         .unwrap();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "aaa_first_in_key_order"),
             TenantId::new(1),
-            "aaa_first_in_key_order",
             b"b",
             Surrogate::new(9_000),
         )
         .unwrap();
         cat.put_surrogate(
-            DatabaseId::new(7),
+            nodedb_types::CollectionKey::from_bare(DatabaseId::new(7), "other_db"),
             TenantId::new(2),
-            "other_db",
             b"c",
             Surrogate::new(41),
         )
@@ -478,9 +476,8 @@ mod max_bound_surrogate_tests {
     fn floor_outranks_a_stale_hwm_singleton() {
         let (_dir, cat) = open();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             TenantId::new(1),
-            "users",
             b"alice",
             Surrogate::new(500),
         )
@@ -519,21 +516,28 @@ mod tests {
     fn put_then_get_roundtrip() {
         let (_dir, cat) = open_catalog();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             T0,
-            "users",
             b"alice",
             Surrogate::new(7),
         )
         .unwrap();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, T0, "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                T0,
+                b"alice"
+            )
+            .unwrap(),
             Some(Surrogate::new(7))
         );
         assert_eq!(
-            cat.get_pk_for_surrogate(DatabaseId::DEFAULT, T0, "users", Surrogate::new(7))
-                .unwrap(),
+            cat.get_pk_for_surrogate(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                T0,
+                Surrogate::new(7)
+            )
+            .unwrap(),
             Some(b"alice".to_vec())
         );
     }
@@ -544,29 +548,35 @@ mod tests {
         let t1 = TenantId::new(1);
         let t2 = TenantId::new(2);
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             t1,
-            "users",
             b"alice",
             Surrogate::new(10),
         )
         .unwrap();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             t2,
-            "users",
             b"alice",
             Surrogate::new(20),
         )
         .unwrap();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, t1, "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                t1,
+                b"alice"
+            )
+            .unwrap(),
             Some(Surrogate::new(10))
         );
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, t2, "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                t2,
+                b"alice"
+            )
+            .unwrap(),
             Some(Surrogate::new(20))
         );
     }
@@ -575,8 +585,12 @@ mod tests {
     fn missing_returns_none() {
         let (_dir, cat) = open_catalog();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, T0, "users", b"nobody")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                T0,
+                b"nobody"
+            )
+            .unwrap(),
             None
         );
     }
@@ -585,56 +599,72 @@ mod tests {
     fn delete_is_idempotent_and_removes_both_directions() {
         let (_dir, cat) = open_catalog();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             T0,
-            "users",
             b"alice",
             Surrogate::new(7),
         )
         .unwrap();
-        cat.delete_surrogate(DatabaseId::DEFAULT, T0, "users", b"alice")
-            .unwrap();
+        cat.delete_surrogate(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+            T0,
+            b"alice",
+        )
+        .unwrap();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, T0, "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                T0,
+                b"alice"
+            )
+            .unwrap(),
             None
         );
-        cat.delete_surrogate(DatabaseId::DEFAULT, T0, "users", b"alice")
-            .unwrap();
+        cat.delete_surrogate(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+            T0,
+            b"alice",
+        )
+        .unwrap();
     }
 
     #[test]
     fn scan_returns_only_named_collection() {
         let (_dir, cat) = open_catalog();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             T0,
-            "users",
             b"alice",
             Surrogate::new(1),
         )
         .unwrap();
-        cat.put_surrogate(DatabaseId::DEFAULT, T0, "users", b"bob", Surrogate::new(2))
-            .unwrap();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             T0,
-            "orders",
+            b"bob",
+            Surrogate::new(2),
+        )
+        .unwrap();
+        cat.put_surrogate(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "orders"),
+            T0,
             b"alice",
             Surrogate::new(3),
         )
         .unwrap();
         // A different tenant's same-named collection must not leak into the scan.
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             TenantId::new(9),
-            "users",
             b"carol",
             Surrogate::new(4),
         )
         .unwrap();
         let mut got = cat
-            .scan_surrogates_for_collection(DatabaseId::DEFAULT, T0, "users")
+            .scan_surrogates_for_collection(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                T0,
+            )
             .unwrap();
         got.sort();
         assert_eq!(
@@ -650,30 +680,47 @@ mod tests {
     fn delete_all_wipes_collection_and_leaves_others_intact() {
         let (_dir, cat) = open_catalog();
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             T0,
-            "users",
             b"alice",
             Surrogate::new(1),
         )
         .unwrap();
-        cat.put_surrogate(DatabaseId::DEFAULT, T0, "orders", b"o1", Surrogate::new(2))
-            .unwrap();
-        cat.delete_all_surrogates_for_collection(DatabaseId::DEFAULT, T0, "users")
-            .unwrap();
+        cat.put_surrogate(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "orders"),
+            T0,
+            b"o1",
+            Surrogate::new(2),
+        )
+        .unwrap();
+        cat.delete_all_surrogates_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+            T0,
+        )
+        .unwrap();
         assert!(
-            cat.scan_surrogates_for_collection(DatabaseId::DEFAULT, T0, "users")
-                .unwrap()
-                .is_empty()
+            cat.scan_surrogates_for_collection(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                T0
+            )
+            .unwrap()
+            .is_empty()
         );
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, T0, "orders", b"o1")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "orders"),
+                T0,
+                b"o1"
+            )
+            .unwrap(),
             Some(Surrogate::new(2))
         );
         // double-delete is a no-op
-        cat.delete_all_surrogates_for_collection(DatabaseId::DEFAULT, T0, "users")
-            .unwrap();
+        cat.delete_all_surrogates_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+            T0,
+        )
+        .unwrap();
     }
 
     // ── Migration tests ───────────────────────────────────────────────────
@@ -702,9 +749,12 @@ mod tests {
         cat.migrate_surrogate_pk().unwrap();
         cat.migrate_surrogate_pk_v3().unwrap();
         assert!(
-            cat.scan_surrogates_for_collection(DatabaseId::DEFAULT, T0, "users")
-                .unwrap()
-                .is_empty()
+            cat.scan_surrogates_for_collection(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                T0
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -724,9 +774,8 @@ mod tests {
         let (_dir, cat) = open_catalog();
         // v2 row already exists, written under the default tenant in v3 …
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             T0,
-            "users",
             b"alice",
             Surrogate::new(7),
         )
@@ -781,15 +830,18 @@ mod tests {
         // default identity that wrote them pre-upgrade.
         let default_tenant = TenantId::new(1);
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, default_tenant, "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                default_tenant,
+                b"alice"
+            )
+            .unwrap(),
             Some(Surrogate::new(7))
         );
         assert_eq!(
             cat.get_pk_for_surrogate(
-                DatabaseId::DEFAULT,
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
                 default_tenant,
-                "users",
                 Surrogate::new(7)
             )
             .unwrap(),
@@ -802,9 +854,8 @@ mod tests {
         let (_dir, cat) = open_catalog();
         // v3 already populated …
         cat.put_surrogate(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
             T0,
-            "users",
             b"alice",
             Surrogate::new(7),
         )
@@ -824,8 +875,12 @@ mod tests {
         }
         cat.migrate_surrogate_pk_v3().unwrap();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, T0, "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                T0,
+                b"alice"
+            )
+            .unwrap(),
             Some(Surrogate::new(7))
         );
     }

@@ -30,10 +30,6 @@ use nodedb_physical::physical_plan::wire as plan_wire;
 
 use super::super::super::result::DdlError;
 
-fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError::new(sqlstate, message)
-}
-
 /// Remaining budget for per-peer RPCs. Chosen to cover backfill on
 /// collections with up to ~1M rows at the Data Plane's current
 /// throughput; large production collections will need a streaming
@@ -42,9 +38,9 @@ const PEER_BACKFILL_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Run `DocumentOp::BackfillIndex` on every cluster node other than
 /// this coordinator. Returns `Ok(())` only when every peer reports
-/// success; any peer failure is returned as a DDL error with
-/// SQLSTATE 23505 for duplicates and XX000 otherwise, matching the
-/// single-node path.
+/// success. A peer's typed refusal keeps its SQLSTATE, so a duplicate
+/// key is `23505` as on the single-node path. A transport fault is
+/// `XX000`.
 ///
 /// Single-node clusters (no peers) return `Ok(())` immediately — the
 /// coordinator's local dispatch already covered everything.
@@ -106,8 +102,8 @@ pub(super) async fn backfill_on_peers(
         case_insensitive: args.case_insensitive,
         predicate: args.predicate.map(str::to_string),
     });
-    let plan_bytes =
-        plan_wire::encode(&plan).map_err(|e| err("XX000", format!("backfill plan encode: {e}")))?;
+    let plan_bytes = plan_wire::encode(&plan)
+        .map_err(|e| DdlError::internal(format!("backfill plan encode: {e}")))?;
 
     // Fan out in parallel; collect per-peer outcomes. Any failure
     // aborts the commit — we do NOT compensate by dropping the index
@@ -139,27 +135,20 @@ pub(super) async fn backfill_on_peers(
     for join in joins {
         let (node_id, outcome) = join
             .await
-            .map_err(|e| err("XX000", format!("peer backfill join: {e}")))?;
+            .map_err(|e| DdlError::internal(format!("peer backfill join: {e}")))?;
         let resp = outcome.map_err(|e| {
-            err(
-                "XX000",
-                format!("peer backfill transport to node {node_id}: {e}"),
-            )
+            DdlError::internal(format!("peer backfill transport to node {node_id}: {e}"))
         })?;
         let RaftRpc::ExecuteResponse(resp) = resp else {
-            return Err(err(
-                "XX000",
-                format!("peer backfill on node {node_id}: unexpected RPC variant {resp:?}"),
-            ));
+            return Err(DdlError::internal(format!(
+                "peer backfill on node {node_id}: unexpected RPC variant {resp:?}"
+            )));
         };
         if let Some(e) = resp.error {
-            let detail = format!("peer backfill on node {node_id}: {e:?}");
-            let code = if detail.to_lowercase().contains("unique") {
-                "23505"
-            } else {
-                "XX000"
-            };
-            return Err(err(code, detail));
+            return Err(DdlError::from_error_in_context(
+                &format!("peer backfill on node {node_id}"),
+                &crate::Error::from(e),
+            ));
         }
     }
 

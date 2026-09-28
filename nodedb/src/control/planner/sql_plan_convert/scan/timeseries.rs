@@ -5,7 +5,7 @@
 use nodedb_sql::types::SqlValue;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 
 use super::super::aggregate::{
@@ -37,16 +37,21 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
         ctx,
         temporal,
     } = p;
-    let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
-    let collection = coll_qualified.as_str();
     let filter_bytes = serialize_filters(filters)?;
     let agg_pairs: Vec<(String, String)> = aggregates.iter().map(agg_expr_to_pair).collect();
 
     // AUTO_TIER: split query across retention tiers if enabled.
     if *tiered
         && let Some(registry) = &ctx.retention_registry
-        && let Some(policy) = registry.get(ctx.database_id.as_u64(), tenant_id.as_u64(), collection)
+        // Policies are keyed by policy name. A collection's policy is found
+        // by the bare collection name it targets.
+        && let Some(policy) = registry.get_for_collection(
+            ctx.database_id.as_u64(),
+            tenant_id.as_u64(),
+            collection_key.name(),
+        )
         && policy.auto_tier
     {
         return Ok(super::super::super::auto_tier::plan_tiered_scan(
@@ -65,7 +70,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
 
     let proj_names = extract_projection_names(projection, &[]);
     let computed_bytes = extract_computed_columns(projection, &[], false)?;
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = collection_key.vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,
@@ -97,10 +102,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
     tenant_id: TenantId,
     ctx: &super::super::convert::ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = collection_key.vshard();
     let mut payload = Vec::with_capacity(rows.len() * 128);
     write_msgpack_array_header(&mut payload, rows.len());
     let mut surrogates: Vec<nodedb_types::Surrogate> = Vec::with_capacity(rows.len());
@@ -119,7 +123,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
         // PK collapses every row onto `Surrogate::ZERO` and merges distinct
         // rows. Nothing looks a timeseries row up by this binding, so the
         // identity string is discarded.
-        let (s, _) = ctx.fresh_surrogate(collection)?;
+        let (s, _) = ctx.fresh_surrogate(collection_key)?;
         surrogates.push(s);
     }
     Ok(vec![PhysicalTask {

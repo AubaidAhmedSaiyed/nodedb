@@ -140,7 +140,7 @@ impl InvertedIndex {
     /// Core indexing logic: writes postings, doc length, and stats within
     /// a transaction. Bypasses the LSM memtable so Origin transactions can
     /// stay atomic with the document write.
-    fn write_index_data(
+    pub(super) fn write_index_data(
         &self,
         txn: &WriteTransaction,
         scope: IndexDocScope<'_>,
@@ -153,6 +153,7 @@ impl InvertedIndex {
             surrogate,
         } = scope;
         let t = tid.as_u64();
+        self.note_doc_write(scope);
 
         let mut term_postings: HashMap<&str, (u32, Vec<u32>)> = HashMap::new();
         for (pos, token) in tokens.iter().enumerate() {

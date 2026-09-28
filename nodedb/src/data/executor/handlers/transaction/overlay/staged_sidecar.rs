@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Per-row sidecars of the staging overlay: the KV TTL delta and the
-//! bitemporal stamp. Both live beside [`Staged`](super::Staged) rather than
-//! inside it because only one engine reads each.
+//! Per-row sidecars of the staging overlay: the KV TTL delta, the
+//! bitemporal stamp, the displaced columnar base key and a timeseries
+//! batch's default timestamp. Each lives beside
+//! [`Staged`](super::Staged) rather than inside it because only one engine
+//! reads it.
 
 use nodedb_types::RowIdentity;
 
-use super::staged::TxnOverlay;
+use super::staged::{JournalEntry, TxnOverlay};
 use crate::types::{DatabaseId, TenantId};
 
 /// A staged TTL delta for one KV row, kept OUTSIDE `Staged` because TTL is
@@ -87,6 +89,30 @@ impl TxnOverlay {
         overlay.ttl_by_surrogate.get(surrogate).copied()
     }
 
+    /// Every staged TTL delta of `coll_key` whose row has no staged value:
+    /// an `EXPIRE` or `PERSIST` of a base row. Yields the row's client
+    /// identity and its delta.
+    pub fn iter_ttl_only_for_collection<'a>(
+        &'a self,
+        coll_key: &(DatabaseId, TenantId, String),
+    ) -> impl Iterator<Item = (&'a RowIdentity, StagedTtl)> {
+        self.collections
+            .get(coll_key)
+            .into_iter()
+            .flat_map(|overlay| {
+                overlay
+                    .doc_id_to_surrogate
+                    .iter()
+                    .filter(move |(_, surrogate)| !overlay.by_surrogate.contains_key(surrogate))
+                    .filter_map(move |(doc_id, surrogate)| {
+                        overlay
+                            .ttl_by_surrogate
+                            .get(surrogate)
+                            .map(|ttl| (doc_id, *ttl))
+                    })
+            })
+    }
+
     /// Record the resolve-time bitemporal stamp for `surrogate` in the given
     /// collection. Assigned exactly once, at COMMIT resolve, after all
     /// savepoint activity for the transaction has completed — so no undo
@@ -119,15 +145,98 @@ impl TxnOverlay {
             .copied()
     }
 
-    /// Iterate every `(surrogate, BitemporalStamp)` staged across all
-    /// collections in this overlay. Surrogates are globally unique, so the
-    /// commit-time install flattens these into one per-core scratch map.
-    pub fn all_bitemporal_stamps(&self) -> impl Iterator<Item = (u32, BitemporalStamp)> + '_ {
-        self.collections.values().flat_map(|overlay| {
-            overlay
-                .bitemporal_by_surrogate
-                .iter()
-                .map(|(surrogate, stamp)| (*surrogate, *stamp))
-        })
+    /// Record the primary key of the base row `surrogate` names, the first
+    /// time a statement stages that base row. A base row's key does not change
+    /// inside the transaction, so a later record for the same surrogate is
+    /// dropped and no undo journalling is needed: after a savepoint rollback
+    /// the recorded key still names the same base row.
+    pub fn note_base_pk(
+        &mut self,
+        coll_key: &(DatabaseId, TenantId, String),
+        surrogate: u32,
+        pk_msgpack: Vec<u8>,
+    ) {
+        self.collections
+            .entry(coll_key.clone())
+            .or_default()
+            .base_pk_by_surrogate
+            .entry(surrogate)
+            .or_insert(pk_msgpack);
+    }
+
+    /// The primary key (MessagePack) of the base row a staged columnar write
+    /// displaced for `surrogate`. `None` when the transaction staged no base
+    /// row under that surrogate.
+    pub fn base_pk(
+        &self,
+        coll_key: &(DatabaseId, TenantId, String),
+        surrogate: u32,
+    ) -> Option<&[u8]> {
+        self.collections
+            .get(coll_key)?
+            .base_pk_by_surrogate
+            .get(&surrogate)
+            .map(Vec::as_slice)
+    }
+
+    /// Record the instant a staged timeseries ingest read as its default row
+    /// timestamp, under the batch's first surrogate. Surrogates are fresh per
+    /// staged row, so no later statement records the same key and no undo
+    /// journalling is needed.
+    pub fn note_ingest_now(
+        &mut self,
+        coll_key: &(DatabaseId, TenantId, String),
+        first_surrogate: u32,
+        now_ms: i64,
+    ) {
+        self.collections
+            .entry(coll_key.clone())
+            .or_default()
+            .ingest_now_by_surrogate
+            .insert(first_surrogate, now_ms);
+    }
+
+    /// The default row timestamp the staged ingest whose first row is
+    /// `first_surrogate` read at its statement.
+    pub fn ingest_now(
+        &self,
+        coll_key: &(DatabaseId, TenantId, String),
+        first_surrogate: u32,
+    ) -> Option<i64> {
+        self.collections
+            .get(coll_key)?
+            .ingest_now_by_surrogate
+            .get(&first_surrogate)
+            .copied()
+    }
+
+    /// Record the instant a staged unkeyed timeseries ingest read as its
+    /// default row timestamp. A savepoint rollback removes it.
+    pub fn note_unkeyed_ingest_now(
+        &mut self,
+        coll_key: &(DatabaseId, TenantId, String),
+        now_ms: i64,
+    ) {
+        self.collections
+            .entry(coll_key.clone())
+            .or_default()
+            .unkeyed_ingest_now
+            .push(now_ms);
+        self.journal.push(JournalEntry::UnkeyedIngest {
+            coll_key: coll_key.clone(),
+        });
+    }
+
+    /// The instant the `ordinal`-th unkeyed ingest into `coll_key` read.
+    pub fn unkeyed_ingest_now(
+        &self,
+        coll_key: &(DatabaseId, TenantId, String),
+        ordinal: usize,
+    ) -> Option<i64> {
+        self.collections
+            .get(coll_key)?
+            .unkeyed_ingest_now
+            .get(ordinal)
+            .copied()
     }
 }

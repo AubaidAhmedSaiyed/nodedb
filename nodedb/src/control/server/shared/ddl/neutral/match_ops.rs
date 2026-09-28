@@ -135,7 +135,7 @@ pub async fn match_query(
 
     // Serialize the MatchQuery for SPSC transport.
     let query_bytes = zerompk::to_msgpack_vec(&query)
-        .map_err(|e| DdlError::new("XX000", format!("serialize match query: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("serialize match query: {e}")))?;
 
     let tenant_id = identity.tenant_id;
 
@@ -189,7 +189,7 @@ pub async fn match_query(
                     match_payload_to_rows(&outcome.rows_payload, &column_names)
                 }
             }
-            Err(e) => Err(DdlError::new("XX000", e.to_string())),
+            Err(e) => Err(DdlError::from_error(&e)),
         };
     }
 
@@ -222,7 +222,7 @@ pub async fn match_query(
                 match_payload_to_rows(&outcome.rows_payload, &column_names)
             }
         }
-        Err(e) => Err(DdlError::new("XX000", e.to_string())),
+        Err(e) => Err(DdlError::from_error(&e)),
     }
 }
 
@@ -242,7 +242,7 @@ fn match_payload_to_rows(
 
     let json_text = response_codec::decode_payload_to_json(payload);
     let rows: Vec<serde_json::Value> = sonic_rs::from_str(&json_text)
-        .map_err(|e| DdlError::new("XX000", format!("invalid match result JSON: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("invalid match result JSON: {e}")))?;
 
     let mut out_rows = Vec::with_capacity(rows.len());
     for row in &rows {

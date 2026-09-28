@@ -202,7 +202,7 @@ impl NodeDbPgHandler {
             .ok_or_else(|| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
                     "FATAL".to_owned(),
-                    "XX000".to_owned(),
+                    nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
                     "connection metadata is missing".to_owned(),
                 )))
             })?;

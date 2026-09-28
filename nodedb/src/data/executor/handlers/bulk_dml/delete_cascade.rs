@@ -103,23 +103,14 @@ impl CoreLoop {
             crate::diag::orphaned_index_entry_after_delete(&e, collection, "secondary");
             warn!(core = self.core_id, %collection, %doc_id, error = %e, "bulk delete: secondary index cascade failed");
         }
-        // Cascade: graph edges.
-        let edges_removed = self
-            .csr_partition_mut(database_id, tid)
-            .remove_node_edges(doc_id);
-        let cascade_ord = self.hlc.next_ordinal();
-        if edges_removed > 0
-            && let Err(e) = self.edge_store.delete_edges_for_node(
-                database_id,
-                nodedb_types::TenantId::new(tid),
-                doc_id,
-                cascade_ord,
-            )
-        {
+        // Cascade: graph edges. The graph keys a row's node by its client key.
+        // On an error neither edge store changed: the edges stay in both,
+        // and the dangling-edge sweep retries them.
+        if let Err(e) = self.cascade_node_edges(database_id, tid, row_identity.as_str()) {
             crate::diag::orphaned_index_entry_after_delete(&e, collection, "graph_edge");
             warn!(core = self.core_id, %doc_id, error = %e, "bulk delete: edge cascade failed");
         }
-        self.mark_node_deleted(database_id, tid, doc_id);
+        self.mark_node_deleted(database_id, tid, row_identity.as_str());
         // Cascade: secondary HNSW vector index. The put path indexed
         // this row's vectors under its surrogate; the delete must
         // soft-delete those nodes and drop the reverse-map entry, or the

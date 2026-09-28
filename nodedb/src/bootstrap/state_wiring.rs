@@ -43,10 +43,16 @@ pub async fn wire_state(
         array_catalog,
         maintenance_budget,
     } = components;
-    // Install startup gate.
-    if let Some(state) = Arc::get_mut(shared) {
-        state.startup = Arc::clone(startup_gate);
-    }
+    // Install startup gate. `/healthz` and the HTTP startup gate read it, so
+    // a state left on the test helpers' pre-fired gate would report ready
+    // and open every route during boot.
+    Arc::get_mut(shared)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "startup gate: SharedState is already shared before the gate was installed"
+            )
+        })?
+        .startup = Arc::clone(startup_gate);
 
     // Replay surrogate WAL records.
     // Note: wal_records are not passed here — caller must handle surrogate replay
@@ -244,24 +250,10 @@ pub async fn wire_state(
         state.scheduler_config = config.scheduler.clone();
     }
 
-    // Construct and install the gateway + DDL plan-cache invalidator.
-    //
-    // `Gateway` holds a `Weak<SharedState>` back-reference to its own
-    // `SharedState`, so it cannot be installed via `Arc::get_mut` (which
-    // requires strong count 1 AND weak count 0 — the gateway's own `Weak`
-    // violates the latter). `gateway`/`gateway_invalidator` are therefore
-    // `OnceLock`s, set through `&self` exactly once here at boot.
-    //
-    // That weak reference outlives this call, so every `Arc::get_mut` install
-    // above depends on running BEFORE this block: one placed after it no-ops.
-    {
-        let gateway = Arc::new(crate::control::gateway::Gateway::new(Arc::clone(shared)));
-        let invalidator = Arc::new(crate::control::gateway::PlanCacheInvalidator::new(
-            &gateway.plan_cache,
-        ));
-        let _ = shared.gateway.set(gateway);
-        let _ = shared.gateway_invalidator.set(invalidator);
-    }
+    // The gateway's weak back-reference outlives this call, so every
+    // `Arc::get_mut` install above must run BEFORE it: one placed after
+    // it no-ops.
+    install_gateway(shared);
 
     // Hydrate bitemporal retention registry from array catalog.
     {
@@ -300,4 +292,22 @@ pub async fn wire_state(
     }
 
     Ok(())
+}
+
+/// Construct and install the gateway and the DDL plan-cache invalidator.
+///
+/// `Gateway` holds a `Weak<SharedState>` back-reference to its own
+/// `SharedState`. `Arc::get_mut` requires strong count 1 and weak count 0,
+/// so it cannot install the gateway. `gateway`/`gateway_invalidator` are
+/// `OnceLock`s instead, set through `&self` exactly once.
+///
+/// Every `Arc::get_mut` install on `shared` must run before this call.
+/// A later `get_mut` sees the weak reference and no-ops.
+pub fn install_gateway(shared: &Arc<SharedState>) {
+    let gateway = Arc::new(crate::control::gateway::Gateway::new(Arc::clone(shared)));
+    let invalidator = Arc::new(crate::control::gateway::PlanCacheInvalidator::new(
+        &gateway.plan_cache,
+    ));
+    let _ = shared.gateway.set(gateway);
+    let _ = shared.gateway_invalidator.set(invalidator);
 }

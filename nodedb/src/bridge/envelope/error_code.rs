@@ -25,6 +25,20 @@ pub enum ErrorCode {
     /// a retry channel can tell a retry apart from a permanent refusal instead
     /// of collapsing both into a terminal rejection.
     RetryableRefusal { reason: String },
+    /// A sync frame the validator refused for good. Nothing applied. The
+    /// stream's high-water mark advanced to `provenance`, so the frame is
+    /// never admitted again, and `applied_seq` is the mark after the refusal.
+    SyncRejected {
+        violation: nodedb_types::sync::violation::ViolationType,
+        applied_seq: u64,
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    },
+    /// A sync frame the idempotency gate held back. Nothing applied, and
+    /// the stream's mark did not move. `applied_seq` is that mark.
+    SyncNotApplied {
+        hold: super::SyncHold,
+        applied_seq: u64,
+    },
     /// Document/collection not found.
     NotFound,
     /// Authorization failure.
@@ -79,8 +93,12 @@ pub enum ErrorCode {
     TypeGuardViolation { collection: String, detail: String },
     /// Value type does not match expected type for operation (e.g. INCR on a string).
     TypeMismatch { collection: String, detail: String },
-    /// Arithmetic overflow (e.g. i64::MAX + 1 on INCR).
-    OverflowError { collection: String },
+    /// A KV counter atomic read a stored value it cannot parse as a
+    /// number, or computed a result out of range.
+    CounterFault {
+        collection: String,
+        fault: super::CounterFault,
+    },
     /// Insufficient balance for transfer (source lacks required amount).
     InsufficientBalance { collection: String, detail: String },
     /// Rate limit exceeded for a rate gate / cooldown.
@@ -132,6 +150,55 @@ pub enum ErrorCode {
     /// special-cases `NotFound`) and reaches the client as SQLSTATE `22012`
     /// rather than the generic `XX000` every `Internal` maps to.
     DivisionByZero,
+    /// Expression evaluation called a function no evaluator implements.
+    /// Surfaces as SQLSTATE `42883` (`undefined_function`), never as a
+    /// silent `NULL`.
+    UndefinedFunction { name: String },
+    /// A function received an argument it cannot compute on: vectors of
+    /// different dimensions, an argument of the wrong type, a malformed
+    /// JSONPath. Surfaces as SQLSTATE `22000` (`data_exception`).
+    DataException { detail: String },
+    /// The bridge dispatcher refused the request at a capacity limit, so
+    /// nothing was enqueued or applied. Transient: the same request succeeds
+    /// once capacity frees. `reason` names the limit and its counts.
+    DispatchCapacity { reason: String },
+    /// The request's deadline passed before the core started it, so nothing
+    /// ran. Distinct from [`Self::DeadlineExceeded`], which a core also
+    /// answers for a task it stopped part way. Surfaces as the same
+    /// query-cancelled error.
+    ExpiredBeforeExecution,
+    /// The request itself is malformed: an FTS query with no positive term,
+    /// a value the target cannot hold. The same verdict the Control Plane
+    /// gives `crate::Error::BadRequest`: SQLSTATE `42601` (syntax_error).
+    BadRequest { detail: String },
+    /// The whole transaction aborted before any read-set was validated, and
+    /// the client retries it. SQLSTATE `40000` (transaction_rollback).
+    TransactionRollback { detail: String },
+    /// The statement cannot run in the current transaction state, such as
+    /// inside an explicit transaction block. SQLSTATE `25001`
+    /// (active_sql_transaction).
+    ActiveSqlTransaction { detail: String },
+    /// A DROP refused because other objects depend on its target. `object`
+    /// names the target. SQLSTATE `2BP01` (dependent_objects_still_exist).
+    DependentObjectsExist { object: String, detail: String },
+}
+
+/// An expression evaluation failure, as the Data Plane reports it.
+///
+/// Exhaustive, so a new evaluator error picks its own code rather than
+/// defaulting to one.
+impl From<nodedb_query::EvalError> for ErrorCode {
+    fn from(e: nodedb_query::EvalError) -> Self {
+        match e {
+            nodedb_query::EvalError::DivisionByZero => Self::DivisionByZero,
+            nodedb_query::EvalError::UnknownFunction { name } => Self::UndefinedFunction { name },
+            e @ (nodedb_query::EvalError::VectorDimensionMismatch { .. }
+            | nodedb_query::EvalError::ArgumentType { .. }
+            | nodedb_query::EvalError::InvalidJsonPath { .. }) => Self::DataException {
+                detail: e.to_string(),
+            },
+        }
+    }
 }
 
 impl From<crate::Error> for ErrorCode {
@@ -145,11 +212,14 @@ impl From<crate::Error> for ErrorCode {
                 Self::RejectedPrevalidation { reason }
             }
             crate::Error::RetryableRefusal { reason } => Self::RetryableRefusal { reason },
-            crate::Error::CollectionNotFound { .. } | crate::Error::DocumentNotFound { .. } => {
-                Self::NotFound
-            }
+            crate::Error::CollectionNotFound { .. }
+            | crate::Error::CollectionDeactivated { .. }
+            | crate::Error::DocumentNotFound { .. } => Self::NotFound,
             crate::Error::RejectedAuthz { resource, .. } => Self::RejectedAuthz { resource },
-            crate::Error::ConflictRetry { .. } => Self::ConflictRetry,
+            // The Control Plane gives all three `40001` (serialization_failure).
+            crate::Error::ConflictRetry { .. }
+            | crate::Error::CalvinSerializationConflict
+            | crate::Error::SourceFrozen { .. } => Self::ConflictRetry,
             crate::Error::FanOutExceeded { .. } => Self::FanOutExceeded,
             crate::Error::MemoryExhausted { .. } => Self::ResourcesExhausted,
             crate::Error::Backpressure { .. } => Self::ResourcesExhausted,
@@ -206,7 +276,6 @@ impl From<crate::Error> for ErrorCode {
             crate::Error::TypeMismatch {
                 collection, detail, ..
             } => Self::TypeMismatch { collection, detail },
-            crate::Error::OverflowError { collection, .. } => Self::OverflowError { collection },
             crate::Error::InsufficientBalance {
                 collection, detail, ..
             } => Self::InsufficientBalance { collection, detail },
@@ -218,10 +287,26 @@ impl From<crate::Error> for ErrorCode {
                 gate,
                 retry_after_ms,
             },
+            // A capacity refusal enqueued nothing, and the same request
+            // succeeds once capacity frees.
+            capacity @ crate::Error::DispatchCapacity { .. } => Self::DispatchCapacity {
+                reason: capacity.to_string(),
+            },
             crate::Error::TxnOverlayMemoryExceeded { limit } => {
                 Self::TxnOverlayMemoryExceeded { limit }
             }
             crate::Error::DivisionByZero => Self::DivisionByZero,
+            crate::Error::UndefinedFunction { name } => Self::UndefinedFunction { name },
+            crate::Error::DataException { detail } => Self::DataException { detail },
+            // `42601` (syntax_error), as the Control Plane gives both.
+            crate::Error::BadRequest { detail } | crate::Error::PlanError { detail } => {
+                Self::BadRequest { detail }
+            }
+            // `0A000` (feature_not_supported), as the Control Plane gives both.
+            crate::Error::FeatureNotSupported { detail } => Self::Unsupported { detail },
+            unsupported @ crate::Error::CrossCollectionNotColocated { .. } => Self::Unsupported {
+                detail: unsupported.to_string(),
+            },
             crate::Error::UndefinedColumn { column } => Self::UndefinedColumn { column },
             // Same condition an undefined column reports at plan time, raised
             // here by the strict encoder for a transport the planner never
@@ -230,8 +315,142 @@ impl From<crate::Error> for ErrorCode {
             // Already a Data-Plane verdict: hand back the same code rather
             // than re-wrapping it as `Internal` and losing its SQLSTATE.
             crate::Error::DataPlane(code) => code,
-            other => Self::Internal {
-                detail: other.to_string(),
+            // Class `22`, the class the Control Plane gives both.
+            e @ (crate::Error::OffsetRegression { .. }
+            | crate::Error::BackupTenantMismatch { .. }
+            | crate::Error::InvalidLimitValue { .. }) => Self::DataException {
+                detail: e.to_string(),
+            },
+            // `40000`, as the Control Plane gives it.
+            e @ crate::Error::CalvinParticipantError => Self::TransactionRollback {
+                detail: e.to_string(),
+            },
+            // `40001`: the client retries the statement.
+            e @ crate::Error::RetryableSchemaChanged { .. } => Self::RetryableRefusal {
+                reason: e.to_string(),
+            },
+            // `25001`, as the Control Plane gives all three.
+            e @ (crate::Error::CrdtApplyForbiddenInTransaction
+            | crate::Error::NotInTransactionBlock { .. }
+            | crate::Error::CrossShardInExplicitTransaction) => Self::ActiveSqlTransaction {
+                detail: e.to_string(),
+            },
+            // `2BP01`, as the Control Plane gives both. The detail is the
+            // public message the Control Plane renders.
+            crate::Error::DependentObjectsExist {
+                root_kind,
+                root_name,
+                dependent_count,
+                dependents,
+                ..
+            } => {
+                let (object, detail) = crate::error_classify::dependent_objects_text(
+                    root_kind,
+                    &root_name,
+                    dependent_count,
+                    &dependents,
+                );
+                Self::DependentObjectsExist { object, detail }
+            }
+            crate::Error::RoleInUse { role, dependents } => {
+                let object = format!("role \"{role}\"");
+                let detail = crate::Error::RoleInUse { role, dependents }.to_string();
+                Self::DependentObjectsExist { object, detail }
+            }
+            crate::Error::CrdtAdmissionRetriesExhausted { .. } => Self::ConflictRetry,
+            // Retryable refusals whose class (`55P03`) no Data-Plane code has.
+            // The retry contract survives: nothing was applied.
+            e @ (crate::Error::NoLeader { .. }
+            | crate::Error::GroupQuorumUnavailable { .. }
+            | crate::Error::GroupMarksUnavailable { .. }
+            | crate::Error::AuthorizationStateBehind { .. }
+            | crate::Error::StaleReadNotLeader { .. }) => Self::RetryableRefusal {
+                reason: e.to_string(),
+            },
+            // Class `57`: the client retries once the leader settles.
+            e @ crate::Error::NotLeader { .. } => Self::DispatchCapacity {
+                reason: e.to_string(),
+            },
+            crate::Error::CrdtAdmissionTimeout { .. } => Self::DeadlineExceeded,
+            e @ crate::Error::VShardAdmissionCapacityExceeded { .. } => Self::RateExceeded {
+                gate: e.to_string(),
+                retry_after_ms: 0,
+            },
+            // Class `53`: a configured resource ceiling.
+            crate::Error::QuotaOvercommit { .. }
+            | crate::Error::TenantVectorDimExceeded { .. }
+            | crate::Error::TenantGraphDepthExceeded { .. } => Self::ResourcesExhausted,
+            // Class `28` has no Data-Plane code. The nearest is the access
+            // refusal, which keeps it a client error the client cannot retry.
+            e @ (crate::Error::BackupKeyMismatch | crate::Error::SessionTokenExpired) => {
+                Self::RejectedAuthz {
+                    resource: e.to_string(),
+                }
+            }
+            // Client errors of class `42`, and client errors whose class
+            // (`25006`, `55`) no Data-Plane code has. `BadRequest` is the
+            // class their public code has.
+            e @ (crate::Error::CrdtAdmissionInvalidPlan { .. }
+            | crate::Error::CrdtAdmissionCallerFence
+            | crate::Error::CrdtApplyRequiresAdmission
+            | crate::Error::CloneWriteRequiresMaterialize { .. }
+            | crate::Error::ObjectNotInPrerequisiteState { .. }
+            | crate::Error::MirrorReadOnly { .. }
+            | crate::Error::UndefinedObject { .. }
+            | crate::Error::AmbiguousColumn { .. }
+            | crate::Error::ExecutionLimitExceeded { .. }
+            | crate::Error::LimitExceeded { .. }
+            | crate::Error::Promql(_)
+            | crate::Error::SequencerUnavailable
+            | crate::Error::SessionCapExceeded { .. }
+            | crate::Error::SessionIdleTimeout
+            | crate::Error::SessionKilledByAdmin
+            | crate::Error::SessionUserDropped
+            | crate::Error::OidcProviderTenantUnbound
+            | crate::Error::OidcProviderTenantUnavailable { .. }
+            | crate::Error::ExternalRoleUndefined { .. }
+            | crate::Error::OidcNoDefaultDatabase { .. }
+            | crate::Error::RoleInheritanceCycle { .. }
+            | crate::Error::RoleInheritanceDepthExceeded { .. }) => Self::BadRequest {
+                detail: e.to_string(),
+            },
+            // Retry exhaustion takes the code of its cause.
+            crate::Error::OllpExhausted { cause, .. } => match cause {
+                crate::OllpExhaustedCause::PredicateDrift => Self::ConflictRetry,
+                crate::OllpExhaustedCause::PreAdmission(inner) => Self::from(*inner),
+                crate::OllpExhaustedCause::AdmissionRefused { detail } => Self::RateExceeded {
+                    gate: detail,
+                    retry_after_ms: 0,
+                },
+            },
+            // Server-side faults and system defects. `Shaping`,
+            // `RemoteTyped` and `Ddl` carry a public numeric code that has no
+            // Data-Plane twin, and none is raised on the Data Plane.
+            e @ (crate::Error::MaterializedSumResolutionMissing { .. }
+            | crate::Error::RetryableLeaderChange { .. }
+            | crate::Error::MetadataLeaderUnavailable
+            | crate::Error::Wal(_)
+            | crate::Error::Dispatch { .. }
+            | crate::Error::Storage { .. }
+            | crate::Error::ColdStorage { .. }
+            | crate::Error::Serialization { .. }
+            | crate::Error::Codec { .. }
+            | crate::Error::SegmentCorrupted { .. }
+            | crate::Error::Crdt(_)
+            | crate::Error::Io(_)
+            | crate::Error::Config { .. }
+            | crate::Error::Encryption { .. }
+            | crate::Error::Bridge { .. }
+            | crate::Error::VersionCompat { .. }
+            | crate::Error::Internal { .. }
+            | crate::Error::Shaping(_)
+            | crate::Error::RemoteTyped { .. }
+            | crate::Error::Ddl(_)
+            | crate::Error::DescriptorVersionAnomaly { .. }
+            | crate::Error::CollectionPurgeRowMissing { .. }
+            | crate::Error::CatalogIntegrityViolation { .. }
+            | crate::Error::CascadeCycle { .. }) => Self::Internal {
+                detail: e.to_string(),
             },
         }
     }

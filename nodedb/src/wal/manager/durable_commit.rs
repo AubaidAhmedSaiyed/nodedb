@@ -118,6 +118,7 @@ impl WalManager {
 mod tests {
     use super::*;
     use crate::types::{DatabaseId, TenantId, VShardId};
+    use crate::wal::manager::NO_APPLY_KEY;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
@@ -130,6 +131,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let lsn = wal
+            .appender(NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
             .append_put(
                 TenantId::new(1),
                 VShardId::new(0),
@@ -148,6 +151,8 @@ mod tests {
         let metrics = Arc::new(crate::control::metrics::SystemMetrics::new());
         wal.set_metrics(Arc::clone(&metrics));
         let lsn = wal
+            .appender(NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
             .append_put(
                 TenantId::new(1),
                 VShardId::new(0),
@@ -170,13 +175,15 @@ mod tests {
         let mut lsns = Vec::new();
         for _ in 0..16 {
             lsns.push(
-                wal.append_put(
-                    TenantId::new(1),
-                    VShardId::new(0),
-                    DatabaseId::DEFAULT,
-                    b"payload",
-                )
-                .expect("append"),
+                wal.appender(NO_APPLY_KEY)
+                    .with_event_source(crate::event::EventSource::User)
+                    .append_put(
+                        TenantId::new(1),
+                        VShardId::new(0),
+                        DatabaseId::DEFAULT,
+                        b"payload",
+                    )
+                    .expect("append"),
             );
         }
         let max = *lsns.iter().max().expect("nonempty");

@@ -389,6 +389,17 @@ pub fn fold_function_call_scoped(
     match nodedb_query::functions::eval_function(&name_lower, &folded_args) {
         Ok(result) => Ok(Some(ndb_to_sql_value(result))),
         Err(nodedb_query::EvalError::DivisionByZero) => Err(SqlError::DivisionByZero),
+        Err(
+            e @ (nodedb_query::EvalError::VectorDimensionMismatch { .. }
+            | nodedb_query::EvalError::ArgumentType { .. }
+            | nodedb_query::EvalError::InvalidJsonPath { .. }),
+        ) => Err(SqlError::DataException {
+            detail: e.to_string(),
+        }),
+        // A registered name some other evaluator owns (a search score):
+        // not foldable here. Its search plan serves it, or the plan-time
+        // search-scope pass refuses it.
+        Err(nodedb_query::EvalError::UnknownFunction { .. }) => Ok(None),
     }
 }
 
@@ -471,6 +482,26 @@ mod tests {
             }
             other => panic!("expected SqlValue::Timestamptz, got {other:?}"),
         }
+    }
+
+    /// A constant call whose argument the function cannot compute on fails
+    /// the statement at plan time instead of folding to NULL.
+    #[test]
+    fn fold_of_a_malformed_json_path_is_a_data_exception() {
+        let registry = FunctionRegistry::new();
+        let expr = SqlExpr::Function {
+            name: "doc_get".into(),
+            args: vec![
+                SqlExpr::Literal(SqlValue::String("{\"a\":1}".into())),
+                SqlExpr::Literal(SqlValue::String("$..a".into())),
+            ],
+            distinct: false,
+        };
+        let err = fold_constant(&expr, &registry).expect_err("malformed path must fail");
+        assert!(
+            matches!(&err, SqlError::DataException { detail } if detail.contains("invalid JSONPath")),
+            "{err:?}"
+        );
     }
 
     #[test]

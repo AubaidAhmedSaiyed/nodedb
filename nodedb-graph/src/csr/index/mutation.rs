@@ -3,6 +3,7 @@
 //! Edge insert / remove paths and node-edge cleanup.
 
 use super::types::CsrIndex;
+use crate::csr::rebuild::journal::{CsrWriteOp, OpOutcome};
 
 impl CsrIndex {
     /// Incrementally add an unweighted edge (goes into mutable buffer).
@@ -70,6 +71,31 @@ impl CsrIndex {
         weight: f64,
         force_weights: bool,
     ) -> Result<(), crate::GraphError> {
+        let result = self.apply_add_edge(src, label, dst, collection, weight, force_weights);
+        self.journal_record(
+            || CsrWriteOp::AddEdge {
+                src: src.to_string(),
+                label: label.to_string(),
+                dst: dst.to_string(),
+                collection: collection.to_string(),
+                weight,
+                force_weights,
+            },
+            OpOutcome::of(&result),
+        );
+        result
+    }
+
+    /// The edge insert itself, unjournaled.
+    pub(crate) fn apply_add_edge(
+        &mut self,
+        src: &str,
+        label: &str,
+        dst: &str,
+        collection: &str,
+        weight: f64,
+        force_weights: bool,
+    ) -> Result<(), crate::GraphError> {
         let src_id = self.ensure_node(src)?;
         let dst_id = self.ensure_node(dst)?;
         let label_id = self.ensure_label(label)?;
@@ -87,8 +113,10 @@ impl CsrIndex {
         {
             return Ok(());
         }
-        // Check for duplicates in dense CSR (collection-aware).
+        // A dense copy is the edge itself: a deleted one comes back.
         if self.dense_has_edge(src_id, label_id, dst_id, collection_id) {
+            self.deleted_edges
+                .remove(&(src_id, label_id, dst_id, collection_id));
             return Ok(());
         }
 
@@ -107,8 +135,8 @@ impl CsrIndex {
             self.buffer_in_weights[dst_id as usize].push(weight);
         }
 
-        // If this exact `(src, label, dst, collection)` copy was previously
-        // deleted, un-delete it.
+        // A node-edge removal marks buffered edges deleted too. With no dense
+        // copy that mark names this edge only, so it goes.
         self.deleted_edges
             .remove(&(src_id, label_id, dst_id, collection_id));
         Ok(())
@@ -129,6 +157,26 @@ impl CsrIndex {
     /// Only the copy tagged with `collection` is removed — an identical triple
     /// under a different collection is left intact.
     pub fn remove_edge_in_collection(
+        &mut self,
+        src: &str,
+        label: &str,
+        dst: &str,
+        collection: &str,
+    ) {
+        self.apply_remove_edge(src, label, dst, collection);
+        self.journal_record(
+            || CsrWriteOp::RemoveEdge {
+                src: src.to_string(),
+                label: label.to_string(),
+                dst: dst.to_string(),
+                collection: collection.to_string(),
+            },
+            OpOutcome::Applied,
+        );
+    }
+
+    /// The edge removal itself, unjournaled.
+    pub(crate) fn apply_remove_edge(
         &mut self,
         src: &str,
         label: &str,
@@ -183,6 +231,18 @@ impl CsrIndex {
 
     /// Remove ALL edges touching a node. Returns the number of edges removed.
     pub fn remove_node_edges(&mut self, node: &str) -> usize {
+        let removed = self.apply_remove_node_edges(node);
+        self.journal_record(
+            || CsrWriteOp::RemoveNodeEdges {
+                node: node.to_string(),
+            },
+            OpOutcome::Applied,
+        );
+        removed
+    }
+
+    /// The node-edge removal itself, unjournaled.
+    pub(crate) fn apply_remove_node_edges(&mut self, node: &str) -> usize {
         let Some(&node_id) = self.node_to_id.get(node) else {
             return 0;
         };

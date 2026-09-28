@@ -77,8 +77,9 @@ pub fn append_cross_shard_balance_tasks(
         };
 
         let mut for_task = Vec::new();
+        let source = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?;
         for binding in bindings.iter() {
-            if sum_target_is_co_resident(database_id, collection, &binding.target_collection) {
+            if sum_target_is_co_resident(source, &binding.target_collection) {
                 continue;
             }
             for (join_value, delta) in crate::query::binding_insert_deltas(binding, &docs)? {

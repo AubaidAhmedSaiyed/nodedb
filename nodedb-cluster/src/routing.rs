@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use nodedb_types::id::{DatabaseId, VShardId};
+use nodedb_types::id::{CollectionKey, VShardId};
 
 use crate::error::{ClusterError, Result};
 
@@ -298,17 +298,14 @@ impl RoutingTable {
     }
 }
 
-/// Compute the primary vShard for a `(database, collection)` pair.
+/// Compute the primary vShard for a collection.
 ///
-/// Delegates to [`VShardId::from_collection_in_database`] so the cluster
-/// routing layer and the types-layer hash function cannot drift. The database
-/// id is folded into the hash so the same collection name in two different
-/// databases routes to independent vShards — required for multi-database
-/// isolation. Passing only the collection name (without `db`) would route
-/// every database through the same vShard space and silently corrupt
-/// cross-database deployments; the parameter is mandatory by design.
-pub fn vshard_for_collection(database_id: DatabaseId, collection: &str) -> u32 {
-    VShardId::from_collection_in_database(database_id, collection).as_u32()
+/// Delegates to [`VShardId::from_collection`], so the cluster routing layer
+/// and the types-layer hash cannot drift. The [`CollectionKey`] carries the
+/// database id and the bare catalog name, so a qualified name can never reach
+/// the hash.
+pub fn vshard_for_collection(key: CollectionKey<'_>) -> u32 {
+    VShardId::from_collection(key).as_u32()
 }
 
 /// FNV-1a 64-bit hash for deterministic key partitioning.
@@ -467,11 +464,12 @@ mod tests {
         // gateway while the data plane still keys them by the correct
         // hash. This test pins the contract.
         for db_raw in [0u64, 1, 2, 1024, 999_999] {
-            let db = DatabaseId::new(db_raw);
+            let db = nodedb_types::id::DatabaseId::new(db_raw);
             for name in ["users", "orders", "events", "a", "this_is_a_long_name"] {
+                let key = CollectionKey::from_bare(db, name);
                 assert_eq!(
-                    vshard_for_collection(db, name),
-                    VShardId::from_collection_in_database(db, name).as_u32(),
+                    vshard_for_collection(key),
+                    VShardId::from_collection(key).as_u32(),
                     "drift detected: db={db_raw} collection={name}"
                 );
             }
@@ -484,8 +482,11 @@ mod tests {
         // different vShards (probabilistic; "users" is a canonical
         // example whose hashes are known to differ across DEFAULT and
         // DatabaseId(1024)).
-        let v_default = vshard_for_collection(DatabaseId::DEFAULT, "users");
-        let v_other = vshard_for_collection(DatabaseId::new(1024), "users");
+        use nodedb_types::id::DatabaseId;
+        let v_default =
+            vshard_for_collection(CollectionKey::from_bare(DatabaseId::DEFAULT, "users"));
+        let v_other =
+            vshard_for_collection(CollectionKey::from_bare(DatabaseId::new(1024), "users"));
         assert_ne!(
             v_default, v_other,
             "same collection name across databases must route independently"

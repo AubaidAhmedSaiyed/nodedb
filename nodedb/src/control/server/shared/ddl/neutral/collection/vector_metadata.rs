@@ -178,7 +178,7 @@ pub fn handle_show_vector_models(
 
     let entries = catalog
         .list_vector_models(database_id.as_u64(), tenant_id)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let columns = vec![
         "collection".to_string(),
@@ -235,7 +235,7 @@ pub fn handle_vector_metadata_query(
 
     let entry = catalog
         .get_vector_model(database_id.as_u64(), tenant_id, collection, column)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let json = match entry {
         Some(e) => {

@@ -9,6 +9,8 @@ use crate::OllpExhaustedCause;
 use crate::bridge::envelope::{ErrorCode, Status};
 use crate::control::server::response_shape::types::DmlFoldError;
 
+pub(crate) use super::numeric_sqlstate::numeric_code_to_sqlstate;
+
 /// Create a pgwire ErrorResponse with a SQLSTATE code.
 pub fn sqlstate_error(code: &str, message: &str) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -22,7 +24,7 @@ pub fn sqlstate_error(code: &str, message: &str) -> PgWireError {
 /// Two tasks of one statement disagreeing on their verb is a planner bug,
 /// so it surfaces as an internal error.
 pub fn dml_fold_error_to_pg(e: &DmlFoldError) -> PgWireError {
-    sqlstate_error("XX000", &e.to_string())
+    sqlstate_error(sqlstate::INTERNAL_ERROR, &e.to_string())
 }
 
 /// Map a NodeDB `Error` to the pgwire error the client reads, through the
@@ -33,6 +35,17 @@ pub fn error_to_pg(err: &crate::Error) -> PgWireError {
         severity.to_owned(),
         code.to_owned(),
         message,
+    )))
+}
+
+/// Map a NodeDB `Error` to the pgwire error the client reads, with `context`
+/// before its message. The SQLSTATE stays the error's own.
+pub fn error_to_pg_in_context(context: &str, err: &crate::Error) -> PgWireError {
+    let (severity, code, message) = error_to_sqlstate(err);
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        severity.to_owned(),
+        code.to_owned(),
+        format!("{context}: {message}"),
     )))
 }
 
@@ -52,7 +65,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             ("ERROR", sqlstate::BACKUP_TENANT_MISMATCH, err.to_string())
         }
         crate::Error::BackupKeyMismatch => {
-            ("ERROR", sqlstate::BACKUP_KEY_MISMATCH, err.to_string())
+            ("ERROR", sqlstate::BACKUP_KEY_MISMATCH.0, err.to_string())
         }
         crate::Error::PlanError { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
         crate::Error::CollectionNotFound { collection, .. } => (
@@ -74,6 +87,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         ),
         crate::Error::FeatureNotSupported { detail } => {
             ("ERROR", sqlstate::FEATURE_NOT_SUPPORTED, detail.clone())
+        }
+        crate::Error::NotInTransactionBlock { .. } => {
+            ("ERROR", sqlstate::ACTIVE_SQL_TRANSACTION, err.to_string())
         }
         crate::Error::UndefinedFunction { name } => (
             "ERROR",
@@ -102,6 +118,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             ("ERROR", sqlstate::UNDEFINED_COLUMN, err.to_string())
         }
         crate::Error::DivisionByZero => ("ERROR", sqlstate::DIVISION_BY_ZERO, err.to_string()),
+        crate::Error::DataException { detail } => {
+            ("ERROR", sqlstate::DATA_EXCEPTION, detail.clone())
+        }
         crate::Error::InvalidLimitValue { .. } => {
             ("ERROR", sqlstate::INVALID_LIMIT_VALUE, err.to_string())
         }
@@ -115,19 +134,71 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         ),
         crate::Error::RejectedConstraint {
             constraint, detail, ..
-        } => {
-            let code = if constraint == "not_null" {
-                sqlstate::NOT_NULL_VIOLATION
-            } else {
-                sqlstate::UNIQUE_VIOLATION
-            };
-            ("ERROR", code, detail.clone())
-        }
+        } => (
+            "ERROR",
+            crate::control::server::shared::ddl::sqlstate::constraint_sqlstate(constraint),
+            detail.clone(),
+        ),
         crate::Error::TxnOverlayMemoryExceeded { .. } => {
             ("ERROR", sqlstate::PROGRAM_LIMIT_EXCEEDED, err.to_string())
         }
+        // Control-Plane twins of Data-Plane codes take the SQLSTATE their
+        // Data-Plane code has, so one condition answers one class wherever
+        // it is detected.
+        crate::Error::RejectedPrevalidation { .. } | crate::Error::InsufficientBalance { .. } => {
+            ("ERROR", sqlstate::CHECK_VIOLATION, err.to_string())
+        }
+        crate::Error::RetryableRefusal { .. } => {
+            ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
+        }
+        crate::Error::AppendOnlyViolation { .. } => {
+            ("ERROR", sqlstate::APPEND_ONLY_VIOLATION, err.to_string())
+        }
+        crate::Error::BalanceViolation { .. } => {
+            ("ERROR", sqlstate::BALANCE_VIOLATION, err.to_string())
+        }
+        crate::Error::PeriodLocked { .. } => ("ERROR", sqlstate::PERIOD_LOCKED, err.to_string()),
+        crate::Error::PeriodLockMisconfigured { .. } => (
+            "ERROR",
+            sqlstate::PERIOD_LOCK_MISCONFIGURED,
+            err.to_string(),
+        ),
+        crate::Error::RetentionViolation { .. } => {
+            ("ERROR", sqlstate::RETENTION_VIOLATION, err.to_string())
+        }
+        crate::Error::LegalHoldActive { .. } => {
+            ("ERROR", sqlstate::LEGAL_HOLD_ACTIVE, err.to_string())
+        }
+        crate::Error::StateTransitionViolation { .. } => (
+            "ERROR",
+            sqlstate::STATE_TRANSITION_VIOLATION,
+            err.to_string(),
+        ),
+        crate::Error::TransitionCheckViolation { .. } => (
+            "ERROR",
+            sqlstate::TRANSITION_CHECK_VIOLATION,
+            err.to_string(),
+        ),
+        crate::Error::TypeGuardViolation { .. } => {
+            ("ERROR", sqlstate::TYPE_GUARD_VIOLATION, err.to_string())
+        }
+        crate::Error::TypeMismatch { .. } => ("ERROR", sqlstate::CANNOT_COERCE, err.to_string()),
         crate::Error::DeadlineExceeded { .. } => {
-            ("ERROR", sqlstate::QUERY_CANCELED, err.to_string())
+            ("ERROR", sqlstate::QUERY_CANCELED.0, err.to_string())
+        }
+        // Nothing ran, and a retry plans against caught-up state.
+        crate::Error::AuthorizationStateBehind { .. } => {
+            ("ERROR", sqlstate::STALE_READ_NOT_LEADER, err.to_string())
+        }
+        // Nothing was applied, and a retry succeeds once the group's majority
+        // is reachable again.
+        crate::Error::GroupQuorumUnavailable { .. } => {
+            ("ERROR", sqlstate::LOCK_NOT_AVAILABLE, err.to_string())
+        }
+        // Nothing was restored, and a retry succeeds once a replica of the
+        // group answers.
+        crate::Error::GroupMarksUnavailable { .. } => {
+            ("ERROR", sqlstate::LOCK_NOT_AVAILABLE, err.to_string())
         }
         crate::Error::ConflictRetry { .. } => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
@@ -146,6 +217,16 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::SourceFrozen { .. } => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
+        // A descriptor changed under the statement and the server's own
+        // retries ran out. The client retries the statement, so it takes
+        // SERIALIZATION_FAILURE (40001), the SQLSTATE drivers retry on.
+        crate::Error::RetryableSchemaChanged { .. } => {
+            ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
+        }
+        // The session's bearer token expired. The client re-authenticates.
+        crate::Error::SessionTokenExpired => {
+            ("ERROR", sqlstate::AUTH_TOKEN_EXPIRED.0, err.to_string())
+        }
         crate::Error::CloneWriteRequiresMaterialize { .. } => (
             "ERROR",
             sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE.0,
@@ -159,6 +240,11 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         // canonical retryable code clients recognise.
         crate::Error::RateExceeded { .. } => {
             ("ERROR", sqlstate::TOO_MANY_CONNECTIONS, err.to_string())
+        }
+        // A dispatcher capacity refusal enqueued nothing. SERVER_OVERLOAD
+        // (57P03) is transient: the client retries after a backoff.
+        crate::Error::DispatchCapacity { .. } => {
+            ("ERROR", sqlstate::SERVER_OVERLOAD, err.to_string())
         }
         crate::Error::MemoryExhausted { .. } => ("ERROR", sqlstate::OUT_OF_MEMORY, err.to_string()),
         crate::Error::Backpressure { .. } => ("ERROR", sqlstate::OUT_OF_MEMORY, err.to_string()),
@@ -218,62 +304,99 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             numeric_code_to_sqlstate(e.code()),
             e.message().to_string(),
         ),
-        _ => ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string()),
-    }
-}
-
-/// Map a numeric `ErrorCode` received from a remote node back to a SQLSTATE.
-/// Local errors map by variant identity above; a remote error arrives as a bare
-/// numeric code, so this recovers the classification. Each bucket mirrors the
-/// sqlstate the corresponding local variant arm chooses above for the same
-/// numeric code, so a constraint violation (say) maps to the same SQLSTATE
-/// whether it happened locally or on a remote node. Unmapped/unknown codes
-/// fall back to INTERNAL_ERROR — the behaviour before codes were preserved.
-pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> &'static str {
-    use nodedb_types::error::ErrorCode as Ec;
-    match code {
-        // Mirrors the `RejectedConstraint` arm.
-        Ec::CONSTRAINT_VIOLATION => sqlstate::UNIQUE_VIOLATION,
-        // Mirrors the `ConflictRetry` / `CalvinSerializationConflict` /
-        // `SourceFrozen` arms, and `OllpExhausted` when it exhausted on drift.
-        Ec::WRITE_CONFLICT => sqlstate::SERIALIZATION_FAILURE,
-        // Mirrors the `DeadlineExceeded` arm.
-        Ec::DEADLINE_EXCEEDED => sqlstate::QUERY_CANCELED,
-        // Mirrors the `CollectionNotFound` / `CollectionDeactivated` arms.
-        Ec::COLLECTION_NOT_FOUND | Ec::COLLECTION_DEACTIVATED => sqlstate::UNDEFINED_TABLE,
-        // Mirrors the `DocumentNotFound` arm.
-        Ec::DOCUMENT_NOT_FOUND => sqlstate::NO_DATA,
-        // Mirrors the `BadRequest` / `PlanError` arms.
-        Ec::BAD_REQUEST | Ec::PLAN_ERROR => sqlstate::SYNTAX_ERROR,
-        // Mirrors the `UndefinedFunction` arm.
-        Ec::UNDEFINED_FUNCTION => sqlstate::UNDEFINED_FUNCTION,
-        // Mirrors the `UndefinedObject` arm.
-        Ec::UNDEFINED_OBJECT => sqlstate::UNDEFINED_OBJECT,
-        // Mirrors the `ObjectNotInPrerequisiteState` arm.
-        Ec::OBJECT_NOT_READY => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-        // Mirrors the `UndefinedColumn` arm.
-        Ec::UNDEFINED_COLUMN => sqlstate::UNDEFINED_COLUMN,
-        // Mirrors the `AmbiguousColumn` arm.
-        Ec::AMBIGUOUS_COLUMN => sqlstate::AMBIGUOUS_COLUMN,
-        // Mirrors the `DivisionByZero` arm.
-        Ec::DIVISION_BY_ZERO => sqlstate::DIVISION_BY_ZERO,
-        // Mirrors the `InvalidLimitValue` arm.
-        Ec::INVALID_LIMIT_VALUE => sqlstate::INVALID_LIMIT_VALUE,
-        // Mirrors the `FanOutExceeded` arm.
-        Ec::FAN_OUT_EXCEEDED => sqlstate::STATEMENT_TOO_COMPLEX,
-        // Mirrors the `RejectedAuthz` arm.
-        Ec::AUTHORIZATION_DENIED => sqlstate::INSUFFICIENT_PRIVILEGE,
-        // Mirrors the `RateExceeded` arm.
-        Ec::RATE_EXCEEDED => sqlstate::TOO_MANY_CONNECTIONS,
-        // Mirrors the `MemoryExhausted` / `Backpressure` arms.
-        Ec::MEMORY_EXHAUSTED => sqlstate::OUT_OF_MEMORY,
-        // Mirrors the `NoLeader` arm.
-        Ec::NO_LEADER => sqlstate::LOCK_NOT_AVAILABLE,
-        // Mirrors the `NotLeader` arm.
-        Ec::NOT_LEADER => sqlstate::DATABASE_DROPPED,
-        // Mirrors the `CloneWriteRequiresMaterialize` arm.
-        Ec::CLONE_WRITE_REQUIRES_MATERIALIZE => sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE.0,
-        _ => sqlstate::INTERNAL_ERROR,
+        // A DDL error keeps the exact SQLSTATE its statement reports.
+        crate::Error::Ddl(ddl) => (
+            "ERROR",
+            crate::control::server::shared::ddl::static_sqlstate::static_sqlstate(&ddl.sqlstate),
+            ddl.message.clone(),
+        ),
+        // The DDL path renders a regressed consumer offset as an invalid
+        // parameter value, so the typed error takes that class too.
+        crate::Error::OffsetRegression { .. } => {
+            ("ERROR", sqlstate::INVALID_PARAMETER_VALUE, err.to_string())
+        }
+        // A full admission queue is a rate refusal, its public code's class.
+        crate::Error::VShardAdmissionCapacityExceeded { .. } => {
+            ("ERROR", sqlstate::TOO_MANY_CONNECTIONS, err.to_string())
+        }
+        // The CRDT frontier kept moving. The client retries the write.
+        crate::Error::CrdtAdmissionRetriesExhausted { .. } => {
+            ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
+        }
+        crate::Error::CrdtAdmissionTimeout { .. } => {
+            ("ERROR", sqlstate::QUERY_CANCELED.0, err.to_string())
+        }
+        // Statements refused inside an explicit transaction block share
+        // the class of `NotInTransactionBlock`.
+        crate::Error::CrdtApplyForbiddenInTransaction
+        | crate::Error::CrossShardInExplicitTransaction => {
+            ("ERROR", sqlstate::ACTIVE_SQL_TRANSACTION, err.to_string())
+        }
+        // Each variant here has the public code `BAD_REQUEST`, so pgwire
+        // renders the class that code renders on native and across nodes.
+        crate::Error::CrdtAdmissionInvalidPlan { .. }
+        | crate::Error::CrdtAdmissionCallerFence
+        | crate::Error::CrdtApplyRequiresAdmission
+        | crate::Error::ExecutionLimitExceeded { .. }
+        | crate::Error::LimitExceeded { .. }
+        | crate::Error::Promql(_)
+        | crate::Error::SequencerUnavailable
+        | crate::Error::SessionCapExceeded { .. }
+        | crate::Error::SessionIdleTimeout
+        | crate::Error::SessionKilledByAdmin
+        | crate::Error::SessionUserDropped
+        | crate::Error::OidcProviderTenantUnbound
+        | crate::Error::OidcProviderTenantUnavailable { .. }
+        | crate::Error::ExternalRoleUndefined { .. }
+        | crate::Error::OidcNoDefaultDatabase { .. }
+        | crate::Error::RoleInheritanceCycle { .. }
+        | crate::Error::RoleInheritanceDepthExceeded { .. } => {
+            ("ERROR", sqlstate::SYNTAX_ERROR, err.to_string())
+        }
+        crate::Error::DependentObjectsExist { .. } | crate::Error::RoleInUse { .. } => (
+            "ERROR",
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            err.to_string(),
+        ),
+        crate::Error::QuotaOvercommit { .. } => {
+            ("ERROR", sqlstate::QUOTA_OVERCOMMIT, err.to_string())
+        }
+        crate::Error::TenantVectorDimExceeded { .. }
+        | crate::Error::TenantGraphDepthExceeded { .. } => {
+            ("ERROR", sqlstate::QUOTA_EXCEEDED, err.to_string())
+        }
+        crate::Error::MirrorReadOnly { .. } => (
+            "ERROR",
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            err.to_string(),
+        ),
+        // The client redirects the strong read to the source cluster.
+        crate::Error::StaleReadNotLeader { .. } => {
+            ("ERROR", sqlstate::STALE_READ_NOT_LEADER, err.to_string())
+        }
+        // Server-side faults and system defects. The client can act on none
+        // of them, and their public codes are internal classes.
+        crate::Error::MaterializedSumResolutionMissing { .. }
+        | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::Wal(_)
+        | crate::Error::Dispatch { .. }
+        | crate::Error::Storage { .. }
+        | crate::Error::ColdStorage { .. }
+        | crate::Error::Serialization { .. }
+        | crate::Error::Codec { .. }
+        | crate::Error::SegmentCorrupted { .. }
+        | crate::Error::Crdt(_)
+        | crate::Error::Io(_)
+        | crate::Error::Config { .. }
+        | crate::Error::Encryption { .. }
+        | crate::Error::Bridge { .. }
+        | crate::Error::VersionCompat { .. }
+        | crate::Error::Internal { .. }
+        | crate::Error::DescriptorVersionAnomaly { .. }
+        | crate::Error::CatalogIntegrityViolation { .. }
+        | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CascadeCycle { .. } => ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string()),
     }
 }
 
@@ -297,8 +420,37 @@ pub fn response_status_to_sqlstate(
             if let Some(code) = error_code {
                 Some(crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(code))
             } else {
-                Some(("ERROR", "XX000", "unknown data plane error".into()))
+                Some((
+                    "ERROR",
+                    sqlstate::INTERNAL_ERROR,
+                    "unknown data plane error".into(),
+                ))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A typed error behind a context prefix keeps its own SQLSTATE.
+    #[test]
+    fn an_error_in_context_keeps_its_sqlstate() {
+        let missing = crate::Error::CollectionNotFound {
+            tenant_id: crate::types::TenantId::new(1),
+            collection: "orders".into(),
+        };
+        match error_to_pg_in_context("catalog read", &missing) {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, sqlstate::UNDEFINED_TABLE);
+                assert!(
+                    info.message.starts_with("catalog read: "),
+                    "{}",
+                    info.message
+                );
+            }
+            other => panic!("expected a user error, got {other:?}"),
         }
     }
 }

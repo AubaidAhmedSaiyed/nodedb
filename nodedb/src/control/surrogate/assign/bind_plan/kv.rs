@@ -61,7 +61,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
             key,
             surrogate,
             ..
-        } => binder.resolve_in_place(collection.as_str(), key, surrogate),
+        } => binder.resolve_in_place(binder.plan_key(collection.as_str())?, key, surrogate),
         KvOp::BatchPut {
             collection,
             entries,
@@ -83,7 +83,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
                 });
             }
             for ((key, _value), surrogate) in entries.iter().zip(surrogates.iter_mut()) {
-                binder.resolve_in_place(collection.as_str(), key, surrogate)?;
+                binder.resolve_in_place(binder.plan_key(collection.as_str())?, key, surrogate)?;
             }
             Ok(())
         }
@@ -95,8 +95,16 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
             credit_surrogate,
             ..
         } => {
-            binder.resolve_in_place(collection.as_str(), source_key, debit_surrogate)?;
-            binder.resolve_in_place(collection.as_str(), dest_key, credit_surrogate)
+            binder.resolve_in_place(
+                binder.plan_key(collection.as_str())?,
+                source_key,
+                debit_surrogate,
+            )?;
+            binder.resolve_in_place(
+                binder.plan_key(collection.as_str())?,
+                dest_key,
+                credit_surrogate,
+            )
         }
         // The moved item lands under `dest_key` in the destination collection.
         KvOp::TransferItem {
@@ -104,7 +112,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
             dest_key,
             surrogate,
             ..
-        } => binder.resolve_in_place(dest_collection.as_str(), dest_key, surrogate),
+        } => binder.resolve_in_place(
+            binder.plan_key(dest_collection.as_str())?,
+            dest_key,
+            surrogate,
+        ),
         KvOp::ResolveWrite(inner) => bind(binder, inner),
         KvOp::ResolvedWrite { mutations, .. } => {
             for mutation in mutations.iter_mut() {
@@ -114,7 +126,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
                         key,
                         surrogate,
                         ..
-                    } => binder.resolve_in_place(collection.as_str(), key, surrogate)?,
+                    } => binder.resolve_in_place(
+                        binder.plan_key(collection.as_str())?,
+                        key,
+                        surrogate,
+                    )?,
                     // Named by key; the row's identity was bound when it was put.
                     KvResolvedMutation::Delete { .. }
                     | KvResolvedMutation::Expire { .. }
@@ -145,6 +161,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
+        | KvOp::SortedIndexTxnRead { .. }
         | KvOp::MaterializeScan { .. } => Ok(()),
     }
 }

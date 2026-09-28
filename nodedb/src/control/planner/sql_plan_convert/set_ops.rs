@@ -5,7 +5,7 @@
 use nodedb_sql::types::{EngineType, Projection, SortKey, SqlExpr, SqlPlan, SqlValue, WindowSpec};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 
 use super::body::convert_body_to_single_plan;
@@ -55,7 +55,7 @@ pub(super) fn convert_constant_result(
         })?;
     Ok(vec![PhysicalTask {
         tenant_id,
-        vshard_id: VShardId::from_collection_in_database(ctx.database_id, ""),
+        vshard_id: nodedb_types::CollectionKey::from_bare(ctx.database_id, "").vshard(),
         database_id: ctx.database_id,
         plan: PhysicalPlan::Query(QueryOp::ProviderScan {
             provider: None,
@@ -87,10 +87,11 @@ pub(super) fn convert_truncate(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let collection_key = nodedb_types::CollectionKey::from_bare(ctx.database_id, collection);
     let coll_qualified = super::convert::db_qualified(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = collection_key.vshard();
     let plan = match engine {
         EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
             PhysicalPlan::Document(DocumentOp::Truncate {
@@ -209,6 +210,7 @@ pub(super) fn convert_insert_select(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let target_key = nodedb_types::CollectionKey::from_bare(ctx.database_id, target);
     let target_qualified = super::convert::db_qualified(ctx.database_id, target);
     let qualified_target = nodedb_types::QualifiedCollection::new(ctx.database_id, target);
     let target = target_qualified.as_str();
@@ -254,7 +256,7 @@ pub(super) fn convert_insert_select(
 
     let filter_bytes = super::filter::serialize_filters(filters)?;
     let column_map_bytes = super::aggregate::serialize_column_map(column_map)?;
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, target);
+    let vshard = target_key.vshard();
     let qualified_source = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
 
     Ok(vec![PhysicalTask {
@@ -330,7 +332,7 @@ pub(super) fn convert_subquery(
         tenant_id,
         // Coordinator-local: resolved to a `ProviderScan` over the gathered
         // rows (empty collection, like a constant result), dispatched once.
-        vshard_id: VShardId::from_collection_in_database(ctx.database_id, ""),
+        vshard_id: nodedb_types::CollectionKey::from_bare(ctx.database_id, "").vshard(),
         database_id: ctx.database_id,
         plan: PhysicalPlan::Query(QueryOp::PostProcess {
             input: Box::new(child),

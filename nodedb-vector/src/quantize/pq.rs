@@ -19,7 +19,9 @@ use std::mem::size_of;
 use nodedb_mem::{ReservationToken, ScopedMemory};
 use nodedb_types::decode_bounds::checked_decode_capacity;
 
-use crate::error::VectorError;
+use crate::error::{VectorError, check_dim};
+
+use super::pq_kmeans::{kmeans, l2_sub};
 
 /// Hard ceiling for a decoded PQ vector. This bounds corrupted persisted
 /// configuration even when the codec has no scoped memory handle attached.
@@ -99,24 +101,39 @@ impl PqCodec {
         k: usize,
         max_iter: usize,
         memory: ScopedMemory,
-    ) -> Self {
-        assert!(!vectors.is_empty());
-        assert!(
-            dim > 0
-                && dim <= MAX_PQ_DECODE_DIM
-                && m > 0
-                && k > 0
-                && k <= usize::from(u8::MAX) + 1
-                && k <= vectors.len()
-        );
-        assert!(
-            dim.is_multiple_of(m),
-            "dim ({dim}) must be divisible by m ({m})"
-        );
-
+    ) -> Result<Self, VectorError> {
+        let invalid = |detail: String| Err(VectorError::InvalidInput { detail });
+        if vectors.is_empty() {
+            return invalid("PQ training needs at least one vector".into());
+        }
+        if dim == 0 || dim > MAX_PQ_DECODE_DIM {
+            return invalid(format!(
+                "PQ dimension {dim} is outside 1..={MAX_PQ_DECODE_DIM}"
+            ));
+        }
+        if m == 0 || !dim.is_multiple_of(m) {
+            return invalid(format!("PQ dimension {dim} must be divisible by m ({m})"));
+        }
+        if k == 0 || k > usize::from(u8::MAX) + 1 || k > vectors.len() {
+            return invalid(format!(
+                "PQ centroid count {k} must be in 1..=256 and at most the {} training vectors",
+                vectors.len()
+            ));
+        }
         let sub_dim = dim / m;
-        let codebook_bytes = pq_codebook_allocation_bytes(m, k, sub_dim);
-        assert!(codebook_bytes.is_some_and(|bytes| bytes <= MAX_PQ_CODEBOOK_BYTES));
+        if pq_codebook_allocation_bytes(m, k, sub_dim)
+            .is_none_or(|bytes| bytes > MAX_PQ_CODEBOOK_BYTES)
+        {
+            return invalid(format!(
+                "PQ codebook for m={m}, k={k}, sub-dimension {sub_dim} exceeds \
+                 {MAX_PQ_CODEBOOK_BYTES} bytes"
+            ));
+        }
+        // Parameters are checked before any vector is read.
+        for v in vectors {
+            check_dim(dim, v.len())?;
+        }
+
         let mut codebooks = Vec::with_capacity(m);
 
         for sub in 0..m {
@@ -131,14 +148,14 @@ impl PqCodec {
             codebooks.push(centroids);
         }
 
-        Self {
+        Ok(Self {
             dim,
             m,
             k,
             sub_dim,
             codebooks,
             memory,
-        }
+        })
     }
 
     /// Encode a vector: for each subvector, find the nearest centroid index.
@@ -147,8 +164,11 @@ impl PqCodec {
     /// intentionally skipped here to avoid atomic overhead on every candidate
     /// during search; use [`encode_batch`] for bulk encoding with budget
     /// enforcement.
+    ///
+    /// Precondition: `vector.len() == self.dim`. This per-candidate hot path
+    /// does not re-check it; every caller checks the dimension first
+    /// (`encode_batch`, the IVF-PQ `add`, and the codec-index entry points).
     pub fn encode(&self, vector: &[f32]) -> Vec<u8> {
-        debug_assert_eq!(vector.len(), self.dim);
         let mut code = Vec::with_capacity(self.m);
         for sub in 0..self.m {
             let offset = sub * self.sub_dim;
@@ -165,6 +185,9 @@ impl PqCodec {
     /// before allocating the output buffer.  The guard is released at
     /// the end of this call — the buffer itself remains alive.
     pub fn encode_batch(&self, vectors: &[&[f32]]) -> Result<Vec<u8>, VectorError> {
+        for v in vectors {
+            check_dim(self.dim, v.len())?;
+        }
         let capacity = self.m * vectors.len();
         let _g = try_reserve_or_skip(&self.memory, capacity * size_of::<u8>())?;
         let mut out = Vec::with_capacity(capacity);
@@ -183,7 +206,7 @@ impl PqCodec {
     /// Charges `m * k * size_of::<f32>()` bytes to the bound budget (if set)
     /// before allocating the table.
     pub fn build_distance_table(&self, query: &[f32]) -> Result<Vec<Vec<f32>>, VectorError> {
-        debug_assert_eq!(query.len(), self.dim);
+        check_dim(self.dim, query.len())?;
         let total_bytes = self.m * self.k * size_of::<f32>();
         let _g = try_reserve_or_skip(&self.memory, total_bytes)?;
         let mut table = Vec::with_capacity(self.m);
@@ -223,12 +246,12 @@ impl PqCodec {
             .m
             .checked_mul(self.sub_dim)
             .filter(|&value| value == self.dim && value <= MAX_PQ_DECODE_DIM)
-            .ok_or(VectorError::DimensionMismatch {
+            .ok_or(VectorError::StoredDimensionMismatch {
                 expected: self.dim,
                 got: 0,
             })?;
         if code.len() != self.m {
-            return Err(VectorError::DimensionMismatch {
+            return Err(VectorError::StoredDimensionMismatch {
                 expected: self.m,
                 got: code.len(),
             });
@@ -246,7 +269,7 @@ impl PqCodec {
             MAX_PQ_DECODE_DIM,
             MAX_PQ_DECODE_DIM * size_of::<f32>(),
         )
-        .ok_or(VectorError::DimensionMismatch {
+        .ok_or(VectorError::StoredDimensionMismatch {
             expected: self.dim,
             got: 0,
         })?;
@@ -279,7 +302,11 @@ impl PqCodec {
             sub_dim: self.sub_dim,
             codebooks: self.codebooks.clone(),
         };
-        let payload = zerompk::to_msgpack_vec(&data).unwrap_or_default();
+        let payload = zerompk::to_msgpack_vec(&data).map_err(|e| {
+            VectorError::CheckpointSerializationError {
+                detail: format!("PQ codec encode: {e}"),
+            }
+        })?;
         let mut out = Vec::with_capacity(7 + payload.len());
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
@@ -366,122 +393,52 @@ impl PqCodec {
     }
 }
 
-/// L2 squared distance for sub-vectors (used in k-means and encoding).
-#[inline]
-fn l2_sub(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        let d = a[i] - b[i];
-        sum += d * d;
-    }
-    sum
-}
-
-/// Simple k-means clustering for PQ codebook training.
-///
-/// Uses proper k-means++ initialization (weighted d² sampling) with a
-/// deterministic seed so training is reproducible across runs.
-fn kmeans(data: &[&[f32]], dim: usize, k: usize, max_iter: usize) -> Vec<Vec<f32>> {
-    let n = data.len();
-    if n == 0 || k == 0 {
-        return Vec::new();
-    }
-    let k = k.min(n); // Can't have more centroids than data points.
-
-    // K-means++ initialization with deterministic xorshift.
-    let mut rng = crate::hnsw::Xorshift64::new(0xC0FF_EEDE_ADBE_EF42);
-
-    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
-    centroids.push(data[0].to_vec());
-
-    let mut min_dists = vec![f32::MAX; n];
-    // Update against the first centroid.
-    for (i, point) in data.iter().enumerate() {
-        let d = l2_sub(point, &centroids[0]);
-        if d < min_dists[i] {
-            min_dists[i] = d;
-        }
-    }
-
-    for _ in 1..k {
-        let total: f64 = min_dists.iter().map(|&d| d as f64).sum();
-        let next_idx = if total < f64::EPSILON {
-            // All points coincide with existing centroids.
-            0
-        } else {
-            let target = rng.next_f64() * total;
-            let mut acc = 0.0f64;
-            let mut chosen = n - 1;
-            for (i, &d) in min_dists.iter().enumerate() {
-                acc += d as f64;
-                if acc >= target {
-                    chosen = i;
-                    break;
-                }
-            }
-            chosen
-        };
-        centroids.push(data[next_idx].to_vec());
-        // Incrementally update min_dists against the new centroid.
-        let last = centroids.last().expect("just pushed");
-        for (i, point) in data.iter().enumerate() {
-            let d = l2_sub(point, last);
-            if d < min_dists[i] {
-                min_dists[i] = d;
-            }
-        }
-    }
-
-    // K-means iterations.
-    let mut assignments = vec![0usize; n];
-    for _ in 0..max_iter {
-        // Assignment step.
-        let mut changed = false;
-        for (i, point) in data.iter().enumerate() {
-            let mut best = 0;
-            let mut best_d = f32::MAX;
-            for (c, centroid) in centroids.iter().enumerate() {
-                let d = l2_sub(point, centroid);
-                if d < best_d {
-                    best_d = d;
-                    best = c;
-                }
-            }
-            if assignments[i] != best {
-                assignments[i] = best;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-
-        // Update step: recompute centroids as means.
-        let mut sums = vec![vec![0.0f32; dim]; k];
-        let mut counts = vec![0usize; k];
-        for (i, point) in data.iter().enumerate() {
-            let c = assignments[i];
-            counts[c] += 1;
-            for d in 0..dim {
-                sums[c][d] += point[d];
-            }
-        }
-        for c in 0..k {
-            if counts[c] > 0 {
-                for d in 0..dim {
-                    centroids[c][d] = sums[c][d] / counts[c] as f32;
-                }
-            }
-        }
-    }
-
-    centroids
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::test_memory;
+
+    fn assert_invalid(result: Result<PqCodec, VectorError>) {
+        assert!(
+            matches!(result, Err(VectorError::InvalidInput { .. })),
+            "expected InvalidInput"
+        );
+    }
+
+    #[test]
+    fn train_rejects_a_vector_of_the_wrong_dimension() {
+        let good = [0.0_f32, 1.0];
+        let short = [0.0_f32];
+        let result = PqCodec::train(&[&good, &short], 2, 1, 1, 1, test_memory());
+        assert!(matches!(
+            result,
+            Err(VectorError::DimensionMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn distance_table_rejects_a_query_of_the_wrong_dimension() {
+        let a = [0.0_f32, 1.0];
+        let b = [1.0_f32, 0.0];
+        let codec = PqCodec::train(&[&a, &b], 2, 1, 2, 1, test_memory()).unwrap();
+        assert!(matches!(
+            codec.build_distance_table(&[1.0]),
+            Err(VectorError::DimensionMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+        assert!(matches!(
+            codec.encode_batch(&[&[1.0]]),
+            Err(VectorError::DimensionMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+    }
 
     fn make_clustered_data() -> Vec<Vec<f32>> {
         // 4 clusters in 4D space, 50 points each.
@@ -501,40 +458,49 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn train_rejects_dimension_above_decode_limit() {
         let vector = [0.0];
-        PqCodec::train(&[&vector], MAX_PQ_DECODE_DIM + 1, 1, 1, 1, test_memory());
+        assert_invalid(PqCodec::train(
+            &[&vector],
+            MAX_PQ_DECODE_DIM + 1,
+            1,
+            1,
+            1,
+            test_memory(),
+        ));
     }
 
     #[test]
-    #[should_panic]
     fn train_rejects_raw_64_mib_codebook_once_container_overhead_is_counted() {
         let vector = [0.0];
         let vectors = vec![vector.as_slice(); 256];
-        PqCodec::train(&vectors, 65_536, 1, 256, 1, test_memory());
+        assert_invalid(PqCodec::train(&vectors, 65_536, 1, 256, 1, test_memory()));
     }
 
     #[test]
-    #[should_panic]
     fn train_rejects_codebook_above_decode_limit() {
         let vector = [0.0];
         let vectors = vec![vector.as_slice(); 17];
-        PqCodec::train(&vectors, MAX_PQ_DECODE_DIM, 1, 17, 1, test_memory());
+        assert_invalid(PqCodec::train(
+            &vectors,
+            MAX_PQ_DECODE_DIM,
+            1,
+            17,
+            1,
+            test_memory(),
+        ));
     }
 
     #[test]
-    #[should_panic]
     fn train_rejects_more_centroids_than_training_vectors() {
         let vector = [0.0];
-        PqCodec::train(&[&vector], 1, 1, 2, 1, test_memory());
+        assert_invalid(PqCodec::train(&[&vector], 1, 1, 2, 1, test_memory()));
     }
 
     #[test]
-    #[should_panic]
     fn train_rejects_centroid_count_above_u8_encoding_range() {
         let vector = [0.0];
-        PqCodec::train(&[&vector], 1, 1, 257, 1, test_memory());
+        assert_invalid(PqCodec::train(&[&vector], 1, 1, 257, 1, test_memory()));
     }
 
     #[test]
@@ -602,7 +568,7 @@ mod tests {
     fn encode_decode_roundtrip() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory());
+        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory()).unwrap();
 
         for v in &vecs {
             let code = codec.encode(v);
@@ -616,7 +582,7 @@ mod tests {
     fn distance_table_gives_correct_ordering() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory());
+        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory()).unwrap();
 
         let codes: Vec<Vec<u8>> = vecs.iter().map(|v| codec.encode(v)).collect();
         let query = &[5.0, 5.0, 5.0, 5.0];
@@ -650,7 +616,7 @@ mod tests {
     fn batch_encode() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory());
+        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory()).unwrap();
 
         let batch = codec.encode_batch(&refs).unwrap();
         assert_eq!(batch.len(), 2 * 200); // M=2, N=200
@@ -661,7 +627,7 @@ mod tests {
     fn pq_codec_golden_format() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory());
+        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory()).unwrap();
 
         let bytes = codec.to_bytes().unwrap();
 

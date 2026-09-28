@@ -13,7 +13,7 @@
 //! violating. On success the engine's `*_durable_lsn` advances to the flushed
 //! point and that point is returned. On FAILURE the error is surfaced — logged
 //! at `warn` naming the clamp it caused, never swallowed — and the LAST-KNOWN
-//! durable LSN is returned instead of the watermark. The reported LSN authorises
+//! durable LSN is returned instead of the checkpoint floor. The reported LSN authorises
 //! `WalManager::truncate_before` to unlink segments below it, so a flush that
 //! failed must never widen that authority over the very state it failed to
 //! write. Clamping costs WAL growth until the next cycle succeeds; not clamping
@@ -26,7 +26,7 @@
 //! POSTINGS / DOC_LENGTHS / DOC_TERMS / STATS straight into the same redb `Database` the
 //! `sparse` engine commits to — bypassing the LSM memtable precisely so the
 //! index is atomic with the document write. redb commits durably, so an FTS
-//! write at or below the watermark is already on stable storage in a store that
+//! write at or below the floor is already on stable storage in a store that
 //! is not the WAL. There is nothing to flush and therefore nothing to clamp.
 
 use tracing::warn;
@@ -129,10 +129,9 @@ impl CoreLoop {
     ///
     /// Clamping matters more here than for the engines above, because columnar
     /// replay is not idempotent: `ColumnarOp::Update` is delete-old-PK +
-    /// insert-new-row. So the reported LSN both authorises truncation AND, via
-    /// the restored floor, decides which records replay. Overstating it would
-    /// not merely delete rows — it would gate the records that would have
-    /// rebuilt them.
+    /// insert-new-row, so a record whose WAL copy is gone cannot be rebuilt
+    /// from any other source. Which records replay is the generation's replay
+    /// stamp, not this LSN.
     pub(super) fn checkpoint_columnar_durable_lsn(&mut self) -> Lsn {
         match self.checkpoint_columnar_engines() {
             Ok(lsn) => {
@@ -398,9 +397,61 @@ mod tests {
         .expect("CoreLoop::open")
     }
 
+    /// Records apply out of LSN order. The record at 20 is still on its way
+    /// while 30 applied, so the watermark is 30 and the outcome floor 10.
+    /// Every engine, and the whole checkpoint, reports the floor: truncating
+    /// below 30 would delete the record at 20, which no checkpoint holds.
+    /// Once the floor passes 30, the reported LSN follows it.
+    #[test]
+    fn a_checkpoint_never_reports_past_a_record_in_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = open_core(dir.path());
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(10));
+        core.floors.applied_prefix.note_applied(Lsn::new(30));
+        core.watermark = Lsn::new(30);
+
+        let reported = [
+            core.checkpoint_kv_durable_lsn(),
+            core.checkpoint_sparse_vector_durable_lsn(),
+            core.checkpoint_sync_hwm_durable_lsn(),
+            core.checkpoint_columnar_durable_lsn(),
+            core.checkpoint_graph_label_durable_lsn(),
+            core.checkpoint_array_durable_lsn(),
+            core.checkpoint_ts_durable_lsn(),
+            core.checkpoint_vector_durable_lsn(),
+            core.checkpoint_crdt_durable_lsn(),
+            core.checkpoint_spatial_durable_lsn(),
+        ];
+        assert!(
+            reported.iter().all(|lsn| *lsn == Lsn::new(10)),
+            "every engine reports the outcome floor, not the watermark: {reported:?}"
+        );
+        let checkpoint_lsn = |core: &mut CoreLoop| {
+            let response = core
+                .execute_checkpoint(&crate::data::executor::core_loop::tests::make_default_task());
+            let bytes: [u8; 8] = response.payload.as_bytes()[..8]
+                .try_into()
+                .expect("an 8-byte LSN");
+            Lsn::new(u64::from_le_bytes(bytes))
+        };
+        assert_eq!(checkpoint_lsn(&mut core), Lsn::new(10));
+
+        // The record at 20 applied and answered: the floor passes 30.
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(30));
+        assert_eq!(
+            checkpoint_lsn(&mut core),
+            Lsn::new(30),
+            "truncation advances once the in-flight record settles"
+        );
+    }
+
     /// The clamp is the whole point of this module: on flush failure the
-    /// contributor must return the LAST-KNOWN durable LSN, never the watermark.
-    /// Returning the watermark would widen `WalManager::truncate_before` over
+    /// contributor must return the LAST-KNOWN durable LSN, never the floor.
+    /// Returning the floor would widen `WalManager::truncate_before` over
     /// exactly the state the flush just failed to write.
     #[test]
     fn columnar_flush_failure_clamps_to_the_last_known_durable_lsn() {
@@ -417,7 +468,7 @@ mod tests {
             core.checkpoint_columnar_durable_lsn(),
             Lsn::ZERO,
             "a fresh core has flushed nothing, so a failed flush must clamp to \
-             zero rather than authorise truncating up to the watermark"
+             zero rather than authorise truncating up to the floor"
         );
         assert_eq!(core.floors.columnar_durable_lsn, Lsn::ZERO);
     }
@@ -426,10 +477,13 @@ mod tests {
     /// LSN — the two must not drift, since the field is what a later failure
     /// clamps back to.
     #[test]
-    fn columnar_flush_success_advances_and_returns_the_watermark() {
+    fn columnar_flush_success_advances_and_returns_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = open_core(dir.path());
         core.watermark = Lsn::new(750);
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(750));
 
         assert_eq!(core.checkpoint_columnar_durable_lsn(), Lsn::new(750));
         assert_eq!(core.floors.columnar_durable_lsn, Lsn::new(750));
@@ -456,16 +510,19 @@ mod tests {
             core.checkpoint_graph_label_durable_lsn(),
             Lsn::ZERO,
             "a fresh core has flushed nothing, so a failed flush must clamp to \
-             zero rather than authorise truncating up to the watermark"
+             zero rather than authorise truncating up to the floor"
         );
         assert_eq!(core.floors.graph_label_durable_lsn, Lsn::ZERO);
     }
 
     #[test]
-    fn graph_label_flush_success_advances_and_returns_the_watermark() {
+    fn graph_label_flush_success_advances_and_returns_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = open_core(dir.path());
         core.watermark = Lsn::new(750);
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(750));
 
         assert_eq!(core.checkpoint_graph_label_durable_lsn(), Lsn::new(750));
         assert_eq!(core.floors.graph_label_durable_lsn, Lsn::new(750));
@@ -537,10 +594,13 @@ mod tests {
     }
 
     #[test]
-    fn array_flush_success_advances_and_returns_the_watermark() {
+    fn array_flush_success_advances_and_returns_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = open_core(dir.path());
         core.watermark = Lsn::new(750);
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(750));
         open_array_with_a_pending_cell(&mut core);
 
         assert_eq!(core.checkpoint_array_durable_lsn(), Lsn::new(750));
@@ -608,10 +668,13 @@ mod tests {
     }
 
     #[test]
-    fn timeseries_flush_success_advances_and_returns_the_watermark() {
+    fn timeseries_flush_success_advances_and_returns_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = open_core(dir.path());
         core.watermark = Lsn::new(750);
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(750));
         ts_memtable_with_a_pending_row(&mut core);
 
         assert_eq!(core.checkpoint_ts_durable_lsn(), Lsn::new(750));
@@ -631,7 +694,8 @@ mod tests {
         use crate::engine::vector::hnsw::HnswParams;
 
         let mut coll = VectorCollection::new(4, HnswParams::default());
-        coll.insert_with_surrogate(vec![0.1, 0.2, 0.3, 0.4], nodedb_types::Surrogate::new(1));
+        coll.insert_with_surrogate(vec![0.1, 0.2, 0.3, 0.4], nodedb_types::Surrogate::new(1))
+            .unwrap();
         core.vector_collections.insert(
             (
                 nodedb_types::DatabaseId::DEFAULT,
@@ -661,16 +725,19 @@ mod tests {
             core.checkpoint_vector_durable_lsn(),
             Lsn::ZERO,
             "a fresh core has flushed nothing, so a failed flush must clamp to \
-             zero rather than authorise truncating up to the watermark"
+             zero rather than authorise truncating up to the floor"
         );
         assert_eq!(core.floors.vector_durable_lsn, Lsn::ZERO);
     }
 
     #[test]
-    fn vector_flush_success_advances_and_returns_the_watermark() {
+    fn vector_flush_success_advances_and_returns_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = open_core(dir.path());
         core.watermark = Lsn::new(750);
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(750));
         vector_collection_with_a_pending_vector(&mut core);
 
         assert_eq!(core.checkpoint_vector_durable_lsn(), Lsn::new(750));
@@ -700,16 +767,19 @@ mod tests {
             core.checkpoint_crdt_durable_lsn(),
             Lsn::ZERO,
             "a fresh core has flushed nothing, so a failed flush must clamp to \
-             zero rather than authorise truncating up to the watermark"
+             zero rather than authorise truncating up to the floor"
         );
         assert_eq!(core.floors.crdt_durable_lsn, Lsn::ZERO);
     }
 
     #[test]
-    fn crdt_flush_success_advances_and_returns_the_watermark() {
+    fn crdt_flush_success_advances_and_returns_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = open_core(dir.path());
         core.watermark = Lsn::new(750);
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(750));
         core.get_crdt_engine(
             nodedb_types::DatabaseId::DEFAULT,
             nodedb_types::TenantId::new(1),
@@ -764,16 +834,19 @@ mod tests {
             core.checkpoint_spatial_durable_lsn(),
             Lsn::ZERO,
             "a fresh core has flushed nothing, so a failed flush must clamp to \
-             zero rather than authorise truncating up to the watermark"
+             zero rather than authorise truncating up to the floor"
         );
         assert_eq!(core.floors.spatial_durable_lsn, Lsn::ZERO);
     }
 
     #[test]
-    fn spatial_flush_success_advances_and_returns_the_watermark() {
+    fn spatial_flush_success_advances_and_returns_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = open_core(dir.path());
         core.watermark = Lsn::new(750);
+        core.floors
+            .applied_prefix
+            .observe_outcome_floor(Lsn::new(750));
         spatial_index_with_a_pending_entry(&mut core);
 
         assert_eq!(core.checkpoint_spatial_durable_lsn(), Lsn::new(750));

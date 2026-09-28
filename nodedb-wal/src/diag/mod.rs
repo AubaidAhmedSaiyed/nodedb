@@ -17,25 +17,24 @@
 //! redactor belongs to the binary; everything here is inert until the host
 //! application initializes the recorder, so a library emitting these costs
 //! nothing on its own. The real implementation compiles only under the
-//! `diagnostics` feature and off wasm32 (where there is no filesystem to write
-//! a report to); otherwise every entry point is a no-op with the same
+//! `diagnostics` feature; otherwise every entry point is a no-op with the same
 //! signature, so call sites never need a `cfg`.
 
-#[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
+#[cfg(feature = "diagnostics")]
 mod context;
-#[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
+#[cfg(feature = "diagnostics")]
 mod recording;
 
-#[cfg(not(all(feature = "diagnostics", not(target_arch = "wasm32"))))]
+#[cfg(not(feature = "diagnostics"))]
 mod inert;
 
-#[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
+#[cfg(feature = "diagnostics")]
 pub use recording::{
     durability_lost, encrypted_record_without_key, mid_file_corruption, out_of_space,
     replay_below_retained_floor, segment_lsn_gap,
 };
 
-#[cfg(not(all(feature = "diagnostics", not(target_arch = "wasm32"))))]
+#[cfg(not(feature = "diagnostics"))]
 pub use inert::{
     durability_lost, encrypted_record_without_key, mid_file_corruption, out_of_space,
     replay_below_retained_floor, segment_lsn_gap,

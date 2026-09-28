@@ -136,6 +136,12 @@ impl ToMessagePack for ErrorDetails {
                 write1(writer, TAG_INSUFFICIENT_BALANCE, collection)
             }
             ErrorDetails::RateExceeded { gate } => write1(writer, TAG_RATE_EXCEEDED, gate),
+            ErrorDetails::TransactionRollback { detail } => {
+                write1(writer, TAG_TRANSACTION_ROLLBACK, detail)
+            }
+            ErrorDetails::ActiveSqlTransaction { detail } => {
+                write1(writer, TAG_ACTIVE_SQL_TRANSACTION, detail)
+            }
             ErrorDetails::CollectionNotFound { collection } => {
                 write1(writer, TAG_COLLECTION_NOT_FOUND, collection)
             }
@@ -178,6 +184,10 @@ impl ToMessagePack for ErrorDetails {
                 write1(writer, TAG_AMBIGUOUS_COLUMN, column)
             }
             ErrorDetails::DivisionByZero => write_unit(writer, TAG_DIVISION_BY_ZERO),
+            ErrorDetails::DataException { detail } => write1(writer, TAG_DATA_EXCEPTION, detail),
+            ErrorDetails::ProgramLimitExceeded { detail } => {
+                write1(writer, TAG_PROGRAM_LIMIT_EXCEEDED, detail)
+            }
             ErrorDetails::InvalidLimitValue { clause, value } => {
                 write2(writer, TAG_INVALID_LIMIT_VALUE, clause, value)
             }
@@ -185,6 +195,7 @@ impl ToMessagePack for ErrorDetails {
                 write1(writer, TAG_AUTHORIZATION_DENIED, resource)
             }
             ErrorDetails::AuthExpired => write_unit(writer, TAG_AUTH_EXPIRED),
+            ErrorDetails::AuthenticationFailed => write_unit(writer, TAG_AUTHENTICATION_FAILED),
             ErrorDetails::HandshakeFailed { server_code } => {
                 write1(writer, TAG_HANDSHAKE_FAILED, server_code)
             }
@@ -325,6 +336,9 @@ impl ToMessagePack for ErrorDetails {
             ErrorDetails::AlreadyExists { object } => write1(writer, TAG_ALREADY_EXISTS, object),
             ErrorDetails::ObjectNotReady { object } => write1(writer, TAG_OBJECT_NOT_READY, object),
             ErrorDetails::NotFound { detail } => write1(writer, TAG_NOT_FOUND, detail),
+            ErrorDetails::DependentObjectsExist { object } => {
+                write1(writer, TAG_DEPENDENT_OBJECTS_EXIST, object)
+            }
             ErrorDetails::CannotDropDefaultDatabase => {
                 write_unit(writer, TAG_CANNOT_DROP_DEFAULT_DATABASE)
             }

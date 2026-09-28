@@ -23,6 +23,7 @@ use tracing::trace;
 
 use super::delivery::CrdtSyncDelivery;
 use super::types::{DeltaOp, OutboundDelta};
+use crate::event::sink_ledger::{CrdtLedger, SinkEventKey};
 use crate::event::types::{EventSource, WriteEvent, WriteOp};
 
 /// Per-collection sequence counter for ordering enforcement.
@@ -79,14 +80,29 @@ impl DeltaPackager {
     /// are already captured by the triggering event's delta). Events from
     /// `CrdtSync` are skipped (prevent echo: Lite → Origin → Lite loop).
     ///
+    /// With a `ledger`, the event's `key` and the collection's sequence are
+    /// recorded durably before the delta is handed on: an event the ledger
+    /// already holds is not packaged again, and sequences continue across a
+    /// restart.
+    ///
     /// Returns `true` if the delta was enqueued, `false` if skipped.
-    pub fn package_and_enqueue(&self, event: &WriteEvent, delivery: &CrdtSyncDelivery) -> bool {
-        // Only package User-originated writes.
-        // CrdtSync events are inbound FROM Lite — don't echo back.
-        // Trigger/RaftFollower events are derivative — the original User
-        // event already covers the data change.
-        if event.source != EventSource::User {
-            return false;
+    pub fn package_and_enqueue(
+        &self,
+        event: &WriteEvent,
+        key: Option<&SinkEventKey>,
+        ledger: Option<&CrdtLedger>,
+        delivery: &CrdtSyncDelivery,
+    ) -> bool {
+        // User writes and restored rows change the base data Lite peers hold,
+        // so both are packaged. CrdtSync events came FROM Lite and are not
+        // echoed back. Trigger, RaftFollower and Deferred events are derived
+        // from a User event that already carries the data change.
+        match event.source {
+            EventSource::User | EventSource::Restore => {}
+            EventSource::Trigger
+            | EventSource::RaftFollower
+            | EventSource::CrdtSync
+            | EventSource::Deferred => return false,
         }
 
         // Check if any connected Lite session cares about this collection.
@@ -123,7 +139,24 @@ impl DeltaPackager {
             WriteOp::Heartbeat => return false,
         };
 
-        let sequence = self.sequences.next(&event.collection);
+        let sequence = match ledger {
+            None => self.sequences.next(&event.collection),
+            Some(ledger) => match ledger.claim(key, &event.collection) {
+                Ok(Some(sequence)) => sequence,
+                // Packaged before a restart: the delta already went out.
+                Ok(None) => return false,
+                Err(error) => {
+                    // Packaging without the ledger could hand the same event
+                    // on twice, so the delta is not packaged.
+                    tracing::error!(
+                        %error,
+                        collection = %event.collection,
+                        "crdt ledger unavailable; outbound delta not packaged"
+                    );
+                    return false;
+                }
+            },
+        };
 
         let delta = OutboundDelta {
             database_id: event.database_id,
@@ -171,6 +204,7 @@ mod tests {
             op,
             row_id: RowId::row(nodedb_types::RowIdentity::from_user_key("o-1")),
             lsn: Lsn::new(100),
+            record: None,
             database_id: DatabaseId::new(7),
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),
@@ -190,10 +224,21 @@ mod tests {
         let delivery = CrdtSyncDelivery::new();
 
         let crdt_event = make_event(EventSource::CrdtSync, WriteOp::Insert);
-        assert!(!packager.package_and_enqueue(&crdt_event, &delivery));
+        assert!(!packager.package_and_enqueue(&crdt_event, None, None, &delivery));
 
         let trigger_event = make_event(EventSource::Trigger, WriteOp::Insert);
-        assert!(!packager.package_and_enqueue(&trigger_event, &delivery));
+        assert!(!packager.package_and_enqueue(&trigger_event, None, None, &delivery));
+    }
+
+    #[test]
+    fn a_restored_row_passes_the_source_gate() {
+        let packager = DeltaPackager::new();
+        let delivery = CrdtSyncDelivery::new();
+        // No session subscribes, so the event stops at the subscriber check.
+        // The skip counter moves only for an event past the source gate.
+        let restored = make_event(EventSource::Restore, WriteOp::Insert);
+        assert!(!packager.package_and_enqueue(&restored, None, None, &delivery));
+        assert_eq!(packager.deltas_skipped.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -202,7 +247,7 @@ mod tests {
         let delivery = CrdtSyncDelivery::new();
 
         let hb = make_event(EventSource::User, WriteOp::Heartbeat);
-        assert!(!packager.package_and_enqueue(&hb, &delivery));
+        assert!(!packager.package_and_enqueue(&hb, None, None, &delivery));
     }
 
     #[test]
@@ -211,7 +256,7 @@ mod tests {
         let delivery = CrdtSyncDelivery::new();
         // No sessions registered → no subscribers.
         let event = make_event(EventSource::User, WriteOp::Insert);
-        assert!(!packager.package_and_enqueue(&event, &delivery));
+        assert!(!packager.package_and_enqueue(&event, None, None, &delivery));
         assert_eq!(packager.deltas_skipped.load(Ordering::Relaxed), 1);
     }
 
@@ -230,7 +275,7 @@ mod tests {
             .as_ref()
             .map(|v| v.to_vec())
             .unwrap_or_default();
-        let _ = packager.package_and_enqueue(&event, &delivery);
+        let _ = packager.package_and_enqueue(&event, None, None, &delivery);
 
         assert_eq!(expected, b"payload".to_vec());
     }

@@ -98,7 +98,7 @@ pub fn drop_collection(
             name,
             &mut visited,
         )
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
     };
 
     // Implicit SERIAL/BIGSERIAL sequences (`{collection}_{field}_seq`)
@@ -187,7 +187,7 @@ pub fn drop_collection(
         let catalog = state.credentials.catalog();
         if catalog
             .get_materialized_view(database_id.as_u64(), tenant_id.as_u64(), name)
-            .map_err(|error| err("XX000", error.to_string()))?
+            .map_err(|error| DdlError::from_error(&error))?
             .is_some()
         {
             return Err(err(
@@ -271,7 +271,7 @@ pub fn drop_collection(
         None
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|error| err("XX000", error.to_string()))?;
+        .map_err(|error| DdlError::from_error(&error))?;
     if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         if purge {
@@ -323,7 +323,9 @@ pub fn drop_collection(
                 },
                 catalog,
             )
-            .map_err(|error| err("XX000", format!("catalog deactivate failed: {error}")))?;
+            .map_err(|error| {
+                DdlError::from_error_in_context("catalog deactivate failed", &error)
+            })?;
         }
     }
 
@@ -337,9 +339,9 @@ pub fn drop_collection(
                 catalog
                     .delete_sequence(database_id.as_u64(), tenant_id.as_u64(), &seq.name)
                     .map_err(|e| {
-                        err(
-                            "XX000",
-                            format!("failed to drop sequence '{}': {e}", seq.name),
+                        DdlError::from_error_in_context(
+                            &format!("failed to drop sequence '{}'", seq.name),
+                            &e,
                         )
                     })?;
                 // Best-effort: registry removal is non-critical since catalog

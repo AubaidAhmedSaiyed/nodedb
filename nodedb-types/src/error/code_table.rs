@@ -71,6 +71,8 @@ error_code_table! {
     OVERFLOW => Overflow { collection: String::new() },
     INSUFFICIENT_BALANCE => InsufficientBalance { collection: String::new() },
     RATE_EXCEEDED => RateExceeded { gate: String::new() },
+    TRANSACTION_ROLLBACK => TransactionRollback { detail: message.to_owned() },
+    ACTIVE_SQL_TRANSACTION => ActiveSqlTransaction { detail: message.to_owned() },
 
     // Read path.
     COLLECTION_NOT_FOUND => CollectionNotFound { collection: String::new() },
@@ -79,6 +81,7 @@ error_code_table! {
     ALREADY_EXISTS => AlreadyExists { object: String::new() },
     OBJECT_NOT_READY => ObjectNotReady { object: String::new() },
     NOT_FOUND => NotFound { detail: message.to_owned() },
+    DEPENDENT_OBJECTS_EXIST => DependentObjectsExist { object: String::new() },
     DOCUMENT_NOT_FOUND => DocumentNotFound { collection: String::new(), document_id: String::new() },
     COLLECTION_DRAINING => CollectionDraining { collection: String::new() },
     COLLECTION_DEACTIVATED => CollectionDeactivated {
@@ -95,11 +98,14 @@ error_code_table! {
     UNDEFINED_COLUMN => UndefinedColumn { column: String::new() },
     AMBIGUOUS_COLUMN => AmbiguousColumn { column: String::new() },
     DIVISION_BY_ZERO => DivisionByZero,
+    DATA_EXCEPTION => DataException { detail: message.to_owned() },
+    PROGRAM_LIMIT_EXCEEDED => ProgramLimitExceeded { detail: message.to_owned() },
     INVALID_LIMIT_VALUE => InvalidLimitValue { clause: "remote".into(), value: message.to_owned() },
 
     // Auth / tenant quota.
     AUTHORIZATION_DENIED => AuthorizationDenied { resource: String::new() },
     AUTH_EXPIRED => AuthExpired,
+    AUTHENTICATION_FAILED => AuthenticationFailed,
     TENANT_VECTOR_DIM_EXCEEDED => TenantVectorDimExceeded { dim: 0, limit: 0 },
     TENANT_GRAPH_DEPTH_EXCEEDED => TenantGraphDepthExceeded { depth: 0, limit: 0 },
 
@@ -237,6 +243,11 @@ mod tests {
             ErrorCode::CANNOT_DROP_DEFAULT_DATABASE,
             ErrorCode::COLLECTION_DEACTIVATED,
             ErrorCode::ARRAY,
+            ErrorCode::PROGRAM_LIMIT_EXCEEDED,
+            ErrorCode::TRANSACTION_ROLLBACK,
+            ErrorCode::ACTIVE_SQL_TRANSACTION,
+            ErrorCode::DEPENDENT_OBJECTS_EXIST,
+            ErrorCode::AUTHENTICATION_FAILED,
             ErrorCode::QUOTA_OVERCOMMIT,
             ErrorCode::CLONE_DEPTH_EXCEEDED,
             ErrorCode::CLONE_WRITE_REQUIRES_MATERIALIZE,

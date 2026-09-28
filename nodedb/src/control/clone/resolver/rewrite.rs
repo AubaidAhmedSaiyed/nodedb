@@ -251,7 +251,11 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
             let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
             let Some(source_surrogate) = state
                 .surrogate_assigner
-                .lookup(source_db_id, tenant_id, source_qualified.as_str(), pk_bytes)
+                .lookup(
+                    nodedb_types::CollectionKey::from_bare(source_db_id, source_coll),
+                    tenant_id,
+                    pk_bytes,
+                )
                 .ok()
                 .flatten()
             else {

@@ -5,6 +5,7 @@
 //! fast path.
 
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
+use nodedb_cluster::error::ClusterError;
 use nodedb_cluster::wire::VShardMessageType;
 
 use crate::Error;
@@ -94,15 +95,75 @@ pub(super) fn finalize_agg_partials(
     rows
 }
 
-pub(super) fn cluster_err(e: nodedb_cluster::error::ClusterError) -> Error {
+pub(super) fn cluster_err(e: ClusterError) -> Error {
     match e {
         // A shard did not answer within its timeout: surface as a deterministic
         // deadline rather than an opaque internal error, matching the
         // `TypedClusterError::DeadlineExceeded` mapping used elsewhere.
-        nodedb_cluster::error::ClusterError::ShardTimeout { .. } => Error::DeadlineExceeded {
+        ClusterError::ShardTimeout { .. } => Error::DeadlineExceeded {
             request_id: crate::types::RequestId::new(0),
         },
-        other => Error::Internal {
+        // A shard's Data-Plane verdict keeps its code, so the statement
+        // renders the SQLSTATE a single-node execution renders.
+        ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
+        // A shard's typed execution error is rebuilt, so the statement
+        // renders the SQLSTATE a single-node execution renders.
+        ClusterError::ShardExecution { error, .. } | ClusterError::StreamTerminal { error, .. } => {
+            Error::from(*error)
+        }
+        // The shard still refused after the fan-out's reroute retry. The
+        // vShard's owner is moving, so the client retries the statement.
+        ClusterError::WrongOwner {
+            vshard_id,
+            expected_owner_node,
+        } => match expected_owner_node {
+            Some(leader_node) => Error::NotLeader {
+                vshard_id: crate::types::VShardId::new(vshard_id),
+                leader_node,
+                leader_addr: String::new(),
+            },
+            None => Error::NoLeader {
+                vshard_id: crate::types::VShardId::new(vshard_id),
+            },
+        },
+        // The vShard is moving to another node. It has no serving owner
+        // until the cut-over, so the client retries the statement.
+        ClusterError::MigrationInProgress { vshard_id } => Error::NoLeader {
+            vshard_id: crate::types::VShardId::new(vshard_id),
+        },
+        // Cluster machinery faults. The client can act on none of them.
+        other @ (ClusterError::Raft(_)
+        | ClusterError::VShardNotMapped { .. }
+        | ClusterError::GroupNotFound { .. }
+        | ClusterError::LearnerNotCaughtUp { .. }
+        | ClusterError::MigrationPauseBudgetExceeded { .. }
+        | ClusterError::NodeUnreachable { .. }
+        | ClusterError::GhostNotFound { .. }
+        | ClusterError::Transport { .. }
+        | ClusterError::Storage { .. }
+        | ClusterError::Codec { .. }
+        | ClusterError::UnsupportedWireVersion { .. }
+        | ClusterError::CircuitOpen { .. }
+        | ClusterError::JoinGroupDisappeared { .. }
+        | ClusterError::JoinCommitTimeout { .. }
+        | ClusterError::ReadIndexNotLeader { .. }
+        | ClusterError::ReadIndexTimeout { .. }
+        | ClusterError::Config { .. }
+        | ClusterError::MigrationCheckpoint(_)
+        | ClusterError::MigrationRecovery(_)
+        | ClusterError::Calvin(_)
+        | ClusterError::SnapshotCrcMismatch { .. }
+        | ClusterError::SnapshotOffsetRegression { .. }
+        | ClusterError::PartialSnapshotCorrupt { .. }
+        | ClusterError::PartialSnapshotCleanupFailed { .. }
+        | ClusterError::SnapshotApplyFailed { .. }
+        | ClusterError::Mirror(_)
+        | ClusterError::BspBarrier(_)
+        | ClusterError::VectorGather(_)
+        | ClusterError::SpatialGather(_)
+        | ClusterError::Bm25Gather(_)
+        | ClusterError::TsGather(_)
+        | ClusterError::RemoteUntyped { .. }) => Error::Internal {
             detail: format!("array cluster: {other}"),
         },
     }
@@ -127,5 +188,73 @@ pub(super) fn array_resp_msg_type(opcode: u32) -> Option<VShardMessageType> {
         87 => Some(VShardMessageType::ArrayShardDeleteResp),
         89 => Some(VShardMessageType::ArrayShardSurrogateBitmapResp),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::ErrorCode;
+
+    /// A shard verdict that crossed the cluster keeps its code at the
+    /// coordinator, never `Internal`.
+    #[test]
+    fn a_shard_verdict_keeps_its_code() {
+        let code = ErrorCode::Unsupported {
+            detail: "not on this engine".into(),
+        };
+        let wire = nodedb_cluster::error::ClusterError::DataPlane {
+            code: code.clone().into(),
+        };
+        match cluster_err(wire) {
+            Error::DataPlane(rebuilt) => assert_eq!(rebuilt, code),
+            other => panic!("expected the typed verdict, got {other:?}"),
+        }
+    }
+
+    /// A shard that still refused after the reroute retry answers the
+    /// retryable leader class, never `Internal`.
+    #[test]
+    fn a_persistent_wrong_owner_is_a_leader_error() {
+        let known = nodedb_cluster::error::ClusterError::WrongOwner {
+            vshard_id: 7,
+            expected_owner_node: Some(3),
+        };
+        assert!(matches!(
+            cluster_err(known),
+            Error::NotLeader { leader_node: 3, .. }
+        ));
+        let unknown = nodedb_cluster::error::ClusterError::WrongOwner {
+            vshard_id: 7,
+            expected_owner_node: None,
+        };
+        assert!(matches!(cluster_err(unknown), Error::NoLeader { .. }));
+    }
+
+    /// A vShard mid-migration has no serving owner, so the statement answers
+    /// the retryable no-leader class, never `Internal`.
+    #[test]
+    fn a_migrating_vshard_is_a_no_leader_error() {
+        let wire = ClusterError::MigrationInProgress { vshard_id: 5 };
+        match cluster_err(wire) {
+            Error::NoLeader { vshard_id } => assert_eq!(vshard_id.as_u32(), 5),
+            other => panic!("expected NoLeader, got {other:?}"),
+        }
+    }
+
+    /// A typed terminal error is rebuilt, never flattened to `Internal`.
+    #[test]
+    fn a_typed_terminal_error_is_rebuilt() {
+        let typed = nodedb_cluster::rpc_codec::TypedClusterError::DataPlane {
+            code: ErrorCode::DivisionByZero.into(),
+        };
+        let wire = ClusterError::StreamTerminal {
+            error: Box::new(typed),
+            detail: "division by zero".into(),
+        };
+        match cluster_err(wire) {
+            Error::DataPlane(code) => assert_eq!(code, ErrorCode::DivisionByZero),
+            other => panic!("expected the typed verdict, got {other:?}"),
+        }
     }
 }

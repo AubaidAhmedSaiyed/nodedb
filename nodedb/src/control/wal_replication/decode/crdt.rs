@@ -658,9 +658,8 @@ mod tests {
         for i in 0..5 {
             assigner
                 .assign(
-                    DatabaseId::DEFAULT,
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs"),
                     tenant,
-                    "docs",
                     format!("burn-{i}").as_bytes(),
                 )
                 .expect("burn allocation");
@@ -713,7 +712,11 @@ mod tests {
 
         assert_eq!(
             assigner
-                .lookup(DatabaseId::DEFAULT, tenant, "docs", b"doc-1")
+                .lookup(
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs"),
+                    tenant,
+                    b"doc-1"
+                )
                 .expect("catalog lookup"),
             Some(leader_surrogate),
             "the carried surrogate must be installed in the local catalog"

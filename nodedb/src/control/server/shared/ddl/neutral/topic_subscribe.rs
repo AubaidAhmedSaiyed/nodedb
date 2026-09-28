@@ -93,7 +93,7 @@ pub fn subscribe_to(
             .credentials
             .catalog()
             .load_ep_topic_messages(database_id, tenant_id, &topic_name)
-            .map_err(|error| err("XX000", format!("topic backlog: {error}")))?
+            .map_err(|error| DdlError::from_error_in_context("topic backlog", &error))?
             .into_iter()
             .filter(|message| message.sequence >= since_seq)
             .collect()

@@ -45,8 +45,12 @@ async fn alert_eval_loop(
     registry: Arc<AlertRegistry>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Initial delay to let the system warm up.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Initial delay to let the system warm up. Shutdown ends the delay: a
+    // server stopped within it must not wait it out.
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        _ = shutdown.wait_for(|stopping| *stopping) => return,
+    }
 
     // Use the shared hysteresis manager from SharedState so DROP/ALTER handlers
     // and the eval loop operate on the same state.
@@ -188,8 +192,10 @@ async fn execute_aggregate_scan(
         sync_dispatch::SystemTask::new(
             sync_dispatch::SystemReason::EventPlane,
             tenant_id,
-            crate::types::DatabaseId::new(alert.database_id),
-            &alert.collection,
+            nodedb_types::CollectionKey::from_bare(
+                crate::types::DatabaseId::new(alert.database_id),
+                &alert.collection,
+            ),
             plan,
         ),
         Duration::from_secs(30),

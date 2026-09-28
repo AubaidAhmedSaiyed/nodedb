@@ -99,7 +99,9 @@ pub fn create_spatial_index(
         .credentials
         .catalog()
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
-        .map_err(|e| DdlError::new("XX000", format!("{CONTEXT}: read index registry: {e}")))?
+        .map_err(|e| {
+            DdlError::from_error_in_context(&format!("{CONTEXT}: read index registry"), &e)
+        })?
     {
         if stmt.header.if_not_exists && taken.kind == IndexKind::Spatial {
             return Ok(vec![DdlResult::Status {

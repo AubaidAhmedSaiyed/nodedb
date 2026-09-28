@@ -28,7 +28,7 @@ pub enum WindowError {
     #[error("window frame error: {detail}")]
     BadFrame { detail: String },
 
-    #[error("division by zero in window expression")]
+    #[error("window expression: {0}")]
     Eval(#[from] crate::expr::EvalError),
 }
 

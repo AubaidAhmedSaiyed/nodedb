@@ -9,7 +9,8 @@ use crate::control::state::SharedState;
 use crate::types::TenantId;
 
 use super::super::super::result::DdlError;
-use super::reassign_owned::{OwnerKind, ddl_err, propose, sweep_grants};
+use super::owner_kind::OwnerKind;
+use super::reassign_owned::{propose, sweep_grants};
 
 /// Purge every object owned by the tenant administrator during `DROP TENANT`,
 /// returning the number of owned objects deleted so the caller can record an
@@ -22,13 +23,13 @@ pub(super) fn purge_owned_for_tenant_teardown(
     let catalog = state.credentials.catalog();
     let mut owned = catalog
         .owners_for_user(username, tenant.as_u64())
-        .map_err(|e| ddl_err(format!("load owner rows: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("load owner rows", &e))?;
     owned.sort_by_key(|owner| owner.object_type == object_type::COLLECTION);
     let purged = owned.len();
 
     for owner in owned {
         let kind = OwnerKind::from_object_type(&owner.object_type).ok_or_else(|| {
-            ddl_err(format!(
+            DdlError::internal(format!(
                 "cannot delete object of unknown owner type '{}' ('{}') during tenant teardown",
                 owner.object_type, owner.object_name
             ))
@@ -76,10 +77,13 @@ pub(super) fn purge_owned_for_tenant_teardown(
                 )
             });
             reclaim.map_err(|failure| {
-                ddl_err(format!(
-                    "tenant teardown collection reclaim failed for '{}': {}",
-                    owner.object_name, failure.error
-                ))
+                DdlError::from_error_in_context(
+                    &format!(
+                        "tenant teardown collection reclaim failed for '{}'",
+                        owner.object_name
+                    ),
+                    &failure.error,
+                )
             })?;
         }
         if outcome.needs_local_apply() {
@@ -116,7 +120,7 @@ fn purge_collection_rls_policies(
         crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, collection);
     let policies = catalog
         .load_all_rls_policies()
-        .map_err(|e| ddl_err(format!("load RLS policies: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("load RLS policies", &e))?;
     for policy in policies
         .into_iter()
         .filter(|policy| policy.tenant_id == tenant_id && policy.collection == qualified_collection)
@@ -164,7 +168,7 @@ fn purge_collection_redaction_policies(
         tenant_id,
         collection,
     )
-    .map_err(|e| ddl_err(format!("load redaction policies: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("load redaction policies", &e))?;
     for for_role in roles {
         let entry = CatalogEntry::DeleteRedactionPolicy {
             tenant_id,

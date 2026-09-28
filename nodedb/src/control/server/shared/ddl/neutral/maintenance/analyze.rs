@@ -48,7 +48,7 @@ pub async fn handle_analyze(
 
     let coll = catalog
         .get_collection(database_id, tenant_id, &collection)
-        .map_err(|e| ddl_err("XX000", format!("catalog error: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog error", &e))?
         .ok_or_else(|| {
             ddl_err(
                 "42P01",
@@ -89,7 +89,7 @@ pub async fn handle_analyze(
             TraceId::ZERO,
         )
         .await
-        .map_err(|error| ddl_err("XX000", format!("ANALYZE scan failed: {error}")))?;
+        .map_err(|error| DdlError::from_error_in_context("ANALYZE scan failed", &error))?;
         if !resp.payload.is_empty() {
             let json = crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
             push_scan_rows(&json, &mut rows);
@@ -141,7 +141,7 @@ pub async fn handle_analyze(
     super::super::replicate::propose_and_apply(state, &entry, || {
         catalog
             .put_column_stats_batch(&local_rows)
-            .map_err(|e| ddl_err("XX000", format!("failed to store column stats: {e}")))
+            .map_err(|e| DdlError::from_error_in_context("failed to store column stats", &e))
     })?;
 
     state

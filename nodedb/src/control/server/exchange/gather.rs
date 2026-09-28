@@ -60,7 +60,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
     Vec<(
         usize,
         crate::types::RequestId,
-        tokio::sync::mpsc::Receiver<crate::bridge::envelope::Response>,
+        crate::control::ResponseReceiver,
     )>,
 > {
     // Every core in this fan-out belongs to ONE statement, so all of them
@@ -177,9 +177,9 @@ pub(crate) async fn gather_all_cores(
         .into_iter()
         .map(|(core_id, request_id, mut rx)| async move {
             let context = format!("gather on core {core_id}");
-            let result = crate::control::server::dispatch_utils::collect_under_deadline(
+            let result = crate::control::local_dispatch::collect_under_deadline(
                 &mut rx,
-                crate::control::server::dispatch_utils::DeadlineCollect {
+                crate::control::local_dispatch::DeadlineCollect {
                     request_id,
                     deadline,
                     max_result_bytes,
@@ -218,7 +218,7 @@ pub(crate) async fn gather_all_cores(
         };
 
         if resp.status == Status::Error {
-            if let Err(e) = crate::control::server::dispatch_utils::reject_data_plane_error(&resp)
+            if let Err(e) = crate::control::local_dispatch::reject_data_plane_error(&resp)
                 && first_error.is_none()
             {
                 first_error = Some(e);
@@ -340,8 +340,8 @@ pub(crate) fn gather_all_cores_stream(
 /// timeseries, spatial, vector, text)
 ///
 /// Standard collections are *single-vShard-homed*: all rows for a collection
-/// live on exactly one vShard determined by `vshard_for_collection(database_id,
-/// &name)`.  The data-plane scan is **not** vshard-scoped, so broadcasting the
+/// live on exactly one vShard determined by `vshard_for_collection` over the
+/// collection's canonical key.  The data-plane scan is **not** vshard-scoped, so broadcasting the
 /// plan to every vShard via `Exchange{Gather}` causes the owning node to return
 /// the full collection once per route that lands on it — 1 024× duplication.
 ///

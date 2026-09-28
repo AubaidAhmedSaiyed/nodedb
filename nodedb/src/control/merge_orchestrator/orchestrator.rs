@@ -230,9 +230,11 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
         for (join_key, body) in &insert_rows {
             let surrogate = assign_target_surrogate(
                 state,
-                args.database_id,
+                nodedb_types::CollectionKey::from_qualified_str(
+                    args.database_id,
+                    args.target_collection,
+                )?,
                 args.tenant_id,
-                args.target_collection,
                 &target_pk,
                 body,
             )?;

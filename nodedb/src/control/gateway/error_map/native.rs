@@ -2,99 +2,71 @@
 
 //! Native-protocol error shape: `(numeric code, message)`.
 
+use nodedb_types::error::ErrorCode;
+
 use super::gateway_map::GatewayErrorMap;
 use crate::Error;
-
-/// Error code constants (subset matching `nodedb_types` numeric codes).
-const CODE_NOT_LEADER: u32 = 10;
-const CODE_DEADLINE: u32 = 20;
-const CODE_SCHEMA_CHANGED: u32 = 30;
-const CODE_NOT_FOUND: u32 = 40;
-const CODE_AUTHZ: u32 = 50;
-const CODE_BAD_REQUEST: u32 = 60;
-const CODE_CONSTRAINT: u32 = 70;
-const CODE_INTERNAL: u32 = 99;
 
 impl GatewayErrorMap {
     /// Map a gateway error into `(code, message)` for the native protocol.
     ///
-    /// Error codes are aligned with `nodedb_types::error::ErrorCode` numeric
-    /// values so native clients can switch on the code without string matching.
-    pub fn to_native(err: &Error) -> (u32, String) {
-        match err {
-            Error::NotLeader { leader_addr, .. } => {
-                (CODE_NOT_LEADER, format!("not leader; hint: {leader_addr}"))
-            }
-            Error::DeadlineExceeded { .. } => (CODE_DEADLINE, err.to_string()),
-            Error::RetryableSchemaChanged { .. } => (CODE_SCHEMA_CHANGED, err.to_string()),
-            Error::CollectionNotFound { collection, .. } => (
-                CODE_NOT_FOUND,
-                format!("collection \"{collection}\" not found"),
-            ),
-            Error::RejectedAuthz { .. } => (CODE_AUTHZ, err.to_string()),
-            Error::BadRequest { detail } | Error::PlanError { detail } => {
-                (CODE_BAD_REQUEST, detail.clone())
-            }
-            Error::RejectedConstraint { detail, .. } => (CODE_CONSTRAINT, detail.clone()),
-            Error::CrossCollectionNotColocated { .. } => (CODE_BAD_REQUEST, err.to_string()),
-            Error::RemoteTyped { code, message } => {
-                use nodedb_types::error::ErrorCode as Ec;
-                let native_code = match *code {
-                    Ec::DEADLINE_EXCEEDED => CODE_DEADLINE,
-                    Ec::COLLECTION_NOT_FOUND => CODE_NOT_FOUND,
-                    Ec::AUTHORIZATION_DENIED => CODE_AUTHZ,
-                    Ec::BAD_REQUEST | Ec::PLAN_ERROR => CODE_BAD_REQUEST,
-                    Ec::CONSTRAINT_VIOLATION => CODE_CONSTRAINT,
-                    _ => CODE_INTERNAL,
-                };
-                (native_code, message.clone())
-            }
-            _ => (CODE_INTERNAL, err.to_string()),
-        }
+    /// The code and message are the ones the native error frame carries,
+    /// from the one native mapping the listener uses. The code is the stable
+    /// `nodedb_types::error::ErrorCode`, so a native client switches on it
+    /// without string matching.
+    pub fn to_native(err: &Error) -> (ErrorCode, String) {
+        let fields = crate::control::server::native::dispatch::native_error_fields(err);
+        (fields.code, fields.message)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_fixtures::{
-        authz, deadline, internal, not_found, not_leader, schema_changed,
-    };
+    use super::super::test_fixtures::{authz, deadline, internal, not_found, not_leader};
     use super::*;
 
     #[test]
     fn native_not_leader() {
-        let (code, msg) = GatewayErrorMap::to_native(&not_leader());
-        assert_eq!(code, 10);
-        assert!(msg.contains("hint:"));
+        let (code, _) = GatewayErrorMap::to_native(&not_leader());
+        assert_eq!(code, ErrorCode::NOT_LEADER);
     }
 
     #[test]
     fn native_deadline() {
         let (code, _) = GatewayErrorMap::to_native(&deadline());
-        assert_eq!(code, 20);
-    }
-
-    #[test]
-    fn native_schema_changed() {
-        let (code, _) = GatewayErrorMap::to_native(&schema_changed());
-        assert_eq!(code, 30);
+        assert_eq!(code, ErrorCode::DEADLINE_EXCEEDED);
     }
 
     #[test]
     fn native_not_found() {
-        let (code, _) = GatewayErrorMap::to_native(&not_found());
-        assert_eq!(code, 40);
+        let (code, msg) = GatewayErrorMap::to_native(&not_found());
+        assert_eq!(code, ErrorCode::COLLECTION_NOT_FOUND);
+        assert!(msg.contains("missing_col"));
     }
 
     #[test]
     fn native_authz() {
         let (code, _) = GatewayErrorMap::to_native(&authz());
-        assert_eq!(code, 50);
+        assert_eq!(code, ErrorCode::AUTHORIZATION_DENIED);
     }
 
     #[test]
     fn native_internal() {
         let (code, _) = GatewayErrorMap::to_native(&internal());
-        assert_eq!(code, 99);
+        assert_eq!(code, ErrorCode::INTERNAL);
+    }
+
+    /// The gateway map and the native listener read one mapping, so the code
+    /// a gateway caller sees is the code the wire frame carries.
+    #[test]
+    fn gateway_map_matches_the_wire_frame() {
+        let err = Error::DataPlane(crate::bridge::envelope::ErrorCode::Unsupported {
+            detail: "not here".into(),
+        });
+        let frame = crate::control::server::native::dispatch::error_to_native(1, &err);
+        let payload = frame.error.expect("error frames carry a payload");
+        let (code, message) = GatewayErrorMap::to_native(&err);
+        assert_eq!(code.0, payload.ndb_code);
+        assert_eq!(message, payload.message);
     }
 }

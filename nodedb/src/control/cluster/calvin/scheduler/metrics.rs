@@ -58,6 +58,28 @@ pub struct SchedulerMetrics {
     /// flags that catch-up is relying on snapshot coverage rather than log replay
     /// and warrants operator attention.
     pub catch_up_log_compacted: AtomicU64,
+    /// Scheduler dispatches the bridge dispatcher refused at capacity. Each
+    /// refusal parks the request for re-send; none is an abort.
+    pub dispatch_deferred_count: AtomicU64,
+    /// Requests parked for re-send right now, waiting for dispatcher capacity.
+    pub dispatch_deferred_depth: AtomicU64,
+    /// Intake gate state: 1 while the scheduler takes no new sequenced input,
+    /// 0 while it does.
+    pub intake_gate_closed: AtomicU64,
+    /// In-flight backlog: pending, blocked, and dependent-barrier txns.
+    pub intake_backlog: AtomicU64,
+    /// Intake gate closures by reason. Indexes are the constants in
+    /// [`intake_closure_reason`].
+    pub intake_gate_closed_counts: [AtomicU64; 3],
+    /// Apply halt state: 1 once the scheduler halted, 0 while it applies.
+    pub apply_halted: AtomicU64,
+    /// Reason of the halt. An index into [`apply_halt_reason`], read only
+    /// while `apply_halted` is 1.
+    pub apply_halt_reason: AtomicU64,
+    /// Owed sequencer entries re-proposed because their effect was not yet
+    /// applied, by kind. Indexes are the constants in
+    /// [`sequencer_propose_kind`].
+    pub sequencer_propose_retry_counts: [AtomicU64; 4],
 }
 
 /// Reason codes for `nodedb_calvin_infra_abort_total`.
@@ -77,6 +99,48 @@ pub mod infra_abort_reason {
         "corruption_detected",
         "passive_participant_timeout",
     ];
+}
+
+/// Reason codes for `nodedb_calvin_intake_gate_closed_total`.
+pub mod intake_closure_reason {
+    pub const DEFERRED_DISPATCH: usize = 0;
+    pub const BACKLOG_FULL: usize = 1;
+    pub const APPLY_HALTED: usize = 2;
+
+    pub const LABELS: &[&str] = &["deferred_dispatch", "backlog_full", "apply_halted"];
+}
+
+/// Reason codes for `nodedb_calvin_apply_halted`.
+pub mod apply_halt_reason {
+    pub const DRAINING: usize = 0;
+    pub const DISPATCH_REFUSED: usize = 1;
+    pub const RESPONSE_DISCONNECTED: usize = 2;
+    pub const RESOLVE_FAILED: usize = 3;
+    pub const FLUSH_FAILED: usize = 4;
+    pub const LOCAL_STAGE_FAILED: usize = 5;
+    pub const IDENTITY_BIND_FAILED: usize = 6;
+    pub const WAL_APPEND_FAILED: usize = 7;
+
+    pub const LABELS: &[&str] = &[
+        "draining",
+        "dispatch_refused",
+        "response_disconnected",
+        "resolve_failed",
+        "flush_failed",
+        "local_stage_failed",
+        "identity_bind_failed",
+        "wal_append_failed",
+    ];
+}
+
+/// Kind codes for `nodedb_calvin_sequencer_propose_retry_total`.
+pub mod sequencer_propose_kind {
+    pub const VOTE: usize = 0;
+    pub const COMPLETION_ACK: usize = 1;
+    pub const OLLP_MISMATCH: usize = 2;
+    pub const ROUTING_FAILED: usize = 3;
+
+    pub const LABELS: &[&str] = &["vote", "completion_ack", "ollp_mismatch", "routing_failed"];
 }
 
 impl SchedulerMetrics {
@@ -133,6 +197,55 @@ impl SchedulerMetrics {
     /// Record that the catch-up drain hit a compacted sequencer log.
     pub fn record_catch_up_log_compacted(&self) {
         self.catch_up_log_compacted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that the dispatcher refused a scheduler dispatch at capacity.
+    pub fn record_dispatch_deferred(&self) {
+        self.dispatch_deferred_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the number of requests parked for re-send.
+    pub fn set_dispatch_deferred_depth(&self, depth: usize) {
+        self.dispatch_deferred_depth
+            .store(depth as u64, Ordering::Relaxed);
+    }
+
+    /// Record that the intake gate closed for `reason`.
+    ///
+    /// `reason` must be one of the constants in [`intake_closure_reason`].
+    pub fn record_intake_gate_closed(&self, reason: usize) {
+        if let Some(counter) = self.intake_gate_closed_counts.get(reason) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Set the intake gate state gauge.
+    pub fn set_intake_gate_closed(&self, closed: bool) {
+        self.intake_gate_closed
+            .store(u64::from(closed), Ordering::Relaxed);
+    }
+
+    /// Set the apply halt gauge for `reason`.
+    ///
+    /// `reason` must be one of the constants in [`apply_halt_reason`].
+    pub fn set_apply_halted(&self, reason: usize) {
+        self.apply_halt_reason
+            .store(reason as u64, Ordering::Relaxed);
+        self.apply_halted.store(1, Ordering::Relaxed);
+    }
+
+    /// Record that an owed sequencer entry of `kind` was re-proposed.
+    ///
+    /// `kind` must be one of the constants in [`sequencer_propose_kind`].
+    pub fn record_sequencer_propose_retry(&self, kind: usize) {
+        if let Some(counter) = self.sequencer_propose_retry_counts.get(kind) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Set the in-flight backlog gauge.
+    pub fn set_intake_backlog(&self, backlog: usize) {
+        self.intake_backlog.store(backlog as u64, Ordering::Relaxed);
     }
 
     /// Record the end-to-end executor txn duration (dispatch → response).
@@ -290,6 +403,8 @@ impl SchedulerMetrics {
             self.catch_up_log_compacted.load(Ordering::Relaxed)
         );
 
+        self.render_flow_prometheus(&mut out, &label);
+
         out
     }
 }
@@ -309,6 +424,14 @@ impl Default for SchedulerMetrics {
             verdict_stall_count: AtomicU64::new(0),
             catch_up_replayed: AtomicU64::new(0),
             catch_up_log_compacted: AtomicU64::new(0),
+            dispatch_deferred_count: AtomicU64::new(0),
+            dispatch_deferred_depth: AtomicU64::new(0),
+            intake_gate_closed: AtomicU64::new(0),
+            intake_backlog: AtomicU64::new(0),
+            intake_gate_closed_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            apply_halted: AtomicU64::new(0),
+            apply_halt_reason: AtomicU64::new(0),
+            sequencer_propose_retry_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }

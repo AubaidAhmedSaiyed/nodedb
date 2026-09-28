@@ -15,7 +15,7 @@ use nodedb_cluster::{RaftRpc, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, T
 
 use crate::Error;
 use crate::bridge::envelope::Response;
-use crate::control::server::exchange::resolve::register_peers_from_topology;
+use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::state::SharedState;
 
 use super::local::{submit_and_await_calvin, synthetic_returning_response};

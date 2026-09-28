@@ -129,7 +129,7 @@ pub fn define_quota(
                 .credentials
                 .catalog()
                 .put_scope_quota(&stored)
-                .map_err(|e| err("XX000", e.to_string()))?;
+                .map_err(|e| DdlError::from_error(&e))?;
             scope_quota_post_apply::put(&stored, state);
             Ok(())
         },
@@ -185,7 +185,7 @@ pub fn drop_quota(
                 .credentials
                 .catalog()
                 .delete_scope_quota(&scope_name)
-                .map_err(|e| err("XX000", e.to_string()))?;
+                .map_err(|e| DdlError::from_error(&e))?;
             scope_quota_post_apply::delete(&scope_name, state);
             Ok(())
         },

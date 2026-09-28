@@ -57,6 +57,7 @@ impl InvertedIndex {
         txn: &WriteTransaction,
         scope: IndexDocScope<'_>,
     ) -> crate::Result<()> {
+        self.note_doc_write(scope);
         let Some(old_len) = prior_doc_length(txn, scope)? else {
             return Ok(());
         };

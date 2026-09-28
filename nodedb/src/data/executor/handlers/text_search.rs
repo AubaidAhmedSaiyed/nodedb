@@ -96,14 +96,7 @@ impl CoreLoop {
             },
         ) {
             Ok(r) => r,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => return self.response_error(task, e),
         };
 
         // Read-your-own-writes for FTS: fold this transaction's staged

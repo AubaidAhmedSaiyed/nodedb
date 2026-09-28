@@ -4558,6 +4558,7 @@ dependencies = [
  "nodedb-query",
  "nodedb-sql",
  "nodedb-types",
+ "rust_decimal",
  "serde",
  "thiserror 2.0.20",
  "zerompk",
@@ -4648,6 +4649,7 @@ dependencies = [
 name = "nodedb-test-support"
 version = "0.5.0"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "bytes",
  "futures",

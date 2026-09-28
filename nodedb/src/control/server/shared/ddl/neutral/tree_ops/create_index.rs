@@ -10,8 +10,8 @@
 //! 1. **Atomic-ish**: the whole edge set is dispatched in a single
 //!    `EdgePutBatch` per vshard. Any `Err` from the Data Plane causes
 //!    the DDL to attempt a best-effort rollback via `EdgeDeleteBatch`
-//!    on the shards that already succeeded, then surfaces SQLSTATE
-//!    `XX000` to the client.
+//!    on the shards that already succeeded, then surfaces the dispatch
+//!    error with its own SQLSTATE to the client.
 //! 2. **Loud on partial failure**: no `tracing::warn!` + continue. The
 //!    reported `edges_created` count either matches the number of
 //!    valid parent→child relations in the collection or the DDL fails.
@@ -85,7 +85,7 @@ pub async fn create_graph_index(
     let catalog = state.credentials.catalog();
     let stored = catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)
-        .map_err(|e| ddl_err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| ddl_err("42P01", format!("collection '{collection}' not found")))?;
     if !stored.collection_type.is_document() {
         return Err(ddl_err(
@@ -121,7 +121,7 @@ pub async fn create_graph_index(
     if state
         .rls
         .combined_read_predicate_with_auth(tenant_id.as_u64(), &collection, scope.auth())
-        .map_err(|e| ddl_err("XX000", format!("rls compile: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("rls compile", &e))?
         .is_none_or(|filters| !filters.is_empty())
     {
         return Err(ddl_err(
@@ -149,7 +149,7 @@ pub async fn create_graph_index(
     });
     let scan_resp = broadcast_to_all_cores(state, tenant_id, database_id, scan_plan, TraceId::ZERO)
         .await
-        .map_err(|e| ddl_err("XX000", format!("scan failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("scan failed", &e))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
@@ -172,12 +172,9 @@ pub async fn create_graph_index(
             continue;
         };
         let Some(obj) = obj_outer.get("data").and_then(|v| v.as_object()) else {
-            return Err(ddl_err(
-                "XX000",
-                format!(
-                    "CREATE GRAPH INDEX: document scan returned a row without a `data` field: {doc}"
-                ),
-            ));
+            return Err(DdlError::internal(format!(
+                "CREATE GRAPH INDEX: document scan returned a row without a `data` field: {doc}"
+            )));
         };
 
         let doc_id = obj
@@ -210,12 +207,20 @@ pub async fn create_graph_index(
                 let shard = VShardId::from_key(parent.as_bytes());
                 let src_surrogate = state
                     .surrogate_assigner
-                    .assign(database_id, tenant_id, &collection, parent.as_bytes())
-                    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+                    .assign(
+                        nodedb_types::CollectionKey::from_bare(database_id, &collection),
+                        tenant_id,
+                        parent.as_bytes(),
+                    )
+                    .map_err(|e| DdlError::from_error(&e))?;
                 let dst_surrogate = state
                     .surrogate_assigner
-                    .assign(database_id, tenant_id, &collection, child.as_bytes())
-                    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+                    .assign(
+                        nodedb_types::CollectionKey::from_bare(database_id, &collection),
+                        tenant_id,
+                        child.as_bytes(),
+                    )
+                    .map_err(|e| DdlError::from_error(&e))?;
                 edges_by_shard.entry(shard).or_default().push(BatchEdge {
                     collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
                     src_id: parent.to_string(),
@@ -236,28 +241,21 @@ pub async fn create_graph_index(
         let plan = PhysicalPlan::Graph(GraphOp::EdgePutBatch {
             edges: edges.clone(),
         });
-        // Append locally first so the batch is durable even on a single-node
+        // Append locally first so the batch is durable on a single-node
         // deployment with no Raft proposer configured (see the module doc
-        // comment, point 4). `dispatch_sync_response` below additionally
-        // replicates via Raft under RF>1 — a second, independent durability
-        // mechanism, not a duplicate WAL record.
-        crate::control::server::wal_dispatch::wal_append_if_write(
-            &state.wal,
-            tenant_id,
-            shard,
-            DatabaseId::DEFAULT,
-            &plan,
-        )
-        .map_err(|e| ddl_err("XX000", format!("edge-insert WAL append failed: {e}")))?;
+        // comment, point 4). Under RF>1 the dispatch below proposes through
+        // Raft: the entry's apply appends its own record, and the dispatch
+        // cancels this one.
+        let minted = append_edge_batch(state, tenant_id, shard, &plan)
+            .await
+            .map_err(|e| DdlError::from_error_in_context("edge-insert WAL append failed", &e))?;
 
-        match crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
+        match crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_minted_sync_response(
             state,
-            tenant_id,
-            DatabaseId::DEFAULT,
-            shard,
+            edge_batch_owner(tenant_id, shard),
             plan,
-            TraceId::ZERO,
             crate::event::EventSource::User,
+            minted,
         )
         .await
         {
@@ -267,7 +265,8 @@ pub async fn create_graph_index(
                     state,
                     tenant_id,
                     &committed_shards,
-                    format!("edge-insert dispatch failed on shard {shard:?}: {e}"),
+                    &format!("edge-insert dispatch failed on shard {shard:?}"),
+                    &e,
                 )
                 .await;
             }
@@ -289,11 +288,49 @@ pub async fn create_graph_index(
     ))])
 }
 
+/// Append an edge batch's records under an outcome-floor window opened before
+/// the first append. The dispatch that follows closes the window.
+async fn append_edge_batch(
+    state: &SharedState,
+    tenant_id: TenantId,
+    shard: VShardId,
+    plan: &PhysicalPlan,
+) -> crate::Result<crate::control::server::dispatch_utils::MintedRecords> {
+    let owner = edge_batch_owner(tenant_id, shard);
+    let minted = crate::control::server::dispatch_utils::MintedRecords::open(&state.outcome_floor);
+    match minted.append_plan(
+        &state.wal,
+        owner,
+        plan,
+        // The same source the index write is dispatched with.
+        crate::event::EventSource::User,
+    ) {
+        Ok(_) => Ok(minted),
+        Err(e) => {
+            // Any record appended before the error never reaches a core.
+            minted.cancel(&state.wal, owner, 0).await?;
+            Err(e)
+        }
+    }
+}
+
+/// Where an edge batch's record lives.
+fn edge_batch_owner(
+    tenant_id: TenantId,
+    shard: VShardId,
+) -> crate::control::server::dispatch_utils::RecordOwner {
+    crate::control::server::dispatch_utils::RecordOwner {
+        tenant_id,
+        database_id: DatabaseId::DEFAULT,
+        vshard_id: shard,
+    }
+}
+
 /// Surface a build-time failure.
 ///
 /// Runs rollback in parallel across all committed shards. If **every**
-/// shard's `EdgeDeleteBatch` succeeds, returns a clean
-/// `XX000 CREATE GRAPH INDEX failed: <reason>; reverted N shards`.
+/// shard's `EdgeDeleteBatch` succeeds, returns `cause` with its own SQLSTATE,
+/// prefixed `CREATE GRAPH INDEX failed: <context>; reverted N shards`.
 ///
 /// If **any** shard's rollback itself fails, the CSR is now in an
 /// inconsistent state across shards — some have the partial index,
@@ -306,7 +343,8 @@ async fn surface_failure(
     state: &SharedState,
     tenant_id: TenantId,
     committed: &[(VShardId, Vec<BatchEdge>)],
-    cause: String,
+    context: &str,
+    cause: &crate::Error,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let committed_count = committed.len();
     let rollback_futures = committed.iter().map(|(shard, edges)| {
@@ -315,29 +353,21 @@ async fn surface_failure(
         });
         let shard = *shard;
         async move {
-            // Same local-WAL-then-Raft-dispatch discipline as the forward
-            // path above: append locally first so the rollback tombstones
-            // are durable on single-node, then dispatch (which additionally
-            // replicates via Raft under RF>1).
-            if let Err(e) = crate::control::server::wal_dispatch::wal_append_if_write(
-                &state.wal,
-                tenant_id,
-                shard,
-                DatabaseId::DEFAULT,
-                &plan,
-            ) {
-                return (shard, Err(e));
-            }
+            // Same discipline as the forward path above: append locally
+            // first so the rollback tombstones are durable on single-node,
+            // then dispatch, which proposes through Raft under RF>1.
+            let minted = match append_edge_batch(state, tenant_id, shard, &plan).await {
+                Ok(minted) => minted,
+                Err(e) => return (shard, Err(e)),
+            };
             (
                 shard,
-                crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
+                crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_minted_sync_response(
                     state,
-                    tenant_id,
-                    DatabaseId::DEFAULT,
-                    shard,
+                    edge_batch_owner(tenant_id, shard),
                     plan,
-                    TraceId::ZERO,
                     crate::event::EventSource::User,
+                    minted,
                 )
                 .await,
             )
@@ -351,11 +381,11 @@ async fn surface_failure(
         .collect();
 
     if failed.is_empty() {
-        Err(ddl_err(
-            "XX000",
-            format!(
-                "CREATE GRAPH INDEX failed: {cause}; reverted {committed_count} committed shards"
+        Err(DdlError::from_error_in_context(
+            &format!(
+                "CREATE GRAPH INDEX failed: {context}; reverted {committed_count} committed shards"
             ),
+            cause,
         ))
     } else {
         // Distinct SQLSTATE so clients / operators can distinguish
@@ -363,7 +393,7 @@ async fn surface_failure(
         Err(ddl_err(
             "XX001",
             format!(
-                "CREATE GRAPH INDEX failed: {cause}; rollback also failed on {}/{} shards \
+                "CREATE GRAPH INDEX failed: {context}: {cause}; rollback also failed on {}/{} shards \
                  ({:?}); GRAPH INDEX LEFT IN INCONSISTENT STATE — operator intervention required",
                 failed.len(),
                 committed_count,

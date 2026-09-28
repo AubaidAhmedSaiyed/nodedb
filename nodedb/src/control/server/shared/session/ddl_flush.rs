@@ -18,6 +18,7 @@ use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, PendingDdlObject, encode_
 use crate::control::catalog_entry::{self, CatalogEntry};
 use crate::control::metadata_proposer::MetadataRaftHandle;
 use crate::control::security::catalog::SystemCatalog;
+use crate::control::server::shared::ddl::DdlError;
 use crate::control::state::SharedState;
 
 use super::connection::SessionId;
@@ -90,40 +91,63 @@ pub(super) fn flush_local(state: &SharedState, buffered: DdlBuffer) -> Option<Ab
         Err(error) => return Some(AbortReason::DdlPropose(error)),
     };
     let catalog = shared.credentials.catalog();
+    // A statement can break a role rule for a later one in the same
+    // transaction. Refuse the batch before anything is written.
+    if let Err(error) = crate::control::catalog_entry::role_rules::check_batch(
+        buffered.iter().map(|item| &item.entry),
+        catalog,
+    ) {
+        return Some(AbortReason::DdlPropose(error));
+    }
     let total = buffered.len();
     for (position, item) in buffered.into_iter().enumerate() {
         match crate::control::catalog_entry::apply::apply_to(&item.entry, catalog) {
             // Wrote nothing (if-absent create for an existing descriptor):
             // the applier suppresses post-apply here, so this must too.
-            Ok(false) => continue,
-            Ok(true) => {}
+            Ok(crate::control::catalog_entry::apply::ApplyOutcome::Unchanged) => continue,
+            // An earlier statement of this transaction broke a role rule for
+            // this one, such as dropping a role a user created earlier in
+            // the same transaction holds. The COMMIT fails with the refusal.
+            Ok(crate::control::catalog_entry::apply::ApplyOutcome::Refused(refusal)) => {
+                return Some(AbortReason::DdlPropose(crate::Error::from(refusal)));
+            }
+            Ok(crate::control::catalog_entry::apply::ApplyOutcome::Applied) => {}
+            // The COMMIT fails with the apply error's own class. The message
+            // names the statement and its catalog entry.
             Err(error) => {
-                return Some(AbortReason::DdlPropose(crate::Error::Internal {
-                    detail: format!(
-                        "transactional DDL local apply failed on statement {} of {} \
-                         (catalog entry {}): {error}; roll back and re-run the transaction",
-                        position + 1,
-                        total,
-                        item.entry.kind()
-                    ),
-                }));
+                return Some(AbortReason::DdlPropose(local_apply_error(
+                    position + 1,
+                    total,
+                    item.entry.kind(),
+                    &error,
+                )));
             }
         }
         crate::control::catalog_entry::post_apply::apply_post_apply_side_effects_sync(
             &item.entry,
             &shared,
         );
-        // No raft index exists here; the async phase uses it purely as the
-        // purge LSN for storage reclaim, which the local DDL paths take from
-        // the WAL instead.
-        let purge_lsn = shared.wal.next_lsn().as_u64();
         crate::control::catalog_entry::post_apply::spawn_post_apply_async_side_effects(
             item.entry,
             Arc::clone(&shared),
-            purge_lsn,
         );
     }
     None
+}
+
+/// The COMMIT error for a local apply that failed on statement `statement`
+/// of `total`. It keeps `error`'s SQLSTATE, code and details.
+fn local_apply_error(
+    statement: usize,
+    total: usize,
+    entry_kind: &str,
+    error: &crate::Error,
+) -> crate::Error {
+    let context = format!(
+        "transactional DDL local apply failed on statement {statement} of {total} \
+         (catalog entry {entry_kind})"
+    );
+    crate::Error::from(DdlError::from_error_in_context(&context, error))
 }
 
 /// Fencing token, metadata log index, preparation lease, and reserved
@@ -248,6 +272,13 @@ fn propose_pending_buffered<'a>(
         })?;
     let distributed_guard =
         crate::control::metadata_proposer::acquire_ddl_prepare_lease(state, handle.as_ref())?;
+    // Checked under the preparation lease, which every DDL takes: no other
+    // role or user change commits between this check and the finalize, so
+    // the finalize never applies part of the batch.
+    crate::control::catalog_entry::role_rules::check_batch(
+        buffered.iter().map(|item| &item.entry),
+        state.credentials.catalog(),
+    )?;
 
     for item in &buffered {
         if let Some((descriptor_id, prior_version)) =
@@ -343,13 +374,18 @@ pub(super) fn finalize_pending(
         log_index = handle.log_index(),
         "finalizing pending DDL"
     );
-    propose_and_await(
+    let bears_authorization =
+        super::ddl_authorization::objects_bear_authorization(handle.objects())?;
+    let log_index = propose_and_await(
         state,
         raft_handle.as_ref(),
         &MetadataEntry::DdlPendingFinalize {
             token: handle.token(),
         },
     )?;
+    if bears_authorization {
+        super::ddl_authorization::barrier_at(state, log_index)?;
+    }
     Ok(())
 }
 
@@ -379,7 +415,12 @@ pub(super) fn compensate_finalized(
         };
         entries.push(MetadataEntry::CatalogDdl { payload });
     }
-    propose_and_await(state, handle.as_ref(), &MetadataEntry::Batch { entries })?;
+    let log_index = propose_and_await(state, handle.as_ref(), &MetadataEntry::Batch { entries })?;
+    // The compensation restores prior authorization state, which binds every
+    // node like any other authorization change.
+    if super::ddl_authorization::objects_bear_authorization(objects)? {
+        super::ddl_authorization::barrier_at(state, log_index)?;
+    }
     Ok(())
 }
 
@@ -464,7 +505,8 @@ mod tests {
     use super::super::{conn_scope, ddl_buffer};
     use super::{
         DdlCommitPlan, MetadataEntry, PendingDdlHandle, PendingDdlObject, SharedState,
-        begin_commit, compensate_finalized, finalize_pending, flush_local, reverse_create,
+        begin_commit, compensate_finalized, finalize_pending, flush_local, local_apply_error,
+        reverse_create,
     };
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -822,5 +864,69 @@ mod tests {
 
         compensate_finalized(&state, &objects)
             .expect("compensate_finalized must propose a reversal batch for the finalized create");
+    }
+
+    /// A local apply that fails at COMMIT reports the apply error's own
+    /// SQLSTATE and code on pgwire and native. Only the message gains the
+    /// statement context.
+    #[test]
+    fn a_local_apply_error_keeps_its_class() {
+        use nodedb_types::error::{ErrorCode, sqlstate};
+
+        use crate::control::server::native::dispatch::native_error_fields;
+        use crate::control::server::pgwire::types::error_to_sqlstate;
+
+        let cases = [
+            (
+                crate::Error::RoleInUse {
+                    role: "analyst".into(),
+                    dependents: crate::control::security::role_assignment::RoleDependents::Users(
+                        vec!["bob".into()],
+                    ),
+                },
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                ErrorCode::DEPENDENT_OBJECTS_EXIST,
+            ),
+            (
+                crate::Error::RejectedAuthz {
+                    tenant_id: crate::types::TenantId::new(7),
+                    resource: "role 'analyst'".into(),
+                },
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                ErrorCode::AUTHORIZATION_DENIED,
+            ),
+            (
+                crate::Error::CollectionNotFound {
+                    tenant_id: crate::types::TenantId::new(7),
+                    collection: "orders".into(),
+                },
+                sqlstate::UNDEFINED_TABLE,
+                ErrorCode::COLLECTION_NOT_FOUND,
+            ),
+            (
+                crate::Error::CollectionPurgeRowMissing {
+                    database_id: 0,
+                    tenant_id: 7,
+                    name: "orders".into(),
+                },
+                sqlstate::INTERNAL_ERROR,
+                ErrorCode::INTERNAL,
+            ),
+        ];
+        for (source, state, code) in cases {
+            let error = local_apply_error(2, 3, "PutCollection", &source);
+            let (_, pg_state, message) = error_to_sqlstate(&error);
+            assert_eq!(pg_state, state, "{source:?} on pgwire");
+            assert!(
+                message.starts_with(
+                    "transactional DDL local apply failed on statement 2 of 3 \
+                     (catalog entry PutCollection): "
+                ),
+                "{message}"
+            );
+            let native = native_error_fields(&error);
+            assert_eq!(native.sqlstate, state, "{source:?} native SQLSTATE");
+            assert_eq!(native.code, code, "{source:?} native code");
+        }
     }
 }

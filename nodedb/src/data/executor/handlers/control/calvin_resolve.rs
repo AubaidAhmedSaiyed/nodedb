@@ -52,31 +52,34 @@ impl CoreLoop {
         // `commit_pending` so the `&mut self` resolve call — which assigns
         // bitemporal stamps into the overlay — does not overlap the immutable
         // borrow of the pending buffer.
-        let (tid, plans, epoch_system_ms) =
-            match self.commit_pending.get(&(epoch, position, vshard_id)) {
-                Some(pending) => (
-                    pending.tenant_id.as_u64(),
-                    pending.plans.clone(),
-                    pending.epoch_system_ms,
-                ),
-                None => {
-                    return self.response_error(
-                        task,
-                        crate::Error::Internal {
-                            detail: format!(
-                                "calvin resolve: no staged commit for epoch={epoch} \
+        let (tid, plans, epoch_system_ms) = match self
+            .calvin
+            .commit_pending
+            .get(&(epoch, position, vshard_id))
+        {
+            Some(pending) => (
+                pending.tenant_id.as_u64(),
+                pending.plans.clone(),
+                pending.epoch_system_ms,
+            ),
+            None => {
+                return self.response_error(
+                    task,
+                    crate::Error::Internal {
+                        detail: format!(
+                            "calvin resolve: no staged commit for epoch={epoch} \
                                  position={position} vshard={vshard_id} (must be staged via \
                                  CalvinExecuteStatic before CalvinResolve)"
-                            ),
-                        },
-                    );
-                }
-            };
+                        ),
+                    },
+                );
+            }
+        };
 
         // Restore the epoch's deterministic time anchor around resolve so the
         // bitemporal stamps `execute_resolve_txn` assigns are identical across
-        // replicas (mirrors `execute_calvin_flush`). `CalvinFlush` reads these
-        // stamps back from the overlay, so redo and base install agree.
+        // replicas. The redo record carries them, so every install writes the
+        // same version key.
         let prev_epoch_ms = self.epoch_system_ms;
         self.epoch_system_ms = Some(epoch_system_ms);
         let resp = self.execute_resolve_txn(task, tid, synthetic_txn_id, &plans);
@@ -437,6 +440,82 @@ mod tests {
             resp.status,
             Status::Error,
             "resolving an (epoch, position) that was never staged must error"
+        );
+    }
+
+    #[test]
+    fn a_calvin_columnar_upsert_resolves_to_the_merged_row_it_installs() {
+        use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
+        use nodedb_types::columnar::{
+            COLUMNAR_IMAGE_KIND, ColumnDef, ColumnType, ColumnarImageWalRecord, ColumnarSchema,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let task = make_task();
+        let schema = ColumnarSchema {
+            columns: vec![
+                ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+                ColumnDef::required("v", ColumnType::Int64),
+            ],
+            version: 1,
+        };
+        let mut engine = nodedb_columnar::MutationEngine::new("m".to_string(), schema);
+        engine
+            .insert_with_surrogate(&[Value::Integer(1), Value::Integer(10)], Surrogate::new(5))
+            .expect("seed base row");
+        core.columnar_engines.insert(
+            (DatabaseId::DEFAULT, TenantId::new(1), "m".to_string()),
+            engine,
+        );
+
+        let mut submitted = std::collections::HashMap::new();
+        submitted.insert("id".to_string(), Value::Integer(1));
+        submitted.insert("v".to_string(), Value::Integer(20));
+        let upsert = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "m"),
+            payload: nodedb_types::value_to_msgpack(&Value::Array(vec![Value::Object(submitted)]))
+                .expect("encode row"),
+            format: "msgpack".to_string(),
+            intent: ColumnarInsertIntent::Put,
+            on_conflict_updates: vec![(
+                "v".to_string(),
+                UpdateValue::Literal(
+                    nodedb_types::value_to_msgpack(&Value::Integer(99)).expect("literal"),
+                ),
+            )],
+            surrogates: vec![Surrogate::new(5)],
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        stage(&mut core, &task, 6, 0, &[upsert]);
+
+        let resp = core.execute_calvin_resolve(&task, 6, 0);
+        assert_eq!(resp.status, Status::Ok, "resolve must succeed: {resp:?}");
+        let record = RedoRecord::from_bytes(resp.payload.as_bytes()).expect("decode redo");
+        let image = record
+            .ops
+            .iter()
+            .find_map(|op| {
+                zerompk::from_msgpack::<ColumnarImageWalRecord>(&op.payload)
+                    .ok()
+                    .filter(|image| image.kind == COLUMNAR_IMAGE_KIND)
+            })
+            .expect("the upsert resolves to a columnar image record");
+        assert_eq!(image.rows.len(), 1);
+        let row =
+            nodedb_types::value_from_msgpack(&image.rows[0].image_msgpack).expect("decode image");
+        let Value::Object(row) = row else {
+            panic!("image is a column-name object: {row:?}");
+        };
+        assert_eq!(
+            row.get("v"),
+            Some(&Value::Integer(99)),
+            "the redo carries the merged row, not the submitted one"
         );
     }
 }

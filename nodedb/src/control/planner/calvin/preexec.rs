@@ -21,7 +21,7 @@ use nodedb_types::TenantId;
 
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 
 /// One implicit graph edge surfaced from the pre-execution reconnaissance scan.
@@ -84,7 +84,7 @@ pub async fn run_preexec_scan(
     collection: &str,
     filter_bytes: Vec<u8>,
 ) -> crate::Result<PreexecScan> {
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    let vshard_id = nodedb_types::CollectionKey::from_bare(database_id, collection).vshard();
 
     let scan_plan = PhysicalPlan::Document(DocumentOp::Scan {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),
@@ -128,13 +128,8 @@ pub async fn run_preexec_scan(
             database_id,
             txn_id: None,
         };
-        let payloads = gateway
-            .execute_internal(&gw_ctx, scan_plan)
-            .await
-            .map_err(|e| crate::Error::Storage {
-                engine: "preexec-scan".into(),
-                detail: format!("pre-execution scan failed: {e}"),
-            })?;
+        // A shard verdict keeps its own typed error.
+        let payloads = gateway.execute_internal(&gw_ctx, scan_plan).await?;
         // A single-collection scan routes to one vshard → one payload. An
         // absent payload means zero matching rows.
         let payload = payloads.into_iter().next().unwrap_or_default();
@@ -151,16 +146,17 @@ pub async fn run_preexec_scan(
     )
     .await?;
 
-    // A shard verdict keeps its own typed error, so a scan the statement's
-    // deadline cut short reports the deadline rather than a storage fault.
-    crate::control::server::dispatch_utils::reject_data_plane_error(&response)?;
-    if response.status != crate::bridge::envelope::Status::Ok {
-        return Err(crate::Error::Storage {
-            engine: "preexec-scan".into(),
-            detail: format!("pre-execution scan failed: {:?}", response.error_code),
-        });
-    }
+    scan_from_response(&response)
+}
 
+/// Decode a local scan response.
+///
+/// A shard verdict keeps its own typed error, so a scan the statement's
+/// deadline cut short reports the deadline rather than a storage fault.
+/// `reject_data_plane_error` passes only a `NotFound` refusal. Its payload is
+/// empty, so it decodes as no matches, the answer the gateway path gives.
+fn scan_from_response(response: &crate::bridge::envelope::Response) -> crate::Result<PreexecScan> {
+    crate::control::local_dispatch::reject_data_plane_error(response)?;
     Ok(decode_scan(&response.payload))
 }
 
@@ -276,6 +272,46 @@ fn decode_scan_json(json_str: &str) -> PreexecScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
+    use crate::types::{Lsn, RequestId};
+
+    fn refusal(code: ErrorCode) -> Response {
+        Response {
+            request_id: RequestId::new(1),
+            status: Status::Error,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: Lsn::ZERO,
+            error_code: Some(Box::new(code)),
+            read_set_valid: None,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    /// A refused scan keeps its code, never a storage error.
+    #[test]
+    fn a_refused_scan_keeps_its_code() {
+        let code = ErrorCode::Unsupported {
+            detail: "not on this engine".into(),
+        };
+        match scan_from_response(&refusal(code.clone())) {
+            Err(crate::Error::DataPlane(kept)) => assert_eq!(kept, code),
+            Err(other) => panic!("expected the typed refusal, got {other:?}"),
+            Ok(_) => panic!("a refused scan must fail"),
+        }
+    }
+
+    /// A `NotFound` refusal means the shard holds no slice of the collection,
+    /// so the scan matched nothing.
+    #[test]
+    fn a_not_found_scan_matches_nothing() {
+        let scan = scan_from_response(&refusal(ErrorCode::NotFound))
+            .expect("a NotFound refusal reads as an empty scan");
+        assert!(scan.surrogates.is_empty());
+        assert!(scan.edges.is_empty());
+    }
 
     #[test]
     fn decode_empty_payload_returns_empty() {

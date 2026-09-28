@@ -270,12 +270,8 @@ impl CoreLoop {
                 ) {
                     Ok(true) => {}
                     Ok(false) => continue,
-                    // `EvalError` has exactly one variant and no direct
-                    // `Into<ErrorCode>` — mirrors `stage_columnar_dml.rs`'s
-                    // identical call site, which hardcodes the same typed
-                    // code rather than collapsing to `Internal`/`XX000`.
-                    Err(_e) => {
-                        return self.response_error(task, ErrorCode::DivisionByZero);
+                    Err(e) => {
+                        return self.response_error(task, ErrorCode::from(e));
                     }
                 }
                 let obj = match row_to_projected_value(

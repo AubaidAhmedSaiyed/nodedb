@@ -3,6 +3,7 @@
 //! Rollback driver for the undo log.
 
 use super::UndoEntry;
+use super::graph_node::NodeLabelsUndo;
 use crate::data::executor::core_loop::CoreLoop;
 
 impl CoreLoop {
@@ -13,32 +14,13 @@ impl CoreLoop {
     /// Returns `Err((entry_index, detail))` on the first undo failure —
     /// the entry index is the original forward-order position of the failed
     /// entry (before reversal). On failure the caller **must** return a
-    /// `RollbackFailed` error to the client; the shard state is unknown
-    /// and requires a restart to restore consistency via WAL replay.
+    /// `RollbackFailed` error. The core's state is then unknown: the core
+    /// fail-stops when that response leaves it, and a restart rebuilds the
+    /// state through WAL replay.
     pub(in crate::data::executor::handlers) fn rollback_undo_log(
         &mut self,
         did: u64,
         tid: u64,
-        undo_log: Vec<UndoEntry>,
-    ) -> Result<(), (usize, String)> {
-        self.rollback_undo_log_inner(did, tid, None, undo_log)
-    }
-
-    pub(in crate::data::executor::handlers) fn rollback_undo_log_at(
-        &mut self,
-        did: u64,
-        tid: u64,
-        vshard_id: crate::types::VShardId,
-        undo_log: Vec<UndoEntry>,
-    ) -> Result<(), (usize, String)> {
-        self.rollback_undo_log_inner(did, tid, Some(vshard_id), undo_log)
-    }
-
-    fn rollback_undo_log_inner(
-        &mut self,
-        did: u64,
-        tid: u64,
-        vshard_id: Option<crate::types::VShardId>,
         undo_log: Vec<UndoEntry>,
     ) -> Result<(), (usize, String)> {
         let total = undo_log.len();
@@ -47,7 +29,7 @@ impl CoreLoop {
             // diagnostics (makes it easier to correlate with the sub-plan that
             // produced this undo entry).
             let original_idx = total.saturating_sub(1 + rev_idx);
-            self.apply_undo_entry(did, tid, vshard_id, original_idx, entry)?;
+            self.apply_undo_entry(did, tid, original_idx, entry)?;
         }
         Ok(())
     }
@@ -59,7 +41,6 @@ impl CoreLoop {
         &mut self,
         did: u64,
         tid: u64,
-        vshard_id: Option<crate::types::VShardId>,
         entry_index: usize,
         entry: UndoEntry,
     ) -> Result<(), (usize, String)> {
@@ -73,22 +54,20 @@ impl CoreLoop {
             UndoEntry::SpatialInsert { .. } | UndoEntry::SpatialDelete { .. } => {
                 self.apply_undo_spatial(entry_index, entry)
             }
-            UndoEntry::PutEdge { ref src_id, .. } | UndoEntry::DeleteEdge { ref src_id, .. } => {
-                let account_stats = vshard_id.is_none_or(|vshard_id| {
-                    vshard_id == crate::types::VShardId::from_key(src_id.as_bytes())
-                });
-                self.apply_undo_edge_with_stats(did, tid, entry_index, entry, account_stats)
-            }
+            UndoEntry::EdgeWrite(undo) => self.apply_undo_edge_write(entry_index, *undo),
             UndoEntry::KvPut { .. }
             | UndoEntry::KvDelete { .. }
-            | UndoEntry::KvBatchPut { .. }
-            | UndoEntry::KvTransfer { .. }
-            | UndoEntry::KvTransferItem { .. }
             | UndoEntry::KvTtl { .. }
-            | UndoEntry::SortedIndexDdl { .. } => self.apply_undo_kv(did, tid, entry_index, entry),
+            | UndoEntry::KvTruncate { .. } => self.apply_undo_kv(did, tid, entry_index, entry),
             UndoEntry::ColumnarInsert { .. }
             | UndoEntry::ColumnarUpdate { .. }
             | UndoEntry::ColumnarDelete { .. } => self.apply_undo_columnar(entry_index, entry),
+            UndoEntry::ColumnarEngineCreated { collection_key } => {
+                self.columnar_engines.remove(&collection_key);
+                self.columnar_flushed_segments.remove(&collection_key);
+                self.columnar_flushed_surrogates.remove(&collection_key);
+                Ok(())
+            }
             UndoEntry::TimeseriesIngest(_) => self.apply_undo_timeseries(entry_index, entry),
             UndoEntry::ColumnarTruncate(undo) => {
                 self.apply_undo_columnar_truncate(entry_index, undo)
@@ -98,27 +77,85 @@ impl CoreLoop {
             }
             UndoEntry::StatsRestore { .. } => self.apply_undo_stats(entry_index, entry),
             UndoEntry::MarkNodeDeleted { .. } => self.apply_undo_mark_node(entry_index, entry),
+            UndoEntry::SpatialRow(undo) => self.apply_undo_spatial_row(entry_index, *undo),
+            UndoEntry::VectorWrite(undo) => self.apply_undo_vector_write(entry_index, *undo),
+            UndoEntry::CrdtCollection(undo) => self.apply_undo_crdt_collection(entry_index, *undo),
+            UndoEntry::ArrayTiles { array_id, snapshot } => self
+                .array_engine
+                .restore_tiles(&array_id, snapshot)
+                .map_err(|e| {
+                    (
+                        entry_index,
+                        format!(
+                            "restoring the memtable tiles of array '{}': {e}",
+                            array_id.name
+                        ),
+                    )
+                }),
+            UndoEntry::SparseDoc {
+                key,
+                doc_id,
+                prior,
+                next_id,
+            } => {
+                match next_id {
+                    Some(next_id) => {
+                        if let Some(index) = self.sparse_vector_indexes.get_mut(&key) {
+                            index.roll_back_doc(&doc_id, prior.as_ref(), next_id);
+                        }
+                    }
+                    None => {
+                        self.sparse_vector_indexes.remove(&key);
+                    }
+                }
+                Ok(())
+            }
+            UndoEntry::VectorTruncate(undo) => self.apply_undo_vector_truncate(entry_index, *undo),
+            UndoEntry::FtsDocument(undo) => self.apply_undo_fts_doc(entry_index, *undo),
+            UndoEntry::SyncHwm {
+                producer_id,
+                stream_id,
+                prior,
+            } => {
+                self.apply_undo_sync_hwm(producer_id, stream_id, prior);
+                Ok(())
+            }
+            UndoEntry::NodeLabels {
+                database_id,
+                tid: label_tid,
+                node_id,
+                prior,
+                interned_labels,
+                created_node,
+            } => self.apply_undo_node_labels(
+                entry_index,
+                NodeLabelsUndo {
+                    database_id,
+                    tid: label_tid,
+                    node_id,
+                    prior,
+                    interned_labels,
+                    created_node,
+                },
+            ),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::*;
-    use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
     use crate::data::executor::core_loop::tests::make_core_with_dir;
     use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
     use crate::data::executor::handlers::point::apply_put::PointPutParams;
-    use crate::data::executor::handlers::transaction::sub_plan_doc::{TxPointDelete, TxPointPut};
-    use crate::data::executor::task::ExecutionTask;
+    use crate::data::executor::handlers::transaction::redo_apply::test_commit::{
+        doc_delete_sub_record, doc_put_sub_record,
+    };
     use crate::engine::document::store::CollectionConfig;
     use crate::engine::graph::csr::Direction;
     use crate::engine::graph::edge_store::EdgeRef;
     use crate::engine::sparse::btree_versioned::{VersionedIndexEntry, VersionedPut};
-    use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
-    use nodedb_physical::physical_plan::DocumentOp;
+    use crate::types::TenantId;
     use nodedb_types::Surrogate;
 
     const DB: u64 = 0;
@@ -165,8 +202,8 @@ mod tests {
 
     /// Scenario 4 (unit level): a rolled-back transaction that does a
     /// bitemporal PUT followed by a bitemporal DELETE (tombstone) must, via
-    /// `rollback_undo_log` — the same reverse-order driver `execute_transaction_batch`
-    /// uses on abort — restore `core.sparse.versioned_get_current` to its
+    /// `rollback_undo_log` — the same reverse-order driver a failed redo
+    /// install runs — restore `core.sparse.versioned_get_current` to its
     /// pre-transaction state (nothing) with the version rows and index entries
     /// physically gone, not merely hidden.
     #[test]
@@ -213,7 +250,6 @@ mod tests {
             UndoEntry::PutDocument {
                 collection: "c".into(),
                 document_id: d1,
-                identity: d1.to_identity(),
                 old_value: None,
                 bitemporal_sys_from_ms: Some(1_000),
                 bitemporal_index_tuples: vec![("status".into(), "active".into())],
@@ -224,7 +260,6 @@ mod tests {
             UndoEntry::DeleteDocument {
                 collection: "c".into(),
                 document_id: d1,
-                identity: d1.to_identity(),
                 old_value: b"v1".to_vec(),
                 bitemporal_sys_from_ms: Some(2_000),
                 bitemporal_index_tuples: vec![("status".into(), "active".into())],
@@ -233,8 +268,8 @@ mod tests {
             },
         ];
 
-        // Abort: roll back in reverse order, exactly as `execute_transaction_batch`
-        // does when a sub-plan fails.
+        // Abort: roll back in reverse order, exactly as a redo install does
+        // when a sub-record fails.
         core.rollback_undo_log(DB, TID, undo_log)
             .expect("rollback must succeed");
 
@@ -387,7 +422,7 @@ mod tests {
     fn vector_searchable(core: &Core) -> bool {
         core.vector_collections
             .get(&vector_key())
-            .map(|coll| !coll.search(&[1.0, 2.0, 3.0], 1, 16).is_empty())
+            .map(|coll| !coll.search(&[1.0, 2.0, 3.0], 1, 16).unwrap().is_empty())
             .unwrap_or(false)
     }
 
@@ -455,42 +490,6 @@ mod tests {
         txn.commit().unwrap();
     }
 
-    /// A throwaway `ExecutionTask` (DEFAULT database id, inert `PointGet` plan) —
-    /// the only fields the tx doc helpers read are `database_id` and `request_id`.
-    fn dummy_task() -> ExecutionTask {
-        ExecutionTask::new(Request {
-            request_id: RequestId::new(1),
-            tenant_id: TenantId::new(TID),
-            database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::new(0),
-            plan: PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLL),
-                document_id: PK.into(),
-                surrogate: Surrogate::ZERO,
-                pk_bytes: Vec::new(),
-                rls_filters: Vec::new(),
-                system_time: nodedb_types::SystemTimeScope::Current,
-                valid_at_ms: None,
-            }),
-            // no-determinism: test-only deadline is not written to Calvin state.
-            deadline: Instant::now() + Duration::from_secs(30),
-            priority: Priority::Normal,
-            trace_id: TraceId::ZERO,
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-            txn_id: None,
-            wal_lsn: None,
-            resolved_now_ms: None,
-            admission: crate::bridge::envelope::Admission::Exempt(
-                crate::bridge::envelope::ExemptReason::Read,
-            ),
-        })
-    }
-
     fn seed_edge(core: &mut Core) {
         let tenant = nodedb_types::TenantId::new(TID);
         let ord = core.hlc.next_ordinal();
@@ -527,25 +526,7 @@ mod tests {
         let dir_b = tempfile::tempdir().unwrap();
         let (mut b, _tb, _rb) = make_core_with_dir(dir_b.path());
         register(&mut b);
-        let task = dummy_task();
-        let mut undo_log = Vec::new();
-        let value = doc_bytes();
-        b.tx_point_put(
-            TxPointPut {
-                task: &task,
-                tid: TID,
-                collection: COLL,
-                document_id: PK,
-                surrogate: Surrogate::new(1),
-                value: &value,
-                user_roles: &[],
-                insert_if_absent: None,
-                resolved_sum_targets: &[],
-                deferred_sum_targets: &[],
-            },
-            &mut undo_log,
-        )
-        .unwrap();
+        b.install_with_undo_for_test(TID, 20, vec![doc_put_sub_record(COLL, PK, &doc_bytes(), 1)]);
 
         // Identical index state across the autocommit and committed-tx paths.
         assert_eq!(secondary_index_docs(&a), secondary_index_docs(&b));
@@ -573,25 +554,11 @@ mod tests {
         assert!(!vector_searchable(&core));
         assert!(!fts_searchable(&core));
 
-        let task = dummy_task();
-        let mut undo_log = Vec::new();
-        let value = doc_bytes();
-        core.tx_point_put(
-            TxPointPut {
-                task: &task,
-                tid: TID,
-                collection: COLL,
-                document_id: PK,
-                surrogate: Surrogate::new(1),
-                value: &value,
-                user_roles: &[],
-                insert_if_absent: None,
-                resolved_sum_targets: &[],
-                deferred_sum_targets: &[],
-            },
-            &mut undo_log,
-        )
-        .unwrap();
+        let undo_log = core.install_with_undo_for_test(
+            TID,
+            20,
+            vec![doc_put_sub_record(COLL, PK, &doc_bytes(), 1)],
+        );
         // Mid-tx: side-effects landed.
         assert_eq!(secondary_index_docs(&core), vec![row_key()]);
         assert!(spatial_entry_present(&core));
@@ -641,21 +608,7 @@ mod tests {
         register(&mut b);
         autocommit_put(&mut b);
         seed_edge(&mut b);
-        let task = dummy_task();
-        let mut undo_log = Vec::new();
-        b.tx_point_delete(
-            TxPointDelete {
-                task: &task,
-                tid: TID,
-                collection: COLL,
-                document_id: PK,
-                surrogate: Surrogate::new(1),
-                user_roles: &[],
-                resolved_sum_targets: &[],
-            },
-            &mut undo_log,
-        )
-        .unwrap();
+        b.install_with_undo_for_test(TID, 20, vec![doc_delete_sub_record(COLL, PK, 1)]);
 
         // Both paths wiped every index identically.
         assert_eq!(secondary_index_docs(&a), secondary_index_docs(&b));
@@ -694,21 +647,8 @@ mod tests {
         assert!(edge_present(&mut core));
         assert!(!core.is_node_deleted(DB, TID, PK));
 
-        let task = dummy_task();
-        let mut undo_log = Vec::new();
-        core.tx_point_delete(
-            TxPointDelete {
-                task: &task,
-                tid: TID,
-                collection: COLL,
-                document_id: PK,
-                surrogate: Surrogate::new(1),
-                user_roles: &[],
-                resolved_sum_targets: &[],
-            },
-            &mut undo_log,
-        )
-        .unwrap();
+        let undo_log =
+            core.install_with_undo_for_test(TID, 20, vec![doc_delete_sub_record(COLL, PK, 1)]);
         // Mid-tx: the delete cascaded.
         assert!(!spatial_entry_present(&core));
         assert!(!vector_searchable(&core));

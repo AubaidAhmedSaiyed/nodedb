@@ -27,8 +27,8 @@ impl CoreLoop {
         interval: std::time::Duration,
         tombstone_threshold: f64,
     ) {
-        self.compaction_interval = interval;
-        self.compaction_tombstone_threshold = tombstone_threshold;
+        self.maintenance.compaction_interval = interval;
+        self.maintenance.compaction_tombstone_threshold = tombstone_threshold;
     }
 
     /// Set shared system metrics reference (called after open, before event loop).
@@ -55,7 +55,7 @@ impl CoreLoop {
         &mut self,
         tracker: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
     ) {
-        self.maintenance_budget = Some(tracker);
+        self.maintenance.maintenance_budget = Some(tracker);
     }
 
     /// Set checkpoint coordinator config (called after open, before event loop).
@@ -69,7 +69,15 @@ impl CoreLoop {
         &mut self,
         config: crate::storage::compaction::CompactionConfig,
     ) {
-        self.segment_compaction_config = config;
+        self.maintenance.segment_compaction_config = config;
+    }
+
+    /// Set the number of Data Plane cores on this node. The committed-redo
+    /// apply routes its records through the replay arms, which pick a record's
+    /// core as `vshard_id % num_cores`. Called after open, before the event
+    /// loop starts.
+    pub fn set_num_cores(&mut self, num_cores: usize) {
+        self.redo_apply.num_cores = num_cores;
     }
 
     /// Set query execution tuning parameters (called after open, before event loop).
@@ -99,6 +107,12 @@ impl CoreLoop {
     /// captures these limits when it is CREATED and keeps them for its whole
     /// life, so a memtable built ahead of this call would silently keep the
     /// defaults.
+    /// Apply vector engine tuning. Must land before the checkpoint restore:
+    /// restored collections take its seal threshold.
+    pub fn set_vector_tuning(&mut self, tuning: nodedb_types::config::tuning::VectorTuning) {
+        self.vector_tuning = tuning;
+    }
+
     pub fn set_timeseries_tuning(
         &mut self,
         tuning: nodedb_types::config::tuning::TimeseriesToning,
@@ -237,26 +251,18 @@ impl CoreLoop {
             .collect();
         let swept_nodes = work.len();
         for (db, tid, node) in &work {
-            let edges = match self.csr.partition_mut(*db, *tid) {
-                Some(partition) => partition.remove_node_edges(node),
-                None => 0,
-            };
-            if edges > 0 {
-                let ord = self.hlc.next_ordinal();
-                if let Err(e) = self
-                    .edge_store
-                    .delete_edges_for_node(db.as_u64(), *tid, node, ord)
-                {
-                    tracing::warn!(
-                        core = self.core_id,
-                        db = db.as_u64(),
-                        tid = tid.as_u64(),
-                        node = %node,
-                        error = %e,
-                        "sweep: failed to delete edges from store"
-                    );
-                }
-                removed += edges;
+            // On an error neither store changed, so the edges stay in both
+            // and the next sweep retries them.
+            match self.cascade_node_edges(db.as_u64(), tid.as_u64(), node) {
+                Ok(edges) => removed += edges.len(),
+                Err(e) => tracing::warn!(
+                    core = self.core_id,
+                    db = db.as_u64(),
+                    tid = tid.as_u64(),
+                    node = %node,
+                    error = %e,
+                    "sweep: failed to delete edges from store"
+                ),
             }
         }
         if removed > 0 {

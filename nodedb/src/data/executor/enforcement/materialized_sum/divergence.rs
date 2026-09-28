@@ -78,7 +78,7 @@ impl CoreLoop {
         check: &SumTargetCheck<'_>,
         rows: &[serde_json::Value],
     ) -> bool {
-        if !self.ollp_is_group_leader {
+        if !self.calvin.ollp_is_group_leader {
             return false;
         }
         let key = (
@@ -87,6 +87,15 @@ impl CoreLoop {
             check.collection.to_string(),
         );
         let Some(config) = self.doc_configs.get(&key) else {
+            return false;
+        };
+        // A name that will not de-qualify fails the statement in the write
+        // path with the same typed error. That is not a prediction drift, and
+        // reporting it as one would retry the same failing statement forever.
+        let Ok(source) = nodedb_types::CollectionKey::from_qualified_str(
+            DatabaseId::new(check.database_id),
+            check.collection,
+        ) else {
             return false;
         };
         for binding in &config.enforcement.materialized_sum_sources {
@@ -101,11 +110,7 @@ impl CoreLoop {
             // instead: the images the shipped deltas were folded from are
             // stamped as a read, and this core votes ABORT before any mutation
             // if they have moved.
-            if !crate::query::sum_target_is_co_resident(
-                DatabaseId::new(check.database_id),
-                check.collection,
-                &binding.target_collection,
-            ) {
+            if !crate::query::sum_target_is_co_resident(source, &binding.target_collection) {
                 continue;
             }
             // An assignment that will not evaluate fails the statement in the
@@ -147,7 +152,7 @@ impl CoreLoop {
         check: &SumTargetCheck<'_>,
         doc_ids: &[nodedb_types::StorageKey],
     ) -> bool {
-        if !self.ollp_is_group_leader || !self.declares_materialized_sums(check) {
+        if !self.calvin.ollp_is_group_leader || !self.declares_materialized_sums(check) {
             return false;
         }
         let mut rows: Vec<serde_json::Value> = Vec::with_capacity(doc_ids.len());

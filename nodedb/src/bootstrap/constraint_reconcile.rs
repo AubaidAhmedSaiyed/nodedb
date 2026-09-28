@@ -153,7 +153,9 @@ pub async fn reconcile_once(
             continue;
         }
 
-        let vshard_id = nodedb_cluster::routing::vshard_for_collection(database_id, &stored.name);
+        let vshard_id = nodedb_cluster::routing::vshard_for_collection(
+            nodedb_types::CollectionKey::from_bare(database_id, &stored.name),
+        );
         let entry = ReplicatedEntry::new(
             stored.tenant_id,
             database_id.as_u64(),

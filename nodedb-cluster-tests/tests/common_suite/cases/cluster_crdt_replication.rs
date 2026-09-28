@@ -133,7 +133,9 @@ async fn crdt_apply_replicates_and_survives_leader_loss() {
 
     // Resolve the collection's data group and its leader from node 0's shared
     // routing view (same idiom as multi_replica_data_groups).
-    let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    let vshard = nodedb_cluster::routing::vshard_for_collection(
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLL),
+    );
     let (group_id, group_leader) = {
         let routing = cluster.nodes[0]
             .shared

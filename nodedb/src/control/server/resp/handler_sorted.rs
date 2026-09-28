@@ -65,9 +65,8 @@ pub(super) async fn handle_zadd(
         .unwrap_or_default();
 
         let surrogate = match state.surrogate_assigner.assign(
-            crate::types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(crate::types::DatabaseId::DEFAULT, &index_name),
             session.tenant_id,
-            &index_name,
             &member,
         ) {
             Ok(s) => s,
@@ -81,6 +80,7 @@ pub(super) async fn handle_zadd(
             surrogate,
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
 
         match dispatch_kv_write(state, session, plan).await {
@@ -116,6 +116,7 @@ pub(super) async fn handle_zrem(
         // RESP has no RETURNING clause.
         returning: None,
         rls_filters: Vec::new(),
+        provenance: None,
     });
 
     match dispatch_kv_write(state, session, plan).await {

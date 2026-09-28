@@ -36,7 +36,9 @@ impl TestClusterNode {
     /// error or non-Ok response.
     pub async fn create_tenant_snapshot(&self, tenant: TenantId) -> Vec<u8> {
         let request_id = RequestId::new(SNAPSHOT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
-        let vshard_id = VShardId::new(vshard_for_collection(DatabaseId::DEFAULT, "__system"));
+        let vshard_id = VShardId::new(vshard_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "__system"),
+        ));
         let request = Request {
             request_id,
             tenant_id: tenant,
@@ -44,6 +46,7 @@ impl TestClusterNode {
             vshard_id,
             plan: PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
                 tenant_id: tenant.as_u64(),
+                cut_watermark: None,
             }),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             priority: Priority::Normal,
@@ -97,7 +100,9 @@ impl TestClusterNode {
     /// `Ok`.
     pub async fn restore_tenant_snapshot(&self, snapshot_bytes: Vec<u8>) -> bool {
         let request_id = RequestId::new(SNAPSHOT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
-        let vshard_id = VShardId::new(vshard_for_collection(DatabaseId::DEFAULT, "__system"));
+        let vshard_id = VShardId::new(vshard_for_collection(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "__system"),
+        ));
         let request = Request {
             request_id,
             tenant_id: TenantId::new(0),

@@ -18,15 +18,50 @@ use super::types::SqlExpr;
 ///
 /// Mirrors the [`WindowError`](crate::window::WindowError) idiom: a small,
 /// `thiserror`-derived enum living next to the evaluator it describes.
-/// Everything that historically folded to `Value::Null` (bad casts, wrong
-/// arg counts, unknown-value coercions) keeps doing so — this type exists
-/// solely for division/modulo by a zero divisor, which must surface as
-/// SQLSTATE `22012` (`division_by_zero`) instead of silently evaluating to
-/// `NULL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// Bad casts, wrong argument counts and unknown-value coercions fold to
+/// `Value::Null`. These faults fail the statement instead:
+/// - division or modulo by a zero divisor, SQLSTATE `22012`;
+/// - a call to a function no evaluator implements. It never evaluates to a
+///   silent `NULL`;
+/// - a function argument it cannot compute on: vectors of different
+///   dimensions, an argument of the wrong type, a malformed JSONPath.
+///   SQLSTATE `22000`. A `NULL` argument stays `NULL` instead.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
     #[error("division by zero")]
     DivisionByZero,
+    #[error("function {name}() has no evaluator")]
+    UnknownFunction {
+        /// The function name as called.
+        name: String,
+    },
+    /// Two vector operands have different dimensions. Same message shape
+    /// as the vector engine's dimension error.
+    #[error("{function}(): vector dimension mismatch: expected {expected}, got {got}")]
+    VectorDimensionMismatch {
+        function: &'static str,
+        /// Dimension of the first operand.
+        expected: usize,
+        /// Dimension of the second operand.
+        got: usize,
+    },
+    /// An argument holds a value of a type the function cannot compute on.
+    #[error("{function}(): argument {position} must be {expected}, got {got}")]
+    ArgumentType {
+        function: &'static str,
+        /// 1-based argument position.
+        position: usize,
+        expected: &'static str,
+        /// `Value::type_name` of the argument received.
+        got: &'static str,
+    },
+    /// A path argument is not a supported JSONPath.
+    #[error("{function}(): invalid JSONPath {path:?}: {reason}")]
+    InvalidJsonPath {
+        function: &'static str,
+        path: String,
+        reason: String,
+    },
 }
 
 /// Row scope for `SqlExpr::eval_scope`: how `Column(..)` and `OldColumn(..)`

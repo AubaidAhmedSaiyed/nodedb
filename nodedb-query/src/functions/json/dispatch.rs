@@ -4,7 +4,28 @@
 
 use nodedb_types::Value;
 
-pub(in crate::functions) fn try_eval(name: &str, args: &[Value]) -> Option<Value> {
+use crate::expr::EvalError;
+
+/// `None` when no JSON-family function has `name`. The document functions
+/// can fail with a typed error; every other JSON function returns a value.
+pub(in crate::functions) fn try_eval(
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, EvalError>> {
+    let doc_result = match name {
+        "doc_get" => Some(super::doc::doc_get(args)),
+        "doc_exists" => Some(super::doc::doc_exists(args)),
+        "doc_array_contains" => Some(super::doc::doc_array_contains(args)),
+        "nav" => Some(super::doc::nav(args)),
+        _ => None,
+    };
+    if doc_result.is_some() {
+        return doc_result;
+    }
+    try_eval_value(name, args).map(Ok)
+}
+
+fn try_eval_value(name: &str, args: &[Value]) -> Option<Value> {
     // PostgreSQL JSON operator functions (lowered from AST BinaryOp).
     let pg_result = match name {
         "pg_json_get" => {

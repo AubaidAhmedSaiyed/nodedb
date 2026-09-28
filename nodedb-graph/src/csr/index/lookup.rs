@@ -14,6 +14,7 @@ use nodedb_mem::ScopedMemory;
 use super::types::{CsrIndex, Direction};
 use crate::GraphError;
 use crate::csr::LocalNodeId;
+use crate::csr::rebuild::journal::{CsrWriteOp, OpOutcome};
 
 /// Contiguous CSR adjacency arrays produced by [`CsrIndex::build_dense`].
 pub(crate) struct DenseAdjacency {
@@ -127,8 +128,14 @@ impl CsrIndex {
     /// Returns `Err(GraphError::NodeOverflow)` when the partition's node-id
     /// space is exhausted (more than `MAX_NODES_PER_CSR` distinct nodes).
     pub fn add_node(&mut self, name: &str) -> Result<LocalNodeId, crate::GraphError> {
-        let raw = self.ensure_node(name)?;
-        Ok(LocalNodeId::new(raw, self.partition_tag))
+        let result = self.ensure_node(name);
+        self.journal_record(
+            || CsrWriteOp::AddNode {
+                name: name.to_string(),
+            },
+            OpOutcome::of(&result),
+        );
+        Ok(LocalNodeId::new(result?, self.partition_tag))
     }
 
     pub fn node_count(&self) -> usize {

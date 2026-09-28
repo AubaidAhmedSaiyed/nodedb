@@ -51,7 +51,11 @@ pub struct IlpListener {
 impl IlpListener {
     /// Bind to the given address.
     pub async fn bind(addr: SocketAddr) -> crate::Result<Self> {
-        let tcp = TcpListener::bind(addr).await.map_err(crate::Error::Io)?;
+        Self::from_listener(TcpListener::bind(addr).await.map_err(crate::Error::Io)?)
+    }
+
+    /// Serve on a socket that already listens.
+    pub fn from_listener(tcp: TcpListener) -> crate::Result<Self> {
         let local_addr = tcp.local_addr().map_err(crate::Error::Io)?;
         info!(%local_addr, "ILP TCP listener bound");
         Ok(Self {

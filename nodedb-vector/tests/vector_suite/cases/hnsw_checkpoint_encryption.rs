@@ -30,7 +30,7 @@ fn make_key() -> WalEncryptionKey {
 fn make_collection() -> VectorCollection {
     let mut coll = VectorCollection::new(DIM, params());
     for i in 0u32..10 {
-        coll.insert(vec![i as f32, 0.0, 0.0, 0.0]);
+        coll.insert(vec![i as f32, 0.0, 0.0, 0.0]).unwrap();
     }
     coll
 }
@@ -72,7 +72,7 @@ fn hnsw_checkpoint_encrypted_at_rest() {
     assert_eq!(restored.dim(), DIM);
 
     // Nearest neighbour to [5.0, 0, 0, 0] must be vector id=5.
-    let results = restored.search(&[5.0, 0.0, 0.0, 0.0], 1, 64);
+    let results = restored.search(&[5.0, 0.0, 0.0, 0.0], 1, 64).unwrap();
     assert!(!results.is_empty(), "search must return a result");
     assert_eq!(
         results[0].id, 5,

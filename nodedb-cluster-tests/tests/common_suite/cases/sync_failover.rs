@@ -245,7 +245,7 @@ async fn cluster_sync_columnar_dedup_survives_failover() {
     const COLL: &str = "csync_failover";
     const PRODUCER: u64 = 7777;
     let tenant = TenantId::new(0);
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, COLL);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLL).vshard();
 
     cluster
         .exec_ddl_on_any_leader(&format!(

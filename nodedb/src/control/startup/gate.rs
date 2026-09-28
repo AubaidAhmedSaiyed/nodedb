@@ -74,7 +74,8 @@ impl StartupGate {
         Self { rx }
     }
 
-    /// Create a gate that is pre-fired at [`StartupPhase::GatewayEnable`].
+    /// Create a gate that is pre-fired at [`StartupPhase::Serving`], the
+    /// final phase.
     ///
     /// Used by test helpers that construct a [`SharedState`] without a real
     /// [`StartupSequencer`]. Any call to [`await_phase`] on this gate returns
@@ -83,14 +84,14 @@ impl StartupGate {
     /// [`await_phase`]: StartupGate::await_phase
     pub fn pre_fired() -> Arc<Self> {
         let (tx, rx) = watch::channel(SequencerSnapshot {
-            phase: StartupPhase::GatewayEnable,
+            phase: StartupPhase::Serving,
             failed: None,
         });
         // Keep the sender alive inside the gate so the receiver never sees
         // the channel as closed and returns `AlreadyTerminated`.
         let gate = Arc::new(Self { rx });
         // The sender is dropped intentionally: no further phase changes will
-        // occur. The already-received value (GatewayEnable) is what all
+        // occur. The already-received value (Serving) is what all
         // `await_phase` callers will see.
         drop(tx);
         gate

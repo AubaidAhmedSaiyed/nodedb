@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 
 use nodedb_array::types::ArrayId;
 use nodedb_cluster::error::{ClusterError, Result};
+use nodedb_cluster::rpc_codec::DataPlaneErrorCode;
 
-use crate::bridge::envelope::{Priority, Request};
+use super::refusal::execution_error;
+use crate::bridge::envelope::{Priority, Request, Response};
 use crate::control::state::SharedState;
 use crate::event::types::EventSource;
 use crate::types::{ReadConsistency, RequestId, TraceId, TxnId, VShardId};
@@ -47,7 +49,7 @@ impl DataPlaneArrayExecutor {
         local_vshard_id: VShardId,
         plan: PhysicalPlan,
         txn_id: Option<TxnId>,
-    ) -> Result<crate::bridge::envelope::Response> {
+    ) -> Result<Response> {
         let request_id = self.state.next_request_id();
         let request = local_request(request_id, array_id, local_vshard_id, plan, txn_id);
 
@@ -58,23 +60,28 @@ impl DataPlaneArrayExecutor {
             Err(poisoned) => poisoned.into_inner().dispatch(request),
         };
 
+        // A dispatch refusal, such as a capacity limit, keeps its own class.
         if let Err(e) = dispatch_result {
-            return Err(ClusterError::Storage {
-                detail: format!("array executor dispatch: {e}"),
-            });
+            return Err(execution_error("array executor dispatch", e));
         }
 
-        match tokio::time::timeout(LOCAL_DISPATCH_TIMEOUT, async { rx.recv().await.ok_or(()) })
-            .await
-        {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(_)) => Err(ClusterError::Storage {
-                detail: "array executor: response channel closed".into(),
-            }),
-            Err(_) => Err(ClusterError::Storage {
-                detail: "array executor: local dispatch timed out".into(),
-            }),
-        }
+        await_local_response(rx.recv()).await
+    }
+}
+
+/// Await the local Data Plane's response. A timeout is the typed
+/// `DeadlineExceeded` verdict, which the coordinator renders as `57014`.
+async fn await_local_response(
+    rx: impl std::future::Future<Output = Option<Response>>,
+) -> Result<Response> {
+    match tokio::time::timeout(LOCAL_DISPATCH_TIMEOUT, rx).await {
+        Ok(Some(resp)) => Ok(resp),
+        Ok(None) => Err(ClusterError::Storage {
+            detail: "array executor: response channel closed".into(),
+        }),
+        Err(_) => Err(ClusterError::DataPlane {
+            code: DataPlaneErrorCode::DeadlineExceeded,
+        }),
     }
 }
 
@@ -150,6 +157,27 @@ mod tests {
         assert_eq!(request.tenant_id, tenant_id);
         assert_eq!(request.database_id, database_id);
         assert_eq!(request.vshard_id, vshard_id);
+    }
+
+    /// A local timeout crosses as the typed deadline verdict, and the
+    /// coordinator renders it as `57014`.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_timeout_is_a_typed_deadline() {
+        let error = await_local_response(std::future::pending::<Option<Response>>())
+            .await
+            .expect_err("a pending response must time out");
+        assert!(
+            matches!(
+                &error,
+                ClusterError::DataPlane {
+                    code: DataPlaneErrorCode::DeadlineExceeded
+                }
+            ),
+            "expected a typed deadline, got {error:?}"
+        );
+        let rebuilt = crate::control::cluster::array_cluster_helpers::cluster_err(error);
+        let (_, state, _) = crate::control::server::pgwire::types::error_to_sqlstate(&rebuilt);
+        assert_eq!(state, nodedb_types::error::sqlstate::QUERY_CANCELED.0);
     }
 
     #[test]

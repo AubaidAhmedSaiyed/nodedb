@@ -31,6 +31,36 @@ impl SystemMetrics {
             "Vectors stored",
             self.vector_vectors_stored.load(Ordering::Relaxed),
         );
+        counter(
+            out,
+            "nodedb_vector_builds_started_total",
+            "HNSW builds sent to a builder thread",
+            self.vector_builds_started.load(Ordering::Relaxed),
+        );
+        counter(
+            out,
+            "nodedb_vector_builds_completed_total",
+            "HNSW builds installed",
+            self.vector_builds_completed.load(Ordering::Relaxed),
+        );
+        counter(
+            out,
+            "nodedb_vector_builds_failed_total",
+            "HNSW builds that failed",
+            self.vector_builds_failed.load(Ordering::Relaxed),
+        );
+        counter(
+            out,
+            "nodedb_vector_builds_deferred_total",
+            "Times a full builder queue kept an HNSW build waiting",
+            self.vector_builds_deferred.load(Ordering::Relaxed),
+        );
+        gauge(
+            out,
+            "nodedb_vector_build_pending",
+            "HNSW builds waiting for or running on a builder",
+            self.vector_build_pending.load(Ordering::Relaxed),
+        );
         self.vector_query_seconds.write_prometheus(
             out,
             "nodedb_vector_query_seconds",

@@ -227,7 +227,7 @@ mod tests {
 
         for target in 0..20u32 {
             let query = idx.get_vector(target).unwrap().to_vec();
-            let results = idx.search(&query, 1, 32);
+            let results = idx.search(&query, 1, 32).unwrap();
             assert_eq!(results[0].id, target, "node {target} not reachable");
         }
     }
@@ -247,7 +247,7 @@ mod tests {
 
         for target_old_id in (1..20u32).step_by(2) {
             let query = vec![target_old_id as f32, 0.0, 0.0];
-            let results = idx.search(&query, 1, 32);
+            let results = idx.search(&query, 1, 32).unwrap();
             assert!(!results.is_empty());
             let found_vec = idx.get_vector(results[0].id).unwrap();
             assert_eq!(found_vec[0], target_old_id as f32);

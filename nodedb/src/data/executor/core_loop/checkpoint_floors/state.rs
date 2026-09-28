@@ -7,6 +7,7 @@
 //! nothing may be claimed that was not actually put on stable storage. Failing to
 //! advance one of these costs WAL growth; overstating one costs data.
 
+use crate::data::executor::applied_prefix::AppliedPrefix;
 use crate::data::executor::replay_floors::ReplayFloors;
 use crate::types::Lsn;
 
@@ -108,12 +109,9 @@ pub(in crate::data::executor) struct CheckpointFloors {
     /// the WAL (i.e. in `{data_dir}/vector-ckpt/`), advanced only by a fully
     /// successful `checkpoint_vector_indexes`.
     ///
-    /// Not restored at boot: `load_vector_checkpoints` restores the INDEXES, but
-    /// each file carries only its own collection's `checkpoint_wal_lsn`, which
-    /// is a per-collection replay gate and says nothing about what this CORE is
-    /// durable through. So this starts at zero and is first advanced by this
-    /// process's own successful flush; clamping to zero until then costs WAL
-    /// growth, never data.
+    /// Restored at boot from the live generation's manifest
+    /// (`load_vector_checkpoints`), and otherwise advanced by this process's
+    /// own successful flush.
     ///
     /// Scoped to what the rebuild cannot reach.
     /// `rebuild_vector_indexes_from_store` re-indexes every document of a
@@ -158,9 +156,15 @@ pub(in crate::data::executor) struct CheckpointFloors {
     /// watermark — is what the core may report.
     pub(in crate::data::executor) spatial_durable_lsn: Lsn,
 
-    /// Per-engine "already durable through LSN X" floors recovered from on-disk
-    /// checkpoints during boot, before WAL replay. Consulted by the replay paths
+    /// Per-engine replay stamps recovered from on-disk checkpoints during
+    /// boot, before WAL replay. Consulted by the replay paths
     /// so records already folded into a restored checkpoint are not applied a
     /// second time. Empty outside boot, and empty means "replay everything".
     pub(in crate::data::executor) replay_floors: ReplayFloors,
+
+    /// The node's outcome floor as this core last read it from a request, and
+    /// the records this core applied above it: the replay stamp every KV,
+    /// columnar, vector and sparse-vector checkpoint, array manifest and
+    /// timeseries partition carries.
+    pub(in crate::data::executor) applied_prefix: AppliedPrefix,
 }

@@ -5,13 +5,17 @@
 
 use nodedb_types::Surrogate;
 use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
-use tracing::{debug, warn};
+use std::collections::hash_map::Entry;
+
+use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::sync_gate::{SyncAdmit, ack_status_from_admit};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::vector::collection::VectorCollection;
+
+use super::vector_settle::{check_ivf_dim, vector_index_config_for};
 use crate::types::TenantId;
 use nodedb_types::DatabaseId;
 
@@ -59,6 +63,14 @@ pub(in crate::data::executor) struct VectorInsertInner<'a> {
     pub surrogate: Surrogate,
 }
 
+/// A vector whose dimension differs from the index's: the caller's data
+/// error, SQLSTATE `22000`, in the vector engine's message shape.
+pub(in crate::data::executor) fn dimension_mismatch(expected: usize, got: usize) -> ErrorCode {
+    ErrorCode::DataException {
+        detail: nodedb_vector::error::VectorError::DimensionMismatch { expected, got }.to_string(),
+    }
+}
+
 impl CoreLoop {
     /// Get or create a vector collection, validating dimension compatibility.
     pub(in crate::data::executor) fn get_or_create_vector_index(
@@ -79,33 +91,33 @@ impl CoreLoop {
             && declared != 0
             && declared != dim
         {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!("dimension mismatch: index declares {declared}, got {dim}"),
-            });
+            return Err(dimension_mismatch(declared, dim));
         }
 
-        if let Some(existing) = self.vector_collections.get(&index_key)
-            && existing.dim() != dim
-        {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!(
-                    "dimension mismatch: index has {}, got {dim}",
-                    existing.dim()
-                ),
-            });
-        }
         let core_id = self.core_id;
-        let params = self
-            .vector_params
-            .get(&index_key)
-            .cloned()
-            .unwrap_or_default();
-        Ok(self.vector_collections.entry(index_key).or_insert_with(|| {
-            debug!(core = core_id, dim, m = params.m, ef = params.ef_construction, ?params.metric, "creating vector collection");
-            VectorCollection::new(dim, params)
-        }))
+        let seal_threshold = self.vector_tuning.seal_threshold.max(1);
+        match self.vector_collections.entry(index_key) {
+            Entry::Occupied(entry) => {
+                let existing = entry.into_mut();
+                if existing.dim() != dim {
+                    return Err(dimension_mismatch(existing.dim(), dim));
+                }
+                Ok(existing)
+            }
+            Entry::Vacant(entry) => {
+                let config =
+                    vector_index_config_for(&self.index_configs, &self.vector_params, entry.key());
+                check_ivf_dim(&config, dim).map_err(ErrorCode::from)?;
+                debug!(core = core_id, dim, index_type = ?config.index_type, "creating vector collection");
+                Ok(
+                    entry.insert(VectorCollection::with_seal_threshold_and_config(
+                        dim,
+                        config,
+                        seal_threshold,
+                    )),
+                )
+            }
+        }
     }
 
     pub(in crate::data::executor) fn execute_vector_insert(
@@ -196,47 +208,22 @@ impl CoreLoop {
             surrogate,
         } = args;
         if vector.len() != dim {
-            return self.response_error(
-                task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: format!(
-                        "vector dimension mismatch: expected {dim}, got {}",
-                        vector.len()
-                    ),
-                },
-            );
+            return self.response_error(task, dimension_mismatch(dim, vector.len()));
         }
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
-        // Check if this collection uses IVF-PQ index.
-        if let Some(cfg) = self.index_configs.get(&index_key)
-            && cfg.index_type == crate::engine::vector::index_config::IndexType::IvfPq
-        {
-            let key = index_key.clone();
-            return self.ivf_insert(task, tid, &key, vector, dim, surrogate);
-        }
-
-        // Default: HNSW (with or without PQ).
+        // A committed-redo install seals, or trains an IVF-PQ collection,
+        // once the whole record landed, so a rollback finds its inserts in
+        // the growing segment.
+        let defer_seal = self.recording_redo_undo();
         match self.get_or_create_vector_index(database_id, tid, collection, dim, field_name) {
             Ok(collection_ref) => {
-                collection_ref.insert_with_surrogate(vector.to_vec(), surrogate);
-                // Advance this collection's checkpoint watermark to the write's
-                // WAL LSN so a later checkpoint records that this insert is
-                // already absorbed; startup replay then skips the straddling
-                // WAL record instead of appending a duplicate HNSW node. `None`
-                // (unassigned LSN) leaves the watermark untouched.
-                if let Some(lsn) = task.wal_lsn() {
-                    collection_ref.note_checkpoint_lsn(lsn.as_u64());
+                if let Err(e) = collection_ref.insert_with_surrogate(vector.to_vec(), surrogate) {
+                    return self.response_error(task, crate::Error::from(e));
                 }
-                let seal_key = CoreLoop::vector_build_key(&index_key);
-                if collection_ref.needs_seal()
-                    && let Some(req) = collection_ref.seal(&seal_key)
-                    && let Some(tx) = &self.build_tx
-                    && let Err(e) = tx.send(req)
-                {
-                    warn!(core = self.core_id, error = %e, "failed to send HNSW build request");
+                if !defer_seal {
+                    self.settle_vector_collection(&index_key);
                 }
                 self.checkpoint_coordinator.mark_dirty("vector", 1);
                 // Record this write's version so cross-shard OCC read-set
@@ -252,70 +239,6 @@ impl CoreLoop {
             }
             Err(err) => self.response_error(task, err),
         }
-    }
-
-    /// Insert into an IVF-PQ index, returning the assigned vector ID.
-    fn ivf_insert(
-        &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        index_key: &(DatabaseId, TenantId, String),
-        vector: &[f32],
-        dim: usize,
-        surrogate: Surrogate,
-    ) -> Response {
-        let ivf = self
-            .ivf_indexes
-            .entry(index_key.clone())
-            .or_insert_with(|| {
-                let cfg = self
-                    .index_configs
-                    .get(index_key)
-                    .cloned()
-                    .unwrap_or_default();
-                let params = cfg.to_ivf_params();
-                debug!(
-                    core = self.core_id,
-                    key = %index_key.2,
-                    "creating IVF-PQ index"
-                );
-                crate::engine::vector::ivf::IvfPqIndex::new(dim, params)
-            });
-
-        // IVF-PQ requires training before the first insert.
-        if ivf.n_cells() == 0 {
-            let refs: Vec<&[f32]> = vec![vector];
-            let memory = nodedb_mem::ScopedMemory::new(
-                self.governor.clone(),
-                index_key.0,
-                index_key.1,
-                nodedb_mem::EngineId::Vector,
-            );
-            ivf.train(&refs, memory);
-        }
-
-        let vector_id = ivf.add(vector);
-
-        // Register surrogate mapping using the actual IVF-assigned vector ID.
-        if surrogate != Surrogate::ZERO {
-            let coll = self
-                .vector_collections
-                .entry(index_key.clone())
-                .or_insert_with(|| VectorCollection::new(dim, Default::default()));
-            coll.surrogate_map.insert(vector_id, surrogate);
-            coll.surrogate_to_local.insert(surrogate, vector_id);
-        }
-
-        self.checkpoint_coordinator.mark_dirty("vector", 1);
-        // Record this write's version so cross-shard OCC read-set validation
-        // sees this insert, same as the HNSW insert path above. `ZERO` means
-        // no surrogate binding was made (headless insert) — floor-only.
-        if surrogate == Surrogate::ZERO {
-            self.note_collection_write_lsn(task, &index_key.2);
-        } else {
-            self.note_surrogate_write_lsn(task, tid, &index_key.2, surrogate.as_u32());
-        }
-        self.response_ok(task)
     }
 
     /// Delete a vector by surrogate (sync inbound path).

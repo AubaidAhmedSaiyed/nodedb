@@ -70,7 +70,9 @@ impl VectorCollection {
             return None;
         }
 
-        let codec = Sq8Codec::calibrate(&refs, dim);
+        // The refs are live vectors of this index, so calibration fails only
+        // for a zero dimension, which has nothing to quantize.
+        let codec = Sq8Codec::calibrate(&refs, dim).ok()?;
 
         let mut data = Vec::with_capacity(dim * n);
         for i in 0..n {
@@ -85,7 +87,7 @@ impl VectorCollection {
     }
 
     /// Train a PQ codec from a built HNSW index's live vectors, tracking
-    /// codebook allocations against `memory`.
+    /// codebook allocations against `memory`, and encode every node.
     pub fn build_pq_for_index(
         index: &HnswIndex,
         pq_m: usize,
@@ -109,8 +111,29 @@ impl VectorCollection {
         }
         let refs_slices: Vec<&[f32]> = refs.iter().map(|v| v.as_slice()).collect();
         let k = 256usize.min(refs.len());
-        let codec = PqCodec::train(&refs_slices, dim, pq_m, k, 20, memory);
-        let codes = codec.encode_batch(&refs_slices).ok()?;
+        // A PQ shape the codec cannot train (a codebook over its byte limit,
+        // a dimension over its decode limit) leaves the segment on plain
+        // HNSW, which answers the same queries exactly.
+        let codec = match PqCodec::train(&refs_slices, dim, pq_m, k, 20, memory) {
+            Ok(codec) => codec,
+            Err(e) => {
+                tracing::warn!(error = %e, dim, pq_m, "PQ training refused; segment stays unquantized");
+                return None;
+            }
+        };
+        // One code per local node id, soft-deleted nodes included: search
+        // reads the code of node `id` at `id * pq_m`.
+        let zero = vec![0.0f32; dim];
+        let all: Vec<&[f32]> = (0..n as u32)
+            .map(|i| index.get_vector(i).unwrap_or(zero.as_slice()))
+            .collect();
+        let codes = match codec.encode_batch(&all) {
+            Ok(codes) => codes,
+            Err(e) => {
+                tracing::warn!(error = %e, dim, pq_m, "PQ encoding refused; segment stays unquantized");
+                return None;
+            }
+        };
         Some((codec, codes))
     }
 }

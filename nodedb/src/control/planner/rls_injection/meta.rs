@@ -101,7 +101,8 @@ pub(super) fn inject_meta(ctx: &RlsCtx<'_>, op: &mut MetaOp) -> crate::Result<()
         | MetaOp::RollbackToSavepoint { .. }
         | MetaOp::CalvinFlush { .. }
         | MetaOp::CalvinDrop { .. }
-        | MetaOp::CalvinResolve { .. } => Ok(()),
+        | MetaOp::CalvinResolve { .. }
+        | MetaOp::ApplyTransactionRedo { .. } => Ok(()),
     }
 }
 
@@ -134,7 +135,10 @@ mod tests {
     #[test]
     fn tenant_snapshot_is_refused_while_any_policy_applies() {
         let store = store_with_read_policy("users");
-        let mut plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot { tenant_id: 1 });
+        let mut plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
+            tenant_id: 1,
+            cut_watermark: None,
+        });
         assert!(matches!(
             inject(&mut plan, &store),
             Err(crate::Error::PlanError { .. })

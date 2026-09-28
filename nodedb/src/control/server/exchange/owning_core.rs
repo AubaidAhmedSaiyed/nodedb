@@ -15,9 +15,8 @@
 //! minus the empty cores' spurious contributions.
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::dispatch_utils::{
-    dispatch_to_data_plane_with_txn, reject_data_plane_error,
-};
+use crate::control::local_dispatch::reject_data_plane_error;
+use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
@@ -51,7 +50,8 @@ pub async fn gather_single_node(
         return gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await;
     }
     if let Some(collection) = plan.collection() {
-        let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+        let vshard_id =
+            nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
         return gather_single_owning_core(
             state,
             tenant_id,
@@ -69,8 +69,8 @@ pub async fn gather_single_node(
 /// Dispatch `plan` to the single Data-Plane core that owns `vshard_id` and
 /// gather the one bounded response into a [`GatherOutcome`].
 ///
-/// `vshard_id` is the collection's owning vShard
-/// (`VShardId::from_collection_in_database(database_id, collection)`); the
+/// `vshard_id` is the collection's owning vShard (the vShard of its
+/// canonical `CollectionKey`); the
 /// dispatcher's `VShardRouter` resolves it to the one core holding the
 /// collection's rows.
 ///
@@ -78,7 +78,7 @@ pub async fn gather_single_node(
 /// `read_version_lsn` and exactly one `shard_watermarks` entry keyed to the
 /// collection's vShard — matching the cluster `dispatch_local` path so an
 /// in-transaction read records the same OCC read-set entry the write-set uses
-/// (writes home to the same `from_collection_in_database` vShard). Aggregate
+/// (writes home to the same `CollectionKey` vShard). Aggregate
 /// finalization (`finalize_aggregate`) is a passthrough over the merged array,
 /// so one complete aggregate row in yields one row out.
 pub async fn gather_single_owning_core(
@@ -90,6 +90,40 @@ pub async fn gather_single_owning_core(
     trace_id: TraceId,
     txn_id: Option<TxnId>,
 ) -> crate::Result<GatherOutcome> {
+    let resp = dispatch_single_owning_core(
+        state,
+        tenant_id,
+        database_id,
+        plan,
+        vshard_id,
+        trace_id,
+        txn_id,
+    )
+    .await?;
+    let payload_bytes: &[u8] = resp.payload.as_ref();
+    let all_elements = extract_msgpack_elements(payload_bytes);
+    let merged_array = encode_msgpack_array(&all_elements);
+
+    Ok(GatherOutcome {
+        raw: payload_bytes.to_vec(),
+        merged_array,
+        watermark_lsn: resp.watermark_lsn,
+        read_version_lsn: resp.read_version_lsn,
+        shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
+    })
+}
+
+/// Dispatch `plan` to the single Data-Plane core that owns `vshard_id` and
+/// return that core's response, its payload in the shape the core produced.
+pub async fn dispatch_single_owning_core(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    vshard_id: VShardId,
+    trace_id: TraceId,
+    txn_id: Option<TxnId>,
+) -> crate::Result<crate::bridge::envelope::Response> {
     // `Box::pin` breaks an async-fn recursion cycle: `dispatch_to_data_plane_*`
     // re-enters `resolve_exchange_in_plan`. The plan handed here is the bare,
     // Exchange-free child of the resolved Gather, so the re-entrant resolve is a
@@ -109,16 +143,5 @@ pub async fn gather_single_owning_core(
     // validatable) observation; any other error status surfaces with its typed
     // code rather than being swallowed as an empty success.
     reject_data_plane_error(&resp)?;
-
-    let payload_bytes: &[u8] = resp.payload.as_ref();
-    let all_elements = extract_msgpack_elements(payload_bytes);
-    let merged_array = encode_msgpack_array(&all_elements);
-
-    Ok(GatherOutcome {
-        raw: payload_bytes.to_vec(),
-        merged_array,
-        watermark_lsn: resp.watermark_lsn,
-        read_version_lsn: resp.read_version_lsn,
-        shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
-    })
+    Ok(resp)
 }

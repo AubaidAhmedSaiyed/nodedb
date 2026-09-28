@@ -97,7 +97,7 @@ pub(super) fn resolve_checkpoint_vv(
     let catalog = state.credentials.catalog();
     let record = catalog
         .get_checkpoint(doc, checkpoint_or_vv)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| {
             err(
                 "42704",

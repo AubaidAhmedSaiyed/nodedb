@@ -87,47 +87,43 @@ impl CoreLoop {
         let index_key =
             CoreLoop::vector_index_key(task.request.database_id.as_u64(), tid, collection, "");
         let vector_collection = self.vector_collections.get(&index_key);
-        let vector_results = if let Some(index) = vector_collection {
-            if index.is_empty() {
-                Vec::new()
-            } else {
+        let vector_results = match vector_collection {
+            Some(index) => {
                 let ef = if ef_search > 0 {
                     ef_search.max(fetch_k)
                 } else {
                     fetch_k.saturating_mul(4).max(64)
                 };
-                match filter_bitmap {
-                    Some(surrogate_bm) => {
-                        let mut buf = Vec::with_capacity(surrogate_bm.0.serialized_size());
-                        if surrogate_bm.0.serialize_into(&mut buf).is_ok() {
-                            index.search_with_bitmap_bytes(query_vector, fetch_k, ef, &buf)
-                        } else {
-                            index.search(query_vector, fetch_k, ef)
-                        }
-                    }
-                    None => index.search(query_vector, fetch_k, ef),
+                match super::vector_search::search_vector_leg(
+                    index,
+                    query_vector,
+                    fetch_k,
+                    ef,
+                    filter_bitmap,
+                ) {
+                    Ok(results) => results,
+                    Err(code) => return self.response_error(task, code),
                 }
             }
-        } else {
-            Vec::new()
+            None => Vec::new(),
         };
 
         // 2. Text search (no surrogate prefilter for the text leg of hybrid search).
-        let text_results = self
-            .inverted
-            .search(
-                task.request.database_id.as_u64(),
-                tenant_id,
-                collection,
-                FtsSearchParams {
-                    query: query_text,
-                    top_k: fetch_k,
-                    fuzzy_enabled: fuzzy,
-                    mode: QueryMode::And,
-                    prefilter: None,
-                },
-            )
-            .unwrap_or_default();
+        let text_results = match self.inverted.search(
+            task.request.database_id.as_u64(),
+            tenant_id,
+            collection,
+            FtsSearchParams {
+                query: query_text,
+                top_k: fetch_k,
+                fuzzy_enabled: fuzzy,
+                mode: QueryMode::And,
+                prefilter: None,
+            },
+        ) {
+            Ok(results) => results,
+            Err(e) => return self.response_error(task, e),
+        };
 
         // 3. Build ranked lists for weighted RRF.
         // Higher weight → lower k → steeper rank discount → more influence.

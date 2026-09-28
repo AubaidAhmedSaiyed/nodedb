@@ -38,7 +38,7 @@ pub fn show_constraints(
     let tenant_id = identity.tenant_id.as_u64();
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| err("XX000", &e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
     let columns = vec![

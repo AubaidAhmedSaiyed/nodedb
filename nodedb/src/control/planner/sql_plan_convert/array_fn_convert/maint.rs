@@ -5,7 +5,7 @@
 use nodedb_array::types::ArrayId;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::ArrayOp;
 
 use super::super::convert::ConvertContext;
@@ -21,7 +21,7 @@ pub(crate) fn convert_flush(
         detail: "ARRAY_FLUSH: no WAL wired into convert context".into(),
     })?;
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
     // A frontier read, not an allocation: `Flush` appends no WAL record, and
     // this LSN becomes the flushed segment's watermark — every cell it contains
     // was written by a record below the current frontier. The write funnel mints
@@ -47,7 +47,7 @@ pub(crate) fn convert_compact(
 ) -> crate::Result<Vec<PhysicalTask>> {
     let entry = super::helpers::load_entry(name, tenant_id, ctx)?;
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,

@@ -57,7 +57,7 @@ use crate::common;
 
 use std::time::Duration;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 
 use common::cluster_harness::{TestClusterNode, wait_for, wait_for_async};
 use common::occ_shuffle::{
@@ -66,13 +66,15 @@ use common::occ_shuffle::{
 
 /// Three `metrics`/`w1`/`w2` collection names whose vShard ids are pairwise
 /// distinct, so a transaction that writes two of them and reads the third is
-/// genuinely multi-vShard. Deterministic: `VShardId::from_collection_in_database`
+/// genuinely multi-vShard. Deterministic: `VShardId::from_collection`
 /// is a pure function of the database id + collection-name bytes.
 fn distinct_vshard_triple() -> (String, String, String) {
     let mut chosen: Vec<(String, u32)> = Vec::new();
     for i in 0u32..1024 {
         let name = format!("shuffle_occ_{i}");
-        let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+        let v = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+            .vshard()
+            .as_u32();
         if chosen.iter().all(|(_, cv)| *cv != v) {
             chosen.push((name, v));
             if chosen.len() == 3 {

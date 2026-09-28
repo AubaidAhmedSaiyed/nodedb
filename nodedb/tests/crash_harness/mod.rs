@@ -17,6 +17,12 @@ use std::time::{Duration, Instant};
 // `pub` so a crash test can read faultbox reports directly, not just via
 // the panic-path diagnostics wired into `pgwire.rs`.
 pub mod diagnostics;
+// `wait_ready` and its bind-collision respawn.
+mod boot;
+// Boot sections and numeric fields read back from the server log.
+pub mod log_fields;
+// WAL segment names and checkpoint truncation lines.
+pub mod wal_truncation;
 // The ILP client helper lives in `nodedb-test-support` and is imported
 // directly by tests that need it, not re-exported here.
 mod pgwire;
@@ -26,6 +32,7 @@ mod pgwire;
 pub use pgwire::{RetryableSchemaChange, Session};
 #[path = "../support/mod.rs"]
 pub mod support;
+pub mod vshards;
 
 /// Re-exported so a crash test can state its own filesystem precondition
 /// without pulling the support module in a second time.
@@ -198,6 +205,18 @@ impl CrashHarness {
         self
     }
 
+    /// Boot without the single-node Calvin stack. The node runs no Raft
+    /// proposer, so every autocommit write takes the local funnel route, and
+    /// two writes can apply out of LSN order. Writes a config file into the
+    /// data directory and points `NODEDB_CONFIG` at it. Call before `spawn`.
+    pub fn standalone(self) -> CrashHarness {
+        let config = self.data_dir_path.join("standalone.toml");
+        std::fs::write(&config, "[server]\nsingle_node_calvin = false\n")
+            .expect("write the standalone config file");
+        let path = config.to_string_lossy().into_owned();
+        self.with_env("NODEDB_CONFIG", &path)
+    }
+
     /// Set (or replace) a server env override in place, between spawns.
     /// Unlike [`CrashHarness::with_env`], this lets a crash-during-recovery
     /// test arm `NODEDB_FAILPOINTS` for exactly one boot — left armed, every
@@ -246,6 +265,15 @@ impl CrashHarness {
             .collect();
         names.sort();
         names
+    }
+
+    /// The WAL segment the server appends to now. Segment names carry their
+    /// zero-padded first LSN, so the last name is the active segment.
+    pub fn active_wal_segment(&self) -> String {
+        self.wal_segments()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| panic!("no WAL segment on disk after an acknowledged write"))
     }
 
     /// Path the server's stdout/stderr is appended to across every spawn.
@@ -314,23 +342,6 @@ impl CrashHarness {
         self.child = Some(child);
     }
 
-    /// Block until `/healthz` reports ready, panicking on timeout.
-    pub fn wait_ready(&self) {
-        self.wait_ready_within(BOOT_READY_TIMEOUT);
-    }
-
-    /// [`wait_ready`] for a test whose nextest kill budget is raised.
-    pub fn wait_ready_extended(&self) {
-        self.wait_ready_within(BOOT_READY_TIMEOUT_EXTENDED);
-    }
-
-    fn wait_ready_within(&self, budget: Duration) {
-        assert!(
-            wait_for_healthz(self.http_port, budget),
-            "nodedb did not become ready within {budget:?}"
-        );
-    }
-
     /// Spawn the server and assert that boot fails-stop rather than coming up.
     /// The server must never report `/healthz`-ready and must exit non-zero
     /// within `timeout`. Panics otherwise.
@@ -367,8 +378,13 @@ impl CrashHarness {
     }
 
     pub fn pgwire_conn_str(&self) -> String {
+        self.pgwire_conn_str_for("default")
+    }
+
+    /// Connection string for a session opened in `database`.
+    pub fn pgwire_conn_str_for(&self, database: &str) -> String {
         format!(
-            "host=127.0.0.1 port={} dbname=default user=nodedb password=nodedb",
+            "host=127.0.0.1 port={} dbname={database} user=nodedb password=nodedb",
             self.pgwire_port
         )
     }

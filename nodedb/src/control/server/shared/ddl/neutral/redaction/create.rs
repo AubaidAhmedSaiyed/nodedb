@@ -130,17 +130,17 @@ pub fn create_redaction_policy(
     };
 
     let stored = StoredRedactionPolicy::from_runtime(&policy)
-        .map_err(|e| DdlError::new("XX000", format!("redaction serialize: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("redaction serialize", &e))?;
 
     let entry = CatalogEntry::PutRedactionPolicy(Box::new(stored.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .put_redaction_policy(&stored)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state.redaction.install_replicated_policy(policy);
     }

@@ -107,7 +107,7 @@ pub struct EpochBatch {
 #[cfg(test)]
 mod tests {
     use nodedb_types::TenantId;
-    use nodedb_types::id::{DatabaseId, VShardId};
+    use nodedb_types::id::{CollectionKey, DatabaseId};
 
     use super::super::primitives::{EngineKeySet, SortedVec, VersionedReadSet};
     use super::super::transaction::ReadWriteSet;
@@ -133,7 +133,9 @@ mod tests {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..512 {
             let name = format!("col_{i}");
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             if let Some((ref fname, fv)) = first {
                 if fv != vshard {
                     return (fname.clone(), name);
@@ -170,7 +172,7 @@ mod tests {
         };
         let bytes = zerompk::to_msgpack_vec(&st).unwrap();
         let mut decoded: SequencedTxn = zerompk::from_msgpack(&bytes).unwrap();
-        decoded.tx_class.restore_derived();
+        decoded.tx_class.restore_derived().expect("restore derived");
         assert_eq!(st.epoch, decoded.epoch);
         assert_eq!(st.position, decoded.position);
         assert_eq!(st.epoch_system_ms, decoded.epoch_system_ms);
@@ -205,7 +207,7 @@ mod tests {
         let bytes = zerompk::to_msgpack_vec(&batch).unwrap();
         let mut decoded: EpochBatch = zerompk::from_msgpack(&bytes).unwrap();
         for txn in &mut decoded.txns {
-            txn.tx_class.restore_derived();
+            txn.tx_class.restore_derived().expect("restore derived");
         }
         assert_eq!(batch.epoch, decoded.epoch);
         assert_eq!(batch.epoch_system_ms, decoded.epoch_system_ms);

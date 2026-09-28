@@ -2,11 +2,22 @@
 
 //! Collection-tombstone replay filter.
 //!
-//! A [`TombstoneSet`] records, per `(database_id, tenant_id, collection)` tuple,
-//! the highest `purge_lsn` observed in any `RecordType::CollectionTombstoned`
-//! record. Replay consumers query [`TombstoneSet::is_tombstoned`] after
-//! decoding the collection field from their payload; any record with
-//! `lsn < purge_lsn` for a tombstoned pair MUST be skipped.
+//! A [`TombstoneSet`] records, per `(database_id, tenant_id, collection)`, the
+//! highest `purge_lsn` observed in any `RecordType::CollectionTombstoned`
+//! record or persisted tombstone row. Replay consumers query
+//! [`TombstoneSet::is_tombstoned`] after decoding the collection field from
+//! their payload. A record with `lsn < purge_lsn` for a tombstoned collection
+//! MUST be skipped.
+//!
+//! Two name forms meet here:
+//! - Tombstones name a collection by its bare catalog name. They enter
+//!   through [`CollectionKey`].
+//! - Data records name it by the database-qualified storage name
+//!   ([`nodedb_types::QualifiedCollection`]), `"{database_id}/{name}"` outside the default
+//!   database.
+//!
+//! The set keys every entry by the storage name, derived from the key at
+//! insert. A data record's name then matches with no parsing.
 //!
 //! Rationale: the WAL crate is payload-schema agnostic. Each engine's
 //! payload (vector / KV / document / graph / ...) has its own MessagePack
@@ -15,18 +26,28 @@
 
 use std::collections::HashMap;
 
+use nodedb_types::{CollectionKey, DatabaseId};
+
 use crate::record::{RecordType, WalRecord, WriteAbortedPayload};
 use crate::replay::aborted::AbortedWrites;
 use crate::tombstone::CollectionTombstonePayload;
 
+/// One tombstoned collection: its bare catalog name and its purge boundary.
+#[derive(Debug, Clone)]
+struct Tombstone {
+    bare_name: String,
+    purge_lsn: u64,
+}
+
 /// In-memory index of active collection tombstones.
 ///
-/// Keyed by `(database_id, tenant_id, collection)`; value is the `purge_lsn`
-/// written at tombstone time. If the same object is tombstoned more than once
-/// (re-create → re-drop in the same log), the highest `purge_lsn` wins.
+/// Keyed by `(database_id, tenant_id, storage name)`. The value keeps the bare
+/// catalog name and the `purge_lsn` written at tombstone time. If the same
+/// collection is tombstoned more than once (re-create → re-drop in the same
+/// log), the highest `purge_lsn` wins.
 #[derive(Debug, Default, Clone)]
 pub struct TombstoneSet {
-    entries: HashMap<(u64, u64, String), u64>,
+    entries: HashMap<(u64, u64, String), Tombstone>,
 }
 
 impl TombstoneSet {
@@ -43,39 +64,73 @@ impl TombstoneSet {
         }
     }
 
-    /// Record a tombstone. If the object already has a higher `purge_lsn`,
-    /// the existing value is kept (idempotent, order-independent).
-    pub fn insert(&mut self, database_id: u64, tenant_id: u64, collection: String, purge_lsn: u64) {
-        self.entries
-            .entry((database_id, tenant_id, collection))
-            .and_modify(|existing| {
-                if purge_lsn > *existing {
-                    *existing = purge_lsn;
-                }
-            })
-            .or_insert(purge_lsn);
+    /// Record a tombstone for the collection `key` names. If the collection
+    /// already has a higher `purge_lsn`, the existing value is kept
+    /// (idempotent, order-independent).
+    pub fn insert(&mut self, key: CollectionKey<'_>, tenant_id: u64, purge_lsn: u64) {
+        let storage = key.qualified();
+        self.merge(
+            (
+                key.database_id().as_u64(),
+                tenant_id,
+                storage.as_str().to_string(),
+            ),
+            Tombstone {
+                bare_name: key.name().to_string(),
+                purge_lsn,
+            },
+        );
     }
 
-    /// Return `true` iff a write at `lsn` for the database-scoped object
-    /// is shadowed by a later tombstone and therefore must be skipped.
+    fn merge(&mut self, slot: (u64, u64, String), tombstone: Tombstone) {
+        self.entries
+            .entry(slot)
+            .and_modify(|existing| {
+                if tombstone.purge_lsn > existing.purge_lsn {
+                    existing.purge_lsn = tombstone.purge_lsn;
+                }
+            })
+            .or_insert(tombstone);
+    }
+
+    /// Return `true` iff a data record at `lsn` is shadowed by a later
+    /// tombstone and therefore must be skipped.
+    ///
+    /// `storage_name` is the collection name as the data record carries it:
+    /// the database-qualified storage name.
     pub fn is_tombstoned(
         &self,
         database_id: u64,
         tenant_id: u64,
-        collection: &str,
+        storage_name: &str,
         lsn: u64,
     ) -> bool {
         self.entries
-            .get(&(database_id, tenant_id, collection.to_string()))
-            .is_some_and(|&purge_lsn| lsn < purge_lsn)
+            .get(&(database_id, tenant_id, storage_name.to_string()))
+            .is_some_and(|tombstone| lsn < tombstone.purge_lsn)
     }
 
-    /// Return the `purge_lsn` for an object, if any. Primarily used by redb
-    /// persistence to serialize the current set after a replay pass.
-    pub fn purge_lsn(&self, database_id: u64, tenant_id: u64, collection: &str) -> Option<u64> {
+    /// [`Self::is_tombstoned`] for a record that names its collection by the
+    /// bare catalog name.
+    pub fn is_key_tombstoned(&self, key: CollectionKey<'_>, tenant_id: u64, lsn: u64) -> bool {
+        self.is_tombstoned(
+            key.database_id().as_u64(),
+            tenant_id,
+            key.qualified().as_str(),
+            lsn,
+        )
+    }
+
+    /// Return the `purge_lsn` for the collection `key` names, if any.
+    pub fn purge_lsn(&self, key: CollectionKey<'_>, tenant_id: u64) -> Option<u64> {
+        let storage = key.qualified();
         self.entries
-            .get(&(database_id, tenant_id, collection.to_string()))
-            .copied()
+            .get(&(
+                key.database_id().as_u64(),
+                tenant_id,
+                storage.as_str().to_string(),
+            ))
+            .map(|tombstone| tombstone.purge_lsn)
     }
 
     pub fn len(&self) -> usize {
@@ -86,18 +141,18 @@ impl TombstoneSet {
         self.entries.is_empty()
     }
 
-    /// Iterate over every `(database_id, tenant_id, collection, purge_lsn)`.
+    /// Iterate over every `(database_id, tenant_id, bare name, purge_lsn)`.
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64, &str, u64)> + '_ {
-        self.entries
-            .iter()
-            .map(|((db, tid, name), lsn)| (*db, *tid, name.as_str(), *lsn))
+        self.entries.iter().map(|((db, tid, _storage), tombstone)| {
+            (*db, *tid, tombstone.bare_name.as_str(), tombstone.purge_lsn)
+        })
     }
 
     /// Merge another tombstone set into this one. Used when loading
     /// persisted tombstones from redb at startup before a fresh WAL pass.
     pub fn extend(&mut self, other: TombstoneSet) {
-        for ((db, tid, name), lsn) in other.entries {
-            self.insert(db, tid, name, lsn);
+        for (slot, tombstone) in other.entries {
+            self.merge(slot, tombstone);
         }
     }
 }
@@ -109,9 +164,11 @@ pub struct DatabaseTombstones<'a> {
 }
 
 impl DatabaseTombstones<'_> {
-    pub fn is_tombstoned(&self, tenant_id: u64, collection: &str, lsn: u64) -> bool {
+    /// [`TombstoneSet::is_tombstoned`] in the bound database. `storage_name`
+    /// is the database-qualified name the data record carries.
+    pub fn is_tombstoned(&self, tenant_id: u64, storage_name: &str, lsn: u64) -> bool {
         self.set
-            .is_tombstoned(self.database_id, tenant_id, collection, lsn)
+            .is_tombstoned(self.database_id, tenant_id, storage_name, lsn)
     }
 }
 
@@ -178,10 +235,13 @@ pub fn extract_replay_filters(records: &[WalRecord]) -> crate::Result<ReplayFilt
             RecordType::CollectionTombstoned => {
                 reject_if_encrypted(record, "collection-tombstone extraction")?;
                 let payload = CollectionTombstonePayload::from_bytes(&record.payload)?;
+                // The payload names the collection by its bare catalog name.
                 filters.tombstones.insert(
-                    record.header.database_id,
+                    CollectionKey::from_bare(
+                        DatabaseId::new(record.header.database_id),
+                        &payload.collection,
+                    ),
                     record.header.tenant_id,
-                    payload.collection,
                     payload.purge_lsn,
                 );
             }
@@ -234,6 +294,8 @@ pub fn drop_aborted_records(records: Vec<WalRecord>, aborted: &AbortedWrites) ->
 
 #[cfg(test)]
 mod tests {
+    use nodedb_types::QualifiedCollection;
+
     use super::*;
     use crate::record::{WalRecord, WalRecordArgs};
 
@@ -260,26 +322,88 @@ mod tests {
         .unwrap()
     }
 
+    fn key(database: u64, name: &str) -> CollectionKey<'_> {
+        CollectionKey::from_bare(DatabaseId::new(database), name)
+    }
+
     #[test]
     fn is_tombstoned_shadows_older_writes() {
         let mut set = TombstoneSet::new();
-        set.insert(7, 1, "users".into(), 100);
-        assert!(set.is_tombstoned(7, 1, "users", 50));
-        assert!(!set.is_tombstoned(7, 1, "users", 100));
-        assert!(!set.is_tombstoned(7, 1, "users", 200));
-        assert!(!set.is_tombstoned(7, 1, "other", 50));
-        assert!(!set.is_tombstoned(7, 2, "users", 50));
-        assert!(!set.is_tombstoned(8, 1, "users", 50));
+        set.insert(key(7, "users"), 1, 100);
+        // Database 7 is a named database: its records carry "7/users".
+        assert!(set.is_tombstoned(7, 1, "7/users", 50));
+        assert!(!set.is_tombstoned(7, 1, "7/users", 100));
+        assert!(!set.is_tombstoned(7, 1, "7/users", 200));
+        assert!(!set.is_tombstoned(7, 1, "7/other", 50));
+        assert!(!set.is_tombstoned(7, 2, "7/users", 50));
+        assert!(!set.is_tombstoned(8, 1, "8/users", 50));
+    }
+
+    /// A tombstone enters by its bare catalog name. A data record in a named
+    /// database carries the qualified storage name. The two must match.
+    #[test]
+    fn bare_tombstone_shadows_qualified_record_in_named_database() {
+        let db = DatabaseId::new(1024);
+        let mut set = TombstoneSet::new();
+        set.insert(CollectionKey::from_bare(db, "orders"), 1, 100);
+        let storage = QualifiedCollection::new(db, "orders");
+        assert_eq!(storage.as_str(), "1024/orders");
+        assert!(set.is_tombstoned(1024, 1, storage.as_str(), 99));
+        assert!(
+            set.for_database(1024)
+                .is_tombstoned(1, storage.as_str(), 99)
+        );
+        assert!(!set.is_tombstoned(1024, 1, storage.as_str(), 100));
+        // The bare string is not a storage name in a named database.
+        assert!(!set.is_tombstoned(1024, 1, "orders", 99));
+        assert!(set.is_key_tombstoned(CollectionKey::from_bare(db, "orders"), 1, 99));
+    }
+
+    /// The default database stores names unqualified, so bare and storage
+    /// names are the same string there.
+    #[test]
+    fn default_database_tombstone_shadows_bare_record() {
+        let mut set = TombstoneSet::new();
+        set.insert(
+            CollectionKey::from_bare(DatabaseId::DEFAULT, "orders"),
+            1,
+            100,
+        );
+        assert!(set.is_tombstoned(0, 1, "orders", 99));
+        assert!(set.for_database(0).is_tombstoned(1, "orders", 99));
+        assert!(!set.is_tombstoned(0, 1, "orders", 100));
+        assert!(set.is_key_tombstoned(
+            CollectionKey::from_bare(DatabaseId::DEFAULT, "orders"),
+            1,
+            99
+        ));
+    }
+
+    /// A WAL tombstone record carries the bare name. Extraction must shadow
+    /// the named database's qualified data records.
+    #[test]
+    fn extracted_tombstone_shadows_qualified_records() {
+        let set = extract_tombstones(&[tombstone_record(1024, 1, "orders", 100, 101)]).unwrap();
+        assert!(set.is_tombstoned(1024, 1, "1024/orders", 50));
+        assert!(!set.is_tombstoned(1024, 1, "orders", 50));
+    }
+
+    #[test]
+    fn iter_yields_bare_names() {
+        let mut set = TombstoneSet::new();
+        set.insert(key(1024, "orders"), 1, 100);
+        let rows: Vec<_> = set.iter().collect();
+        assert_eq!(rows, vec![(1024, 1, "orders", 100)]);
     }
 
     #[test]
     fn insert_keeps_highest_purge_lsn() {
         let mut set = TombstoneSet::new();
-        set.insert(7, 1, "users".into(), 100);
-        set.insert(7, 1, "users".into(), 50);
-        assert_eq!(set.purge_lsn(7, 1, "users"), Some(100));
-        set.insert(7, 1, "users".into(), 200);
-        assert_eq!(set.purge_lsn(7, 1, "users"), Some(200));
+        set.insert(key(7, "users"), 1, 100);
+        set.insert(key(7, "users"), 1, 50);
+        assert_eq!(set.purge_lsn(key(7, "users"), 1), Some(100));
+        set.insert(key(7, "users"), 1, 200);
+        assert_eq!(set.purge_lsn(key(7, "users"), 1), Some(200));
     }
 
     #[test]
@@ -291,9 +415,9 @@ mod tests {
         ];
         let set = extract_tombstones(&records).unwrap();
         assert_eq!(set.len(), 3);
-        assert_eq!(set.purge_lsn(7, 1, "users"), Some(100));
-        assert_eq!(set.purge_lsn(7, 1, "orders"), Some(150));
-        assert_eq!(set.purge_lsn(8, 1, "users"), Some(200));
+        assert_eq!(set.purge_lsn(key(7, "users"), 1), Some(100));
+        assert_eq!(set.purge_lsn(key(7, "orders"), 1), Some(150));
+        assert_eq!(set.purge_lsn(key(8, "users"), 1), Some(200));
     }
 
     #[test]
@@ -388,7 +512,7 @@ mod tests {
             abort_record(12, 14),
         ];
         let filters = extract_replay_filters(&records).unwrap();
-        assert_eq!(filters.tombstones.purge_lsn(0, 1, "users"), Some(100));
+        assert_eq!(filters.tombstones.purge_lsn(key(0, "users"), 1), Some(100));
         assert_eq!(filters.aborted.len(), 2);
         assert!(filters.aborted.contains(10));
         assert!(filters.aborted.contains(12));
@@ -440,12 +564,12 @@ mod tests {
     #[test]
     fn extend_merges_sets() {
         let mut a = TombstoneSet::new();
-        a.insert(7, 1, "users".into(), 100);
+        a.insert(key(7, "users"), 1, 100);
         let mut b = TombstoneSet::new();
-        b.insert(7, 1, "users".into(), 150);
-        b.insert(8, 1, "orders".into(), 200);
+        b.insert(key(7, "users"), 1, 150);
+        b.insert(key(8, "orders"), 1, 200);
         a.extend(b);
-        assert_eq!(a.purge_lsn(7, 1, "users"), Some(150));
-        assert_eq!(a.purge_lsn(8, 1, "orders"), Some(200));
+        assert_eq!(a.purge_lsn(key(7, "users"), 1), Some(150));
+        assert_eq!(a.purge_lsn(key(8, "orders"), 1), Some(200));
     }
 }

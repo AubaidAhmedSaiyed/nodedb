@@ -44,7 +44,7 @@ pub(crate) fn broadcast_call_count_increment() {
 /// a constraint refusal keeps its own SQLSTATE. A `{code:?}` dump into a
 /// generic dispatch failure made every one of them read as internal.
 fn typed_core_error(resp: &Response) -> crate::Error {
-    match crate::control::server::dispatch_utils::reject_data_plane_error(resp) {
+    match crate::control::local_dispatch::reject_data_plane_error(resp) {
         Err(error) => error,
         // `NotFound` is an empty observation elsewhere. A barrier takes any
         // error status as a core that did not acknowledge.

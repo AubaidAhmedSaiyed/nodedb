@@ -8,7 +8,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::{SessionId, TransactionState};
 
-use super::super::types::sqlstate_error;
+use super::super::types::{error_to_pg_in_context, sqlstate_error};
 use super::core::NodeDbPgHandler;
 
 impl NodeDbPgHandler {
@@ -78,7 +78,7 @@ impl NodeDbPgHandler {
             let catalog = self.state.credentials.catalog();
             let stored = catalog
                 .find_tenant_by_name(value)
-                .map_err(|error| sqlstate_error("XX000", &format!("catalog read: {error}")))?
+                .map_err(|error| error_to_pg_in_context("catalog read", &error))?
                 .ok_or_else(|| sqlstate_error("42704", &format!("tenant '{value}' not found")))?;
             crate::types::TenantId::new(stored.tenant_id)
         };

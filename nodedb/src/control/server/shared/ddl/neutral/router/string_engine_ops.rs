@@ -96,23 +96,31 @@ pub(super) async fn try_string(
     // doc-object UPSERT body, string literal, or comment carrying the token
     // can never reach these arms.
     if upper.starts_with("SELECT RANK(") || upper.starts_with("SELECT RANK (") {
-        return Some(kv_sorted_index::select_rank(state, identity, database_id, sql).await);
+        return Some(
+            kv_sorted_index::select_rank(state, identity, database_id, sql, txn_ctx).await,
+        );
     }
     if upper.starts_with("SELECT TOPK(")
         || upper.starts_with("SELECT TOPK (")
         || upper.starts_with("SELECT * FROM TOPK(")
         || upper.starts_with("SELECT * FROM TOPK (")
     {
-        return Some(kv_sorted_index::select_topk(state, identity, database_id, sql).await);
+        return Some(
+            kv_sorted_index::select_topk(state, identity, database_id, sql, txn_ctx).await,
+        );
     }
     if upper.starts_with("SELECT SORTED_COUNT(") || upper.starts_with("SELECT SORTED_COUNT (") {
-        return Some(kv_sorted_index::select_sorted_count(state, identity, database_id, sql).await);
+        return Some(
+            kv_sorted_index::select_sorted_count(state, identity, database_id, sql, txn_ctx).await,
+        );
     }
     // RANGE as a sorted index function (check it's not a standard SQL RANGE).
     if (upper.starts_with("SELECT * FROM RANGE(") || upper.starts_with("SELECT * FROM RANGE ("))
         && !upper.contains(" BETWEEN ")
     {
-        return Some(kv_sorted_index::select_range(state, identity, database_id, sql).await);
+        return Some(
+            kv_sorted_index::select_range(state, identity, database_id, sql, txn_ctx).await,
+        );
     }
 
     // KV_INCR / KV_DECR / KV_INCR_FLOAT / KV_CAS / KV_GETSET — atomic KV operations.
@@ -322,14 +330,16 @@ pub(super) async fn try_string(
         return Some(estimate_count::estimate_count(state, identity, database_id, sql).await);
     }
 
-    // `DEFINE FIELD …` / `DEFINE EVENT …` — string-recognized (no typed DDL
-    // variant); the pgwire schema string router dispatched both from the raw
-    // SQL. Replicate that exactly here, before the parse gate.
+    // `DEFINE FIELD …` / `DEFINE EVENT …` / `REMOVE EVENT …` —
+    // string-recognized (no typed DDL variant), before the parse gate.
     if upper.starts_with("DEFINE FIELD ") {
         return Some(field_def::define_field(state, identity, database_id, sql));
     }
     if upper.starts_with("DEFINE EVENT ") {
         return Some(field_def::define_event(state, identity, database_id, sql));
+    }
+    if upper.starts_with("REMOVE EVENT ") {
+        return Some(field_def::remove_event(state, identity, database_id, sql));
     }
 
     // `EXPLAIN TIERS ON <collection> [RANGE …]` — string-recognized (no typed
@@ -354,10 +364,7 @@ fn crdt_apply_forbidden_in_transaction(txn_ctx: &DmlTxnCtx<'_>) -> bool {
 }
 
 fn crdt_transaction_error() -> DdlError {
-    DdlError::new(
-        "25001",
-        crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
-    )
+    DdlError::from_error(&crate::Error::CrdtApplyForbiddenInTransaction)
 }
 
 #[cfg(test)]
@@ -385,6 +392,10 @@ mod tests {
 
         let error = crdt_transaction_error();
         assert_eq!(error.sqlstate, "25001");
+        assert_eq!(
+            error.code,
+            nodedb_types::error::ErrorCode::ACTIVE_SQL_TRANSACTION
+        );
         assert_eq!(
             error.message,
             crate::Error::CrdtApplyForbiddenInTransaction.to_string()

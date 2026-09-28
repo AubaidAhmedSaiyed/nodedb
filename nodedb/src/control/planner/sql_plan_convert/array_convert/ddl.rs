@@ -19,7 +19,7 @@ use nodedb_sql::types_array::{
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::array_catalog::ArrayCatalogEntry;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::ArrayOp;
 
 use super::super::convert::ConvertContext;
@@ -131,7 +131,7 @@ pub(in super::super) fn convert_create_array(
 
     // 4. Emit OpenArray so the authorized execution boundary can durably
     // register it immediately before opening the engine side.
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,
@@ -177,7 +177,7 @@ pub(in super::super) fn convert_drop_array(
             detail: format!("DROP ARRAY {name}: not found"),
         });
     };
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,

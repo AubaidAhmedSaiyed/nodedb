@@ -40,13 +40,12 @@ impl Sq8Rerank {
     /// which is suitable for normalized embeddings. For best accuracy call
     /// `train()` with representative samples before encoding.
     pub fn new(dim: usize) -> Self {
-        // Build a minimal calibration over the unit range so encoding is
-        // functional before train() is called.
-        let lo = vec![0.0f32; dim];
-        let hi = vec![1.0f32; dim];
-        let samples: Vec<&[f32]> = vec![lo.as_slice(), hi.as_slice()];
-        let codec = Sq8Codec::calibrate(&samples, dim);
-        Self { codec, dim }
+        // Calibrated over the unit range so encoding is functional before
+        // train() is called.
+        Self {
+            codec: Sq8Codec::unit_range(dim),
+            dim,
+        }
     }
 
     /// Wrap an already-trained `Sq8Codec`.
@@ -133,7 +132,8 @@ impl RerankCodec for Sq8Rerank {
                 "sq8 train: empty sample set".to_string(),
             ));
         }
-        self.codec = Sq8Codec::calibrate(samples, self.dim);
+        self.codec = Sq8Codec::calibrate(samples, self.dim)
+            .map_err(|e| RerankError::BadInput(format!("sq8 train: {e}")))?;
         Ok(())
     }
 }

@@ -18,7 +18,7 @@
 
 use nodedb_types::TenantId;
 
-use crate::bridge::envelope::{PhysicalPlan, Status};
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
 use crate::control::state::SharedState;
 use crate::types::VShardId;
@@ -91,8 +91,11 @@ pub(crate) async fn resolve_and_emit_merge_ops(
         })?;
     let target_pk = resolve_target_pk(&target, "MERGE")?;
 
-    let vshard_id =
-        VShardId::from_collection_in_database(task.database_id, target_collection.as_str());
+    let vshard_id = nodedb_types::CollectionKey::from_qualified_str(
+        task.database_id,
+        target_collection.as_str(),
+    )?
+    .vshard();
     let mut out: Vec<PhysicalTask> = Vec::new();
     emit_arms(
         state,
@@ -178,15 +181,10 @@ async fn resolve_merge_arms(
         task.txn_id,
     )
     .await?;
-    if resolve_resp.status != Status::Ok {
-        return Err(crate::Error::Dispatch {
-            detail: format!(
-                "in-transaction MERGE resolve failed: {:?}",
-                resolve_resp.error_code
-            ),
-        });
-    }
-    decode_resolve(&resolve_resp.payload)
+    // A refused resolve keeps its Data-Plane code.
+    let payload =
+        crate::control::server::shared::response_payload::payload_or_typed_error(resolve_resp)?;
+    decode_resolve(&payload)
 }
 
 /// Rewrite the three resolved arms into concrete point-write tasks appended
@@ -205,9 +203,8 @@ fn emit_arms(
     for (_join_key, body) in arms.inserts {
         let surrogate = assign_target_surrogate(
             state,
-            task.database_id,
+            nodedb_types::CollectionKey::from_qualified_str(task.database_id, target_collection)?,
             task.tenant_id,
-            target_collection,
             target_pk,
             &body,
         )?;

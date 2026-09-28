@@ -6,7 +6,7 @@ use nodedb_array::types::ArrayId;
 use nodedb_sql::types_array::ArrayBinaryOpAst;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::ArrayOp;
 
 use super::super::convert::ConvertContext;
@@ -44,7 +44,7 @@ pub(crate) fn convert_elementwise(
     }
     let left = ArrayId::in_database(tenant_id, ctx.database_id, left_name);
     let right = ArrayId::in_database(tenant_id, ctx.database_id, right_name);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, left_name);
+    let vshard = ctx.collection_key(left_name).vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,

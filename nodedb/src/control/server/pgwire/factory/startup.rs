@@ -22,7 +22,7 @@ use crate::control::server::session_auth::identity::stored_user_identity;
 use crate::control::state::SharedState;
 
 use super::super::handler::NodeDbPgHandler;
-use super::super::types::sqlstate_error;
+use super::super::types::{error_to_pg_in_context, sqlstate_error};
 use super::provider::NodeDbParameterProvider;
 
 /// Enum dispatch for startup handler — avoids dyn trait object issues.
@@ -68,7 +68,7 @@ fn bind_startup_database<C: pgwire::api::ClientInfo>(
         .credentials
         .catalog()
         .get_database_id_by_name(&db_name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
+        .map_err(|e| error_to_pg_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| sqlstate_error("3D000", &format!("database '{db_name}' does not exist")))?;
 
     handler.sessions.set_current_database(session_id, db_id);
@@ -109,7 +109,7 @@ fn admit_connection(
         .set_admission_permit(handler.session_id, permit)
     {
         return Err(sqlstate_error(
-            "XX000",
+            nodedb_types::error::sqlstate::INTERNAL_ERROR,
             "internal error: connection session is not registered",
         ));
     }

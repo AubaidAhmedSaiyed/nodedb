@@ -66,6 +66,10 @@ pub fn select_strategy(selectivity: f64, thresholds: &FilterThresholds) -> Filte
 }
 
 /// Execute adaptive filtered search on an HNSW index.
+///
+/// A query without the index dimension fails with
+/// [`VectorError::DimensionMismatch`](crate::error::VectorError::DimensionMismatch)
+/// under every strategy.
 pub fn adaptive_search(
     index: &HnswIndex,
     query: &[f32],
@@ -73,7 +77,8 @@ pub fn adaptive_search(
     ef: usize,
     bitmap: &RoaringBitmap,
     thresholds: &FilterThresholds,
-) -> Vec<SearchResult> {
+) -> Result<Vec<SearchResult>, crate::error::VectorError> {
+    crate::error::check_dim(index.dim(), query.len())?;
     let total = index.len();
     let selectivity = estimate_selectivity(bitmap, total);
     let strategy = select_strategy(selectivity, thresholds);
@@ -82,13 +87,13 @@ pub fn adaptive_search(
         FilterStrategy::PreFilter => index.search_filtered(query, top_k, ef, bitmap),
         FilterStrategy::PostFilter { over_fetch_factor } => {
             let fetch_k = top_k * over_fetch_factor;
-            let results = index.search(query, fetch_k, ef.max(fetch_k));
+            let results = index.search(query, fetch_k, ef.max(fetch_k))?;
             let mut filtered: Vec<SearchResult> = results
                 .into_iter()
                 .filter(|r| bitmap.contains(r.id))
                 .collect();
             filtered.truncate(top_k);
-            filtered
+            Ok(filtered)
         }
         FilterStrategy::BruteForceMatching => {
             let metric = index.params().metric;
@@ -119,7 +124,7 @@ pub fn adaptive_search(
                     .partial_cmp(&b.distance)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            results
+            Ok(results)
         }
     }
 }
@@ -179,7 +184,8 @@ mod tests {
             bitmap.insert(i);
         }
 
-        let results = adaptive_search(&idx, &[505.0, 0.0, 0.0], 3, 64, &bitmap, &thresholds);
+        let results =
+            adaptive_search(&idx, &[505.0, 0.0, 0.0], 3, 64, &bitmap, &thresholds).unwrap();
         assert_eq!(results.len(), 3);
         for r in &results {
             assert!(bitmap.contains(r.id), "got filtered-out id {}", r.id);
@@ -197,7 +203,8 @@ mod tests {
             bitmap.insert(i);
         }
 
-        let results = adaptive_search(&idx, &[100.0, 0.0, 0.0], 5, 64, &bitmap, &thresholds);
+        let results =
+            adaptive_search(&idx, &[100.0, 0.0, 0.0], 5, 64, &bitmap, &thresholds).unwrap();
         assert_eq!(results.len(), 5);
         for r in &results {
             assert!(bitmap.contains(r.id));
@@ -212,5 +219,27 @@ mod tests {
         }
         let sel = estimate_selectivity(&bitmap, 1000);
         assert!((sel - 0.9).abs() < 0.01);
+    }
+
+    /// Every strategy refuses a query of the wrong dimension, including the
+    /// brute-force path that never touches the graph.
+    #[test]
+    fn wrong_dimension_query_is_a_typed_error() {
+        let idx = build_test_index();
+        let thresholds = FilterThresholds::default();
+        for n in [5u32, 500, 1000] {
+            let bitmap: RoaringBitmap = (0..n).collect();
+            let result = adaptive_search(&idx, &[1.0, 0.0], 3, 64, &bitmap, &thresholds);
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::VectorError::DimensionMismatch {
+                        expected: 3,
+                        got: 2
+                    })
+                ),
+                "{result:?}"
+            );
+        }
     }
 }

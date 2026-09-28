@@ -36,7 +36,7 @@ fn serialize_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, DdlError> {
     let mut out = Vec::with_capacity(rows.len() * 64);
     for row in rows {
         let line = sonic_rs::to_vec(row)
-            .map_err(|e| ddl_err("XX000", format!("COPY TO: JSON serialization error: {e}")))?;
+            .map_err(|e| DdlError::internal(format!("COPY TO: JSON serialization error: {e}")))?;
         out.extend_from_slice(&line);
         out.push(b'\n');
     }
@@ -46,12 +46,8 @@ fn serialize_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, DdlError> {
 fn serialize_json_array(rows: &[serde_json::Value]) -> Result<Vec<u8>, DdlError> {
     // Build a serde_json::Value::Array and serialize once.
     let arr = serde_json::Value::Array(rows.to_vec());
-    let bytes = sonic_rs::to_vec(&arr).map_err(|e| {
-        ddl_err(
-            "XX000",
-            format!("COPY TO: JSON array serialization error: {e}"),
-        )
-    })?;
+    let bytes = sonic_rs::to_vec(&arr)
+        .map_err(|e| DdlError::internal(format!("COPY TO: JSON array serialization error: {e}")))?;
     Ok(bytes)
 }
 

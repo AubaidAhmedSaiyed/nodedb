@@ -93,13 +93,8 @@ impl CoreLoop {
             base_results.clear();
         }
 
-        let Some((positive_terms, negative_terms)) =
-            self.analyze_query_terms(database_id.as_u64(), tid, collection, query)
-        else {
-            // An invalid query already failed the base search with an
-            // error before this merge could run — nothing to fold in.
-            return Ok(());
-        };
+        let (positive_terms, negative_terms) =
+            self.analyze_query_terms(database_id.as_u64(), tid, collection, query)?;
         if positive_terms.is_empty() {
             // No positive terms to score staged docs against — but staged
             // tombstones still hide base rows.
@@ -109,7 +104,7 @@ impl CoreLoop {
 
         let config_key = (database_id, tid, collection.to_string());
         let bm25_params = Bm25Params::default();
-        let ctx = self.staged_score_ctx(database_id, tid, collection, &config_key, &bm25_params);
+        let ctx = self.staged_score_ctx(database_id, tid, collection, &config_key, &bm25_params)?;
 
         let mut seen: HashMap<u32, usize> = base_results
             .iter()
@@ -202,16 +197,14 @@ impl CoreLoop {
         // (`InvertedIndex::phrase_search`) uses — so the contiguity check
         // compares stemmed/normalized tokens on both sides.
         let db_u64 = database_id.as_u64();
-        let phrase_terms: Vec<String> = terms
-            .iter()
-            .map(|t| {
-                self.inverted
-                    .analyze_for_collection(db_u64, tid, collection, t)
-                    .ok()
-                    .and_then(|tokens| tokens.into_iter().next())
-                    .unwrap_or_else(|| t.clone())
-            })
-            .collect();
+        // A term the analyzer drops (a stop word) is matched as written.
+        let mut phrase_terms: Vec<String> = Vec::with_capacity(terms.len());
+        for t in terms {
+            let tokens = self
+                .inverted
+                .analyze_for_collection(db_u64, tid, collection, t)?;
+            phrase_terms.push(tokens.into_iter().next().unwrap_or_else(|| t.clone()));
+        }
 
         let config_key = (database_id, tid, collection.to_string());
 
@@ -282,15 +275,12 @@ impl CoreLoop {
         if overlay.is_truncated(&coll_key) {
             base_results.clear();
         }
-        let Some((positive_terms, negative_terms)) =
-            self.analyze_query_terms(database_id.as_u64(), tid, collection, query)
-        else {
-            return Ok(());
-        };
+        let (positive_terms, negative_terms) =
+            self.analyze_query_terms(database_id.as_u64(), tid, collection, query)?;
 
         let config_key = (database_id, tid, collection.to_string());
         let bm25_params = Bm25Params::default();
-        let ctx = self.staged_score_ctx(database_id, tid, collection, &config_key, &bm25_params);
+        let ctx = self.staged_score_ctx(database_id, tid, collection, &config_key, &bm25_params)?;
 
         for (surrogate, staged) in overlay.iter_for_collection(&coll_key) {
             match staged {
@@ -384,25 +374,31 @@ impl CoreLoop {
     /// — the same resolution the forward-indexing path and the base search
     /// use), once per merge call (never per staged document — every staged
     /// doc in the merge loop is scored against this same pair of term
-    /// lists). Returns `None` when `query` fails to parse (the base search
-    /// already surfaced that error).
+    /// lists). A query that fails to parse fails with `BadRequest`, as the
+    /// base search does. An analyzer error propagates.
     fn analyze_query_terms(
         &self,
         database_id: u64,
         tid: TenantId,
         collection: &str,
         query: &str,
-    ) -> Option<(Vec<String>, Vec<String>)> {
-        let parsed = parse_query(query).ok()?;
-        let positive_terms = self
-            .inverted
-            .analyze_for_collection(database_id, tid, collection, &parsed.positive.join(" "))
-            .unwrap_or_default();
-        let negative_terms = self
-            .inverted
-            .analyze_for_collection(database_id, tid, collection, &parsed.negative.join(" "))
-            .unwrap_or_default();
-        Some((positive_terms, negative_terms))
+    ) -> crate::Result<(Vec<String>, Vec<String>)> {
+        let parsed = parse_query(query).map_err(|e| crate::Error::BadRequest {
+            detail: e.to_string(),
+        })?;
+        let positive_terms = self.inverted.analyze_for_collection(
+            database_id,
+            tid,
+            collection,
+            &parsed.positive.join(" "),
+        )?;
+        let negative_terms = self.inverted.analyze_for_collection(
+            database_id,
+            tid,
+            collection,
+            &parsed.negative.join(" "),
+        )?;
+        Ok((positive_terms, negative_terms))
     }
 }
 

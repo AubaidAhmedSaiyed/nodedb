@@ -1,23 +1,28 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Per-engine "already durable through LSN X" floors recovered from on-disk
-//! checkpoints at boot, consulted by WAL replay so a restored checkpoint is not
-//! re-derived from records it already contains.
+//! Per-engine replay stamps recovered from on-disk checkpoints at boot,
+//! consulted by WAL replay so a restored checkpoint is not re-derived from
+//! records it already contains.
 //!
-//! ## Why replaying ABOVE the floor is safe
+//! ## Why replaying the records a stamp does not hold is safe
 //!
+//! A checkpoint's [`ReplayStamp`] names exactly the records its state holds:
+//! every record at or below its prefix, and the records above the prefix this
+//! core applied before the checkpoint. Every other record replays, through the
+//! same paths, in LSN order, on top of the restored state.
+//!
+//! A replayed record can have a lower LSN than a record the state already
+//! holds: it was still on its way when the higher one applied. The live core
+//! applied the two in that same order, so replay reproduces the live result.
 //! Every KV WAL record replays either as an absolute overwrite (`kv_put`,
-//! `kv_batch_put`, `kv_delete`, `kv_truncate`) or as a delta re-executed against
-//! the engine's current state (`kv_incr`, `kv_cas`, `kv_field_set`,
-//! `kv_transfer`, ...). Restoring a checkpoint durable through LSN F reproduces
-//! exactly the engine state that existed after record F was applied, so feeding
-//! the records above F back through the same replay paths — in LSN order, on top
-//! of that state — reaches the state a full from-zero replay would.
+//! `kv_batch_put`, `kv_delete`, `kv_truncate`) or as a delta re-executed
+//! against the engine's current state (`kv_incr`, `kv_cas`, `kv_field_set`,
+//! `kv_transfer`, ...), and both land where the live apply landed.
 //!
-//! It is records at or below F that MUST be skipped. For the absolute-overwrite
+//! Records the stamp holds MUST be skipped. For the absolute-overwrite
 //! records re-applying is merely redundant, but for the delta records it is
-//! corruption: an increment already folded into the checkpoint would be counted
-//! twice.
+//! corruption: an increment already folded into the checkpoint would be
+//! counted twice.
 //!
 //! ## Why a floor is engine-wide rather than per-collection
 //!
@@ -37,15 +42,13 @@
 //!
 //! ## Which engines need one
 //!
-//! Only those whose WAL records are DELTAS against current state. A floor is not
-//! a general "I restored a checkpoint" marker, and adding one where replay is
-//! already idempotent gates records for no reason.
+//! An engine whose WAL records are deltas or appends against current state
+//! needs one. The sparse-vector engine carries one as well: its checkpoint
+//! names the records it holds, and deciding every record by that stamp keeps
+//! replay in the order the live core applied them.
 //!
-//! Six checkpointed engines deliberately have no field here:
+//! Checkpointed engines with no field here:
 //!
-//! * Sparse vector — `SparseVectorPut` is an upsert keyed by `doc_id` and
-//!   `SparseVectorDelete` is a no-op against an absent document, so a record
-//!   re-applied over the restored index reproduces it.
 //! * The sync idempotency gate — `SyncSeqAdvance` advances both its maps by
 //!   max-wins, so re-folding a record already contained in the restored state
 //!   cannot change it. What that restore needs instead is for replay to MERGE
@@ -57,10 +60,12 @@
 //!   precisely because ids are not stable across restarts, and replay uses the
 //!   same `add_node_label` / `remove_node_label` entry points as the live
 //!   handler.
-//! * The array engine — it carries its own per-array floor rather than one
-//!   here: each array's manifest records the `durable_lsn` its flushed segments
-//!   reach, and `replay_array_wal` gates on that. A shared engine-wide field
-//!   would be wrong for it, since arrays flush independently of one another.
+//! * The array and timeseries engines. Each carries its own stamp per
+//!   artifact rather than one here: an array manifest carries the stamp of
+//!   the flush that last published it, and a timeseries partition carries the
+//!   stamp of the flush that wrote it. Arrays and timeseries collections flush
+//!   independently of one another, so an engine-wide field is wrong for both.
+//!   Both still decide a record through `ReplayStamp::skips`.
 //! * Full-text search — `FtsIndex` rewrites the surrogate's posting, length and
 //!   stats entries wholesale, deriving the corpus-counter deltas from the prior
 //!   doc-length row read in the same write transaction, so a re-applied record
@@ -102,7 +107,7 @@
 //! a floor here, or with a per-collection watermark it carries itself. It must
 //! not assume a cursor will cover it.
 
-use crate::types::Lsn;
+use crate::data::executor::applied_prefix::ReplayStamp;
 
 /// Checkpoint-restored replay floors for every engine on one core.
 ///
@@ -138,42 +143,61 @@ pub(in crate::data::executor) struct ReplayFloors {
     /// and a record class that tolerates gating does not need an exemption
     /// from it.
     pub(in crate::data::executor) columnar: ReplayFloor,
+
+    /// Vector engine floor (HNSW, multi-vector and direct-row indexes),
+    /// populated by `CoreLoop::load_vector_checkpoints`.
+    ///
+    /// An HNSW insert appends a node and never dedups, so a record the
+    /// restored generation holds must not replay. The generation is published
+    /// whole under one manifest, so one engine-wide stamp describes every
+    /// index in it, including an index emptied or dropped since.
+    pub(in crate::data::executor) vector: ReplayFloor,
+
+    /// Sparse-vector engine floor, populated by
+    /// `CoreLoop::load_sparse_vector_checkpoints`.
+    ///
+    /// A sparse put upserts by `doc_id`, so re-applying a record the restored
+    /// generation holds lands on the same postings. The stamp still decides
+    /// every record, so replay applies exactly the records the live core
+    /// applied after the generation was written, in LSN order.
+    pub(in crate::data::executor) sparse_vector: ReplayFloor,
 }
 
-/// The LSN an engine's restored checkpoint is durable through.
+/// What an engine's restored checkpoint holds.
 ///
 /// `None` means no checkpoint was restored, so nothing is gated and the full WAL
-/// replays. Shared by every engine in [`ReplayFloors`]: the gating rule (an
-/// inclusive `record_lsn <= durable_through` check) is identical across
-/// engines — what differs between them is WHY they need one at all, which is
-/// documented on each field above rather than on this type.
+/// replays. Shared by every engine in [`ReplayFloors`]: the gating rule is
+/// [`ReplayStamp::skips`] for every engine. What differs between them is WHY
+/// they need one at all, which is documented on each field above rather than
+/// on this type.
 #[derive(Debug, Default)]
 pub(in crate::data::executor) struct ReplayFloor {
-    durable_through: Option<Lsn>,
+    stamp: Option<ReplayStamp>,
 }
 
 impl ReplayFloor {
-    /// Record that the restored checkpoint is durable through `lsn`.
+    /// Record what the restored checkpoint holds.
     ///
     /// Set once per boot, from the manifest that named the restored generation.
-    pub(in crate::data::executor) fn set(&mut self, lsn: Lsn) {
-        self.durable_through = Some(lsn);
+    pub(in crate::data::executor) fn set(&mut self, stamp: ReplayStamp) {
+        self.stamp = Some(stamp);
     }
 
     /// Whether a record at `record_lsn` is already folded into the restored
-    /// checkpoint and must therefore NOT be replayed.
-    ///
-    /// Inclusive: the manifest's LSN is the one the generation is durable
-    /// THROUGH, so that record's effect is already present.
+    /// checkpoint, or has a final outcome that is not an apply, and must
+    /// therefore NOT be replayed. Every KV, columnar, vector and sparse-vector
+    /// skip site asks here.
     pub(in crate::data::executor) fn covers(&self, record_lsn: u64) -> bool {
-        self.durable_through
-            .is_some_and(|floor| record_lsn <= floor.as_u64())
+        self.stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.skips(record_lsn))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::executor::applied_prefix::stamp::LsnRange;
 
     #[test]
     fn unset_floor_covers_nothing() {
@@ -186,33 +210,30 @@ mod tests {
     }
 
     #[test]
-    fn covers_is_inclusive_of_the_stamped_lsn() {
+    fn covers_is_inclusive_of_the_stamped_prefix() {
         let mut floor = ReplayFloor::default();
-        floor.set(Lsn::new(100));
-        assert!(floor.covers(99), "below the floor is already durable");
-        assert!(floor.covers(100), "the floor itself is already durable");
-        assert!(!floor.covers(101), "above the floor must replay");
+        floor.set(ReplayStamp::through(100));
+        assert!(floor.covers(99), "below the prefix is already durable");
+        assert!(floor.covers(100), "the prefix itself is already durable");
+        assert!(!floor.covers(101), "above the prefix must replay");
     }
 
     #[test]
-    fn unset_columnar_floor_covers_nothing() {
-        let floor = ReplayFloor::default();
-        assert!(!floor.covers(1));
-        assert!(
-            !floor.covers(u64::MAX),
-            "no checkpoint restored must never gate a record"
-        );
-    }
-
-    #[test]
-    fn columnar_covers_is_inclusive_of_the_stamped_lsn() {
+    fn covers_the_applied_set_and_replays_the_gaps_in_it() {
         let mut floor = ReplayFloor::default();
-        floor.set(Lsn::new(100));
-        assert!(floor.covers(99), "below the floor is already durable");
-        assert!(floor.covers(100), "the floor itself is already durable");
+        floor.set(ReplayStamp {
+            prefix: 100,
+            applied_above: vec![LsnRange {
+                start: 103,
+                end: 104,
+            }],
+        });
+        assert!(floor.covers(103));
+        assert!(floor.covers(104));
         assert!(
             !floor.covers(101),
-            "above the floor must replay — gating it would drop the write"
+            "a record in flight when the checkpoint was written must replay"
         );
+        assert!(!floor.covers(105));
     }
 }

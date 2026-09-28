@@ -104,6 +104,88 @@ async fn resp_kv_set_survives_kill_9() {
     );
 }
 
+/// WAL replay recomputes each counter increment from the replayed body, so
+/// replay must read and write decimal text the way the live write did.
+#[tokio::test(flavor = "multi_thread")]
+async fn resp_kv_counters_replay_to_the_acknowledged_values_after_kill_9() {
+    counters_replay_after_kill_9(no_incidental_checkpoint()).await;
+}
+
+/// A standalone node runs no Raft proposer, so the gateway applies each RESP
+/// write on its own cores. It must still append the write's WAL record.
+#[tokio::test(flavor = "multi_thread")]
+async fn resp_kv_counters_replay_after_kill_9_on_a_standalone_node() {
+    counters_replay_after_kill_9(no_incidental_checkpoint().standalone()).await;
+}
+
+async fn counters_replay_after_kill_9(mut h: CrashHarness) {
+    let spawned_at = Instant::now();
+    h.spawn();
+    h.wait_ready();
+
+    h.exec(
+        "CREATE COLLECTION resp_kv_counters (key TEXT PRIMARY KEY, value TEXT) \
+         WITH (engine='kv')",
+    )
+    .await;
+    let password = resp_test_password();
+    h.exec(&format!(
+        "CREATE USER resp_kv_counter_user PASSWORD '{password}'"
+    ))
+    .await;
+    h.exec("GRANT ROLE readwrite TO resp_kv_counter_user").await;
+
+    let mut client = resp_client::session(
+        resp_addr(h.resp_port),
+        "resp_kv_counter_user",
+        &password,
+        "resp_kv_counters",
+    )
+    .await;
+
+    assert_eq!(
+        client.cmd(&["SET", "hits", "41"]).await,
+        Reply::Simple("OK".to_string())
+    );
+    assert_eq!(
+        client.cmd(&["INCRBY", "hits", "1"]).await,
+        Reply::Integer(42)
+    );
+    assert_eq!(client.cmd(&["INCR", "fresh"]).await, Reply::Integer(1));
+    assert_eq!(
+        client.cmd(&["SET", "score", "1.5"]).await,
+        Reply::Simple("OK".to_string())
+    );
+    assert_eq!(
+        client.cmd(&["INCRBYFLOAT", "score", "1"]).await,
+        Reply::Bulk(Some("2.5".to_string()))
+    );
+
+    assert!(
+        spawned_at.elapsed() < MAX_TEST_WALL_CLOCK,
+        "test ran long enough that an incidental checkpoint cycle becomes possible \
+         even with the interval pushed out; tighten the test or the bound"
+    );
+    h.kill_9();
+    h.reopen();
+
+    let mut post_crash_client = resp_client::session(
+        resp_addr(h.resp_port),
+        "resp_kv_counter_user",
+        &password,
+        "resp_kv_counters",
+    )
+    .await;
+    for (key, expected) in [("hits", "42"), ("fresh", "1"), ("score", "2.5")] {
+        let got = post_crash_client.cmd(&["GET", key]).await;
+        assert_eq!(
+            got,
+            Reply::Bulk(Some(expected.to_string())),
+            "counter {key} must replay to the value acknowledged before kill -9"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn http_query_kv_write_survives_kill_9() {
     let mut h = no_incidental_checkpoint();

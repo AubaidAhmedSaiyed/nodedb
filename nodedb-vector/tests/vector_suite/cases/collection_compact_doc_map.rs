@@ -30,7 +30,8 @@ fn build_collection_with_docs() -> VectorCollection {
     let mut coll = VectorCollection::with_seal_threshold(2, params(), 6);
     // Six docs, one vector each. Global ids 0..6, surrogates 1..=6.
     for i in 0..6u32 {
-        coll.insert_with_surrogate(vec![i as f32, 0.0], Surrogate::new(i + 1));
+        coll.insert_with_surrogate(vec![i as f32, 0.0], Surrogate::new(i + 1))
+            .unwrap();
     }
     let req = coll.seal("k").expect("seal produced request");
     let mut idx = HnswIndex::new(req.dim, req.params.clone());
@@ -56,7 +57,7 @@ fn surrogate_map_stays_correct_after_compact() {
     let removed = coll.compact();
     assert_eq!(removed, 2, "compact should remove 2 tombstoned nodes");
 
-    let results = coll.search(&[0.0, 0.0], 4, 64);
+    let results = coll.search(&[0.0, 0.0], 4, 64).unwrap();
     let ids: Vec<u32> = results.iter().map(|r| r.id).collect();
     assert_eq!(ids.len(), 4, "expected 4 live vectors post-compact");
 
@@ -81,12 +82,12 @@ fn multi_doc_map_stays_correct_after_compact() {
 
     let a_vecs: Vec<Vec<f32>> = (0..3u32).map(|i| vec![i as f32, 0.0]).collect();
     let a_refs: Vec<&[f32]> = a_vecs.iter().map(|v| v.as_slice()).collect();
-    let a_ids = coll.insert_multi_vector(&a_refs, doc_a);
+    let a_ids = coll.insert_multi_vector(&a_refs, doc_a).unwrap();
     assert_eq!(a_ids, vec![0, 1, 2]);
 
     let b_vecs: Vec<Vec<f32>> = (3..6u32).map(|i| vec![i as f32, 0.0]).collect();
     let b_refs: Vec<&[f32]> = b_vecs.iter().map(|v| v.as_slice()).collect();
-    let b_ids = coll.insert_multi_vector(&b_refs, doc_b);
+    let b_ids = coll.insert_multi_vector(&b_refs, doc_b).unwrap();
     assert_eq!(b_ids, vec![3, 4, 5]);
 
     let req = coll.seal("k").expect("seal produced request");

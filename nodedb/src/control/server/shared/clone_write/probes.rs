@@ -38,7 +38,8 @@ pub(super) async fn probe_row_in_target(
         valid_at_ms: None,
     });
     let plan = with_caller_rls(state, identity, tenant_id, db_id, plan)?;
-    let vshard_id = VShardId::from_collection_in_database(db_id, collection_qualified);
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(db_id, collection_qualified)?.vshard();
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, plan).await?;
     Ok(!resp.payload.is_empty() && resp.status == Status::Ok)
 }
@@ -65,7 +66,9 @@ pub(super) async fn fetch_source_row(
         valid_at_ms: None,
     });
     let plan = with_caller_rls(state, identity, tenant_id, source_db_id, plan)?;
-    let vshard_id = VShardId::from_collection_in_database(source_db_id, source_coll_qualified);
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(source_db_id, source_coll_qualified)?
+            .vshard();
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, source_db_id, plan).await?;
     if resp.payload.is_empty() || resp.status != Status::Ok {
         return Ok(None);
@@ -94,7 +97,8 @@ pub(super) async fn probe_kv_key_in_target(
         surrogate_ceiling: None,
     });
     let plan = with_caller_rls(state, identity, tenant_id, db_id, plan)?;
-    let vshard_id = VShardId::from_collection_in_database(db_id, collection_qualified);
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(db_id, collection_qualified)?.vshard();
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, plan).await?;
     Ok(!resp.payload.is_empty() && resp.status == Status::Ok)
 }
@@ -120,7 +124,9 @@ pub(super) async fn fetch_kv_source_value(
         surrogate_ceiling: None,
     });
     let plan = with_caller_rls(state, identity, tenant_id, source_db_id, plan)?;
-    let vshard_id = VShardId::from_collection_in_database(source_db_id, source_coll_qualified);
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(source_db_id, source_coll_qualified)?
+            .vshard();
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, source_db_id, plan).await?;
     if resp.payload.is_empty() || resp.status != Status::Ok {
         return Ok(None);

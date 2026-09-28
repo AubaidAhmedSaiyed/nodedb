@@ -107,7 +107,7 @@ pub fn create_tenant(
         .credentials
         .catalog()
         .find_tenant_by_name(name)
-        .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .is_some()
     {
         if if_not_exists {
@@ -128,7 +128,7 @@ pub fn create_tenant(
             TenantId::new(
                 catalog
                     .allocate_tenant_id()
-                    .map_err(|e| ddl_err("XX000", format!("tenant id alloc: {e}")))?,
+                    .map_err(|e| DdlError::from_error_in_context("tenant id alloc", &e))?,
             )
         }
     };
@@ -180,13 +180,13 @@ pub fn create_tenant(
         admin: Box::new(admin.clone()),
     };
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| ddl_err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()
             .put_tenant_with_admin(&stored, &admin)
-            .map_err(|e| ddl_err("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         state.credentials.install_replicated_user(&admin, None);
         let mut tenants = match state.tenants.lock() {
             Ok(t) => t,
@@ -200,12 +200,12 @@ pub fn create_tenant(
     let catalog = state.credentials.catalog();
     let tenant_applied = catalog
         .load_all_tenants()
-        .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .into_iter()
         .any(|persisted| persisted == stored);
     let admin_applied = catalog
         .get_user(&admin_name)
-        .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .is_some_and(|persisted| persisted == admin);
     if !tenant_applied || !admin_applied {
         return Err(ddl_err(

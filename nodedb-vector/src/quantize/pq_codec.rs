@@ -166,7 +166,7 @@ mod tests {
             })
             .collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        PqCodec::train(&refs, 4, 2, 8, 10, test_memory())
+        PqCodec::train(&refs, 4, 2, 8, 10, test_memory()).unwrap()
     }
 
     /// `encode` round-trip: packed_bits in the UQV must match the raw

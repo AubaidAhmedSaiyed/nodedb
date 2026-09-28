@@ -136,18 +136,20 @@ async fn dispatch_rename_ops(
             sync_dispatch::SystemTask::new(
                 sync_dispatch::SystemReason::TenantLifecycle,
                 tenant_id,
-                target_db_id,
-                "__system",
+                nodedb_types::CollectionKey::from_bare(target_db_id, "__system"),
                 plan,
             ),
             RENAME_DISPATCH_TIMEOUT,
         )
         .await
+        // The phase code stays the statement's verdict, and the typed
+        // dispatch error rides as its cause with its own class.
         .map_err(|e| {
             NodeDbError::move_tenant_cutover_failed(
                 tenant_id.as_u64().to_string(),
-                format!("rename_collection dispatch ({old_collection} -> {new_collection}): {e}"),
+                format!("rename_collection dispatch ({old_collection} -> {new_collection})"),
             )
+            .with_cause(crate::error_classify::classify(&e))
         })?;
     }
     Ok(())

@@ -2,8 +2,7 @@
 
 //! The non-recording implementation of the WAL's report sites.
 //!
-//! Compiled when the `diagnostics` feature is off, and unconditionally on
-//! wasm32 where there is no filesystem to write a report to. Every entry point
+//! Compiled when the `diagnostics` feature is off. Every entry point
 //! keeps the signature of its recording counterpart so call sites are free of
 //! `cfg`, and every one is empty so the WAL behaves byte-for-byte as it did
 //! before the recorder existed.

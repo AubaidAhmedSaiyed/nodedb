@@ -2,7 +2,7 @@
 
 //! Deterministic name picking for cross-vShard tests.
 //!
-//! vShards are per collection (`VShardId::from_collection_in_database`) and
+//! vShards are per collection (`VShardId::from_collection`) and
 //! per graph endpoint key (`VShardId::from_key`). Both are pure functions of
 //! their input bytes, so a test can pick names that land on distinct vShards
 //! without probing the cluster.
@@ -16,10 +16,12 @@ const MAX_TRIES: u32 = 512;
 /// used verbatim; `second` is `{second_prefix}_{i}` for the lowest `i` that
 /// hashes away from `first`.
 pub fn distinct_vshard_collections(first: &str, second_prefix: &str) -> (String, String) {
-    let first_vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, first);
+    let first_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, first).vshard();
     for i in 0..MAX_TRIES {
         let second = format!("{second_prefix}_{i}");
-        if VShardId::from_collection_in_database(DatabaseId::DEFAULT, &second) != first_vshard {
+        if nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &second).vshard()
+            != first_vshard
+        {
             return (first.to_owned(), second);
         }
     }
@@ -33,7 +35,8 @@ pub fn distinct_vshard_collections(first: &str, second_prefix: &str) -> (String,
 /// `collection`'s own vShard, so an implicit edge task homed on the key is
 /// dispatched to a different vShard than the document write.
 pub fn key_on_other_vshard(collection: &str, prefix: &str) -> String {
-    let coll_vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
+    let coll_vshard =
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection).vshard();
     for i in 0..MAX_TRIES {
         let key = format!("{prefix}_{i}");
         if VShardId::from_key(key.as_bytes()) != coll_vshard {

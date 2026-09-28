@@ -40,7 +40,10 @@ async fn snapshot_round_trip_stale_state() {
     // ── Sanity: both collections' vShards belong to the data group we build. ──
     let routing = single_node_routing();
     for coll in [COLL_A, COLL_B] {
-        let vshard = vshard_for_collection(DatabaseId::DEFAULT, coll);
+        let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+            DatabaseId::DEFAULT,
+            coll,
+        ));
         assert!(
             routing.vshards_for_group(DATA_GROUP_ID).contains(&vshard),
             "collection {coll} vShard {vshard} must belong to data group {DATA_GROUP_ID}"

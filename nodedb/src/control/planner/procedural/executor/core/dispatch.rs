@@ -8,6 +8,7 @@ use super::sql_literal_concat::fold_literal_string_concat;
 use crate::control::planner::procedural::ast::SqlExpr;
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::eval;
+use crate::control::server::dispatch_utils::{MintedRecords, RecordOwner};
 use crate::types::TraceId;
 
 impl<'a> StatementExecutor<'a> {
@@ -172,13 +173,25 @@ impl<'a> StatementExecutor<'a> {
                     }
                 }
 
-                let outcome = crate::control::server::wal_dispatch::wal_append_if_write(
-                    &self.state.wal,
-                    task.tenant_id,
-                    task.vshard_id,
-                    task.database_id,
-                    &task.plan,
-                )?;
+                // The window opens before the append and closes from the
+                // write's outcome inside the funnel.
+                let owner = RecordOwner {
+                    tenant_id: task.tenant_id,
+                    database_id: task.database_id,
+                    vshard_id: task.vshard_id,
+                };
+                let minted = MintedRecords::open(&self.state.outcome_floor);
+                let outcome =
+                    match minted.append_plan(&self.state.wal, owner, &task.plan, self.event_source)
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            // Any record appended before the error never reaches
+                            // a core.
+                            minted.cancel(&self.state.wal, owner, 0).await?;
+                            return Err(error);
+                        }
+                    };
 
                 crate::control::server::dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
                     self.state,
@@ -192,6 +205,7 @@ impl<'a> StatementExecutor<'a> {
                         txn_id: None,
                         wal_lsn: outcome.lsn,
                         resolved_now_ms: outcome.resolved_now_ms,
+                        minted: Some(minted),
                     },
                 )
                 .await?;
@@ -294,96 +308,40 @@ impl<'a> StatementExecutor<'a> {
         }
     }
 
-    /// Flush the procedure transaction buffer: WAL append + dispatch as batch.
+    /// Commit the procedure transaction buffer as one system transaction.
+    ///
+    /// Every statement's tasks stage through the same path a client
+    /// transaction takes, and COMMIT resolves them into one redo record that
+    /// installs all of them or none. Restart replay installs that same
+    /// record. Each statement's descriptor leases stay on the tasks it
+    /// buffered until COMMIT has checked them.
     pub(super) async fn flush_transaction_buffer(&self) -> crate::Result<()> {
-        let (tasks, _lease_scopes) = if let Some(ref tx_ctx) = self.tx_ctx {
+        let statements = if let Some(ref tx_ctx) = self.tx_ctx {
             let mut guard = tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
-            guard.take_buffered()
+            guard.take_statements()
         } else {
             return Ok(());
         };
-
-        // `_lease_scopes` owns every statement's descriptor admission through
-        // all WAL appends and the complete batch dispatch below. It is dropped
-        // only after this function returns, including on an execution error.
-        if tasks.is_empty() {
+        if statements.iter().all(|(tasks, _)| tasks.is_empty()) {
             return Ok(());
         }
-
-        // Each task's WAL record has its own LSN; the batch dispatch below
-        // carries the highest so the Data Plane's write-version floor advances
-        // past every write it applies. Same approximation for the resolved TTL
-        // instant: a single scalar can't represent one-per-task resolved
-        // instants for a heterogeneous multi-statement batch, so it is only
-        // threaded through when the buffer holds exactly one task (below);
-        // resolving that properly for N>1 would need `MetaOp::TransactionBatch`
-        // to carry a per-plan `Vec<Option<u64>>`, a separate, wider change to
-        // the procedural batch-flush path, not this KV-write fix.
-        let mut max_wal_lsn: Option<crate::types::Lsn> = None;
-        let mut single_task_resolved_now_ms: Option<u64> = None;
-        for task in &tasks {
-            let outcome = crate::control::server::wal_dispatch::wal_append_if_write(
-                &self.state.wal,
-                task.tenant_id,
-                task.vshard_id,
-                task.database_id,
-                &task.plan,
-            )?;
-            if let Some(lsn) = outcome.lsn {
-                max_wal_lsn = Some(max_wal_lsn.map_or(lsn, |cur| cur.max(lsn)));
-            }
-            single_task_resolved_now_ms = outcome.resolved_now_ms;
-        }
-
-        if tasks.len() == 1 {
-            if let Some(task) = tasks.into_iter().next() {
-                crate::control::server::dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
-                    self.state,
-                    crate::control::server::dispatch_utils::WriteDispatch {
-                        tenant_id: task.tenant_id,
-                        database_id: task.database_id,
-                        vshard_id: task.vshard_id,
-                        plan: task.plan,
-                        trace_id: TraceId::ZERO,
-                        event_source: self.event_source,
-                        txn_id: None,
-                        wal_lsn: max_wal_lsn,
-                        resolved_now_ms: single_task_resolved_now_ms,
-                    },
-                )
-                .await?;
-            }
-        } else {
-            let tenant_id = tasks[0].tenant_id;
-            let database_id = tasks[0].database_id;
-            let vshard_id = tasks[0].vshard_id;
-            let plans: Vec<_> = tasks.into_iter().map(|t| t.plan).collect();
-            let batch_plan = crate::bridge::envelope::PhysicalPlan::Meta(
-                nodedb_physical::physical_plan::MetaOp::TransactionBatch {
-                    plans,
-                    txn_id: None,
-                },
-            );
-            crate::control::server::dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
-                self.state,
-                crate::control::server::dispatch_utils::WriteDispatch {
-                    tenant_id,
-                    database_id,
-                    vshard_id,
-                    plan: batch_plan,
-                    trace_id: TraceId::ZERO,
-                    event_source: self.event_source,
-                    txn_id: None,
-                    wal_lsn: max_wal_lsn,
-                    // N>1 batch: no single instant represents every task's
-                    // resolved TTL — see the comment above the WAL-append loop.
-                    resolved_now_ms: None,
+        let statements = statements
+            .into_iter()
+            .map(
+                |(tasks, lease_scope)| crate::control::system_txn::SystemTxnStatement {
+                    tasks,
+                    lease_scope: std::sync::Arc::new(lease_scope),
                 },
             )
-            .await?;
-        }
-
-        Ok(())
+            .collect();
+        crate::control::system_txn::run_statements_atomically(
+            self.state,
+            &self.identity_for_dispatch(),
+            statements,
+            self.event_source,
+        )
+        .await
+        .map_err(crate::Error::from)
     }
 }
 
@@ -573,7 +531,9 @@ mod cross_shard_origination_tests {
     fn remote_homed_name(prefix: &str) -> String {
         for i in 0..4096u32 {
             let name = format!("{prefix}_{i}");
-            let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &name);
+            let vshard = nodedb_cluster::routing::vshard_for_collection(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name),
+            );
             if vshard % 2 == 1 {
                 return name;
             }
@@ -586,7 +546,9 @@ mod cross_shard_origination_tests {
     fn local_homed_name(prefix: &str) -> String {
         for i in 0..4096u32 {
             let name = format!("{prefix}_{i}");
-            let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &name);
+            let vshard = nodedb_cluster::routing::vshard_for_collection(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name),
+            );
             if vshard.is_multiple_of(2) {
                 return name;
             }
@@ -652,7 +614,10 @@ mod cross_shard_origination_tests {
         assert_eq!(req.cascade_depth, 0);
         assert_eq!(
             req.target_vshard,
-            nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &tgt)
+            nodedb_cluster::routing::vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+                DatabaseId::DEFAULT,
+                &tgt,
+            ))
         );
     }
 

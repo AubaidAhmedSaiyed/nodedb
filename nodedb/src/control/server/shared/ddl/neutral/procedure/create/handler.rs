@@ -50,7 +50,7 @@ pub fn create_procedure(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError::new("XX000", "system clock before UNIX epoch"))?
+        .map_err(|_| DdlError::internal("system clock before UNIX epoch"))?
         .as_secs();
 
     let routability = extract_routability(&parsed.body_sql);

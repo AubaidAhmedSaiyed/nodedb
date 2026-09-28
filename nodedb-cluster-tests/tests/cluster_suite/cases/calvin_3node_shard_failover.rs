@@ -43,15 +43,12 @@ use std::time::Duration;
 
 use nodedb_cluster::calvin::{
     sequencer::{SequencerConfig, new_inbox},
-    types::{EngineKeySet, ReadWriteSet, SequencedTxn, SortedVec, TxClass, VersionedReadSet},
+    types::{EngineKeySet, ReadWriteSet, SchedulerInput, SortedVec, TxClass, VersionedReadSet},
 };
-use nodedb_types::{
-    TenantId,
-    id::{DatabaseId, VShardId},
-};
+use nodedb_types::{TenantId, id::DatabaseId};
 use tokio::sync::mpsc;
 
-use super::cluster_common::{spawn_with_sequencer, wait_for_sequencer_leader};
+use super::cluster_common::{spawn_with_sequencer, try_recv_txn, wait_for_sequencer_leader};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -59,7 +56,9 @@ fn two_distinct_collections() -> (String, String) {
     let mut first: Option<(String, u32)> = None;
     for i in 0u32..512 {
         let name = format!("col_{i}");
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+            .vshard()
+            .as_u32();
         if let Some((ref fname, fv)) = first {
             if fv != vshard {
                 return (fname.clone(), name);
@@ -130,11 +129,15 @@ async fn scheduler_catchup_via_raft_log_replay() {
 
     // Wire per-vshard receivers on every node so we can verify fan-out.
     let (col_a, col_b) = two_distinct_collections();
-    let va = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_a).as_u32();
-    let vb = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_b).as_u32();
+    let va = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &col_a)
+        .vshard()
+        .as_u32();
+    let vb = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &col_b)
+        .vshard()
+        .as_u32();
 
-    let mut vshard_rxs_a: Vec<mpsc::Receiver<SequencedTxn>> = Vec::new();
-    let mut vshard_rxs_b: Vec<mpsc::Receiver<SequencedTxn>> = Vec::new();
+    let mut vshard_rxs_a: Vec<mpsc::Receiver<SchedulerInput>> = Vec::new();
+    let mut vshard_rxs_b: Vec<mpsc::Receiver<SchedulerInput>> = Vec::new();
     for node in &nodes {
         let (tx_a, rx_a) = mpsc::channel(128);
         let (tx_b, rx_b) = mpsc::channel(128);
@@ -246,7 +249,7 @@ async fn scheduler_catchup_via_raft_log_replay() {
     // Drain whatever arrived — we care that the routing worked, not the count.
     let mut total_received = 0usize;
     for rx in vshard_rxs_a.iter_mut().chain(vshard_rxs_b.iter_mut()) {
-        while rx.try_recv().is_ok() {
+        while try_recv_txn(rx).is_some() {
             total_received += 1;
         }
     }

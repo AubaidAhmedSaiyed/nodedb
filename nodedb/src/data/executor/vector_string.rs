@@ -82,11 +82,11 @@ fn parse_float_list(inner: &str) -> Option<Vec<f32>> {
     Some(floats)
 }
 
+/// A field value that is not a usable vector: the caller's data error,
+/// SQLSTATE `22000`, naming the collection and field.
 fn vector_error(collection: &str, field_name: &str, detail: String) -> crate::Error {
-    crate::Error::RejectedConstraint {
-        collection: collection.to_string(),
-        constraint: format!("vector field '{field_name}'"),
-        detail,
+    crate::Error::DataException {
+        detail: format!("vector field '{field_name}' in '{collection}': {detail}"),
     }
 }
 
@@ -272,7 +272,7 @@ mod tests {
         for bad in ["not-json", "7", "[0.1, \"bad\"]", "{}", "[nan]", "[1 2 3]"] {
             let res = floats_from_value("c", "embedding", &String(bad.to_string()));
             assert!(
-                matches!(res, Err(crate::Error::RejectedConstraint { .. })),
+                matches!(res, Err(crate::Error::DataException { .. })),
                 "String({bad:?}) must be rejected, got {res:?}"
             );
         }
@@ -282,7 +282,7 @@ mod tests {
             &Array(vec![Float(0.1), String("bad".to_string())]),
         );
         assert!(
-            matches!(res, Err(crate::Error::RejectedConstraint { .. })),
+            matches!(res, Err(crate::Error::DataException { .. })),
             "array with a non-numeric element must be rejected"
         );
     }
@@ -293,13 +293,13 @@ mod tests {
         for empty in ["", "[]", "[,,]", "[ ]"] {
             let res = floats_from_value("c", "embedding", &String(empty.to_string()));
             assert!(
-                matches!(res, Err(crate::Error::RejectedConstraint { .. })),
+                matches!(res, Err(crate::Error::DataException { .. })),
                 "String({empty:?}) must be rejected as an empty vector, got {res:?}"
             );
         }
         let res = floats_from_value("c", "embedding", &Array(vec![]));
         assert!(
-            matches!(res, Err(crate::Error::RejectedConstraint { .. })),
+            matches!(res, Err(crate::Error::DataException { .. })),
             "an empty array must be rejected as an empty vector"
         );
     }
@@ -312,19 +312,17 @@ mod tests {
             &nodedb_types::Value::String("not-json".to_string()),
         );
         match res {
-            Err(crate::Error::RejectedConstraint {
-                collection,
-                constraint,
-                detail,
-            }) => {
-                assert_eq!(collection, "docs", "error must name the collection");
+            Err(crate::Error::DataException { detail }) => {
                 assert!(
-                    constraint.contains("embedding"),
-                    "error must name the field, got {constraint:?}"
+                    detail.contains("'docs'"),
+                    "error must name the collection: {detail}"
                 );
-                assert!(!detail.is_empty(), "error must carry the offending input");
+                assert!(
+                    detail.contains("'embedding'"),
+                    "error must name the field: {detail}"
+                );
             }
-            other => panic!("expected RejectedConstraint, got {other:?}"),
+            other => panic!("expected DataException, got {other:?}"),
         }
     }
 }

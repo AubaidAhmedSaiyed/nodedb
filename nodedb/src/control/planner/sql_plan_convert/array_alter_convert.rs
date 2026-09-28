@@ -8,7 +8,7 @@
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::array_catalog::ArrayCatalogEntry;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_types::config::retention::BitemporalRetention;
 
@@ -80,7 +80,7 @@ pub(super) fn convert_alter_array(
     // durably installed by the authorized dispatch boundary.
     let _updated = updated;
 
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,

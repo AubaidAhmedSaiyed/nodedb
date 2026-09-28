@@ -100,13 +100,13 @@ pub fn add_period_lock(
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &name)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
 
     coll.period_lock = Some(def);
 
     persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
 
@@ -141,13 +141,13 @@ pub fn drop_period_lock(
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &name)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
 
     coll.period_lock = None;
 
     persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
 

@@ -87,7 +87,7 @@ pub fn alter_function(
 
     let mut func = catalog
         .get_function_in_database(database_id, tenant_id, &name)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| DdlError::new("42883", format!("function '{name}' does not exist")))?;
 
     let old_owner = func.owner.clone();
@@ -129,7 +129,7 @@ fn alter_function_limits(
 
     let mut func = catalog
         .get_function_in_database(database_id, tenant_id, name)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| DdlError::new("42883", format!("function '{name}' does not exist")))?;
 
     // Parse SET (...) from remaining parts.

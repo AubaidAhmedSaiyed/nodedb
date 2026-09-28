@@ -142,7 +142,9 @@ fn get_or_create_topic_buffer(
 /// Determine the home node for a topic.
 fn topic_home_node(state: &SharedState, database_id: DatabaseId, topic_name: &str) -> Option<u64> {
     let routing_lock = state.cluster_routing.as_ref()?;
-    let vshard_id = nodedb_cluster::routing::vshard_for_collection(database_id, topic_name);
+    let vshard_id = nodedb_cluster::routing::vshard_for_collection(
+        nodedb_types::CollectionKey::from_bare(database_id, topic_name),
+    );
     let routing = routing_lock.read().unwrap_or_else(|p| p.into_inner());
     routing.leader_for_vshard(vshard_id).ok()
 }

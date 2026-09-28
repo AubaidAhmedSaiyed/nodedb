@@ -65,8 +65,8 @@ use nodedb_physical::physical_plan::{
     resolved_sum_surrogate,
 };
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
-use nodedb_types::Surrogate;
 use nodedb_types::id::TxnId;
+use nodedb_types::{CollectionKey, Surrogate};
 
 use crate::control::server::shared::session::read_set::{
     EngineTag, ReadKey, ReadOrigin, ReadSetEntry,
@@ -143,12 +143,9 @@ pub(super) fn settle_cross_shard_images(
     database_id: DatabaseId,
 ) -> crate::Result<Settlement> {
     let mut settlement = Settlement::empty();
+    let source = CollectionKey::from_qualified_str(database_id, input.source_collection)?;
     for binding in bindings {
-        if sum_target_is_co_resident(
-            database_id,
-            input.source_collection,
-            &binding.target_collection,
-        ) {
+        if sum_target_is_co_resident(source, &binding.target_collection) {
             // One core owns both rows: the balance rides the source write's own
             // transaction and is atomic for free.
             continue;
@@ -314,12 +311,9 @@ pub(super) fn co_resident_target_keys(
     database_id: DatabaseId,
 ) -> crate::Result<Vec<SumTargetKey>> {
     let mut keep: Vec<SumTargetKey> = Vec::new();
+    let source = CollectionKey::from_qualified_str(database_id, input.source_collection)?;
     for binding in bindings {
-        if !sum_target_is_co_resident(
-            database_id,
-            input.source_collection,
-            &binding.target_collection,
-        ) {
+        if !sum_target_is_co_resident(source, &binding.target_collection) {
             continue;
         }
         for (old, new) in input.images {
@@ -338,8 +332,6 @@ pub(super) fn co_resident_target_keys(
 mod tests {
     use super::*;
 
-    use crate::types::VShardId;
-
     const TENANT: TenantId = TenantId::new(7);
     const DB: DatabaseId = DatabaseId::DEFAULT;
 
@@ -347,10 +339,10 @@ mod tests {
     /// below exercise the path this module exists for.
     fn cross_shard_pair() -> (String, String) {
         let source = "settle_entries".to_string();
-        let home = VShardId::from_collection_in_database(DB, &source);
+        let home = CollectionKey::from_bare(DB, &source).vshard();
         let target = (0..2048)
             .map(|i| format!("settle_accounts_{i}"))
-            .find(|candidate| VShardId::from_collection_in_database(DB, candidate) != home)
+            .find(|candidate| CollectionKey::from_bare(DB, candidate).vshard() != home)
             .unwrap_or_else(|| panic!("the routing domain must hold more than one vShard"));
         (source, target)
     }

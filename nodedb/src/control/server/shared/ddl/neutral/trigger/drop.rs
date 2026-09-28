@@ -51,7 +51,7 @@ pub fn drop_trigger(
     // trigger returns a clean success without touching raft).
     let exists_before = catalog
         .get_trigger_in_database(database_id, tenant_id, &name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .is_some();
     if !exists_before && !if_exists {
         return Err(DdlError::new(
@@ -138,7 +138,7 @@ pub fn alter_trigger(
 
     let mut trigger = catalog
         .get_trigger_in_database(database_id, tenant_id, name)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| DdlError::new("42704", format!("trigger '{name}' does not exist")))?;
 
     trigger.enabled = enabled;
@@ -179,7 +179,7 @@ fn alter_trigger_owner(
 
     let mut trigger = catalog
         .get_trigger_in_database(database_id, tenant_id, name)
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| DdlError::new("42704", format!("trigger '{name}' does not exist")))?;
 
     // Do not mutate a definition until the target principal is known to

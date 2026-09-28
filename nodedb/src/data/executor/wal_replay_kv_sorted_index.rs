@@ -219,6 +219,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         })
     }
 
@@ -447,7 +448,11 @@ mod tests {
         // register record's LSN must be strictly less than the purge LSN
         // for `is_tombstoned` to gate it out.
         let mut tombstones = TombstoneSet::new();
-        tombstones.insert(0, TID, "players".to_string(), register_lsn + 1);
+        tombstones.insert(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "players"),
+            TID,
+            register_lsn + 1,
+        );
 
         let mut h = make_core();
         h.core.replay_kv_wal(&records, 1, &tombstones);

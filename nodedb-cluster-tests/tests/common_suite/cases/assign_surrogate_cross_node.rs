@@ -101,9 +101,8 @@ async fn assign_remote_surrogate_is_authoritative_and_idempotent() {
     let s1 = assign_surrogate_routed(
         &coordinator.shared,
         vshard,
-        DB,
+        nodedb_types::CollectionKey::from_bare(DB, &collection),
         TENANT,
-        &collection,
         pk.as_bytes(),
         TraceId([0u8; 16]),
     )
@@ -121,9 +120,8 @@ async fn assign_remote_surrogate_is_authoritative_and_idempotent() {
     let s2 = assign_surrogate_routed(
         &coordinator.shared,
         vshard,
-        DB,
+        nodedb_types::CollectionKey::from_bare(DB, &collection),
         TENANT,
-        &collection,
         pk.as_bytes(),
         TraceId([0u8; 16]),
     )

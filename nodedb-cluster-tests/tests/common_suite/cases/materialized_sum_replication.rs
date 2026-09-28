@@ -26,7 +26,7 @@ use common::cluster_harness::TestCluster;
 
 use std::time::Duration;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 
 /// Cross-shard fixture: source and target hash to different vShards.
 const XS_SOURCE: &str = "rep_entries";
@@ -204,8 +204,8 @@ async fn assert_every_replica_agrees(
 #[test]
 fn coresident_fixture_shares_one_vshard() {
     assert_eq!(
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, CO_SOURCE),
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, CO_TARGET),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, CO_SOURCE).vshard(),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, CO_TARGET).vshard(),
         "this fixture must exercise the fold that runs inside the source write's own \
          transaction"
     );
@@ -215,8 +215,8 @@ fn coresident_fixture_shares_one_vshard() {
 #[test]
 fn replication_fixture_is_cross_shard() {
     assert_ne!(
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, XS_SOURCE),
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, XS_TARGET),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, XS_SOURCE).vshard(),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, XS_TARGET).vshard(),
         "this fixture must exercise the replicated cross-shard balance write"
     );
 }

@@ -27,7 +27,6 @@ use super::connection_identity::PgConnectionContext;
 use super::factory::NodeDbPgHandlerFactory;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
-const INTERNAL_ERROR_CODE: &str = "XX000";
 const INTERNAL_ERROR_MESSAGE: &str = "internal server error";
 
 /// The observable outcome of a single connection loop.
@@ -63,7 +62,7 @@ fn materialize_handlers<T>(build: impl FnOnce() -> T) -> Result<T, ()> {
 fn fixed_panic_response() -> PgWireBackendMessage {
     let error = ErrorInfo::new(
         "FATAL".to_owned(),
-        INTERNAL_ERROR_CODE.to_owned(),
+        nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
         INTERNAL_ERROR_MESSAGE.to_owned(),
     );
     PgWireBackendMessage::ErrorResponse(error.into())

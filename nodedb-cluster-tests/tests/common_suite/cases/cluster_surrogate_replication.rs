@@ -43,9 +43,8 @@ fn surrogate_for_pk(
     let catalog = shared.credentials.catalog();
     catalog
         .get_surrogate_for_pk(
-            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection),
             TenantId::new(1),
-            collection,
             pk.as_bytes(),
         )
         .ok()

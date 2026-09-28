@@ -52,13 +52,22 @@ impl NativeSession {
             // status surfaces must agree that this node cannot serve.
             // A halted sequencer is the same shape of after-boot degradation as
             // a wedged applier: the node still serves, but a whole class of
-            // writes no longer completes. Both surfaces must say so.
+            // writes no longer completes. Both surfaces must say so. A halted
+            // Calvin scheduler is the same shape, scoped to one vShard.
             // A stalled Data Plane core is a third after-boot degradation with
             // the same consequence: the gate reads Ok while work sent to that
             // core never completes. One atomic load, so it stays on this path.
+            // A fail-stopped core refuses its work outright, with the same
+            // consequence.
             let native_status = if self.state.metadata_apply_wedge.is_wedged()
                 || self.state.sequencer_halt.is_halted()
+                || self.state.sequencer_halt.apply_halt().is_halted()
                 || self.state.core_stall.is_stalled()
+                || self
+                    .state
+                    .system_metrics
+                    .as_ref()
+                    .is_some_and(|metrics| metrics.core_fail_stops.is_stopped())
             {
                 crate::control::startup::health::NativeStatus::Failed
             } else {
@@ -316,6 +325,27 @@ impl NativeSession {
                 dispatch::handle_sql(&ctx, seq, &format!("EXPLAIN {sql}"), None).await
             }
 
+            // Sorted-index reads name only an index: gated on its owning
+            // collection and run in the caller's transaction, like the SQL
+            // sorted-index functions.
+            OpCode::KvSortedIndexRank
+            | OpCode::KvSortedIndexTopK
+            | OpCode::KvSortedIndexRange
+            | OpCode::KvSortedIndexCount
+            | OpCode::KvSortedIndexScore => {
+                dispatch::handle_sorted_read_op(&ctx, seq, op, fields).await
+            }
+
+            // Index DDL runs as the SQL statement it names, so it reaches the
+            // catalog and the transaction's DDL buffer.
+            OpCode::KvRegisterSortedIndex
+            | OpCode::KvDropSortedIndex
+            | OpCode::VectorSetParams
+            | OpCode::DocumentDropIndex
+            | OpCode::DocumentRegister
+            | OpCode::KvRegisterIndex
+            | OpCode::KvDropIndex => dispatch::handle_index_ddl_op(&ctx, seq, op, fields).await,
+
             // Direct Data Plane operations.
             OpCode::PointGet
             | OpCode::PointPut
@@ -360,23 +390,11 @@ impl NativeSession {
             | OpCode::DocumentTruncate
             | OpCode::DocumentEstimateCount
             | OpCode::DocumentInsertSelect
-            | OpCode::DocumentRegister
-            | OpCode::DocumentDropIndex
-            | OpCode::KvRegisterIndex
-            | OpCode::KvDropIndex
             | OpCode::KvTruncate
-            | OpCode::VectorSetParams
             | OpCode::KvIncr
             | OpCode::KvIncrFloat
             | OpCode::KvCas
             | OpCode::KvGetSet
-            | OpCode::KvRegisterSortedIndex
-            | OpCode::KvDropSortedIndex
-            | OpCode::KvSortedIndexRank
-            | OpCode::KvSortedIndexTopK
-            | OpCode::KvSortedIndexRange
-            | OpCode::KvSortedIndexCount
-            | OpCode::KvSortedIndexScore
             | OpCode::CrdtListInsert
             | OpCode::CrdtListDelete
             | OpCode::CrdtListMove => dispatch::handle_direct_op(&ctx, seq, op, fields).await,

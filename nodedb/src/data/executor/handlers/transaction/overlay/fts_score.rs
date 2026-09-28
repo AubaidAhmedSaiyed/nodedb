@@ -43,12 +43,11 @@ impl CoreLoop {
         collection: &'a str,
         config_key: &'a (DatabaseId, TenantId, String),
         bm25_params: &'a Bm25Params,
-    ) -> StagedFtsScoreCtx<'a> {
-        let (total_docs, avg_doc_len) = self
-            .inverted
-            .corpus_stats(database_id.as_u64(), tid, collection)
-            .unwrap_or((0, 1.0));
-        StagedFtsScoreCtx {
+    ) -> crate::Result<StagedFtsScoreCtx<'a>> {
+        let (total_docs, avg_doc_len) =
+            self.inverted
+                .corpus_stats(database_id.as_u64(), tid, collection)?;
+        Ok(StagedFtsScoreCtx {
             database_id: database_id.as_u64(),
             tid,
             collection,
@@ -56,7 +55,7 @@ impl CoreLoop {
             total_docs: total_docs.max(1),
             avg_doc_len: if avg_doc_len > 0.0 { avg_doc_len } else { 1.0 },
             bm25_params,
-        }
+        })
     }
 
     /// Decode a staged body, re-tokenize with the forward-indexing
@@ -99,8 +98,7 @@ impl CoreLoop {
             matched_any = true;
             let df = self
                 .inverted
-                .term_df(ctx.database_id, ctx.tid, ctx.collection, term)
-                .unwrap_or(0)
+                .term_df(ctx.database_id, ctx.tid, ctx.collection, term)?
                 .max(1);
             score += bm25_score(
                 tf,

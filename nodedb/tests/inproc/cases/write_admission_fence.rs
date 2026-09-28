@@ -3,7 +3,7 @@
 //! Write-admission fence tests.
 //!
 //! The fast-path point-write gate and the deterministic Calvin scheduler share
-//! ONE per-vShard lock table (`SharedState::calvin_lock_managers`). These tests
+//! ONE per-vShard lock table (`CalvinLocalState::lock_managers`). These tests
 //! drive the gate directly against that shared table to prove the fence:
 //!
 //! - A point write whose key is held by a pending commit (a normal Calvin-band
@@ -51,10 +51,11 @@ fn register_lock_manager(
     shared: &SharedState,
     collection: &str,
 ) -> (Arc<Mutex<LockManager>>, VShardId) {
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection).vshard();
     let lm = Arc::new(Mutex::new(LockManager::new()));
     shared
-        .calvin_lock_managers
+        .calvin
+        .lock_managers
         .lock()
         .expect("lock managers")
         .insert(vshard.as_u32(), Arc::clone(&lm));
@@ -70,7 +71,8 @@ fn register_promotion_channel(
 ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<TxnId>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     shared
-        .calvin_promotion_senders
+        .calvin
+        .promotion_senders
         .lock()
         .expect("promotion senders")
         .insert(vshard.as_u32(), tx);
@@ -87,6 +89,7 @@ fn kv_put(collection: &str, key: &[u8]) -> PhysicalPlan {
         surrogate: Surrogate::ZERO,
         returning: None,
         rls_filters: Vec::new(),
+        provenance: None,
     })
 }
 
@@ -189,7 +192,7 @@ async fn single_node_point_write_uses_global_keyed_order_lock() {
     let (shared, _dir) = build_shared();
     let coll = "single_node_coll";
     // Deliberately DO NOT register a lock manager — the single-node path.
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, coll);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, coll).vshard();
     let plan = kv_put(coll, b"K");
 
     let lock = match admit(&shared, &target(vshard, &plan)) {
@@ -216,7 +219,7 @@ async fn single_node_point_write_uses_global_keyed_order_lock() {
 async fn single_node_same_key_serializes_fifo() {
     let (shared, _dir) = build_shared();
     let coll = "single_node_fifo";
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, coll);
+    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, coll).vshard();
     let plan = kv_put(coll, b"K");
 
     let (key, lock) = match admit(&shared, &target(vshard, &plan)) {

@@ -3,9 +3,10 @@
 //! Encode `PhysicalPlan::Kv` variants into `ReplicatedWrite`.
 
 use super::super::types::ReplicatedWrite;
-use super::entry::encode_returning;
-use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
+use super::entry::{encode_provenance, encode_returning};
+use nodedb_physical::physical_plan::{KvCounterShape, ReturningSpec, UpdateValue};
 use nodedb_types::Surrogate;
+use nodedb_types::sync::wire::SyncProvenance;
 
 /// Resolve the wall-clock instant for a TTL-bearing write once, at proposal
 /// time. `None` when `ttl_ms == 0`. Every replica computes `expire_at_ms`
@@ -26,14 +27,27 @@ pub(super) struct WireReturning<'a> {
     pub rls_filters: &'a [u8],
 }
 
+/// The row a KV put writes, and the identity it is written under.
+pub(super) struct WirePut<'a> {
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub ttl_ms: u64,
+    pub surrogate: u32,
+}
+
 pub(super) fn put(
-    collection: &str,
-    key: &[u8],
-    value: &[u8],
-    ttl_ms: u64,
-    surrogate: u32,
+    put: WirePut<'_>,
     returning: WireReturning<'_>,
+    provenance: &Option<SyncProvenance>,
 ) -> ReplicatedWrite {
+    let WirePut {
+        collection,
+        key,
+        value,
+        ttl_ms,
+        surrogate,
+    } = put;
     ReplicatedWrite::KvPut {
         collection: collection.to_owned(),
         key: key.to_vec(),
@@ -43,6 +57,7 @@ pub(super) fn put(
         resolved_now_ms: resolve_now_ms(ttl_ms),
         returning: encode_returning(returning.returning),
         rls_filters: returning.rls_filters.to_vec(),
+        provenance: encode_provenance(provenance),
     }
 }
 
@@ -81,12 +96,14 @@ pub(super) fn delete(
     collection: &str,
     keys: &[Vec<u8>],
     returning: WireReturning<'_>,
+    provenance: &Option<SyncProvenance>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvDelete {
         collection: collection.to_owned(),
         keys: keys.to_vec(),
         returning: encode_returning(returning.returning),
         rls_filters: returning.rls_filters.to_vec(),
+        provenance: encode_provenance(provenance),
     }
 }
 
@@ -193,6 +210,7 @@ pub(super) fn incr(
     delta: i64,
     ttl_ms: u64,
     surrogate: u32,
+    shape: &KvCounterShape,
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvIncr {
         collection: collection.to_owned(),
@@ -201,20 +219,23 @@ pub(super) fn incr(
         ttl_ms,
         surrogate,
         resolved_now_ms: resolve_now_ms(ttl_ms),
+        shape: shape.clone(),
     }
 }
 
 pub(super) fn incr_float(
     collection: &str,
     key: &[u8],
-    delta: f64,
+    delta: &str,
     surrogate: u32,
+    shape: &KvCounterShape,
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvIncrFloat {
         collection: collection.to_owned(),
         key: key.to_vec(),
-        delta,
+        delta: delta.to_owned(),
         surrogate,
+        shape: shape.clone(),
     }
 }
 

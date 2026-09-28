@@ -220,8 +220,10 @@ async fn calvin_commit_publishes_control_changes_at_participant_lsns() {
     let second = (0..4096)
         .map(|i| format!("sncgtx_cdc_b_{i}"))
         .find(|candidate| {
-            VShardId::from_collection_in_database(nodedb_types::DatabaseId::DEFAULT, candidate)
-                != VShardId::from_collection_in_database(nodedb_types::DatabaseId::DEFAULT, first)
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, candidate)
+                .vshard()
+                != nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, first)
+                    .vshard()
         })
         .expect("collection on a distinct vShard");
     for collection in [first, second.as_str()] {

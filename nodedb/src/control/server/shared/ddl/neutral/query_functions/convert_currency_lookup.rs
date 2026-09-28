@@ -11,7 +11,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
@@ -72,7 +72,7 @@ pub async fn convert_currency_lookup(
     let key_value = format!("{from_ccy}/{to_ccy}");
 
     // Scan rate table to find latest rate where key_column == key_value AND time_column <= as_of.
-    let vshard = VShardId::from_collection_in_database(database_id, &rate_table);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &rate_table).vshard();
     let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: nodedb_types::QualifiedCollection::new(database_id, &rate_table),
         limit: usize::MAX,
@@ -98,7 +98,7 @@ pub async fn convert_currency_lookup(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| err("XX000", &format!("rate table scan failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("rate table scan failed", &e))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);

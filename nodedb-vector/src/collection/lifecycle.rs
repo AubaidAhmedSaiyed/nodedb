@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! VectorCollection lifecycle: insert, delete, seal, complete_build, compact.
+//! VectorCollection lifecycle: construction, seal, counts and settings.
+//!
+//! Installing finished builds lives in `build`.
 //!
 //! Identity model: every vector inserted into the collection is bound to
 //! a global `Surrogate` allocated by the Control Plane before the engine
@@ -16,16 +18,18 @@
 
 use std::collections::HashMap;
 
-use nodedb_mem::ScopedMemory;
 use nodedb_types::{Surrogate, VectorQuantization};
 
 use crate::flat::FlatIndex;
-use crate::hnsw::{HnswIndex, HnswParams};
-use crate::index_config::{IndexConfig, IndexType};
+use crate::hnsw::HnswParams;
+use crate::index_config::IndexConfig;
+use crate::ivf::IvfPqIndex;
 
 use super::codec_dispatch::CollectionCodec;
 use super::payload_index::PayloadIndexSet;
-use super::segment::{BuildRequest, BuildingSegment, DEFAULT_SEAL_THRESHOLD, SealedSegment};
+use super::segment::{
+    BuildKind, BuildRequest, BuildingSegment, DEFAULT_SEAL_THRESHOLD, SealedSegment,
+};
 
 /// Manages all vector segments for a single collection (one index key).
 ///
@@ -71,6 +75,12 @@ pub struct VectorCollection {
     /// Coexists with sealed segments — for codec-dispatched collections the
     /// per-segment Sq8 builder is skipped and this index is used instead.
     pub codec_dispatch: Option<CollectionCodec>,
+    /// Trained IVF-PQ index of an `IvfPq` collection. `None` until the
+    /// collection holds the training threshold of vectors: until then its
+    /// vectors wait in the growing segment, searched exactly. Training moves
+    /// every vector into this index under its global id, and later inserts
+    /// land here.
+    pub(crate) ivf: Option<IvfPqIndex>,
     /// Quantization mode requested at collection-creation time.
     ///
     /// When `!= None && != Sq8`, each call to `complete_build` additionally
@@ -111,6 +121,10 @@ pub struct VectorCollection {
     /// gating its siblings). Folded into the persisted watermark at checkpoint
     /// save time via `max(checkpoint_wal_lsn, applied_wal_lsn)`.
     pub(crate) applied_wal_lsn: u64,
+    /// HNSW builds installed since the collection was opened.
+    pub(crate) builds_completed: u64,
+    /// HNSW builds that failed since the collection was opened.
+    pub(crate) builds_failed: u64,
 }
 
 impl VectorCollection {
@@ -159,11 +173,14 @@ impl VectorCollection {
             seal_threshold,
             index_config: config,
             codec_dispatch: None,
+            ivf: None,
             quantization: VectorQuantization::default(),
             payload: PayloadIndexSet::default(),
             arena_index: None,
             checkpoint_wal_lsn: 0,
             applied_wal_lsn: 0,
+            builds_completed: 0,
+            builds_failed: 0,
         }
     }
 
@@ -203,24 +220,34 @@ impl VectorCollection {
         Self::with_seal_threshold(dim, params, DEFAULT_SEAL_THRESHOLD)
     }
 
-    /// Check if the growing segment should be sealed.
-    pub fn needs_seal(&self) -> bool {
-        self.growing.len() >= self.seal_threshold
+    /// Set the growing-segment size that triggers a seal. A zero threshold
+    /// is raised to one vector.
+    pub fn set_seal_threshold(&mut self, threshold: usize) {
+        self.seal_threshold = threshold.max(1);
     }
 
-    /// Seal the growing segment and return a build request.
+    /// Check if the growing segment should be sealed. An `IvfPq` collection
+    /// never seals: its growing segment is the buffer IVF-PQ training reads.
+    pub fn needs_seal(&self) -> bool {
+        !self.is_ivf() && self.growing.len() >= self.seal_threshold
+    }
+
+    /// Seal the growing segment and return a build request. `None` for an
+    /// empty growing segment or an `IvfPq` collection.
     pub fn seal(&mut self, key: &str) -> Option<BuildRequest> {
-        if self.growing.is_empty() {
+        if self.growing.is_empty() || self.is_ivf() {
             return None;
         }
 
         let segment_id = self.next_segment_id;
         self.next_segment_id += 1;
 
+        // Soft-deleted vectors go too: the built graph keeps every local id,
+        // and the tombstones are applied when the build is installed.
         let count = self.growing.len();
         let mut vectors = Vec::with_capacity(count);
         for i in 0..count as u32 {
-            if let Some(v) = self.growing.get_vector(i) {
+            if let Some(v) = self.growing.get_vector_raw(i) {
                 vectors.push(v.to_vec());
             }
         }
@@ -241,63 +268,11 @@ impl VectorCollection {
         Some(BuildRequest {
             key: key.to_string(),
             segment_id,
+            kind: BuildKind::Seal,
             vectors,
             dim: self.dim,
             params: self.params.clone(),
         })
-    }
-
-    /// Accept a completed HNSW build from the background thread.
-    ///
-    /// After promoting the segment to sealed, rebuilds the collection-level
-    /// codec-dispatch index when `self.quantization` is `RaBitQ` or `Bbq`.
-    /// The rebuild trains over all vectors so the codec index always covers
-    /// every sealed segment.
-    pub fn complete_build(&mut self, segment_id: u32, index: HnswIndex, memory: ScopedMemory) {
-        if let Some(pos) = self
-            .building
-            .iter()
-            .position(|b| b.segment_id == segment_id)
-        {
-            let building = self.building.remove(pos);
-            let use_codec_dispatch = matches!(
-                self.quantization,
-                VectorQuantization::RaBitQ | VectorQuantization::Bbq
-            );
-            let use_pq = !use_codec_dispatch && self.index_config.index_type == IndexType::HnswPq;
-            let (sq8, pq) = if use_codec_dispatch {
-                (None, None)
-            } else if use_pq {
-                (
-                    None,
-                    Self::build_pq_for_index(&index, self.index_config.pq_m, memory.clone()),
-                )
-            } else {
-                (Self::build_sq8_for_index(&index), None)
-            };
-            let (tier, mmap_vectors) =
-                self.resolve_tier_for_build(segment_id, building.base_id, &index, &memory);
-
-            self.sealed.push(SealedSegment {
-                index,
-                base_id: building.base_id,
-                sq8,
-                pq,
-                tier,
-                mmap_vectors,
-            });
-
-            if use_codec_dispatch {
-                let tag = match self.quantization {
-                    VectorQuantization::RaBitQ => "rabitq",
-                    VectorQuantization::Bbq => "bbq",
-                    _ => unreachable!(
-                        "invariant: use_codec_dispatch is only true for RaBitQ and Bbq quantization variants"
-                    ),
-                };
-                self.build_codec_dispatch(tag);
-            }
-        }
     }
 
     /// Access sealed segments (read-only).
@@ -316,7 +291,7 @@ impl VectorCollection {
     }
 
     pub fn len(&self) -> usize {
-        let mut total = self.growing.len();
+        let mut total = self.growing.len() + self.ivf.as_ref().map_or(0, IvfPqIndex::len);
         for seg in &self.sealed {
             total += seg.index.len();
         }
@@ -327,7 +302,8 @@ impl VectorCollection {
     }
 
     pub fn live_count(&self) -> usize {
-        let mut total = self.growing.live_count();
+        let mut total =
+            self.growing.live_count() + self.ivf.as_ref().map_or(0, IvfPqIndex::live_count);
         for seg in &self.sealed {
             total += seg.index.live_count();
         }

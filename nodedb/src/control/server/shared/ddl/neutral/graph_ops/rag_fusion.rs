@@ -134,7 +134,7 @@ pub async fn rag_fusion(
         admission: user_dispatch::RequestAdmission::AlreadyAdmitted,
     })
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     let json_text = response_codec::decode_payload_to_json(&payload);
     let mut row = Map::new();

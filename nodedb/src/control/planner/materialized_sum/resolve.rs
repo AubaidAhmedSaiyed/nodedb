@@ -353,14 +353,12 @@ pub(super) async fn lookup_join_value(
     database_id: DatabaseId,
     trace_id: TraceId,
 ) -> crate::Result<Surrogate> {
-    let target = db_qualified(database_id, &binding.target_collection);
     let vshard = VShardId::from_key(join_value.as_bytes());
     lookup_surrogate_routed(
         state,
         vshard,
-        database_id,
+        nodedb_types::CollectionKey::from_bare(database_id, &binding.target_collection),
         tenant_id,
-        &target,
         join_value.as_bytes(),
         trace_id,
     )
@@ -406,13 +404,6 @@ async fn resolve_bodies(
         }
     }
     Ok(resolved)
-}
-
-/// Qualify a catalog collection name for the plan / surrogate namespace.
-fn db_qualified(database_id: DatabaseId, collection: &str) -> String {
-    nodedb_types::QualifiedCollection::new(database_id, collection)
-        .as_str()
-        .to_owned()
 }
 
 /// Strip the `"<db_id>/"` prefix a planned collection name carries, yielding the
@@ -544,7 +535,11 @@ mod tests {
         declare_binding(&state);
         let target_surrogate = state
             .surrogate_assigner
-            .assign(DB, TENANT, "accounts", b"acc-1")
+            .assign(
+                nodedb_types::CollectionKey::from_bare(DB, "accounts"),
+                TENANT,
+                b"acc-1",
+            )
             .expect("bind target row");
 
         let mut tasks = vec![insert_task("entries", body("acc-1"))];
@@ -577,11 +572,19 @@ mod tests {
         declare_second_binding(&state);
         let accounts_row = state
             .surrogate_assigner
-            .assign(DB, TENANT, "accounts", b"acc-1")
+            .assign(
+                nodedb_types::CollectionKey::from_bare(DB, "accounts"),
+                TENANT,
+                b"acc-1",
+            )
             .expect("bind accounts row");
         let audit_row = state
             .surrogate_assigner
-            .assign(DB, TENANT, "audit_totals", b"acc-1")
+            .assign(
+                nodedb_types::CollectionKey::from_bare(DB, "audit_totals"),
+                TENANT,
+                b"acc-1",
+            )
             .expect("bind audit_totals row");
         assert_ne!(
             accounts_row, audit_row,
@@ -680,7 +683,11 @@ mod tests {
         declare_binding(&state);
         let target_surrogate = state
             .surrogate_assigner
-            .assign(DB, TENANT, "accounts", b"acc-1")
+            .assign(
+                nodedb_types::CollectionKey::from_bare(DB, "accounts"),
+                TENANT,
+                b"acc-1",
+            )
             .expect("bind target row");
 
         let mut tasks = vec![PhysicalTask {

@@ -31,6 +31,7 @@ pub mod lateral;
 pub mod merge;
 pub mod predicate_coerce;
 pub mod returning;
+pub mod search_scope;
 pub mod select;
 
 pub use returning::resolve_returning_items;

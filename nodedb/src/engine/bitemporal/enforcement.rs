@@ -61,7 +61,15 @@ async fn enforcement_loop(
     mut shutdown: watch::Receiver<bool>,
     tick: Duration,
 ) {
-    tokio::time::sleep(Duration::from_secs(STARTUP_DELAY_SECS)).await;
+    // Shutdown ends the startup delay: a server stopped within it must not
+    // wait it out.
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(STARTUP_DELAY_SECS)) => {}
+        _ = shutdown.wait_for(|stopping| *stopping) => {
+            info!("bitemporal retention loop shutting down");
+            return;
+        }
+    }
 
     loop {
         tokio::select! {
@@ -145,8 +153,7 @@ async fn run_one(state: &Arc<SharedState>, entry: &Entry) {
         crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
             crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
             tenant_id,
-            entry.database_id,
-            &entry.collection,
+            nodedb_types::CollectionKey::from_bare(entry.database_id, &entry.collection),
             plan,
         ),
         Duration::from_secs(DISPATCH_DEADLINE_SECS),
@@ -156,13 +163,16 @@ async fn run_one(state: &Arc<SharedState>, entry: &Entry) {
         Ok(payload) => {
             let purged = parse_count_from_payload(entry.engine, &payload);
             if purged > 0
-                && let Err(e) = state.wal.append_temporal_purge(
-                    tenant_id,
-                    entry.engine.wire_tag(),
-                    &entry.collection,
-                    cutoff_system_ms,
-                    purged,
-                )
+                && let Err(e) = state
+                    .wal
+                    .appender(crate::wal::manager::NO_APPLY_KEY)
+                    .append_temporal_purge(
+                        tenant_id,
+                        entry.engine.wire_tag(),
+                        &entry.collection,
+                        cutoff_system_ms,
+                        purged,
+                    )
             {
                 warn!(
                     tenant = tenant_id.as_u64(),

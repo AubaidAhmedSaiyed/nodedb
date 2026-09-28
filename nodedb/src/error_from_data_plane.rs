@@ -9,9 +9,10 @@
 //! key is indistinguishable from a crashed database — so the compiler is made
 //! to name every new variant here instead of a catch-all absorbing it.
 
-use nodedb_types::error::{ErrorCode as PublicCode, NodeDbError};
+use nodedb_types::error::{ErrorCode as PublicCode, NodeDbError, sqlstate};
 
 use crate::bridge::envelope::ErrorCode;
+use crate::control::server::shared::ddl::sqlstate::constraint_sqlstate;
 
 /// Convert a deterministic Data-Plane code into the public error a client
 /// can classify.
@@ -23,16 +24,30 @@ use crate::bridge::envelope::ErrorCode;
 /// one.
 pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
     match code {
-        ErrorCode::DeadlineExceeded => NodeDbError::deadline_exceeded(),
+        ErrorCode::DeadlineExceeded | ErrorCode::ExpiredBeforeExecution => {
+            NodeDbError::deadline_exceeded()
+        }
         // The Data Plane's `RejectedConstraint` carries no collection name,
         // only the constraint kind and detail — leave collection blank
         // rather than misreport the kind string as the collection.
         ErrorCode::RejectedConstraint { constraint, detail } => {
-            NodeDbError::constraint_violation("", constraint, detail)
+            rejected_constraint_to_public(String::new(), constraint, detail)
         }
         ErrorCode::RejectedPrevalidation { reason } => {
             NodeDbError::prevalidation_rejected("data plane", reason)
         }
+        // A sync frame the validator refused is a constraint verdict on the
+        // frame.
+        ErrorCode::SyncRejected { violation, .. } => {
+            NodeDbError::constraint_violation("", "sync", violation.to_string())
+        }
+        // The gate held the frame back without applying it. The sender
+        // re-sends or retires it by the hold, so it presents as the
+        // retriable class.
+        ErrorCode::SyncNotApplied { hold, .. } => NodeDbError::from_wire(
+            PublicCode::WRITE_CONFLICT,
+            format!("sync frame not applied: {hold}"),
+        ),
         // Nothing was applied and the identical frame is expected to succeed
         // once the transient precondition resolves, so it presents as the
         // retriable class rather than a permanent refusal.
@@ -107,8 +122,10 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
         ErrorCode::TypeMismatch { collection, detail } => {
             NodeDbError::type_mismatch(collection, detail)
         }
-        ErrorCode::OverflowError { collection } => {
-            NodeDbError::overflow(collection, "arithmetic overflow")
+        // The same text the SQL surfaces send, with the collection in the
+        // details. RESP renders the bare Redis text from the code itself.
+        ErrorCode::CounterFault { collection, fault } => {
+            NodeDbError::kv_counter_fault(collection, fault.message(), fault.is_out_of_range())
         }
         ErrorCode::InsufficientBalance { collection, detail } => {
             NodeDbError::insufficient_balance(collection, detail)
@@ -123,20 +140,36 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
         ErrorCode::RecursionDepthExceeded {
             cte_name,
             max_depth,
-        } => NodeDbError::bad_request(format!(
+        } => NodeDbError::program_limit_exceeded(format!(
             "WITH RECURSIVE CTE '{cte_name}' exceeded max recursion depth {max_depth}; \
              add a stricter termination condition or raise max_recursion_depth"
         )),
         ErrorCode::UndefinedColumn { column } => NodeDbError::undefined_column(column),
-        ErrorCode::Unsupported { detail } => NodeDbError::bad_request(detail),
+        // `0A000` (feature_not_supported). `SQL_NOT_ENABLED` is the class
+        // every bare `0A000` refusal carries.
+        ErrorCode::Unsupported { detail } => {
+            NodeDbError::from_wire(PublicCode::SQL_NOT_ENABLED, detail)
+        }
         ErrorCode::DivisionByZero => NodeDbError::division_by_zero(),
-        ErrorCode::TxnOverlayMemoryExceeded { limit } => NodeDbError::bad_request(format!(
-            "transaction staging overlay exceeded its {limit}-byte per-core budget; \
-             split the transaction into smaller batches"
-        )),
-        // Genuinely internal: the shard is in an unknown or faulted state, or
-        // a scheduler signal leaked past the layer that should have consumed
-        // it. These are the only codes for which NDB-9000 is the truth.
+        ErrorCode::UndefinedFunction { name } => NodeDbError::undefined_function(name),
+        ErrorCode::DataException { detail } => NodeDbError::data_exception(detail),
+        ErrorCode::BadRequest { detail } => NodeDbError::bad_request(detail),
+        ErrorCode::TransactionRollback { detail } => NodeDbError::transaction_rollback(detail),
+        ErrorCode::ActiveSqlTransaction { detail } => NodeDbError::active_sql_transaction(detail),
+        ErrorCode::DependentObjectsExist { object, detail } => {
+            NodeDbError::dependent_objects_exist(object, detail)
+        }
+        // Nothing was enqueued, and the same request succeeds once capacity
+        // frees: the retryable overload class.
+        ErrorCode::DispatchCapacity { reason } => NodeDbError::server_overload(reason),
+        ErrorCode::TxnOverlayMemoryExceeded { limit } => {
+            NodeDbError::program_limit_exceeded(format!(
+                "transaction staging overlay exceeded its {limit}-byte per-core budget; \
+                 split the transaction into smaller batches"
+            ))
+        }
+        // Genuinely internal: the shard is in an unknown or faulted state.
+        // These are the only codes for which NDB-9000 is the truth.
         ErrorCode::Internal { detail } => NodeDbError::internal(detail),
         ErrorCode::RollbackFailed {
             entry_index,
@@ -145,15 +178,40 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
             "transaction rollback failed at undo entry {entry_index}: {detail}; \
              shard state is unknown — restart required"
         )),
-        ErrorCode::OllpRetryRequired => {
-            NodeDbError::internal("optimistic predicate retry required")
-        }
+        // A scheduler signal that reached a client: nothing was written, and
+        // the retry that the signal asks for succeeds, so it takes the
+        // retriable class the SQL surfaces send (`40001`).
+        ErrorCode::OllpRetryRequired => NodeDbError::from_wire(
+            PublicCode::WRITE_CONFLICT,
+            "optimistic predicate retry required; retry the transaction",
+        ),
+    }
+}
+
+/// The public error for a rejected constraint of kind `constraint`.
+///
+/// The class follows the SQLSTATE the SQL surfaces send for the kind
+/// ([`constraint_sqlstate`]): an RLS or permission refusal is an
+/// authorization denial (`42501`), a write to a generated column is a bad
+/// request (`428C9`), and every other kind is a constraint violation (`23`).
+/// Shared by the Data-Plane code and the Control-Plane variant, so both
+/// classify one kind the same way.
+pub(crate) fn rejected_constraint_to_public(
+    collection: String,
+    constraint: String,
+    detail: String,
+) -> NodeDbError {
+    match constraint_sqlstate(&constraint) {
+        sqlstate::INSUFFICIENT_PRIVILEGE => NodeDbError::authorization_denied(detail),
+        sqlstate::GENERATED_ALWAYS => NodeDbError::bad_request(detail),
+        _ => NodeDbError::constraint_violation(collection, constraint, detail),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::envelope::CounterFault;
 
     #[test]
     fn constraint_code_classifies_as_constraint_violation() {
@@ -184,6 +242,41 @@ mod tests {
                 retry_after_ms: 500,
             })
             .is_rate_exceeded()
+        );
+    }
+
+    #[test]
+    fn counter_fault_carries_the_collection() {
+        let e = data_plane_code_to_public(ErrorCode::CounterFault {
+            collection: "counters".into(),
+            fault: CounterFault::NotAnInteger,
+        });
+        assert_eq!(e.code(), PublicCode::DATA_EXCEPTION);
+        assert_eq!(
+            e.message(),
+            "value is not an integer or out of range on counters"
+        );
+        assert_eq!(
+            e.details(),
+            &nodedb_types::error::ErrorDetails::DataException {
+                detail: "value is not an integer or out of range on counters".into()
+            }
+        );
+
+        let e = data_plane_code_to_public(ErrorCode::CounterFault {
+            collection: "counters".into(),
+            fault: CounterFault::IntegerOverflow,
+        });
+        assert_eq!(e.code(), PublicCode::OVERFLOW);
+        assert_eq!(
+            e.message(),
+            "increment or decrement would overflow on counters"
+        );
+        assert_eq!(
+            e.details(),
+            &nodedb_types::error::ErrorDetails::Overflow {
+                collection: "counters".into()
+            }
         );
     }
 

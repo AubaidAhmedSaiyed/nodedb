@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Landing one bulk-UPDATE row: the write transaction the row's body, its
-//! secondary-index diff, and its materialized-sum deltas share.
+//! secondary-index diff, its full-text postings and its materialized-sum
+//! deltas share.
 //!
 //! Its own file because the transaction boundary is the concern — the bulk
 //! handler decides WHICH rows change and what they become, and this decides
 //! when that becomes durable. Every sparse-database write a row produces is
 //! staged into the transaction opened here and lands on its commit, so a row
-//! that fails at any step drops the transaction un-committed and is skipped
-//! whole rather than left with a body the index no longer describes.
+//! that fails at any step drops the transaction un-committed and fails the
+//! statement, rather than being left with a body the index no longer
+//! describes or dropped from the affected count.
 //!
 //! The materialized-sum fold runs inside that same transaction, one level above
 //! the row's own write, so a credited target row can never survive a row whose
 //! commit did not happen.
-
-use tracing::warn;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::images::RowImages;
@@ -39,16 +39,16 @@ impl CoreLoop {
     /// entries, and fold its materialized-sum deltas — committing all three
     /// together.
     ///
-    /// `Ok(None)` is the row's own write failing: it is skipped, exactly as it
-    /// always was, and the transaction is dropped un-committed so it leaves
-    /// nothing behind. `Err` is an enforcement REJECTION, which is not
-    /// skippable — a rejected constraint must fail the statement, not quietly
-    /// shrink its affected count.
+    /// Any failure is an `Err` and fails the statement: the row's write, its
+    /// index diff, its full-text postings, an enforcement rejection, or the
+    /// commit. The transaction is dropped un-committed, so the row leaves
+    /// nothing behind. A row is never skipped, because a skipped row would
+    /// report a smaller affected count than the predicate matched.
     pub(super) fn persist_bulk_update_row(
         &mut self,
         p: NonbitemporalUpdateReindex<'_>,
         hook: &HookCtx<'_>,
-    ) -> crate::Result<Option<PersistedBulkUpdateRow>> {
+    ) -> crate::Result<PersistedBulkUpdateRow> {
         // Hoisted before the transaction opens: the images below borrow them,
         // and a collection that declares no image-folding enforcement must not
         // pay for the fold at all.
@@ -60,20 +60,17 @@ impl CoreLoop {
         let new_doc: &serde_json::Value = p.new_doc;
         let folds = write_hook::folds_images(self, hook);
 
-        let txn = match self.sparse.begin_write() {
-            Ok(txn) => txn,
-            Err(e) => {
-                warn!(%doc_id, error = %e, "bulk update: write txn failed, skipping document");
-                return Ok(None);
-            }
+        let txn = self.sparse.begin_write()?;
+        let text = crate::data::executor::handlers::point::update_reindex_text::UpdateTextReindex {
+            database_id: p.database_id,
+            tid: p.tid,
+            collection: p.collection,
+            surrogate: doc_id.surrogate(),
+            new_doc,
         };
-        let touched = match self.nonbitemporal_update_reindex(&txn, p) {
-            Ok(touched) => touched,
-            Err(e) => {
-                warn!(%doc_id, error = %e, "update reindex failed, skipping document");
-                return Ok(None);
-            }
-        };
+        let touched = self.nonbitemporal_update_reindex(&txn, p)?;
+        // The row's postings follow its new text in the same transaction.
+        self.update_reindex_text(&txn, text)?;
 
         // Both images were materialized by the caller for the index diff, so the
         // fold re-reads and re-decodes nothing. `RowImages::Update` is the only
@@ -100,19 +97,13 @@ impl CoreLoop {
             Vec::new()
         };
 
-        match txn.commit() {
-            Ok(()) => Ok(Some(PersistedBulkUpdateRow {
-                touched,
-                target_writes,
-            })),
-            Err(e) => {
-                warn!(
-                    %doc_id,
-                    error = %e,
-                    "bulk update commit failed, skipping document"
-                );
-                Ok(None)
-            }
-        }
+        txn.commit().map_err(|e| crate::Error::Storage {
+            engine: "sparse".into(),
+            detail: format!("bulk update commit of row {doc_id}: {e}"),
+        })?;
+        Ok(PersistedBulkUpdateRow {
+            touched,
+            target_writes,
+        })
     }
 }

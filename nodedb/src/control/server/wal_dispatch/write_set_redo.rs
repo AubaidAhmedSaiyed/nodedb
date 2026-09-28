@@ -9,8 +9,8 @@
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status, WriteSetEntry};
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
-use crate::wal::manager::WalManager;
-use nodedb_physical::physical_plan::DocumentOp;
+use crate::wal::manager::WalAppender;
+use nodedb_physical::physical_plan::{DocumentOp, MetaOp};
 
 use super::document::{encode_document_delete_record, encode_document_put_record};
 
@@ -46,6 +46,12 @@ pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
         // Journals nothing on the pre-dispatch path; without this redo, a WAL-only
         // restart replays source rows and leaves the total as it stood before.
         Some(collection.to_string())
+    } else if let PhysicalPlan::Meta(MetaOp::ApplyTransactionRedo { collections, .. }) = plan {
+        // A committed transaction's materialized-sum folds write target rows no
+        // redo sub-record names. Each write-set entry names its own target
+        // collection, so the transaction's first collection is only the
+        // fallback an entry without one would use.
+        collections.first().cloned()
     } else {
         None
     }
@@ -57,7 +63,7 @@ pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
 /// the row the way a live event does and the Data Plane replay keys on the
 /// surrogate. Called under the write-admission guard.
 pub fn append_write_set_redo(
-    wal: &WalManager,
+    wal: WalAppender<'_>,
     tenant_id: TenantId,
     vshard_id: VShardId,
     database_id: DatabaseId,
@@ -70,7 +76,8 @@ pub fn append_write_set_redo(
         // A cross-collection entry homes to a different vShard, so it's re-derived
         // per entry rather than reusing the caller-hoisted `vshard_id`.
         let entry_vshard_id = match &entry.collection {
-            Some(c) => VShardId::from_collection_in_database(database_id, c),
+            // A write-set entry names its storage collection, the qualified name.
+            Some(c) => nodedb_types::CollectionKey::from_qualified_str(database_id, c)?.vshard(),
             None => vshard_id,
         };
         let lsn = if entry.is_delete {
@@ -97,7 +104,7 @@ pub fn append_write_set_redo(
 /// Mint the post-apply redo for a `dispatch_local` response built outside the
 /// autocommit funnel's own redo minting. No-op when not `Ok` or write-set is empty.
 pub fn mint_dispatch_local_redo(
-    wal: &WalManager,
+    wal: WalAppender<'_>,
     tenant_id: TenantId,
     database_id: DatabaseId,
     collection: &str,
@@ -106,7 +113,9 @@ pub fn mint_dispatch_local_redo(
     if resp.status != Status::Ok || resp.write_set.is_empty() {
         return Ok(());
     }
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    // `collection` is the plan's database-qualified name.
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     append_write_set_redo(
         wal,
         tenant_id,
@@ -121,6 +130,7 @@ pub fn mint_dispatch_local_redo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::manager::{NO_APPLY_KEY, WalManager};
     use nodedb_physical::physical_plan::ReturningSpec;
     use nodedb_types::sync::wire::SyncProvenance;
     use nodedb_types::{QualifiedCollection, RowIdentity, Surrogate};
@@ -255,7 +265,8 @@ mod tests {
         }];
 
         let lsn = append_write_set_redo(
-            &wal,
+            wal.appender(NO_APPLY_KEY)
+                .with_event_source(crate::event::EventSource::User),
             TenantId::new(1),
             VShardId::new(0),
             DatabaseId::DEFAULT,
@@ -297,7 +308,8 @@ mod tests {
         }];
 
         append_write_set_redo(
-            &wal,
+            wal.appender(NO_APPLY_KEY)
+                .with_event_source(crate::event::EventSource::User),
             TenantId::new(1),
             VShardId::new(0),
             DatabaseId::DEFAULT,
@@ -331,7 +343,8 @@ mod tests {
         }];
 
         append_write_set_redo(
-            &wal,
+            wal.appender(NO_APPLY_KEY)
+                .with_event_source(crate::event::EventSource::User),
             TenantId::new(1),
             VShardId::new(0),
             DatabaseId::DEFAULT,
@@ -358,7 +371,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let lsn = append_write_set_redo(
-            &wal,
+            wal.appender(NO_APPLY_KEY)
+                .with_event_source(crate::event::EventSource::User),
             TenantId::new(1),
             VShardId::new(0),
             DatabaseId::DEFAULT,

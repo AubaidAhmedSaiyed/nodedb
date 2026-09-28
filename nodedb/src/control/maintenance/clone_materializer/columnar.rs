@@ -126,9 +126,8 @@ pub(super) async fn materialize_columnar_collection(
             let target_surrogate = state
                 .surrogate_assigner
                 .assign(
-                    db_id,
+                    nodedb_types::CollectionKey::from_bare(db_id, &coll.name),
                     tenant_id,
-                    &target_qualified,
                     &source_surrogate_u32.to_be_bytes(),
                 )
                 .map_err(|e| crate::Error::Storage {

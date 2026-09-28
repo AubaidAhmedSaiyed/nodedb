@@ -10,8 +10,24 @@ use nodedb_mem::MemError;
 pub enum VectorError {
     #[error("memory budget exhausted: {0}")]
     BudgetExhausted(#[from] MemError),
+    /// An input vector — a search query or an inserted vector — has a
+    /// different dimension from the index. The caller's input is wrong; the
+    /// index is intact.
     #[error("vector dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
+    /// Stored data — a PQ code, a segment backing, a materialized node
+    /// vector — disagrees with the index dimension. The stored data is
+    /// corrupt or belongs to another index.
+    #[error("stored vector data has dimension {got}, index expects {expected}")]
+    StoredDimensionMismatch { expected: usize, got: usize },
+    /// A serialized pre-filter bitmap does not decode. Searching without it
+    /// would return rows the filter excludes, so the search fails instead.
+    #[error("vector search filter bitmap does not decode: {detail}")]
+    InvalidFilterBitmap { detail: String },
+    /// An index build or training call received input it cannot use: an
+    /// empty training set, a zero dimension, or parameters that do not fit.
+    #[error("invalid vector index input: {detail}")]
+    InvalidInput { detail: String },
     /// A node's vector could not be materialized: the node is out of range, or
     /// its local storage is empty and no segment backing supplies the data.
     ///
@@ -57,4 +73,14 @@ pub enum VectorError {
     /// I/O error from segment file operations (open, mmap, metadata).
     #[error("vector segment I/O error: {0}")]
     SegmentIo(#[from] std::io::Error),
+}
+
+/// Check that an input vector of length `got` fits an index of dimension
+/// `expected`.
+pub fn check_dim(expected: usize, got: usize) -> Result<(), VectorError> {
+    if expected == got {
+        Ok(())
+    } else {
+        Err(VectorError::DimensionMismatch { expected, got })
+    }
 }

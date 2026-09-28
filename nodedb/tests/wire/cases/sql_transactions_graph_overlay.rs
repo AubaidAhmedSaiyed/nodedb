@@ -8,7 +8,7 @@
 //! _type }` is mirrored by the Control Plane as an implicit `GraphOp::EdgePut`
 //! task appended to the SAME task list as the document write
 //! (`append_implicit_edge_tasks`). The two tasks do NOT share a `VShardId`:
-//! the document write homes on `VShardId::from_collection_in_database`, the
+//! the document write homes on `VShardId::from_collection`, the
 //! edge on `VShardId::from_key(src)` -- for `g_tx` / `staged_rollback` that is
 //! 348 vs 797. A self-loop does not change that, and cannot: the two homing
 //! functions take different inputs. So the statement classifies as

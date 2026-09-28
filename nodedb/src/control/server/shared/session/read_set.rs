@@ -254,6 +254,7 @@ pub async fn record_read_set(
     let now = std::time::Instant::now();
     let hot = {
         let table = state
+            .calvin
             .hot_key_table
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -266,7 +267,14 @@ pub async fn record_read_set(
     // Route the shared reservation to the SAME vshard the commit batch will use
     // for this key (write/commit routing derives the shard identically), so the
     // self-upgrade at commit finds the shared lock on the right scheduler.
-    let vshard = VShardId::from_collection_in_database(database_id, &collection).as_u32();
+    // `collection` is the plan's database-qualified name. A name that does
+    // not de-qualify takes no reservation, and the read proceeds under OCC.
+    let Ok(collection_key) =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, &collection)
+    else {
+        return;
+    };
+    let vshard = collection_key.vshard().as_u32();
     // Reuse the transaction's single reservation owner (None on the first hot-key
     // read; the assignment mints it, and `record_reservation` adopts it). Guard
     // dropped inside the accessor — nothing is held across the await below.

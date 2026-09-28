@@ -27,7 +27,8 @@ use crate::types::TraceId;
 
 use super::types::ddl_err;
 
-/// Dispatch a plan to WAL + Data Plane, returning an error response on failure.
+/// Dispatch a write plan on the durable route, returning an error response on
+/// failure. `None` means the write applied.
 pub(in crate::control::server::shared::ddl::neutral::collection) async fn dispatch_plan(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -69,18 +70,30 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn dispat
         }
     };
 
-    if let Err(error) =
-        crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
-            state,
-            checked,
-            TraceId::ZERO,
-        )
-        .await
+    // The durable route: Raft in cluster mode, else the funnel's `AppendHere`.
+    match crate::control::server::dispatch_utils::dispatch_authorized_durable_write(
+        state,
+        checked,
+        TraceId::ZERO,
+    )
+    .await
     {
-        let (_, sqlstate, message) = error_to_sqlstate(&error);
-        return Some(Err(ddl_err(sqlstate, message)));
+        Err(error) => {
+            let (_, sqlstate, message) = error_to_sqlstate(&error);
+            Some(Err(ddl_err(sqlstate, message)))
+        }
+        // A refusal arrives as an error status inside an `Ok` response.
+        Ok(response) if response.status == crate::bridge::envelope::Status::Error => {
+            Some(Err(match response.error_code.as_deref() {
+                Some(code) => {
+                    let (_, sqlstate, message) = error_code_to_sqlstate(code);
+                    ddl_err(sqlstate, message)
+                }
+                None => DdlError::internal("unknown data plane error"),
+            }))
+        }
+        Ok(_) => None,
     }
-    None
 }
 
 /// Authorize a write target before triggers, sequences, or catalog reads run.
@@ -139,7 +152,10 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     // un-injected copies.
     let (mut tasks, output_schema, versions) = {
         let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
-        let permission_cache = state.permission_cache.read().await;
+        let permission_cache =
+            crate::control::security::auth_fence::permission_view(state, tenant_id)
+                .await
+                .map_err(|error| DdlError::from_error(&error))?;
         let sec = PlanSecurityContext {
             identity,
             auth: scope.auth(),
@@ -252,13 +268,12 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         return Err(ddl_err(sqlstate, message));
     }
 
+    let sum_read_vshards = crate::control::planner::calvin::read_vshards_of(&sum_target_reads)
+        .map_err(|error| DdlError::from_error(&error))?;
     if !in_txn_block
         && state.sequencer_inbox.get().is_some()
         && matches!(
-            crate::control::planner::calvin::classify_dispatch(
-                &tasks,
-                &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
-            ),
+            crate::control::planner::calvin::classify_dispatch(&tasks, &sum_read_vshards),
             crate::control::planner::calvin::DispatchClass::MultiShard { .. }
         )
     {
@@ -336,14 +351,13 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 Arc::clone(&plan_lease_scope),
             )
         {
-            return Err(ddl_err(
-                "XX000",
+            return Err(DdlError::internal(
                 "internal error: failed to retain descriptor leases for buffered transaction tasks",
             ));
         }
 
         let task = match routed {
-            Ok(InTxnRoute::Read(task)) => *task,
+            Ok(InTxnRoute::Read(task) | InTxnRoute::Autocommit(task)) => *task,
             Ok(InTxnRoute::Buffered) | Ok(InTxnRoute::Staged(_)) => {
                 drop(initial_authorized);
                 // A buffered/staged write produces its rows at COMMIT, not
@@ -362,11 +376,13 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 return Err(ddl_err(sqlstate, message));
             }
             Err(StagingGateError::Rejected { code }) => {
-                let (_, sqlstate, message) = match code {
-                    Some(code) => error_code_to_sqlstate(&code),
-                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-                };
-                return Err(ddl_err(sqlstate, message));
+                return Err(match code {
+                    Some(code) => {
+                        let (_, sqlstate, message) = error_code_to_sqlstate(&code);
+                        ddl_err(sqlstate, message)
+                    }
+                    None => DdlError::internal("unknown data plane error"),
+                });
             }
         };
 
@@ -389,8 +405,10 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             ddl_err(sqlstate, message)
         })? {
             crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => resp,
+            // A write takes the durable route: Raft in cluster mode, else the
+            // funnel's `AppendHere`. A read takes the read route.
             crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
-                crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
+                crate::control::server::dispatch_utils::dispatch_authorized_task_by_class(
                     state,
                     checked,
                     TraceId::ZERO,
@@ -404,15 +422,13 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         };
 
         if response.status == crate::bridge::envelope::Status::Error {
-            let (_, sqlstate, message) = match response.error_code.as_deref() {
-                Some(code) => error_code_to_sqlstate(code),
-                None => (
-                    "ERROR",
-                    "XX000",
-                    String::from_utf8_lossy(&response.payload).into_owned(),
-                ),
-            };
-            return Err(ddl_err(sqlstate, message));
+            return Err(match response.error_code.as_deref() {
+                Some(code) => {
+                    let (_, sqlstate, message) = error_code_to_sqlstate(code);
+                    ddl_err(sqlstate, message)
+                }
+                None => DdlError::internal(String::from_utf8_lossy(&response.payload)),
+            });
         }
 
         // Shape the STORED rows the write returned, redacted for the caller —
@@ -443,7 +459,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 redaction: Some(redaction.ctx(&state.redaction)),
                 sequences: Some(&sequences),
             })
-            .map_err(|error| ddl_err("XX000", error.message().to_string()))?;
+            .map_err(|error| DdlError::from_error(&crate::Error::from(error)))?;
             // Folded rather than pushed: a statement is ONE result set, however
             // many tasks it planned to.
             if let ShapeOutcome::Rows(shaped) = outcome {

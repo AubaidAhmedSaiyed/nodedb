@@ -5,19 +5,22 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::info;
 
 use nodedb_cluster::MultiRaft;
 use nodedb_cluster::calvin::types::SchedulerInput;
-use nodedb_cluster::calvin::{
-    CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerEntry, SequencerStateMachine,
-    VerdictSignal,
-};
+use nodedb_cluster::calvin::{CalvinCompletionRegistry, SequencerStateMachine, VerdictSignal};
 
 use super::super::barrier::{PendingDependentBarrier, ReadResultEvent};
 use super::super::config::SchedulerConfig;
 use super::super::types::{BlockedTxn, PendingTxn};
+use super::catch_up::CatchUpDrain;
+use super::deferred::DeferredQueue;
+use super::halt::HaltLatch;
+use super::intake::IntakeGate;
+use super::owed::OwedEntries;
+use super::sequencer_proposer::SequencerProposer;
 use crate::bridge::envelope::Response;
 use crate::control::cluster::calvin::scheduler::lock_manager::{LockManager, TxnId};
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
@@ -49,10 +52,17 @@ pub struct Scheduler {
     /// Shared control-plane state used for dispatch, response tracking, WAL,
     /// and request-id allocation.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) shared: Arc<SharedState>,
-    /// Handle to MultiRaft so completion acknowledgements can be proposed to
-    /// the sequencer group.
+    /// Handle to MultiRaft for the data-group leader check and the catch-up
+    /// read of the sequencer log.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) multi_raft:
         Arc<Mutex<MultiRaft>>,
+    /// Hands sequencer entries to the sequencer group, locally on its leader
+    /// and by forward from any other node.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) sequencer_proposer:
+        Arc<dyn SequencerProposer>,
+    /// Sequencer entries proposed and not yet seen applied. See
+    /// [`super::owed`].
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) owed: OwedEntries,
     /// Shared handle to the sequencer state machine. The state machine records,
     /// per vShard, the earliest Raft index whose fan-out `try_send` was DROPPED
     /// (channel Full/Closed) so a dropped `SchedulerInput` never permanently
@@ -66,13 +76,14 @@ pub struct Scheduler {
         Arc<Mutex<SequencerStateMachine>>,
     /// Deterministic lock manager for this vshard. Shared (via `Arc<Mutex<_>>`)
     /// with the Control-Plane write-admission gate through
-    /// `SharedState.calvin_lock_managers`, so a fast-path point write contends
+    /// `SharedState.calvin.lock_managers`, so a fast-path point write contends
     /// on the SAME lock table this scheduler validates against. The scheduler
     /// still runs single-threaded per vShard, so the mutex is uncontended except
     /// for the brief probe the gate takes.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) lock_manager:
         Arc<Mutex<LockManager>>,
-    /// In-flight static/active transactions awaiting executor response.
+    /// In-flight static/active transactions awaiting executor response,
+    /// including those whose request waits in `deferred` for capacity.
     /// `BTreeMap` ensures deterministic iteration order.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) pending:
         BTreeMap<TxnId, PendingTxn>,
@@ -101,6 +112,13 @@ pub struct Scheduler {
     /// deterministic threshold below which an orphaned shared reservation is
     /// released. Purely a function of replicated input order — no wall clock.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) max_input_epoch: u64,
+    /// Backup cut markers this scheduler received: the commit HLC floors they
+    /// set and the markers not yet reported.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) cut_floors:
+        crate::control::cluster::calvin::scheduler::cut_floor::CutFloors,
+    /// Shared mirror of `applied`, read by authorization coverage.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) applied_mirror:
+        Arc<crate::control::cluster::calvin::scheduler::AppliedMirror>,
     /// Scheduler configuration.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) config: SchedulerConfig,
     /// Metrics.
@@ -108,7 +126,7 @@ pub struct Scheduler {
     /// Fan-in receiver for executor responses.
     ///
     /// Each dispatched transaction spawns a lightweight bridge task that
-    /// awaits the per-request `mpsc::Receiver<Response>` and forwards the
+    /// awaits the per-request `ResponseReceiver` and forwards the
     /// result here as a [`CompletionItem`]. The scheduler's `select!` loop
     /// includes this channel as a first-class arm so it wakes the moment
     /// any executor response is ready — no polling, no sleep.
@@ -143,6 +161,18 @@ pub struct Scheduler {
     /// push, so a full/closed channel is never a correctness hazard.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) verdict_rx:
         mpsc::Receiver<VerdictSignal>,
+    /// Requests the bridge dispatcher refused at capacity, in refusal order.
+    /// Each txn stays in flight and holds its locks until its request is
+    /// re-sent. Holds at most one step per in-flight txn, plus one
+    /// write-version record per committed txn.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) deferred: DeferredQueue,
+    /// The bridge dispatcher's capacity-freed signal, cloned once at
+    /// construction. The run loop waits on it while requests are deferred.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) capacity_freed: Arc<Notify>,
+    /// Last observed intake gate state. See [`super::intake`].
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) intake: IntakeGate,
+    /// First halt cause, once set. See [`super::halt`].
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) halt: HaltLatch,
 }
 
 /// Parameters for [`Scheduler::new`].
@@ -151,6 +181,9 @@ pub struct SchedulerParams {
     pub receiver: mpsc::Receiver<SchedulerInput>,
     pub shared: Arc<SharedState>,
     pub multi_raft: Arc<Mutex<MultiRaft>>,
+    /// The node's sequencer proposer. Production passes one
+    /// `RaftSequencerProposer` shared by every scheduler on the node.
+    pub sequencer_proposer: Arc<dyn SequencerProposer>,
     /// Shared sequencer state machine, source of the per-vShard catch-up index
     /// the drain replays from. Same `Arc` the Raft apply loop drives.
     pub sequencer_state_machine: Arc<Mutex<SequencerStateMachine>>,
@@ -164,11 +197,11 @@ pub struct SchedulerParams {
     pub read_result_rx: mpsc::Receiver<ReadResultEvent>,
     /// The shared lock table for this vShard. Constructed by
     /// `reconcile_vshard_schedulers` and registered in
-    /// `SharedState.calvin_lock_managers` under the SAME `Arc` passed here.
+    /// `SharedState.calvin.lock_managers` under the SAME `Arc` passed here.
     pub lock_manager: Arc<Mutex<LockManager>>,
     /// Receiver for gate-side lock promotions. Constructed by
     /// `reconcile_vshard_schedulers`; its `UnboundedSender` is registered in
-    /// `SharedState.calvin_promotion_senders` for this same vShard so a fast-path
+    /// `SharedState.calvin.promotion_senders` for this same vShard so a fast-path
     /// guard drop can hand promoted waiters back to this scheduler.
     pub promotion_rx: mpsc::UnboundedReceiver<Vec<TxnId>>,
     /// Shared completion registry for verdict probes on the commit barrier.
@@ -187,6 +220,7 @@ impl Scheduler {
             receiver,
             shared,
             multi_raft,
+            sequencer_proposer,
             sequencer_state_machine,
             fully_applied_epoch,
             applied_tail,
@@ -205,11 +239,28 @@ impl Scheduler {
         let completion_cap = config.channel_capacity;
         let (completion_tx, completion_rx) = mpsc::channel(completion_cap);
 
+        let applied_mirror = shared.authorization_fence.calvin_mirrors().register(
+            vshard_id,
+            fully_applied_epoch,
+            &applied_tail,
+        );
+
+        // A backup's cut waits on every scheduler this node runs.
+        shared.calvin.cuts.register(vshard_id);
+
+        let capacity_freed = shared
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .capacity_freed();
+
         Self {
             vshard_id,
             receiver,
             shared,
             multi_raft,
+            sequencer_proposer,
+            owed: OwedEntries::new(),
             sequencer_state_machine,
             lock_manager,
             pending: BTreeMap::new(),
@@ -217,6 +268,8 @@ impl Scheduler {
             dependent_barrier: BTreeMap::new(),
             read_result_rx,
             applied: AppliedGate::new(fully_applied_epoch, applied_tail),
+            cut_floors: Default::default(),
+            applied_mirror,
             rebuild_target_epoch,
             max_input_epoch: 0,
             config,
@@ -226,6 +279,10 @@ impl Scheduler {
             promotion_rx,
             registry,
             verdict_rx,
+            deferred: DeferredQueue::new(),
+            capacity_freed,
+            intake: IntakeGate::default(),
+            halt: HaltLatch::default(),
         }
     }
 
@@ -262,19 +319,23 @@ impl Scheduler {
     /// Publish an advanced fully-applied watermark to the metrics gauge and the
     /// shared cross-shard snapshot anchor.
     ///
-    /// `BEGIN` reads `SharedState::last_applied_calvin_epoch` to anchor a
+    /// `BEGIN` reads `CalvinLocalState::last_applied_epoch` to anchor a
     /// session's cross-shard snapshot version, so it MUST reflect the
     /// FULLY-applied epoch — never an epoch that has only some of its positions
     /// committed, which would let a session anchor on a torn epoch. `fetch_max`
     /// keeps it monotonic across all per-vShard schedulers writing the counter.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn publish_watermark(
-        &self,
+        &mut self,
         watermark: u64,
     ) {
         self.metrics.update_last_applied_epoch(watermark);
+        self.applied_mirror.fold(watermark);
         self.shared
-            .last_applied_calvin_epoch
+            .calvin
+            .last_applied_epoch
             .fetch_max(watermark, std::sync::atomic::Ordering::Release);
+        // A marker passes once every epoch delivered before it folded.
+        self.report_passed_cuts();
     }
 
     /// Spawn a bridge task that awaits a single executor response and forwards
@@ -287,7 +348,7 @@ impl Scheduler {
         &self,
         txn_id: TxnId,
         request_id: RequestId,
-        mut response_rx: mpsc::Receiver<Response>,
+        mut response_rx: crate::control::ResponseReceiver,
     ) {
         let tx = self.completion_tx.clone();
         tokio::spawn(async move {
@@ -314,9 +375,31 @@ impl Scheduler {
         let mut stall_tick = tokio::time::interval(self.config.verdict_stall_warn() / 4);
         stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Woken when a routed Data-Plane response frees dispatcher capacity.
+        let capacity_freed = Arc::clone(&self.capacity_freed);
+        // Set when a tick left armed catch-up unreplayed. The next open-gate
+        // pass fires the tick at once to resume it.
+        let mut catch_up_resume = false;
+
         loop {
+            // Register for the capacity wake BEFORE the re-send pass. A
+            // response routed after a refusal but before this point is
+            // covered by the pass itself. One routed after it wakes the arm.
+            let capacity_notified = capacity_freed.notified();
+            tokio::pin!(capacity_notified);
+            capacity_notified.as_mut().enable();
+            if self.resends_deferred() {
+                self.redispatch_deferred();
+            }
+
             self.check_dependent_barrier_timeouts();
             self.check_awaiting_verdict_stalls();
+
+            let intake_open = self.refresh_intake_gate();
+            if intake_open && catch_up_resume {
+                catch_up_resume = false;
+                stall_tick.reset_immediately();
+            }
 
             tokio::select! {
                 biased;
@@ -328,7 +411,10 @@ impl Scheduler {
 
                 maybe_completion = self.completion_rx.recv() => {
                     if let Some((txn_id, request_id, resp_opt)) = maybe_completion {
-                        self.handle_completion(txn_id, request_id, resp_opt);
+                        // Awaited in the arm: the loop takes no other input
+                        // until this completion, its durability wait included,
+                        // is fully handled.
+                        self.handle_completion(txn_id, request_id, resp_opt).await;
                     }
                 }
 
@@ -357,7 +443,12 @@ impl Scheduler {
                     }
                 }
 
-                maybe_txn = self.receiver.recv() => {
+                _ = &mut capacity_notified, if self.resends_deferred() => {
+                    // Capacity freed: the next loop pass re-sends deferred
+                    // requests in FIFO order.
+                }
+
+                maybe_txn = self.receiver.recv(), if intake_open => {
                     match maybe_txn {
                         Some(input) => self.process_scheduler_input(input),
                         None => {
@@ -375,54 +466,20 @@ impl Scheduler {
                     // (channel Full/Closed) so a missed `SchedulerInput` never
                     // permanently diverges this vShard's lock table from its peers.
                     // O(1) common case (no pending catch-up). See `drain_catch_up`.
-                    self.drain_catch_up();
+                    // A closed intake gate skips the drain until it opens.
+                    catch_up_resume =
+                        !intake_open || self.drain_catch_up() == CatchUpDrain::Remaining;
+                    // Propose again every owed sequencer entry not yet applied.
+                    self.retry_owed_sequencer_entries();
                     // The top-of-loop check_awaiting_verdict_stalls /
-                    // check_dependent_barrier_timeouts do the stall work on every
-                    // wake; this arm guarantees the loop wakes to run them (and the
-                    // drain) when no other event arrives.
+                    // check_dependent_barrier_timeouts and the deferred re-send
+                    // pass run on every wake; this arm guarantees the loop wakes
+                    // to run them (and the drain) when no other event arrives.
                 }
             }
         }
-    }
-
-    /// Encode `entry` as MessagePack and propose it to the sequencer Raft group.
-    ///
-    /// Logs a warning on encode failure or propose failure; never panics.
-    /// `op_name` is a short human-readable label used in warning messages
-    /// (e.g. `"completion ack"`, `"OLLP mismatch signal"`).
-    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn propose_sequencer_entry(
-        &self,
-        entry: SequencerEntry,
-        txn_id: TxnId,
-        op_name: &str,
-    ) {
-        match zerompk::to_msgpack_vec(&entry) {
-            Ok(bytes) => {
-                if let Err(e) = self
-                    .multi_raft
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .propose_to_group(SEQUENCER_GROUP_ID, bytes)
-                {
-                    tracing::warn!(
-                        vshard_id = self.vshard_id,
-                        epoch = txn_id.epoch,
-                        position = txn_id.position,
-                        error = %e,
-                        "calvin: failed to propose {op_name}",
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    vshard_id = self.vshard_id,
-                    epoch = txn_id.epoch,
-                    position = txn_id.position,
-                    error = %e,
-                    "calvin: failed to encode {op_name}",
-                );
-            }
-        }
+        // Every txn still pending stays unapplied on this replica.
+        self.hold_all_redo_records();
     }
 
     /// Allocate a fresh request ID for a dispatch.
@@ -437,70 +494,9 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
 
-    use nodedb_cluster::RoutingTable;
-
-    use crate::bridge::dispatch::Dispatcher;
-
-    /// Build a minimally-wired `Scheduler` for driver-level unit tests. The Data
-    /// Plane is NOT started — tests exercise Control-Plane routing, guards, and
-    /// request dispatch only, so no core loop is needed. The returned `TempDir`
-    /// must be kept alive for the scheduler's lifetime (backs the WAL and
-    /// Raft storage).
-    fn build_test_scheduler(vshard_id: u32) -> (Scheduler, tempfile::TempDir) {
-        let registry = CalvinCompletionRegistry::new_detached();
-        let dir = tempfile::tempdir().unwrap();
-        let wal = Arc::new(
-            crate::wal::WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap(),
-        );
-        let (dispatcher, mut data_sides) = Dispatcher::new(1, 64);
-        let _data_side = data_sides
-            .pop()
-            .expect("one configured core has one data side");
-        let shared = SharedState::new(dispatcher, wal).unwrap();
-
-        let rt = RoutingTable::uniform(1, &[1], 1);
-        let multi_raft = Arc::new(Mutex::new(MultiRaft::new(1, rt, dir.path().to_path_buf())));
-
-        let sequencer_state_machine = Arc::new(Mutex::new(SequencerStateMachine::new(
-            HashMap::new(),
-            Arc::clone(&registry),
-        )));
-
-        let (_tx, receiver) = mpsc::channel(16);
-        let (_rr_tx, read_result_rx) = mpsc::channel(16);
-        let (_prom_tx, promotion_rx) = mpsc::unbounded_channel();
-        let (verdict_tx, verdict_rx) = mpsc::channel(16);
-        registry.register_verdict_signal_sender(vshard_id, verdict_tx);
-
-        let lock_manager = Arc::new(Mutex::new(LockManager::new()));
-
-        let scheduler = Scheduler::new(SchedulerParams {
-            vshard_id,
-            receiver,
-            shared,
-            multi_raft,
-            sequencer_state_machine,
-            // A freshly-built scheduler has applied nothing, so its watermark is the
-            // not-yet-applied sentinel (matching `read_applied_recovery` for a clean
-            // node). Hardcoding `0` here would instead claim epoch 0 is fully applied,
-            // making the exactly-once gate (`AppliedGate::is_applied`) short-circuit
-            // every epoch-0 replay before it reaches the lock table — silently
-            // defeating the end-to-end drain tests below.
-            fully_applied_epoch: NOT_YET_APPLIED_EPOCH,
-            applied_tail: BTreeSet::new(),
-            rebuild_target_epoch: 0,
-            config: SchedulerConfig::default(),
-            metrics: SchedulerMetrics::new(),
-            read_result_rx,
-            lock_manager,
-            promotion_rx,
-            registry,
-            verdict_rx,
-        });
-        (scheduler, dir)
-    }
+    use crate::control::cluster::calvin::scheduler::driver::core::test_support::build_test_scheduler;
 
     /// A freshly-recovered scheduler (`fully_applied_epoch` still the
     /// `NOT_YET_APPLIED_EPOCH` sentinel) with a REAL, non-zero rebuild target must

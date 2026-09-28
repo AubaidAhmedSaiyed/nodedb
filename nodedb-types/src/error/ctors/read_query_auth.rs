@@ -147,6 +147,20 @@ impl NodeDbError {
         }
     }
 
+    /// A drop or revoke refused because other objects still depend on
+    /// `object`. SQLSTATE `2BP01` (`dependent_objects_still_exist`).
+    /// `message` is the full message and names the dependents.
+    pub fn dependent_objects_exist(object: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::DEPENDENT_OBJECTS_EXIST,
+            message: message.into(),
+            details: ErrorDetails::DependentObjectsExist {
+                object: object.into(),
+            },
+            cause: None,
+        }
+    }
+
     /// An object exists but a prerequisite step has not run, such as `currval`
     /// before this session called `nextval`. Renders as SQLSTATE `55000`
     /// (`object_not_in_prerequisite_state`).
@@ -199,6 +213,32 @@ impl NodeDbError {
         }
     }
 
+    /// A function received a value it cannot compute on: a vector of the
+    /// wrong dimension, an argument of the wrong shape, a malformed path.
+    /// SQLSTATE `22000` (`data_exception`). `detail` is the full message.
+    pub fn data_exception(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            code: ErrorCode::DATA_EXCEPTION,
+            message: detail.clone(),
+            details: ErrorDetails::DataException { detail },
+            cause: None,
+        }
+    }
+
+    /// A statement exceeded a server limit on its own size or depth: a
+    /// recursion depth, a per-transaction staging budget. SQLSTATE `54000`
+    /// (`program_limit_exceeded`). `detail` is the full message.
+    pub fn program_limit_exceeded(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            code: ErrorCode::PROGRAM_LIMIT_EXCEEDED,
+            message: detail.clone(),
+            details: ErrorDetails::ProgramLimitExceeded { detail },
+            cause: None,
+        }
+    }
+
     /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
     /// Distinct from `plan_error` so clients match the code, SQLSTATE
     /// `2201W`, instead of parsing the message.
@@ -219,6 +259,17 @@ impl NodeDbError {
             code: ErrorCode::AUTHORIZATION_DENIED,
             message: format!("authorization denied on {resource}"),
             details: ErrorDetails::AuthorizationDenied { resource },
+            cause: None,
+        }
+    }
+
+    /// Credentials were rejected. `detail` must not say whether the user
+    /// exists.
+    pub fn authentication_failed(detail: impl fmt::Display) -> Self {
+        Self {
+            code: ErrorCode::AUTHENTICATION_FAILED,
+            message: format!("authentication failed: {detail}"),
+            details: ErrorDetails::AuthenticationFailed,
             cause: None,
         }
     }

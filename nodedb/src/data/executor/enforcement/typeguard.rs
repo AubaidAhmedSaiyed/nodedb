@@ -39,10 +39,10 @@ pub fn inject_defaults(
                     }
                 })?;
             let doc = nodedb_types::Value::Object(fields.clone());
-            // A division/modulo-by-zero — the only error `eval` can produce —
-            // surfaces as SQLSTATE 22012, not this guard's own violation
-            // code, matching generated-column enforcement.
-            let val = expr.eval(&doc).map_err(|_e| ErrorCode::DivisionByZero)?;
+            // An evaluation error (division by zero, an unknown function)
+            // surfaces as its own SQLSTATE, not this guard's violation code,
+            // matching generated-column enforcement.
+            let val = expr.eval(&doc).map_err(ErrorCode::from)?;
             fields.insert(guard.field.clone(), val);
         }
         // DEFAULT: inject only if absent or null.
@@ -60,9 +60,9 @@ pub fn inject_defaults(
                         ),
                     })?;
                 let doc = nodedb_types::Value::Object(fields.clone());
-                // Div-by-zero → SQLSTATE 22012, not this guard's violation
-                // code (see the VALUE arm above).
-                let val = expr.eval(&doc).map_err(|_e| ErrorCode::DivisionByZero)?;
+                // An evaluation error keeps its own SQLSTATE, not this
+                // guard's violation code (see the VALUE arm above).
+                let val = expr.eval(&doc).map_err(ErrorCode::from)?;
                 fields.insert(guard.field.clone(), val);
             }
         }
@@ -181,11 +181,9 @@ pub fn check_type_guards(
                         guard.field, check_str
                     ),
                 })?;
-            // Div-by-zero → SQLSTATE 22012, not this guard's violation code,
-            // matching CHECK-constraint enforcement elsewhere.
-            let result = check_expr
-                .eval(doc)
-                .map_err(|_e| ErrorCode::DivisionByZero)?;
+            // An evaluation error keeps its own SQLSTATE, not this guard's
+            // violation code, matching CHECK-constraint enforcement elsewhere.
+            let result = check_expr.eval(doc).map_err(ErrorCode::from)?;
             match result {
                 nodedb_types::Value::Bool(true) => {} // CHECK passed
                 nodedb_types::Value::Null => {}       // NULL passes CHECK (SQL semantics)

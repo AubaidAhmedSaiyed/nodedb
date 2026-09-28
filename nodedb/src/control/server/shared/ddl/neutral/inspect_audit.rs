@@ -75,7 +75,7 @@ pub fn show_audit_log(
 
     let entries = catalog
         .load_recent_audit_entries(limit)
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let (columns, column_types) = audit_columns();
     let mut rows = Vec::with_capacity(entries.len());
@@ -236,7 +236,7 @@ pub fn show_audit_in_database(
 
     let db_id = catalog
         .get_database_id_by_name(db_name)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{db_name}' does not exist")))?;
 
     let (columns, column_types) = audit_columns();
@@ -289,7 +289,7 @@ pub fn show_audit_in_database(
         let remaining = limit - rows.len();
         let all_entries = catalog
             .load_recent_audit_entries(remaining * 10)
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         for entry in all_entries.iter().rev() {
             if rows.len() >= limit {
                 break;
