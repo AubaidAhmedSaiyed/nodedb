@@ -59,7 +59,7 @@ impl EnvelopeWriter {
         Ok(())
     }
 
-    /// Finalize without encryption. Produces a version-1 envelope.
+    /// Finalize without encryption. Produces a plaintext envelope of [`VERSION`].
     pub fn finalize(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.framed_size as usize);
         write_header(&mut out, &self.meta, self.sections.len() as u16, VERSION);

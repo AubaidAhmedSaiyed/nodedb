@@ -33,7 +33,7 @@ use crate::common;
 
 use std::time::Duration;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 use nodedb_client::NativeClient;
 use nodedb_client::native::pool::PoolConfig;
 use nodedb_types::error::NodeDbError;

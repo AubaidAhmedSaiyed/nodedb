@@ -8,6 +8,10 @@
 //! its history and its valid-from time. A tombstone version re-issues as a
 //! delete at its `system_from`. Every replica updates its CSR index and its
 //! node identities as it installs each version.
+//!
+//! The key's collection is the name the source Data Plane stored it under.
+//! Each version re-issues under the destination-qualified name, and binds its
+//! node identities under the bare name in the destination database.
 
 use std::collections::BTreeMap;
 
@@ -19,6 +23,7 @@ use crate::engine::graph::edge_store::{
 use crate::types::{DatabaseId, TenantId};
 use crate::wal::{EdgeDeleteRedo, EdgePutRedo};
 
+use super::super::target::{DatabaseTarget, RestoredName};
 use super::sub_record::{edge_delete, edge_put};
 use super::units::{CollectionUnits, RowUnit};
 
@@ -51,19 +56,21 @@ fn node_identity(
     })
 }
 
-/// One edge version as a unit.
+/// One edge version of the collection `name` as a unit.
 fn edge_unit(
     state: &SharedState,
     database_id: DatabaseId,
     tenant: TenantId,
+    name: &RestoredName,
     key: &str,
     value: &[u8],
 ) -> crate::Result<RowUnit> {
-    let (collection, src_id, label, dst_id, system_from) =
+    let (_, src_id, label, dst_id, system_from) =
         parse_versioned_edge_key(key).ok_or_else(|| malformed(key))?;
+    let collection = name.bare.as_str();
     if is_tombstone(value) {
         let op = edge_delete(&EdgeDeleteRedo {
-            collection: collection.to_string(),
+            collection: name.stored.to_string(),
             src_id: src_id.to_string(),
             label: label.to_string(),
             dst_id: dst_id.to_string(),
@@ -87,7 +94,7 @@ fn edge_unit(
     let src = node_identity(state, database_id, tenant, collection, src_id)?;
     let dst = node_identity(state, database_id, tenant, collection, dst_id)?;
     let op = edge_put(&EdgePutRedo {
-        collection: collection.to_string(),
+        collection: name.stored.to_string(),
         src_id: src_id.to_string(),
         label: label.to_string(),
         dst_id: dst_id.to_string(),
@@ -102,16 +109,17 @@ fn edge_unit(
     })
 }
 
-/// Every restored edge version of `tenant_id`, one unit per version, grouped
-/// by edge collection in key order: each edge's versions in system-time order.
+/// Every restored edge version of `tenant_id` in one database, one unit per
+/// version, grouped by edge collection in key order: each edge's versions in
+/// system-time order. The edge section of a database's data section holds
+/// that database's edges only.
 pub(super) fn edge_units(
     state: &SharedState,
     tenant_id: u64,
+    target: DatabaseTarget,
     edges: Vec<(String, Vec<u8>)>,
 ) -> crate::Result<Vec<CollectionUnits>> {
-    // The edge section carries no database: a tenant backup reads the default
-    // database's edge store.
-    let database_id = DatabaseId::DEFAULT;
+    let database_id = target.dest;
     let tenant = TenantId::new(tenant_id);
     let mut by_key: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (key, value) in edges {
@@ -119,12 +127,10 @@ pub(super) fn edge_units(
     }
     let mut grouped: BTreeMap<String, Vec<RowUnit>> = BTreeMap::new();
     for (key, value) in &by_key {
-        let (collection, ..) = parse_versioned_edge_key(key).ok_or_else(|| malformed(key))?;
-        let unit = edge_unit(state, database_id, tenant, key, value)?;
-        grouped
-            .entry(collection.to_string())
-            .or_default()
-            .push(unit);
+        let (stored, ..) = parse_versioned_edge_key(key).ok_or_else(|| malformed(key))?;
+        let name = target.resolve(stored)?;
+        let unit = edge_unit(state, database_id, tenant, &name, key, value)?;
+        grouped.entry(name.bare).or_default().push(unit);
     }
     Ok(grouped
         .into_iter()

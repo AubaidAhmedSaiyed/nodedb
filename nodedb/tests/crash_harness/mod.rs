@@ -378,8 +378,13 @@ impl CrashHarness {
     }
 
     pub fn pgwire_conn_str(&self) -> String {
+        self.pgwire_conn_str_for("default")
+    }
+
+    /// Connection string for a session opened in `database`.
+    pub fn pgwire_conn_str_for(&self, database: &str) -> String {
         format!(
-            "host=127.0.0.1 port={} dbname=default user=nodedb password=nodedb",
+            "host=127.0.0.1 port={} dbname={database} user=nodedb password=nodedb",
             self.pgwire_port
         )
     }

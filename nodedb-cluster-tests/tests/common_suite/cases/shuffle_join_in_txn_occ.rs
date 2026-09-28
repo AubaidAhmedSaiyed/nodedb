@@ -57,7 +57,7 @@ use crate::common;
 
 use std::time::Duration;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 
 use common::cluster_harness::{TestClusterNode, wait_for, wait_for_async};
 use common::occ_shuffle::{

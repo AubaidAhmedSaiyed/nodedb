@@ -146,9 +146,7 @@ impl MetadataCommitApplier {
             // the commit.
             emit_ddl_audit(&shared, raft_index, &stamped, audit.as_ref());
 
-            catalog_entry::post_apply::spawn_post_apply_async_side_effects(
-                stamped, shared, raft_index,
-            );
+            catalog_entry::post_apply::spawn_post_apply_async_side_effects(stamped, shared);
         }
         Ok(())
     }

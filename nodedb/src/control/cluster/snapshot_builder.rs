@@ -9,9 +9,11 @@
 //! chunked `InstallSnapshot` RPC for a lagging/new follower.
 //!
 //! The build reuses the existing Data-Plane snapshot builder
-//! (`MetaOp::CreateTenantSnapshot`) per tenant, then FILTERS every section down
-//! to the collections whose vshard belongs to the target Raft group, and merges
-//! the per-tenant slices into one `TenantDataSnapshot` for the wire.
+//! (`MetaOp::CreateTenantSnapshot`) per tenant and per database the tenant has
+//! collections in, then FILTERS every section down to the collections whose
+//! vshard belongs to the target Raft group, and merges the slices into one
+//! `TenantDataSnapshot` for the wire. Every section entry names its database,
+//! so the follower installs each row in the database it came from.
 //!
 //! The vshard-partitioned engines are filtered and shipped, including graph
 //! `edges` (the edge key already embeds the collection, so it is routed through
@@ -20,22 +22,20 @@
 //! and is shipped to the group that owns that collection's vshard — the same
 //! per-collection vshard filter as every other section.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use nodedb_types::id::DatabaseId;
 
 use crate::Error;
-use crate::bridge::envelope::PhysicalPlan;
 use crate::control::backup::snapshot_keys::{
-    extract_db_scoped_collection, extract_db_tenant_scoped_collection,
+    extract_db_scoped_collection, extract_db_tenant_scoped_collection, vshard_of_stored,
 };
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::parse_versioned_edge_key;
 use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
-use nodedb_physical::physical_plan::MetaOp;
 
 /// Per-tenant snapshot dispatch timeout (mirrors the backup orchestrator).
 const TENANT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -52,43 +52,50 @@ impl DataPlaneSnapshotBuilder {
         Self { shared }
     }
 
-    /// Compute the vshard for a `(DEFAULT db, collection)` pair.
-    ///
-    /// One helper, used uniformly by every section's filter so the
-    /// vshard-of-key logic is never duplicated. Matches the canonical routing
-    /// function (`vshard_for_collection`) used by the RESTORE topology splitter.
-    fn vshard_of(collection: &str) -> u32 {
-        nodedb_cluster::routing::vshard_for_collection(nodedb_types::CollectionKey::from_bare(
-            DatabaseId::DEFAULT,
-            collection,
-        ))
+    /// Every tenant with an active collection, and the databases it has
+    /// active collections in.
+    fn tenant_databases(catalog: &SystemCatalog) -> Result<BTreeMap<u64, BTreeSet<u64>>, Error> {
+        let mut tenants: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        for coll in catalog
+            .load_all_collections_across_databases()?
+            .iter()
+            .filter(|c| c.is_active)
+        {
+            tenants
+                .entry(coll.tenant_id)
+                .or_default()
+                .insert(coll.database_id.as_u64());
+        }
+        Ok(tenants)
     }
 
     /// Capture PK→surrogate bindings for every active collection whose vshard
-    /// belongs to the target group, for each enumerated tenant.
+    /// belongs to the target group, for each enumerated tenant, in every
+    /// database.
     ///
-    /// Uses the SAME `vshard_of` membership filter every section uses (one
-    /// source of truth), so only in-group collections' identities ship — never
-    /// more, never less than the data sections carry.
+    /// Routes each collection by its `(database, bare name)` key, the same
+    /// key every section's filter routes by, so only in-group collections'
+    /// identities ship — never more, never less than the data sections carry.
     fn capture_surrogates(
         catalog: &SystemCatalog,
-        tenants: &[u64],
+        tenants: &BTreeMap<u64, BTreeSet<u64>>,
         group_vshards: &HashSet<u32>,
         merged: &mut TenantDataSnapshot,
     ) -> Result<(), Error> {
-        let collections = catalog.load_all_collections(DatabaseId::DEFAULT)?;
-        let tenant_set: HashSet<u64> = tenants.iter().copied().collect();
+        let collections = catalog.load_all_collections_across_databases()?;
         for coll in collections
             .iter()
-            .filter(|c| c.is_active && tenant_set.contains(&c.tenant_id))
-            .filter(|c| group_vshards.contains(&Self::vshard_of(&c.name)))
+            .filter(|c| c.is_active && tenants.contains_key(&c.tenant_id))
         {
-            let bindings = catalog.scan_surrogates_for_collection(
-                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &coll.name),
-                TenantId::new(coll.tenant_id),
-            )?;
+            let key = nodedb_types::CollectionKey::from_bare(coll.database_id, &coll.name);
+            if !group_vshards.contains(&nodedb_cluster::routing::vshard_for_collection(key)) {
+                continue;
+            }
+            let bindings =
+                catalog.scan_surrogates_for_collection(key, TenantId::new(coll.tenant_id))?;
             for (pk, surrogate) in bindings {
                 merged.surrogate_pk.push(SurrogateBindEntry {
+                    database_id: coll.database_id.as_u64(),
                     tenant_id: coll.tenant_id,
                     collection: coll.name.clone(),
                     pk,
@@ -99,46 +106,41 @@ impl DataPlaneSnapshotBuilder {
         Ok(())
     }
 
-    /// Build the merged, group-filtered snapshot for `tenant_id`.
+    /// Build the group-filtered snapshot of `tenant_id` in `database_id` and
+    /// merge it into `merged`.
     async fn build_tenant_filtered(
         &self,
         tenant_id: u64,
+        database_id: DatabaseId,
         group_vshards: &HashSet<u32>,
         merged: &mut TenantDataSnapshot,
     ) -> Result<(), Error> {
-        let plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
-            tenant_id,
-            cut_watermark: None,
-        });
-        let bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_system(
+        let bytes = crate::control::server::exchange::snapshot_tenant_on_local_cores(
             &self.shared,
-            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
-                crate::control::server::shared::ddl::sync_dispatch::SystemReason::ClusterSnapshot,
-                TenantId::new(tenant_id),
-                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "__system"),
-                plan,
-            ),
+            TenantId::new(tenant_id),
+            database_id,
             TENANT_SNAPSHOT_TIMEOUT,
         )
         .await?;
 
         let snap: TenantDataSnapshot =
             zerompk::from_msgpack(&bytes).map_err(|e| Error::Internal {
-                detail: format!("snapshot build: decode tenant {tenant_id} snapshot: {e}"),
+                detail: format!(
+                    "snapshot build: decode tenant {tenant_id} snapshot of database {}: {e}",
+                    database_id.as_u64()
+                ),
             })?;
+        // Every section names its collection as the Data Plane stores it in
+        // `database_id`.
+        let in_group =
+            |stored: &str| group_vshards.contains(&vshard_of_stored(database_id, stored));
 
         // db-tenant-scoped sections: key shape "{db}:{tid}:{collection}[:suffix]"
-        let in_group_db_tenant_scoped = |key: &str| {
-            extract_db_tenant_scoped_collection(key, tenant_id)
-                .map(|c| group_vshards.contains(&Self::vshard_of(c)))
-                .unwrap_or(false)
-        };
+        let in_group_db_tenant_scoped =
+            |key: &str| extract_db_tenant_scoped_collection(key, tenant_id).is_some_and(in_group);
         // db-scoped sections: key shape "{db}:{tid}:{collection}" (coll may contain ':')
-        let in_group_db_scoped = |key: &str| {
-            extract_db_scoped_collection(key, tenant_id)
-                .map(|c| group_vshards.contains(&Self::vshard_of(c)))
-                .unwrap_or(false)
-        };
+        let in_group_db_scoped =
+            |key: &str| extract_db_scoped_collection(key, tenant_id).is_some_and(in_group);
 
         for (k, v) in snap.documents {
             if in_group_db_tenant_scoped(&k) {
@@ -170,13 +172,12 @@ impl DataPlaneSnapshotBuilder {
                 merged.timeseries.push((k, v));
             }
         }
-        // kv_tables: the key IS the collection name → route directly.
+        // kv_tables / flushed_ts_segments / columnar_engines: db-scoped keys.
         for (k, v) in snap.kv_tables {
-            if group_vshards.contains(&Self::vshard_of(&k)) {
+            if in_group_db_scoped(&k) {
                 merged.kv_tables.push((k, v));
             }
         }
-        // flushed_ts_segments / columnar_engines: db-scoped keys.
         for blob in snap.flushed_ts_segments {
             if in_group_db_scoped(&blob.collection_key) {
                 merged.flushed_ts_segments.push(blob);
@@ -200,21 +201,22 @@ impl DataPlaneSnapshotBuilder {
 
         // Graph edges: the versioned edge key embeds the collection as its
         // FIRST `\x00`-delimited component, and edge writes are homed at
-        // `vshard_for_collection` over the default-database key — the SAME routing
-        // function `Self::vshard_of` uses. So edges route through the identical
-        // vshard filter every other section uses. The restore path parses the
-        // key and rebuilds CSR, so no key transformation is needed here.
+        // the vshard of the collection's `(database, bare name)` key — the SAME
+        // routing every other section's filter uses. The restore path parses
+        // the key and rebuilds CSR, so no key transformation is needed here.
         //
-        // Unlike every other section, the edge key does NOT carry the tenant,
-        // so the merged multi-tenant snapshot (applied ONCE with no per-tenant
-        // dispatch) carries edges tenant-aware via `tenant_edges` — pushing to
-        // the no-tenant `edges` field here would install them under the wrong
-        // tenant on apply.
+        // Unlike every other section, the edge key carries neither the
+        // database nor the tenant, so the merged snapshot (applied ONCE with no
+        // per-database or per-tenant dispatch) carries edges via
+        // `tenant_edges` — pushing to the plain `edges` field here would
+        // install them under the wrong database and tenant on apply.
         for (key, value) in snap.edges {
             match parse_versioned_edge_key(&key) {
                 Some((collection, ..)) => {
-                    if group_vshards.contains(&Self::vshard_of(collection)) {
-                        merged.tenant_edges.push((tenant_id, key, value));
+                    if in_group(collection) {
+                        merged
+                            .tenant_edges
+                            .push((database_id.as_u64(), tenant_id, key, value));
                     }
                 }
                 None => {
@@ -232,18 +234,16 @@ impl DataPlaneSnapshotBuilder {
         // single collection; include it iff that collection's vshard belongs to
         // this group — the same per-collection vshard filter every other engine
         // uses.
-        for (database_id, tid, collection, bytes) in snap.crdt_state {
-            if group_vshards.contains(&Self::vshard_of(&collection)) {
-                merged
-                    .crdt_state
-                    .push((database_id, tid, collection, bytes));
+        for (crdt_db, tid, collection, bytes) in snap.crdt_state {
+            if in_group(collection.as_str()) {
+                merged.crdt_state.push((crdt_db, tid, collection, bytes));
             }
         }
 
         // CRDT constraints: same per-collection vshard filter as `crdt_state`
         // — each entry is routed by its single collection's vshard.
         for entry in snap.crdt_constraints {
-            if group_vshards.contains(&Self::vshard_of(&entry.collection)) {
+            if in_group(entry.collection.as_str()) {
                 merged.crdt_constraints.push(entry);
             }
         }
@@ -278,31 +278,26 @@ impl nodedb_cluster::SnapshotBuilder for DataPlaneSnapshotBuilder {
             return Ok(Vec::new());
         }
 
-        // Enumerate tenants from the system catalog — the same source the backup
-        // orchestrator's catalog sections use. Every active collection carries
-        // its `tenant_id`; the distinct set is the tenants to snapshot. When no
-        // catalog is configured there is nothing durable to enumerate, so ship
-        // an empty (well-formed) snapshot.
-        let tenants: Vec<u64> = {
-            let catalog = self.shared.credentials.catalog();
-
-            let collections = catalog
-                .load_all_collections(DatabaseId::DEFAULT)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            let mut set: HashSet<u64> = HashSet::new();
-            for coll in collections.iter().filter(|c| c.is_active) {
-                set.insert(coll.tenant_id);
-            }
-            let mut v: Vec<u64> = set.into_iter().collect();
-            v.sort_unstable();
-            v
-        };
+        // Enumerate tenants and their databases from the system catalog — the
+        // same source the backup orchestrator's catalog sections use. Every
+        // active collection carries its `tenant_id` and `database_id`; each
+        // distinct pair is one snapshot to take. With no collection there is
+        // nothing durable to enumerate, so ship an empty (well-formed) snapshot.
+        let tenants = Self::tenant_databases(self.shared.credentials.catalog())
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let mut merged = TenantDataSnapshot::default();
-        for tenant_id in &tenants {
-            self.build_tenant_filtered(*tenant_id, &group_vshards, &mut merged)
+        for (tenant_id, databases) in &tenants {
+            for database_id in databases {
+                self.build_tenant_filtered(
+                    *tenant_id,
+                    DatabaseId::new(*database_id),
+                    &group_vshards,
+                    &mut merged,
+                )
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
         }
 
         // Capture the PK→surrogate identity map for every in-group collection.

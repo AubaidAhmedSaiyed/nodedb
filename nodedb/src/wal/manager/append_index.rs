@@ -105,13 +105,16 @@ impl WalAppender<'_> {
         self.append_record(RecordType::WriteAborted, tid, vs, db, &payload)
     }
 
-    /// Append a `CollectionTombstoned` record. Any subsequent replay
-    /// that extracts this record will filter prior writes for
-    /// `(tid, collection)` whose LSN is less than `purge_lsn`.
+    /// Append a `CollectionTombstoned` record. Any later replay that
+    /// extracts this record skips every write to the collection in
+    /// `(database_id, tid)` whose LSN is less than `purge_lsn`.
     ///
-    /// `vshard_id` of `0` is conventional — tombstones are tenant-level
+    /// `collection` is the bare catalog name. Replay derives the storage
+    /// name that data records carry from it.
+    ///
+    /// `vshard_id` of `0` is conventional: tombstones are collection-level
     /// metadata, not sharded user data. Replay filters on
-    /// `(tenant_id, collection)` pair alone.
+    /// `(database_id, tenant_id, collection)` alone.
     pub fn append_collection_tombstone(
         &self,
         tid: TenantId,

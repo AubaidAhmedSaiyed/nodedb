@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `restore_tenant`: validates a backup envelope, merges all sections into
-//! a single `TenantDataSnapshot`, and re-issues every section as durable,
-//! replicated writes.
+//! `restore_tenant`: validates a backup envelope, maps every backed-up
+//! database to its destination, merges the sections of each database into
+//! one `TenantDataSnapshot`, and re-issues every section as durable,
+//! replicated writes into its destination database.
 
 use std::sync::Arc;
 
@@ -14,9 +15,9 @@ use crate::Error;
 use crate::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored;
 use crate::control::state::SharedState;
 
+use super::super::databases::{decode_databases, resolve_databases};
 use super::super::sections::{apply_metadata_sections, merge_sections};
 use super::rebind;
-use super::reissue;
 use super::stats::RestoreStats;
 
 /// Restore a tenant from a fully-buffered backup envelope.
@@ -96,8 +97,15 @@ pub async fn restore_tenant(
         ..Default::default()
     };
 
+    // Map every backed-up database to its destination, creating each one the
+    // destination lacks. Every other section names its database by source id.
+    let database_blobs = decode_databases(&env)?;
+    let databases = resolve_databases(state, tenant_id, &database_blobs, dry_run)?;
+    stats.databases = database_blobs.len();
+    stats.databases_created = databases.created();
+
     if !dry_run {
-        let restored_collections = apply_metadata_sections(state, tenant_id, &env)?;
+        let restored_collections = apply_metadata_sections(state, tenant_id, &env, &databases)?;
         // Every restored collection's declaration reaches this node's Data
         // Plane before any of its rows do. The catalog row alone leaves
         // `doc_configs` empty for the collection, and the re-issue below
@@ -128,127 +136,46 @@ pub async fn restore_tenant(
         }
     }
 
-    let mut merged = merge_sections(&env.sections)?;
-    stats.documents = merged.documents.len() + merged.documents_versioned.len();
-    stats.indexes = merged.indexes.len() + merged.indexes_versioned.len();
-    stats.edges = merged.edges.len();
-    stats.vectors = merged.vectors.len();
-    stats.kv_tables = merged.kv_tables.len();
-    // CRDT state is one entry per (tenant, collection).
-    stats.crdt_state = merged.crdt_state.len();
-    stats.timeseries = merged.timeseries.len();
-    stats.flushed_ts_segments = merged.flushed_ts_segments.len();
-    stats.surrogate_pk = merged.surrogate_pk.len();
-
-    rebind::warn_on_tombstoned_restores(state, tenant_id, &merged, env.meta.snapshot_watermark);
+    let merged = merge_sections(&env.sections)?;
+    for source in merged.keys() {
+        if !database_blobs
+            .iter()
+            .any(|blob| blob.database_id == *source)
+        {
+            return Err(Error::Internal {
+                detail: format!(
+                    "invalid backup format: a data section names database {source}, which the \
+                     backup's database section does not list"
+                ),
+            });
+        }
+    }
+    for (source, snap) in &merged {
+        stats.count_sections(snap);
+        if dry_run {
+            stats.columnar_engines += snap.columnar_engines.len();
+        }
+        // A dry run has no target for a database this cluster lacks: no
+        // tombstone of this cluster names it.
+        if let Some(target) = databases.get(*source) {
+            rebind::warn_on_tombstoned_restores(
+                state,
+                tenant_id,
+                target,
+                snap,
+                env.meta.snapshot_watermark,
+            );
+        }
+    }
 
     if dry_run {
-        stats.columnar_engines = merged.columnar_engines.len();
         return Ok(stats);
     }
 
-    // Every section re-issues as durable writes: Raft-replicated to every
-    // replica of its group in cluster mode, WAL-appended then installed on a
-    // single node. None is installed straight into a Data-Plane map, which
-    // would hold it on one node only and lose it on restart.
-    let columnar_snapshots = std::mem::take(&mut merged.columnar_engines);
-    let timeseries_memtables = std::mem::take(&mut merged.timeseries);
-    let flushed_ts_segments = std::mem::take(&mut merged.flushed_ts_segments);
-    let crdt_state = std::mem::take(&mut merged.crdt_state);
-    let kv_tables = std::mem::take(&mut merged.kv_tables);
-    let vector_snapshots = std::mem::take(&mut merged.vectors);
-    // Vector-index config re-issues as `VectorOp::SetParams` before the first
-    // vector `Insert`: the Data Plane creates a (collection, field) HNSW index
-    // on its first `Insert`, from whatever params it holds by then.
-    let vector_params_snapshots = std::mem::take(&mut merged.vector_params);
-    let index_config_snapshots = std::mem::take(&mut merged.index_configs);
-
-    // The PK→surrogate identity map. It is bound on this node before any
-    // re-issue, so a re-issued row keeps the surrogate the backup stored it
-    // under unless this node already binds its key.
-    let surrogate_binds = std::mem::take(&mut merged.surrogate_pk);
-    rebind::rebind_surrogates(state, &surrogate_binds)?;
-
-    // Document rows, their versions and graph edges re-issue as committed
-    // redo records through each collection's apply log: every replica binds
-    // the rows' identities, appends the record to its WAL, installs the rows
-    // and derives their secondary index entries. The backup's own index
-    // entries are therefore not installed.
-    let documents = std::mem::take(&mut merged.documents);
-    let documents_versioned = std::mem::take(&mut merged.documents_versioned);
-    let edges = std::mem::take(&mut merged.edges);
-    let redo = super::super::redo_reissue::reissue_rows_and_edges(
-        state,
-        tenant_id,
-        super::super::redo_reissue::RestoredRows {
-            documents,
-            documents_versioned,
-            edges,
-            binds: &surrogate_binds,
-        },
-    )
-    .await?;
-    stats.documents_reissued = redo.documents;
-    stats.edges_reissued = redo.edges;
-    stats.redo_records = redo.records;
-
-    // Durable re-issue of plain-columnar rows. Each restored collection's live
-    // rows are decoded from the snapshot and replayed as a durable
-    // `ColumnarOp::Insert` (Raft-replicated in cluster mode; WAL-appended then
-    // installed in single-node mode). Collections that decode to zero live rows
-    // are skipped. Any failure is fatal — no warn-and-continue.
-    stats.columnar_engines =
-        reissue::reissue_columnar_snapshots(state, tenant_id, columnar_snapshots).await?;
-
-    // Durable re-issue of timeseries rows. Each restored collection's memtable
-    // rows plus every flushed partition's rows are decoded from the snapshot and
-    // replayed as a durable `TimeseriesOp::Ingest` (Raft-replicated in cluster
-    // mode; WAL-appended then installed in single-node mode). Collections that
-    // decode to zero live rows are skipped. Any failure is fatal — no
-    // warn-and-continue.
-    stats.timeseries_reissued = reissue::reissue_timeseries_snapshots(
-        state,
-        tenant_id,
-        timeseries_memtables,
-        flushed_ts_segments,
-    )
-    .await?;
-
-    // Durable re-issue of CRDT state. Each collection's Loro snapshot is
-    // proposed through Raft to the data group owning that collection's vshard
-    // (Raft-replicated in cluster mode; WAL-appended then installed in
-    // single-node mode). Every replica applies the same idempotent Loro merge
-    // and converges deterministically. Any failure is fatal — no
-    // warn-and-continue.
-    stats.crdt_reissued =
-        super::super::crdt_reissue::reissue_crdt_snapshots(state, crdt_state).await?;
-
-    // Durable re-issue of KV rows, one `KvOp::Put` per live row. Any failure
-    // is fatal — no warn-and-continue.
-    stats.kv_reissued =
-        super::super::kv_reissue::reissue_kv_tables(state, tenant_id, kv_tables).await?;
-
-    // Durable re-issue of vector-index configuration. Each restored
-    // (collection, field) HNSW/PQ/IVF config is replayed as a
-    // `VectorOp::SetParams` (Raft-replicated in cluster mode; WAL-appended
-    // then installed in single-node mode). MUST run before the vector-insert
-    // re-issue below — see the `vector_params_snapshots` drain comment
-    // above. Any failure is fatal — no warn-and-continue.
-    stats.vector_params_reissued = reissue::reissue_vector_params(
-        state,
-        tenant_id,
-        vector_params_snapshots,
-        index_config_snapshots,
-    )
-    .await?;
-
-    // Durable re-issue of vector rows. Each restored vector is replayed as an
-    // individual `VectorOp::Insert` (Raft-replicated in cluster mode;
-    // WAL-appended then installed in single-node mode). Collections that
-    // decode to zero vectors are skipped. Any failure is fatal — no
-    // warn-and-continue.
-    stats.vectors_reissued =
-        reissue::reissue_vector_snapshots(state, tenant_id, vector_snapshots).await?;
-
+    // Each database re-issues its rows into its destination database.
+    for (source, snap) in merged {
+        let target = databases.target(source)?;
+        super::database::reissue_database(state, tenant_id, target, snap, &mut stats).await?;
+    }
     Ok(stats)
 }

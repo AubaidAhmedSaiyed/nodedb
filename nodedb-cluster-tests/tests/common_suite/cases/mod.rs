@@ -27,6 +27,7 @@ mod cluster_array;
 mod cluster_array_cell_raft_replication;
 mod cluster_backup_remote_cut;
 mod cluster_backup_restore;
+mod cluster_backup_restore_databases;
 mod cluster_backup_restore_engines;
 mod cluster_cdc_publish_once;
 mod cluster_collection_hard_delete;

@@ -65,7 +65,7 @@ use crate::common;
 
 use std::time::Duration;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 use tokio_postgres::SimpleQueryMessage;
 
 use common::cluster_harness::{TestClusterNode, wait_for, wait_for_async};

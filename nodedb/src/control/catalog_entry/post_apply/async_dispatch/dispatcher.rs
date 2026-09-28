@@ -63,11 +63,12 @@ use super::collection;
 /// Dispatch post-apply side effects of `entry`. Runs on every node (leader
 /// and followers) so each node's local Data Plane observes catalog mutations
 /// symmetrically.
-pub fn spawn_post_apply_async_side_effects(
-    entry: CatalogEntry,
-    shared: Arc<SharedState>,
-    raft_index: u64,
-) {
+///
+/// A storage reclaim takes its purge boundary from this node's own WAL. Replay
+/// compares the boundary against WAL record LSNs, so it must be a WAL LSN,
+/// never a Raft log index. Every write of the reclaimed collection on this
+/// node sits below the next LSN this WAL assigns.
+pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<SharedState>) {
     match entry {
         CatalogEntry::PutCollection(stored) => {
             // SYNCHRONOUS: Register must complete before the applied-index
@@ -124,6 +125,7 @@ pub fn spawn_post_apply_async_side_effects(
             tenant_id,
             name,
         } => {
+            let purge_lsn = shared.wal.next_lsn().as_u64();
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
                     collection::reclaim_collection_storage(
@@ -131,7 +133,7 @@ pub fn spawn_post_apply_async_side_effects(
                         database_id,
                         tenant_id,
                         &name,
-                        raft_index,
+                        purge_lsn,
                         false,
                     )
                     .await
@@ -152,13 +154,14 @@ pub fn spawn_post_apply_async_side_effects(
             tenant_id,
             name,
         } => {
+            let purge_lsn = shared.wal.next_lsn().as_u64();
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
                     super::materialized_view::delete_async(
                         database_id,
                         tenant_id,
                         name,
-                        raft_index,
+                        purge_lsn,
                         shared,
                     )
                     .await
@@ -364,7 +367,6 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::PutColumnStats(_)
         | CatalogEntry::MoveTenantCutover { .. } => {
             let _ = shared;
-            let _ = raft_index;
         }
     }
 }

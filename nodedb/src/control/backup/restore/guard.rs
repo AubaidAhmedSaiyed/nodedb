@@ -19,6 +19,10 @@
 //! group. A group no replica answered for by then refuses the restore.
 //!
 //! A node that restarted, or that never applied the write, answers alike.
+//!
+//! A mark is kept per `(group, tenant)`, whatever database the write named.
+//! Reading every data group's marks therefore covers the groups of every
+//! database the tenant writes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -351,6 +355,8 @@ async fn remote_tenant_marks(
         detail: format!("restore: encode the tenant write-mark request: {e}"),
     })?;
     let budget = remaining(deadline)?;
+    // A group's marks cover the tenant's writes in every database, so the
+    // request needs no database. Its database id only frames it.
     let request = RaftRpc::ExecuteRequest(ExecuteRequest {
         plan_bytes,
         tenant_id,

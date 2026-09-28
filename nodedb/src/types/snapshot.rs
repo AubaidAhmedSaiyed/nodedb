@@ -32,7 +32,8 @@ pub struct TenantDataSnapshot {
     /// Each value is a MessagePack-serialized list of `(vector_id, f32_data, doc_id)`.
     /// HNSW graph is NOT serialized — it's rebuilt on restore from raw vectors.
     pub vectors: Vec<(String, Vec<u8>)>,
-    /// KV tables: `[("{tid}:{collection}", serialized_entries_msgpack), ...]`
+    /// KV tables: `[("{db}:{tid}:{collection}", serialized_entries_msgpack), ...]`.
+    /// `collection` is the database-qualified name the KV engine keys the table by.
     /// Each value is a MessagePack-serialized list of `(key_bytes, value_bytes, expire_at_ms)`.
     pub kv_tables: Vec<(String, Vec<u8>)>,
     /// CRDT state, one entry per `(tenant, collection)`:
@@ -120,20 +121,19 @@ pub struct TenantDataSnapshot {
     #[serde(default)]
     pub surrogate_pk: Vec<SurrogateBindEntry>,
 
-    /// Graph edges WITH their owning tenant, for the per-group Raft snapshot
-    /// (the merged snapshot spans multiple tenants and the edge key —
-    /// `"{collection}\x00{src}\x00{label}\x00{dst}\x00{system:020}"` — does NOT
-    /// carry the tenant, unlike every other section's key). Each entry is
-    /// `(tenant_id, edge_key, value_bytes)`. The legacy `edges` field (no tenant)
-    /// is still used by the per-tenant user RESTORE path, which dispatches with
-    /// the correct tenant; this field is for the multi-tenant merged Raft path.
+    /// Graph edges WITH their owning database and tenant, for the per-group
+    /// Raft snapshot (the merged snapshot spans databases and tenants, and the
+    /// edge key — `"{collection}\x00{src}\x00{label}\x00{dst}\x00{system:020}"` —
+    /// carries neither). Each entry is `(database_id, tenant_id, edge_key,
+    /// value_bytes)`. The `edges` field (no database, no tenant) is used by a
+    /// restore dispatched in the snapshot's own database and tenant.
     ///
     /// `#[msgpack(default)]`: snapshots created before this field was added
     /// decode with an empty Vec — safe because the restore path skips an empty
     /// slice (same evolution pattern as `surrogate_pk`).
     #[msgpack(default)]
     #[serde(default)]
-    pub tenant_edges: Vec<(u64, String, Vec<u8>)>,
+    pub tenant_edges: Vec<(u64, u64, String, Vec<u8>)>,
 
     /// CRDT constraint state, one entry per `(tenant, collection)` that has an
     /// installed constraint set: `[(tenant_id, collection, constraint_version,
@@ -214,7 +214,7 @@ pub struct CrdtConstraintEntry {
 /// A single PK → surrogate identity binding carried in a snapshot/backup.
 ///
 /// Mirrors one row of the `surrogate_pk_v3` catalog table for one
-/// `(tenant_id, collection)`. Rebound on the Control-Plane apply side via
+/// `(database_id, tenant_id, collection)`. Rebound on the Control-Plane apply side via
 /// `SystemCatalog::put_surrogate` so PK point-lookups resolve on a
 /// snapshot-installed / restored node.
 #[derive(
@@ -229,9 +229,11 @@ pub struct CrdtConstraintEntry {
     Default,
 )]
 pub struct SurrogateBindEntry {
+    /// Database the collection lives in.
+    pub database_id: u64,
     /// Owning tenant of the `(collection, pk)` binding.
     pub tenant_id: u64,
-    /// Collection name (DEFAULT database scope).
+    /// Bare catalog name of the collection.
     pub collection: String,
     /// Primary-key bytes (the catalog forward-table key component).
     pub pk: Vec<u8>,
@@ -353,12 +355,14 @@ mod tests {
         let snap = TenantDataSnapshot {
             surrogate_pk: vec![
                 SurrogateBindEntry {
+                    database_id: 0,
                     tenant_id: 7,
                     collection: "users".to_string(),
                     pk: b"row-0".to_vec(),
                     surrogate: 1,
                 },
                 SurrogateBindEntry {
+                    database_id: 1025,
                     tenant_id: 7,
                     collection: "users".to_string(),
                     pk: b"row-1".to_vec(),

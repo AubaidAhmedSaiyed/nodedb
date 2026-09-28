@@ -2,14 +2,15 @@
 
 //! RESTORE TENANT orchestrator logic.
 //!
-//! Validates a backup envelope, merges all sections into a single
-//! `TenantDataSnapshot`, then re-issues every section as durable, replicated
-//! writes.
+//! Validates a backup envelope, merges the sections of each backed-up
+//! database into one `TenantDataSnapshot`, then re-issues every section as
+//! durable, replicated writes into the destination database.
 //!
-//! Durable re-issue of columnar/timeseries/vector rows lives in [`reissue`];
-//! post-install surrogate rebinding and tombstone warnings live in
-//! [`rebind`].
+//! [`database`] re-issues one database. Durable re-issue of
+//! columnar/timeseries/vector rows lives in [`reissue`]; surrogate rebinding
+//! and tombstone warnings live in [`rebind`].
 
+mod database;
 mod rebind;
 mod reissue;
 mod restore;

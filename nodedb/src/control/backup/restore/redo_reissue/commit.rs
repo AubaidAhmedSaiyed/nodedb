@@ -56,8 +56,10 @@ fn batch_units(units: Vec<RowUnit>) -> Vec<Vec<RowUnit>> {
     batches
 }
 
-/// One batch as the payload every replica applies.
-fn batch_payload(collection: &str, batch: Vec<RowUnit>) -> TransactionRedoPayload {
+/// One batch as the payload every replica applies. `stored` is the name the
+/// Data Plane stores the collection under, as a committed transaction's
+/// written-collection list names it.
+fn batch_payload(stored: &str, batch: Vec<RowUnit>) -> TransactionRedoPayload {
     let mut ops: Vec<RedoSubRecord> = Vec::new();
     let mut identities: Vec<CarriedIdentity> = Vec::new();
     let mut seen: HashSet<(String, Vec<u8>)> = HashSet::new();
@@ -75,7 +77,7 @@ fn batch_payload(collection: &str, batch: Vec<RowUnit>) -> TransactionRedoPayloa
             ops,
             calvin_stamp: None,
         },
-        collections: vec![collection.to_string()],
+        collections: vec![stored.to_string()],
         // The backup holds every target row with its total already folded in.
         sum_targets: Vec::new(),
         identities,
@@ -141,9 +143,10 @@ pub(super) async fn commit_collection(
         database_id,
         vshard_id: nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard(),
     };
+    let stored = nodedb_types::QualifiedCollection::new(database_id, &collection);
     let mut records = 0usize;
     for batch in batch_units(units) {
-        let payload = batch_payload(&collection, batch);
+        let payload = batch_payload(stored.as_str(), batch);
         // A classified error keeps its class. Only a machinery failure gains
         // the restore context.
         commit_record(state, target, &payload).await.map_err(|e| {

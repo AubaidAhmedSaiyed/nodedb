@@ -9,6 +9,11 @@
 //! * `documents_versioned` — `"{db}:{tid}:{collection}:{storage_key}\x00{sys:020}"`,
 //!   every version of a `bitemporal=true` row.
 //!
+//! `collection` is the name the source Data Plane stored the collection
+//! under: database-qualified outside the default database. Each row
+//! re-issues under the destination-qualified name, and binds its identity
+//! under the bare name in the destination database.
+//!
 //! Each row becomes one unit: its sub-records in version order plus the
 //! identity every replica binds before it installs them. A strict row's Binary
 //! Tuple decodes back to MessagePack with the collection's schema, the same
@@ -26,6 +31,7 @@ use crate::data::executor::strict_format::{binary_tuple_to_msgpack, undecodable_
 use crate::engine::sparse::btree_versioned::{TAG_LIVE, TAG_TOMBSTONE, decode_value};
 use crate::types::{DatabaseId, SurrogateBindEntry, TenantId};
 
+use super::super::target::DatabaseTarget;
 use super::sub_record::{VersionStamp, document_put, document_tombstone};
 use super::units::{CollectionUnits, RowUnit};
 
@@ -159,9 +165,14 @@ fn body_msgpack(
 /// Builds each row's unit for one collection.
 struct RowBuilder<'a> {
     state: &'a SharedState,
+    /// The destination database.
     database_id: DatabaseId,
     tenant: TenantId,
+    /// Bare catalog name: it keys the identity binds.
     collection: &'a str,
+    /// The name the destination Data Plane stores the collection under: the
+    /// sub-records carry it.
+    stored: &'a str,
     shape: CollectionShape,
     /// `storage surrogate → primary key` the backup bound for this collection.
     binds: HashMap<u32, &'a [u8]>,
@@ -211,7 +222,7 @@ impl RowBuilder<'_> {
         let identity = self.identity(key, Some(&value))?;
         let carried = self.bind(&identity, key)?;
         let op = document_put(
-            self.collection,
+            self.stored,
             identity.as_str(),
             value,
             carried.surrogate.as_u32(),
@@ -262,14 +273,14 @@ impl RowBuilder<'_> {
         for (stamp, body) in decoded {
             ops.push(match body {
                 Some(value) => document_put(
-                    self.collection,
+                    self.stored,
                     identity.as_str(),
                     value,
                     surrogate,
                     Some(stamp),
                 )?,
                 None => document_tombstone(
-                    self.collection,
+                    self.stored,
                     identity.as_str(),
                     surrogate,
                     stamp.sys_from_ms,
@@ -283,28 +294,41 @@ impl RowBuilder<'_> {
     }
 }
 
-/// Every restored row of `tenant_id`, one unit per row, grouped by
-/// collection. `binds` is the backup's primary-key section.
+/// Every restored row of `tenant_id` in one database, one unit per row,
+/// grouped by collection. Every row key must name `target.source`. `binds`
+/// is the backup's primary-key section of that database.
 pub(super) fn document_units(
     state: &SharedState,
     tenant_id: u64,
+    target: DatabaseTarget,
     documents: Vec<(String, Vec<u8>)>,
     documents_versioned: Vec<(String, Vec<u8>)>,
     binds: &[SurrogateBindEntry],
 ) -> crate::Result<Vec<CollectionUnits>> {
     let grouped = group_rows(tenant_id, documents, documents_versioned)?;
     let mut out = Vec::with_capacity(grouped.len());
-    for ((db, collection), rows) in grouped {
-        let database_id = DatabaseId::new(db);
+    for ((db, stored), rows) in grouped {
+        if db != target.source.as_u64() {
+            return Err(crate::Error::Serialization {
+                format: "backup".into(),
+                detail: format!(
+                    "restore: rows of '{stored}' name database {db}, but sit with database {}",
+                    target.source.as_u64()
+                ),
+            });
+        }
+        let name = target.resolve(&stored)?;
+        let database_id = target.dest;
         let builder = RowBuilder {
             state,
             database_id,
             tenant: TenantId::new(tenant_id),
-            collection: &collection,
-            shape: collection_shape(state, database_id, tenant_id, &collection)?,
+            collection: &name.bare,
+            stored: name.stored.as_str(),
+            shape: collection_shape(state, database_id, tenant_id, &name.bare)?,
             binds: binds
                 .iter()
-                .filter(|b| b.tenant_id == tenant_id && b.collection == collection)
+                .filter(|b| b.tenant_id == tenant_id && b.collection == name.bare)
                 .map(|b| (b.surrogate, b.pk.as_slice()))
                 .collect(),
         };
@@ -317,7 +341,7 @@ pub(super) fn document_units(
         }
         out.push(CollectionUnits {
             database_id,
-            collection: collection.clone(),
+            collection: name.bare.clone(),
             units,
         });
     }

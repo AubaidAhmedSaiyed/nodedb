@@ -28,7 +28,9 @@ impl RowUnit {
 
 /// Every unit of one collection. All of them write that collection's vShard.
 pub(super) struct CollectionUnits {
+    /// The destination database.
     pub database_id: DatabaseId,
+    /// Bare catalog name of the collection.
     pub collection: String,
     pub units: Vec<RowUnit>,
 }

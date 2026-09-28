@@ -78,11 +78,20 @@ impl CrashHarness {
     ///   so does the harness, bounded, before writing.
     /// - `RetryableSchemaChanged` (see [`is_retryable_schema_change`]).
     async fn simple_query_ready(&self, sql: &str) -> Vec<tokio_postgres::SimpleQueryMessage> {
+        self.simple_query_ready_in("default", sql).await
+    }
+
+    /// [`Self::simple_query_ready`] over a connection to `database`.
+    async fn simple_query_ready_in(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Vec<tokio_postgres::SimpleQueryMessage> {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut schema_change_attempts = 0usize;
         loop {
             let (client, connection) =
-                tokio_postgres::connect(&self.pgwire_conn_str(), tokio_postgres::NoTls)
+                tokio_postgres::connect(&self.pgwire_conn_str_for(database), tokio_postgres::NoTls)
                     .await
                     .expect("connect for exec");
             let conn_handle = tokio::spawn(async move {
@@ -245,6 +254,25 @@ impl CrashHarness {
             .filter_map(|m| match m {
                 tokio_postgres::SimpleQueryMessage::Row(row) => {
                     Some(row.get(col).unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// [`Self::exec`] over a connection to `database`.
+    pub async fn exec_in(&self, database: &str, sql: &str) {
+        let _ = self.simple_query_ready_in(database, sql).await;
+    }
+
+    /// [`Self::query_col_idx`] over a connection to `database`.
+    pub async fn query_col_idx_in(&self, database: &str, sql: &str, idx: usize) -> Vec<String> {
+        let messages = self.simple_query_ready_in(database, sql).await;
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(row) => {
+                    Some(row.get(idx).unwrap_or_default().to_string())
                 }
                 _ => None,
             })

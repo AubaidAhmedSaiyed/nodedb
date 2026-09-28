@@ -2,30 +2,27 @@
 
 //! Snapshot phase for `MOVE TENANT`.
 //!
-//! Dispatches `PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot)` to the
-//! local Data Plane and returns the raw snapshot bytes.  In the offline v1
-//! implementation the snapshot is performed on the local node only — the
-//! offline drain window ensures no cross-node writes are in-flight.  The
+//! Snapshots the tenant on every core of the local node and returns the
+//! merged snapshot bytes. The snapshot covers the local node only: the
+//! offline drain window ensures no cross-node writes are in flight. The
 //! cluster fan-out orchestrator (`backup::orchestrator::backup_tenant`) is
-//! intentionally bypassed here because its caller path requires
-//! `Arc<SharedState>`, which the DDL dispatch pipeline does not carry.
+//! bypassed here because its caller path requires `Arc<SharedState>`, which
+//! the DDL dispatch pipeline does not carry.
 
 use std::time::Duration;
 
 use bytes::Bytes;
 
-use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan};
-
-use crate::control::server::shared::ddl::sync_dispatch;
+use crate::control::server::exchange::snapshot_tenant_on_local_cores;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_types::NodeDbError;
 
-/// Run the snapshot phase: produce a backup snapshot for `tenant_id` via
-/// a local Data Plane dispatch.
+/// Run the snapshot phase: produce a snapshot of `tenant_id` from every core
+/// of the local node.
 ///
-/// `source_db_id` is the database the tenant is being moved FROM — the
-/// snapshot captures its live data, so the dispatch routes to that database.
+/// `source_db_id` is the database the tenant is being moved FROM. The
+/// snapshot captures its live data.
 ///
 /// Returns the raw snapshot bytes on success.
 pub async fn run(
@@ -34,32 +31,17 @@ pub async fn run(
     source_db_id: DatabaseId,
     timeout: Duration,
 ) -> Result<Bytes, NodeDbError> {
-    let plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
-        tenant_id: tenant_id.as_u64(),
-        cut_watermark: None,
-    });
-    // Route to the source database: the snapshot reads the tenant's live
-    // data from the database it is being moved out of.
-    let raw = sync_dispatch::dispatch_system(
-        state,
-        sync_dispatch::SystemTask::new(
-            sync_dispatch::SystemReason::TenantLifecycle,
-            tenant_id,
-            nodedb_types::CollectionKey::from_bare(source_db_id, "__system"),
-            plan,
-        ),
-        timeout,
-    )
-    .await
     // The phase code stays the statement's verdict, and the typed dispatch
     // error rides as its cause with its own class.
-    .map_err(|e| {
-        NodeDbError::move_tenant_snapshot_failed(
-            tenant_id.as_u64().to_string(),
-            "snapshot dispatch failed",
-        )
-        .with_cause(crate::error_classify::classify(&e))
-    })?;
+    let raw = snapshot_tenant_on_local_cores(state, tenant_id, source_db_id, timeout)
+        .await
+        .map_err(|e| {
+            NodeDbError::move_tenant_snapshot_failed(
+                tenant_id.as_u64().to_string(),
+                "snapshot dispatch failed",
+            )
+            .with_cause(crate::error_classify::classify(&e))
+        })?;
     Ok(Bytes::from(raw))
 }
 

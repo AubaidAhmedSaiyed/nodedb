@@ -169,6 +169,7 @@ mod sql_backup_calvin_cut;
 mod sql_backup_consistent_cut;
 mod sql_backup_restore_columnar;
 mod sql_backup_restore_columnar_restart;
+mod sql_backup_restore_databases;
 mod sql_backup_restore_documents;
 mod sql_backup_restore_durable_marks;
 mod sql_backup_restore_local_marks;

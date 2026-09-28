@@ -2,6 +2,8 @@
 
 pub mod cut;
 pub mod detect;
+pub mod metadata;
+pub mod node_snapshot;
 pub mod orchestrator;
 pub mod restore;
 pub mod snapshot_keys;

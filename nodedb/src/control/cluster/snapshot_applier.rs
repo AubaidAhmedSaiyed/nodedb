@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use nodedb_cluster::routing::vshard_for_collection;
 use nodedb_types::Surrogate;
-use nodedb_types::id::{CollectionKey, DatabaseId};
+use nodedb_types::id::{CollectionKey, DatabaseId, QualifiedCollection};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
@@ -100,29 +100,39 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
         // catalog access, so this resolution is Control-Plane (applier) only.
         let mut clear_vshards: Vec<u32> = group_vshards.iter().copied().collect();
         clear_vshards.sort_unstable();
-        let mut collections_to_clear: Vec<(u64, String)> = Vec::new();
+        //
+        // Every database's collections are listed. Each entry names its
+        // database and the collection as the Data Plane stores it there.
+        let mut collections_to_clear: Vec<(u64, u64, String)> = Vec::new();
         if !group_vshards.is_empty() {
             let catalog = self.shared.credentials.catalog();
             let collections = catalog
-                .load_all_collections(DatabaseId::DEFAULT)
+                .load_all_collections_across_databases()
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             for coll in collections.iter().filter(|c| {
                 c.is_active
                     && group_vshards.contains(&vshard_for_collection(CollectionKey::from_bare(
-                        DatabaseId::DEFAULT,
+                        c.database_id,
                         &c.name,
                     )))
             }) {
-                collections_to_clear.push((coll.tenant_id, coll.name.clone()));
+                collections_to_clear.push((
+                    coll.database_id.as_u64(),
+                    coll.tenant_id,
+                    QualifiedCollection::new(coll.database_id, &coll.name)
+                        .as_str()
+                        .to_string(),
+                ));
             }
         }
 
         // Reuse the existing local restore handler with replace_mode = true so a
         // Raft install OVERWRITES present keys. The handler installs by the
-        // snapshot's own per-key tenant/db prefixes, so the `tenant_id` plan
-        // field is only the dispatch routing key — mirror the local RESTORE
-        // dispatch (DEFAULT db, "__system" collection). Tenant 0 is used as the
-        // representative routing tenant for the multi-tenant payload.
+        // snapshot's own per-entry database and tenant, so the `tenant_id` plan
+        // field and the dispatch database are only routing keys — mirror the
+        // local RESTORE dispatch (DEFAULT db, "__system" collection). Tenant 0
+        // is used as the representative routing tenant for the multi-tenant,
+        // multi-database payload.
         let plan = PhysicalPlan::Meta(MetaOp::RestoreTenantSnapshot {
             tenant_id: 0,
             snapshot: snapshot_bytes.to_vec(),
@@ -160,7 +170,7 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
             for e in &snap.surrogate_pk {
                 catalog
                     .put_surrogate(
-                        CollectionKey::from_bare(DatabaseId::DEFAULT, &e.collection),
+                        CollectionKey::from_bare(DatabaseId::new(e.database_id), &e.collection),
                         TenantId::new(e.tenant_id),
                         &e.pk,
                         Surrogate::new(e.surrogate),

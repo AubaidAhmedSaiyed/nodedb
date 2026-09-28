@@ -72,22 +72,34 @@ impl CoreLoop {
         Ok(())
     }
 
+    /// Install one KV table's rows. `snapshot_key` is the section key
+    /// `"{db}:{tid}:{collection}"`, where `collection` is the db-qualified name
+    /// the KV engine keys the table by (e.g. "2/orders" for database 2; the
+    /// bare name for the default database). Each table installs under the
+    /// database and tenant its key names, so a merged multi-tenant snapshot
+    /// keeps every table with its owner. A key whose database disagrees with
+    /// its qualified collection name fails the restore.
     pub(super) fn restore_kv_table(
         &mut self,
-        tenant_id: u64,
-        collection: &str,
+        snapshot_key: &str,
         entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
-    ) {
+    ) -> crate::Result<()> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        // The snapshot stores the db-qualified collection name (e.g. "2/orders"
-        // for database 2; bare name for the default database). Recover the
-        // database id from that prefix so the restored hash key matches the one
-        // live reads compute from the same (database_id, qualified collection).
-        let database_id = database_id_from_qualified(collection);
+        let (database_id, tenant_id, collection) =
+            super::keys::parse_scoped_snapshot_key(snapshot_key);
+        let collection = collection.as_str();
+        if database_id_from_qualified(collection) != database_id {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "restore: KV table key '{snapshot_key}' names database {database_id}, \
+                     but its collection is qualified for another database"
+                ),
+            });
+        }
         for (key, value, expire_at) in entries {
             let ttl_ms = if expire_at > now_ms {
                 expire_at - now_ms
@@ -107,6 +119,7 @@ impl CoreLoop {
                 surrogate: nodedb_types::Surrogate::ZERO,
             });
         }
+        Ok(())
     }
 
     pub(super) fn restore_crdt_state(
@@ -162,8 +175,8 @@ impl CoreLoop {
 
         // Parse key: "{database_id}:{tenant_id}:{collection}" (canonical).
         // Legacy 2-part key ("{tenant_id}:{collection}") and bare keys are
-        // handled by `parse_timeseries_snapshot_key`.
-        let (database_id, tenant_id, collection) = super::keys::parse_timeseries_snapshot_key(key);
+        // handled by `parse_scoped_snapshot_key`.
+        let (database_id, tenant_id, collection) = super::keys::parse_scoped_snapshot_key(key);
 
         // Restore under this core's operator tuning, not the compiled defaults:
         // a memtable keeps the limits it was built with for its whole life, so

@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use nodedb_types::backup_envelope::{DEFAULT_MAX_TOTAL_BYTES, parse_encrypted};
+use nodedb_types::backup_envelope::{
+    DEFAULT_MAX_TOTAL_BYTES, DatabaseDataSection, parse_encrypted,
+};
 use nodedb_types::fail_point::{FailAction, FailGuard};
 
 use crate::common;
@@ -107,18 +109,21 @@ fn purged_on(node: &TestClusterNode, collection: &str) -> bool {
 }
 
 /// Whether the backup `envelope` holds a KV row of `collection` whose key
-/// carries `key`.
+/// carries `key`. Each data section wraps one database's snapshot, and a KV
+/// table's section key is `"{db}:{tenant}:{collection}"`.
 fn envelope_holds_kv_row(envelope: &[u8], collection: &str, key: &[u8]) -> bool {
     let parsed =
         parse_encrypted(envelope, DEFAULT_MAX_TOTAL_BYTES, &TEST_KEK).expect("parse the envelope");
+    let table_key = format!("0:{TENANT}:{collection}");
     parsed
         .sections
         .iter()
+        .filter_map(|section| zerompk::from_msgpack::<DatabaseDataSection>(&section.body).ok())
         .filter_map(|section| {
-            zerompk::from_msgpack::<nodedb::types::TenantDataSnapshot>(&section.body).ok()
+            zerompk::from_msgpack::<nodedb::types::TenantDataSnapshot>(&section.snapshot).ok()
         })
         .flat_map(|snapshot| snapshot.kv_tables)
-        .filter(|(name, _)| name == collection)
+        .filter(|(name, _)| *name == table_key)
         .filter_map(|(_, rows)| zerompk::from_msgpack::<Vec<(Vec<u8>, Vec<u8>, u64)>>(&rows).ok())
         .flatten()
         .any(|(row_key, _, _)| row_key.windows(key.len()).any(|window| window == key))

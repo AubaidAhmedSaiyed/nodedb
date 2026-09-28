@@ -697,10 +697,20 @@ mod crdt_replay_tests {
     #[test]
     fn replay_crdt_wal_honors_database_scoped_collection_tombstones() {
         let tid = TenantId::new(7);
-        let dropped = make_crdt_record(1, tid, 0, "notes", "dropped-row");
-        let retained = make_crdt_record(2, tid, 0, "notes", "retained-row");
+        let dropped_db = crate::types::DatabaseId::new(1);
+        let retained_db = crate::types::DatabaseId::new(2);
+        // Records in a named database carry the database-qualified name.
+        let dropped_name = nodedb_types::QualifiedCollection::new(dropped_db, "notes");
+        let retained_name = nodedb_types::QualifiedCollection::new(retained_db, "notes");
+        let dropped = make_crdt_record(1, tid, 0, dropped_name.as_str(), "dropped-row");
+        let retained = make_crdt_record(2, tid, 0, retained_name.as_str(), "retained-row");
+        // The tombstone names the collection by its bare catalog name.
         let mut tombstones = nodedb_wal::TombstoneSet::new();
-        tombstones.insert(1, tid.as_u64(), "notes".to_string(), 2);
+        tombstones.insert(
+            nodedb_types::CollectionKey::from_bare(dropped_db, "notes"),
+            tid.as_u64(),
+            2,
+        );
 
         let mut h = make_core(0);
         h.core.replay_crdt_wal(&[dropped, retained], 1, &tombstones);
@@ -709,12 +719,12 @@ mod crdt_replay_tests {
             .core
             .get_crdt_engine(crate::types::DatabaseId::new(1), tid)
             .expect("dropped database engine");
-        assert!(!dropped_engine.row_exists("notes", "dropped-row"));
+        assert!(!dropped_engine.row_exists(dropped_name.as_str(), "dropped-row"));
         let retained_engine = h
             .core
             .get_crdt_engine(crate::types::DatabaseId::new(2), tid)
             .expect("retained database engine");
-        assert!(retained_engine.row_exists("notes", "retained-row"));
+        assert!(retained_engine.row_exists(retained_name.as_str(), "retained-row"));
     }
 
     #[test]

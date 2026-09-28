@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Durable re-issue of columnar, timeseries, and vector rows drained from the
-//! merged backup snapshot (see [`super::restore_tenant`]).
+//! Durable re-issue of columnar, timeseries, and vector rows drained from one
+//! database's merged backup snapshot (see [`super::restore_tenant`]).
+//!
+//! Every section key names a collection as the source Data Plane stored it.
+//! Each re-issue resolves it through the [`DatabaseTarget`]: the plan names
+//! the destination-qualified collection, and the write routes by the bare
+//! name in the destination database.
 
 use std::sync::Arc;
 
@@ -12,7 +17,7 @@ use crate::control::state::SharedState;
 use crate::engine::vector::index_config::IndexConfig;
 use crate::types::TenantId;
 
-use crate::control::backup::snapshot_keys::extract_db_scoped_collection;
+use super::super::target::DatabaseTarget;
 
 /// Decode and durably re-issue every restored timeseries collection.
 ///
@@ -25,6 +30,7 @@ use crate::control::backup::snapshot_keys::extract_db_scoped_collection;
 pub(super) async fn reissue_timeseries_snapshots(
     state: &Arc<SharedState>,
     tenant_id: u64,
+    target: DatabaseTarget,
     memtables: Vec<(String, Vec<u8>)>,
     flushed: Vec<crate::types::TsFlushedCollectionBlob>,
 ) -> Result<usize, Error> {
@@ -32,7 +38,6 @@ pub(super) async fn reissue_timeseries_snapshots(
     // the same key). Absent when at-rest encryption is not configured, in which
     // case segments are plaintext and decode with `kek = None`.
     let kek = state.wal.encryption_key().cloned();
-    let database_id = crate::types::DatabaseId::DEFAULT;
 
     // Index memtable bytes and flushed blobs by their `{db}:{tid}:{collection}`
     // key so each collection is decoded + re-issued exactly once.
@@ -56,18 +61,13 @@ pub(super) async fn reissue_timeseries_snapshots(
     let empty_flushed = crate::types::TsFlushedCollectionBlob::default();
     let mut reissued = 0usize;
     for key in keys_in_order {
-        let Some(collection) = extract_db_scoped_collection(&key, tenant_id) else {
-            return Err(Error::Internal {
-                detail: format!("restore reissue: malformed timeseries snapshot key '{key}'"),
-            });
-        };
-        let collection = collection.to_owned();
+        let name = target.resolve_scoped(&key, tenant_id)?;
 
         let memtable_bytes = memtable_by_key.remove(&key);
         let flushed_blob = flushed_by_key.get(&key).unwrap_or(&empty_flushed);
 
         let rows = super::super::timeseries_reissue::decode_timeseries_live_rows(
-            &collection,
+            &name.bare,
             memtable_bytes.as_deref(),
             flushed_blob,
             kek.as_ref(),
@@ -76,13 +76,15 @@ pub(super) async fn reissue_timeseries_snapshots(
             continue;
         }
 
-        let plan =
-            super::super::timeseries_reissue::build_timeseries_ingest_plan(&collection, rows)?;
+        let plan = super::super::timeseries_reissue::build_timeseries_ingest_plan(
+            name.stored.as_str(),
+            rows,
+        )?;
         super::super::durable::reissue_plan_durably(
             state,
             TenantId::new(tenant_id),
-            database_id,
-            &collection,
+            target.dest,
+            &name.bare,
             plan,
         )
         .await?;
@@ -99,6 +101,7 @@ pub(super) async fn reissue_timeseries_snapshots(
 pub(super) async fn reissue_columnar_snapshots(
     state: &Arc<SharedState>,
     tenant_id: u64,
+    target: DatabaseTarget,
     entries: Vec<(String, Vec<u8>)>,
 ) -> Result<usize, Error> {
     // Columnar segment KEK == the WAL encryption key (segments are written via
@@ -106,27 +109,22 @@ pub(super) async fn reissue_columnar_snapshots(
     // key). Absent when at-rest encryption is not configured, in which case
     // segments are plaintext NDBS and decode with `kek = None`.
     let kek = state.wal.encryption_key().cloned();
-    let database_id = crate::types::DatabaseId::DEFAULT;
 
     let mut reissued = 0usize;
     for (key, bytes) in entries {
-        let Some(collection) = extract_db_scoped_collection(&key, tenant_id) else {
-            return Err(Error::Internal {
-                detail: format!("restore reissue: malformed columnar snapshot key '{key}'"),
-            });
-        };
-        let collection = collection.to_owned();
+        let name = target.resolve_scoped(&key, tenant_id)?;
 
         let snap: nodedb_columnar::ColumnarEngineSnapshot =
             zerompk::from_msgpack(&bytes).map_err(|e| Error::Serialization {
                 format: "msgpack".into(),
                 detail: format!(
-                    "restore reissue: deserialize ColumnarEngineSnapshot for '{collection}': {e}"
+                    "restore reissue: deserialize ColumnarEngineSnapshot for '{}': {e}",
+                    name.bare
                 ),
             })?;
 
         let decoded = super::super::columnar_reissue::decode_snapshot_live_rows(
-            &collection,
+            &name.bare,
             snap,
             kek.as_ref(),
         )?;
@@ -134,13 +132,15 @@ pub(super) async fn reissue_columnar_snapshots(
             continue;
         }
 
-        let plan =
-            super::super::columnar_reissue::build_columnar_insert_plan(&collection, decoded)?;
+        let plan = super::super::columnar_reissue::build_columnar_insert_plan(
+            name.stored.as_str(),
+            decoded,
+        )?;
         super::super::durable::reissue_plan_durably(
             state,
             TenantId::new(tenant_id),
-            database_id,
-            &collection,
+            target.dest,
+            &name.bare,
             plan,
         )
         .await?;
@@ -166,27 +166,23 @@ pub(super) async fn reissue_columnar_snapshots(
 pub(super) async fn reissue_vector_snapshots(
     state: &Arc<SharedState>,
     tenant_id: u64,
+    target: DatabaseTarget,
     entries: Vec<(String, Vec<u8>)>,
 ) -> Result<usize, Error> {
-    let database_id = crate::types::DatabaseId::DEFAULT;
-
     let mut reissued = 0usize;
     for (key, bytes) in entries {
-        let Some(coll_key) = extract_db_scoped_collection(&key, tenant_id) else {
-            return Err(Error::Internal {
-                detail: format!("restore reissue: malformed vector snapshot key '{key}'"),
-            });
-        };
+        let coll_key = target.scoped_rest(&key, tenant_id)?;
         let (collection, field_name) =
             super::super::vector_reissue::split_vector_coll_key(coll_key);
-        let collection = collection.to_owned();
+        let name = target.resolve(collection)?;
         let field_name = field_name.to_owned();
 
         let vectors: Vec<(u32, Vec<f32>, Option<Surrogate>)> = zerompk::from_msgpack(&bytes)
             .map_err(|e| Error::Serialization {
                 format: "msgpack".into(),
                 detail: format!(
-                    "restore reissue: deserialize vector snapshot for '{collection}': {e}"
+                    "restore reissue: deserialize vector snapshot for '{}': {e}",
+                    name.bare
                 ),
             })?;
         if vectors.is_empty() {
@@ -196,7 +192,7 @@ pub(super) async fn reissue_vector_snapshots(
         for (_node_id, vector, surrogate) in vectors {
             let surrogate = surrogate.unwrap_or(Surrogate::ZERO);
             let plan = super::super::vector_reissue::build_vector_insert_plan(
-                &collection,
+                name.stored.as_str(),
                 &field_name,
                 vector,
                 surrogate,
@@ -204,8 +200,8 @@ pub(super) async fn reissue_vector_snapshots(
             super::super::durable::reissue_plan_durably(
                 state,
                 TenantId::new(tenant_id),
-                database_id,
-                &collection,
+                target.dest,
+                &name.bare,
                 plan,
             )
             .await?;
@@ -238,22 +234,16 @@ pub(super) async fn reissue_vector_snapshots(
 pub(super) async fn reissue_vector_params(
     state: &Arc<SharedState>,
     tenant_id: u64,
+    target: DatabaseTarget,
     params: Vec<(String, Vec<u8>)>,
     index_configs: Vec<(String, Vec<u8>)>,
 ) -> Result<usize, Error> {
-    let database_id = crate::types::DatabaseId::DEFAULT;
-
     let mut resolved: std::collections::HashMap<String, IndexConfig> =
         std::collections::HashMap::new();
     let mut keys_in_order: Vec<String> = Vec::new();
 
     for (key, bytes) in index_configs {
-        let Some(coll_key) = extract_db_scoped_collection(&key, tenant_id) else {
-            return Err(Error::Internal {
-                detail: format!("restore reissue: malformed index_configs snapshot key '{key}'"),
-            });
-        };
-        let coll_key = coll_key.to_owned();
+        let coll_key = target.scoped_rest(&key, tenant_id)?.to_owned();
         let cfg: IndexConfig = zerompk::from_msgpack(&bytes).map_err(|e| Error::Serialization {
             format: "msgpack".into(),
             detail: format!("restore reissue: deserialize IndexConfig for '{coll_key}': {e}"),
@@ -263,12 +253,7 @@ pub(super) async fn reissue_vector_params(
     }
 
     for (key, bytes) in params {
-        let Some(coll_key) = extract_db_scoped_collection(&key, tenant_id) else {
-            return Err(Error::Internal {
-                detail: format!("restore reissue: malformed vector_params snapshot key '{key}'"),
-            });
-        };
-        let coll_key = coll_key.to_owned();
+        let coll_key = target.scoped_rest(&key, tenant_id)?.to_owned();
         if resolved.contains_key(&coll_key) {
             // Superseded by a full IndexConfig entry for the same (collection,
             // field) — the two sections always describe the same DDL state,
@@ -298,19 +283,18 @@ pub(super) async fn reissue_vector_params(
         };
         let (collection, field_name) =
             super::super::vector_reissue::split_vector_coll_key(&coll_key);
-        let collection = collection.to_owned();
-        let field_name = field_name.to_owned();
+        let name = target.resolve(collection)?;
 
         let plan = super::super::vector_reissue::build_vector_set_params_plan(
-            &collection,
-            &field_name,
+            name.stored.as_str(),
+            field_name,
             &config,
         );
         super::super::durable::reissue_plan_durably(
             state,
             TenantId::new(tenant_id),
-            database_id,
-            &collection,
+            target.dest,
+            &name.bare,
             plan,
         )
         .await?;

@@ -52,10 +52,10 @@ pub fn replay_surrogate_records(
                 // authoritative parse stays in one place.
                 let parsed = SurrogateBindPayload::from_bytes(&record.payload)
                     .map_err(crate::Error::Wal)?;
-                if tombstones.is_tombstoned(
-                    record.header.database_id,
+                // A bind names its collection by the bare catalog name.
+                if tombstones.is_key_tombstoned(
+                    nodedb_types::CollectionKey::from_bare(db, &parsed.collection),
                     record.header.tenant_id,
-                    &parsed.collection,
                     record.header.lsn,
                 ) {
                     stats.binds_skipped += 1;
@@ -193,7 +193,11 @@ mod tests {
     fn bind_for_a_tombstoned_collection_is_not_resurrected() {
         let (_dir, cat, reg) = open_test();
         let mut tombstones = TombstoneSet::new();
-        tombstones.insert(0, 0, "users".to_string(), 50);
+        tombstones.insert(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+            0,
+            50,
+        );
 
         let stats = replay_surrogate_records(
             &[bind_record(10, "users", b"alice", 7)],
@@ -222,7 +226,11 @@ mod tests {
     fn bind_after_the_drop_still_applies() {
         let (_dir, cat, reg) = open_test();
         let mut tombstones = TombstoneSet::new();
-        tombstones.insert(0, 0, "users".to_string(), 50);
+        tombstones.insert(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+            0,
+            50,
+        );
 
         let stats = replay_surrogate_records(
             &[bind_record(60, "users", b"bob", 11)],

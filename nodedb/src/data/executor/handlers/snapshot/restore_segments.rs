@@ -64,7 +64,7 @@ impl CoreLoop {
     ) -> crate::Result<()> {
         for coll_blob in blobs {
             let (database_id, tenant_id, collection) =
-                super::restore::parse_timeseries_snapshot_key(&coll_blob.collection_key);
+                super::restore::parse_scoped_snapshot_key(&coll_blob.collection_key);
 
             // The collection name is parsed out of a snapshot-supplied key and
             // becomes the last component of the segment directory.
@@ -302,7 +302,7 @@ impl CoreLoop {
     ) -> crate::Result<()> {
         for (collection_key, bytes) in entries {
             let (database_id, tenant_id, collection) =
-                super::restore::parse_timeseries_snapshot_key(collection_key);
+                super::restore::parse_scoped_snapshot_key(collection_key);
 
             let engine_key = (
                 nodedb_types::DatabaseId::new(database_id),

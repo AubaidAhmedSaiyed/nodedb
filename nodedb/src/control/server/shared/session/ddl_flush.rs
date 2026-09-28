@@ -127,14 +127,9 @@ pub(super) fn flush_local(state: &SharedState, buffered: DdlBuffer) -> Option<Ab
             &item.entry,
             &shared,
         );
-        // No raft index exists here; the async phase uses it purely as the
-        // purge LSN for storage reclaim, which the local DDL paths take from
-        // the WAL instead.
-        let purge_lsn = shared.wal.next_lsn().as_u64();
         crate::control::catalog_entry::post_apply::spawn_post_apply_async_side_effects(
             item.entry,
             Arc::clone(&shared),
-            purge_lsn,
         );
     }
     None

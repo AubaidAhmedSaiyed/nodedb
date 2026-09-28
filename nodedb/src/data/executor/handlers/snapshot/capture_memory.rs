@@ -5,6 +5,10 @@
 //!
 //! Every section is all or nothing. A section that fails to export fails the
 //! whole snapshot: a snapshot missing it would restore without it.
+//!
+//! A snapshot covers one database. Every section keeps only the state of the
+//! database the snapshot request names, so a backup that snapshots each of a
+//! tenant's databases captures each row exactly once.
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::types::{DatabaseId, TenantDataSnapshot, TenantId};
@@ -28,28 +32,30 @@ fn scoped_key(database_id: DatabaseId, tenant: TenantId, collection: &str) -> St
 }
 
 impl CoreLoop {
-    /// Fill `snapshot`'s in-memory sections with `tenant`'s state.
+    /// Fill `snapshot`'s in-memory sections with `tenant`'s state in
+    /// `database_id`.
     pub(super) fn capture_memory_engines(
         &self,
         database_id: DatabaseId,
         tenant: TenantId,
         snapshot: &mut TenantDataSnapshot,
     ) -> crate::Result<()> {
-        self.capture_vectors(tenant, snapshot)?;
-        self.capture_kv_tables(tenant, snapshot)?;
+        self.capture_vectors(database_id, tenant, snapshot)?;
+        self.capture_kv_tables(database_id, tenant, snapshot)?;
         self.capture_crdt(database_id, tenant, snapshot)?;
-        self.capture_timeseries_memtables(tenant, snapshot)
+        self.capture_timeseries_memtables(database_id, tenant, snapshot)
     }
 
     /// Raw vectors, HNSW params and index config per collection. The HNSW
     /// graph is rebuilt from the raw vectors on restore.
     fn capture_vectors(
         &self,
+        database_id: DatabaseId,
         tenant: TenantId,
         snapshot: &mut TenantDataSnapshot,
     ) -> crate::Result<()> {
         for (key, collection) in &self.vector_collections {
-            if key.1 != tenant {
+            if key.0 != database_id || key.1 != tenant {
                 continue;
             }
             let key_str = scoped_key(key.0, key.1, &key.2);
@@ -61,7 +67,7 @@ impl CoreLoop {
             snapshot.vectors.push((key_str, bytes));
         }
         for (key, params) in &self.vector_params {
-            if key.1 != tenant {
+            if key.0 != database_id || key.1 != tenant {
                 continue;
             }
             let key_str = scoped_key(key.0, key.1, &key.2);
@@ -70,7 +76,7 @@ impl CoreLoop {
             snapshot.vector_params.push((key_str, bytes));
         }
         for (key, cfg) in &self.index_configs {
-            if key.1 != tenant {
+            if key.0 != database_id || key.1 != tenant {
                 continue;
             }
             let key_str = scoped_key(key.0, key.1, &key.2);
@@ -81,10 +87,12 @@ impl CoreLoop {
         Ok(())
     }
 
-    /// Every live entry of every KV table of `tenant`, keyed by the table's
-    /// stored collection name.
+    /// Every live entry of every KV table of `tenant` in `database_id`, keyed
+    /// `"{db}:{tid}:{collection}"` with the table's stored, database-qualified
+    /// collection name.
     fn capture_kv_tables(
         &self,
+        database_id: DatabaseId,
         tenant: TenantId,
         snapshot: &mut TenantDataSnapshot,
     ) -> crate::Result<()> {
@@ -105,9 +113,15 @@ impl CoreLoop {
                         "snapshot: KV table {hash} of tenant {tid} has no collection name"
                     ),
                 })?;
+            // The KV engine keys a table by its database-qualified name.
+            if super::restore::database_id_from_qualified(&collection_name) != database_id.as_u64()
+            {
+                continue;
+            }
+            let key_str = scoped_key(database_id, tenant, &collection_name);
             let bytes = zerompk::to_msgpack_vec(&table.export_entries())
-                .map_err(|e| capture_error("KV table", &collection_name, e))?;
-            snapshot.kv_tables.push((collection_name, bytes));
+                .map_err(|e| capture_error("KV table", &key_str, e))?;
+            snapshot.kv_tables.push((key_str, bytes));
         }
         Ok(())
     }
@@ -157,14 +171,16 @@ impl CoreLoop {
         Ok(())
     }
 
-    /// The column data of every timeseries memtable of `tenant`.
+    /// The column data of every timeseries memtable of `tenant` in
+    /// `database_id`.
     fn capture_timeseries_memtables(
         &self,
+        database_id: DatabaseId,
         tenant: TenantId,
         snapshot: &mut TenantDataSnapshot,
     ) -> crate::Result<()> {
         for ((d, t, coll), mt) in &self.columnar_memtables {
-            if *t != tenant {
+            if *d != database_id || *t != tenant {
                 continue;
             }
             let key_str = scoped_key(*d, *t, coll);

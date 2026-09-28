@@ -83,38 +83,6 @@ fn db_detail(e: &tokio_postgres::Error) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn three_node_backup_gathers_one_section_per_node() {
-    let cluster = TestCluster::spawn_three().await.expect("cluster");
-
-    let bytes = drain_backup(0, &cluster, TENANT).await;
-    let env = parse_envelope(&bytes, DEFAULT_MAX_TOTAL_BYTES, &TEST_KEK).expect("parse envelope");
-    assert_eq!(
-        env.meta.tenant_id, TENANT,
-        "envelope tenant id should match request"
-    );
-    assert!(
-        env.meta.source_vshard_count >= 1,
-        "envelope must record source vshard count, got {}",
-        env.meta.source_vshard_count
-    );
-    // One section per unique cluster node — three nodes, three sections.
-    // The orchestrator dedupes by node id (leader + replicas of every group).
-    assert!(
-        !env.sections.is_empty() && env.sections.len() <= 3,
-        "expected 1..=3 sections, got {}",
-        env.sections.len()
-    );
-    let origins: std::collections::BTreeSet<u64> =
-        env.sections.iter().map(|s| s.origin_node_id).collect();
-    assert!(
-        !origins.contains(&0),
-        "origin_node_id 0 must not appear in cluster sections: {origins:?}"
-    );
-
-    cluster.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_roundtrip_preserves_data() {
     let cluster = TestCluster::spawn_three().await.expect("cluster");
 

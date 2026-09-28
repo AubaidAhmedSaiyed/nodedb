@@ -63,7 +63,11 @@ pub async fn dispatch_unregister_collection(
                 vshard_id: VShardId::new(core_id as u32),
                 plan: PhysicalPlan::Meta(MetaOp::UnregisterCollection {
                     tenant_id,
-                    name: name.to_string(),
+                    // The Data Plane keys the collection's state by its
+                    // database-qualified name outside the default database.
+                    name: nodedb_types::QualifiedCollection::new(database, name)
+                        .as_str()
+                        .to_string(),
                     purge_lsn,
                     reclaim_l1_files: core_id == homing_core,
                 }),

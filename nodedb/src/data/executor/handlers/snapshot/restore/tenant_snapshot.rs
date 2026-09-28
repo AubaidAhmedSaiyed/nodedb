@@ -28,14 +28,17 @@ impl CoreLoop {
         // Carried for symmetry with the applier; the per-collection list below
         // drives the actual clear. The applier populates this from the catalog.
         _clear_vshards: &[u32],
-        collections_to_clear: &[(u64, String)],
+        collections_to_clear: &[(u64, u64, String)],
     ) -> Response {
         info!(core = self.core_id, tenant_id, "restoring tenant snapshot");
 
         // Clear-then-install: drop stale state for the listed collections before
         // installing, so keys deleted before the snapshot index and dropped
         // collections do not linger on a lagging follower. Empty list = no-op.
-        for (tid_raw, coll) in collections_to_clear {
+        // Each entry is `(database_id, tenant_id, collection)`, the collection
+        // named as the Data Plane stores it: database-qualified outside the
+        // default database.
+        for (db_raw, tid_raw, coll) in collections_to_clear {
             // Preserve the collection definition: clear-then-install replaces row
             // data from the snapshot, but the snapshot does not carry the schema,
             // so the reinstalled rows must land in the still-defined collection.
@@ -43,7 +46,7 @@ impl CoreLoop {
             // rather than install the snapshot over rows that survived — those
             // would linger as un-owned data on this follower.
             if let Err(e) = self.clear_collection_all_engines(
-                nodedb_types::DatabaseId::DEFAULT,
+                nodedb_types::DatabaseId::new(*db_raw),
                 crate::types::TenantId::new(*tid_raw),
                 coll,
                 true,
@@ -117,18 +120,15 @@ impl CoreLoop {
                 }
                 edges_written += 1;
             }
-            // Restore tenant-aware edges from the multi-tenant merged Raft
-            // snapshot. The edge key does NOT carry the tenant, so each entry
-            // carries its owning `tid` explicitly — install it under THAT tenant
-            // rather than the dispatch-context tenant (which is 0 for the merged
-            // group snapshot). Shares `edges_written` with the legacy loop so the
-            // CSR rebuild below runs if EITHER source installed edges.
-            for (tid_raw, key, props) in &snap.tenant_edges {
+            // Restore the database- and tenant-aware edges of the merged Raft
+            // snapshot. The edge key carries neither, so each entry carries its
+            // owning database and tenant — install it under THOSE rather than
+            // the dispatch context (the default database and tenant 0 for the
+            // merged group snapshot). Shares `edges_written` with the loop above
+            // so the CSR rebuild below runs if EITHER source installed edges.
+            for (db_raw, tid_raw, key, props) in &snap.tenant_edges {
                 let edge_tid = crate::types::TenantId::new(*tid_raw);
-                if let Err(e) = self
-                    .edge_store
-                    .put_edge_raw(database_id, edge_tid, key, props)
-                {
+                if let Err(e) = self.edge_store.put_edge_raw(*db_raw, edge_tid, key, props) {
                     return self.response_error(
                         task,
                         ErrorCode::Internal {
@@ -180,10 +180,10 @@ impl CoreLoop {
                             );
                         }
                     };
-                let (vp_db, coll_key) = parse_vector_snapshot_key(key, tenant_id);
+                let (vp_db, vp_tid, coll_key) = parse_vector_snapshot_key(key, tenant_id);
                 let map_key = (
                     nodedb_types::DatabaseId::new(vp_db),
-                    crate::types::TenantId::new(tenant_id),
+                    crate::types::TenantId::new(vp_tid),
                     coll_key.to_string(),
                 );
                 self.vector_params.insert(map_key, params);
@@ -206,10 +206,10 @@ impl CoreLoop {
                             );
                         }
                     };
-                let (ic_db, coll_key) = parse_vector_snapshot_key(key, tenant_id);
+                let (ic_db, ic_tid, coll_key) = parse_vector_snapshot_key(key, tenant_id);
                 let map_key = (
                     nodedb_types::DatabaseId::new(ic_db),
-                    crate::types::TenantId::new(tenant_id),
+                    crate::types::TenantId::new(ic_tid),
                     coll_key.to_string(),
                 );
                 self.index_configs.insert(map_key, cfg);
@@ -235,10 +235,10 @@ impl CoreLoop {
                         }
                     };
                 let count = vectors.len() as u64;
-                let (database_id, coll_key) = parse_vector_snapshot_key(key, tenant_id);
+                let (database_id, vector_tid, coll_key) = parse_vector_snapshot_key(key, tenant_id);
                 if let Err(e) = self.restore_vector_collection(
                     database_id,
-                    tenant_id,
+                    vector_tid,
                     coll_key,
                     vectors,
                     replace_mode,
@@ -282,8 +282,8 @@ impl CoreLoop {
                 }
             }
 
-            // Restore KV tables.
-            for (collection_name, bytes) in &snap.kv_tables {
+            // Restore KV tables, each under the database and tenant its key names.
+            for (table_key, bytes) in &snap.kv_tables {
                 let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = match zerompk::from_msgpack(bytes) {
                     Ok(e) => e,
                     Err(e) => {
@@ -291,14 +291,16 @@ impl CoreLoop {
                             task,
                             ErrorCode::Internal {
                                 detail: format!(
-                                    "restore: KV table '{collection_name}' does not decode: {e}"
+                                    "restore: KV table '{table_key}' does not decode: {e}"
                                 ),
                             },
                         );
                     }
                 };
                 let count = entries.len() as u64;
-                self.restore_kv_table(tenant_id, collection_name, entries);
+                if let Err(e) = self.restore_kv_table(table_key, entries) {
+                    return self.response_error(task, e);
+                }
                 kv_written += count;
             }
 

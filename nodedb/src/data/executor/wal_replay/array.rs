@@ -179,10 +179,13 @@ impl CoreLoop {
                         continue;
                     }
                 };
-                if tombstones.is_tombstoned(
-                    record.header.database_id,
+                // An array names itself by its bare name and its own database.
+                if tombstones.is_key_tombstoned(
+                    nodedb_types::CollectionKey::from_bare(
+                        payload.array_id.database_id,
+                        &payload.array_id.name,
+                    ),
                     tenant_id,
-                    &payload.array_id.name,
                     record_lsn,
                 ) {
                     skipped += 1;
@@ -275,10 +278,12 @@ impl CoreLoop {
                     continue;
                 }
             };
-            if tombstones.is_tombstoned(
-                record.header.database_id,
+            if tombstones.is_key_tombstoned(
+                nodedb_types::CollectionKey::from_bare(
+                    payload.array_id.database_id,
+                    &payload.array_id.name,
+                ),
                 tenant_id,
-                &payload.array_id.name,
                 record_lsn,
             ) {
                 skipped += 1;

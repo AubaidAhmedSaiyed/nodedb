@@ -10,6 +10,7 @@
 use crate::control::state::SharedState;
 use crate::types::{SurrogateBindEntry, TenantId};
 
+use super::super::target::DatabaseTarget;
 use super::commit::commit_collection;
 use super::documents::document_units;
 use super::edges::edge_units;
@@ -34,10 +35,12 @@ pub(in crate::control::backup::restore) struct RedoReissueStats {
     pub records: usize,
 }
 
-/// Re-issue `rows` of `tenant_id` durably. The first error fails the restore.
+/// Re-issue `rows` of `tenant_id`, backed up from `target.source`, durably
+/// into `target.dest`. The first error fails the restore.
 pub(in crate::control::backup::restore) async fn reissue_rows_and_edges(
     state: &SharedState,
     tenant_id: u64,
+    target: DatabaseTarget,
     rows: RestoredRows<'_>,
 ) -> crate::Result<RedoReissueStats> {
     let tenant = TenantId::new(tenant_id);
@@ -45,6 +48,7 @@ pub(in crate::control::backup::restore) async fn reissue_rows_and_edges(
     let documents = document_units(
         state,
         tenant_id,
+        target,
         rows.documents,
         rows.documents_versioned,
         rows.binds,
@@ -53,7 +57,7 @@ pub(in crate::control::backup::restore) async fn reissue_rows_and_edges(
         stats.documents += collection.units.iter().map(|u| u.ops.len()).sum::<usize>();
         stats.records += commit_collection(state, tenant, collection).await?;
     }
-    for collection in edge_units(state, tenant_id, rows.edges)? {
+    for collection in edge_units(state, tenant_id, target, rows.edges)? {
         stats.edges += collection.units.iter().map(|u| u.ops.len()).sum::<usize>();
         stats.records += commit_collection(state, tenant, collection).await?;
     }

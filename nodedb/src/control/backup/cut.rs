@@ -129,6 +129,9 @@ async fn cut_data_groups(
     };
     let barriers = futures::future::join_all(barrier_vshards(state).into_iter().map(
         |(group_id, vshard_id)| {
+            // The barrier orders every entry of its group, whatever database
+            // the entry writes, so one barrier per group cuts every database.
+            // The entry's database id only frames it.
             let entry = ReplicatedEntry::new(
                 tenant_id,
                 DatabaseId::DEFAULT.as_u64(),

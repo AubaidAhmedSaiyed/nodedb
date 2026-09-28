@@ -4,12 +4,18 @@
 
 use serde::Serialize;
 
+use crate::types::TenantDataSnapshot;
+
 /// Aggregate stats returned to the client at the end of a restore.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct RestoreStats {
     pub tenant_id: u64,
     pub dry_run: bool,
     pub sections: u16,
+    /// Number of databases the backup covers.
+    pub databases: usize,
+    /// Number of those databases the restore created on this cluster.
+    pub databases_created: usize,
     pub source_vshard_count: u16,
     pub documents: usize,
     pub indexes: usize,
@@ -41,4 +47,22 @@ pub struct RestoreStats {
     pub edges_reissued: usize,
     /// Redo records the document and edge re-issue committed.
     pub redo_records: usize,
+}
+
+impl RestoreStats {
+    /// Add the section sizes of one database's merged snapshot. The
+    /// columnar count is the number re-issued, so a restore adds it as it
+    /// re-issues and a dry run adds the section size.
+    pub fn count_sections(&mut self, snap: &TenantDataSnapshot) {
+        self.documents += snap.documents.len() + snap.documents_versioned.len();
+        self.indexes += snap.indexes.len() + snap.indexes_versioned.len();
+        self.edges += snap.edges.len();
+        self.vectors += snap.vectors.len();
+        self.kv_tables += snap.kv_tables.len();
+        // CRDT state is one entry per (tenant, collection).
+        self.crdt_state += snap.crdt_state.len();
+        self.timeseries += snap.timeseries.len();
+        self.flushed_ts_segments += snap.flushed_ts_segments.len();
+        self.surrogate_pk += snap.surrogate_pk.len();
+    }
 }
