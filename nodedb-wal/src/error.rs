@@ -100,10 +100,6 @@ pub enum WalError {
     #[error("filesystem holding {path} does not support O_DIRECT")]
     DirectIoUnsupported { path: String },
 
-    /// Operation is not supported on the current platform (e.g. wasm32).
-    #[error("WAL operation not supported on this platform: {detail}")]
-    Unsupported { detail: &'static str },
-
     /// The filesystem ran out of space while appending to the WAL (ENOSPC).
     ///
     /// Distinct from a generic [`WalError::Io`] so callers can stop

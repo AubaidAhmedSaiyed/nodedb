@@ -12,10 +12,10 @@
 //! 4. [`TombstoneSet::is_tombstoned`] against realistic `(tenant,
 //!    collection, lsn)` tuples.
 
+use nodedb_types::{CollectionKey, DatabaseId};
 use nodedb_wal::reader::WalReader;
 use nodedb_wal::record::RecordType;
 use nodedb_wal::writer::WalWriter;
-use nodedb_types::{CollectionKey, DatabaseId};
 use nodedb_wal::{CollectionTombstonePayload, TombstoneSet, WalRecord, extract_tombstones};
 
 /// Append a record, return its LSN.

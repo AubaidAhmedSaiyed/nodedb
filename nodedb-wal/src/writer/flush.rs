@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::Result;
-// Only the unix `pwrite` path constructs an error value directly; elsewhere
-// failures propagate as `Result` from calls that build their own.
-#[cfg(unix)]
-use crate::error::WalError;
+use std::os::unix::io::AsRawFd;
+
+use crate::error::{Result, WalError};
 
 use super::core::WalWriter;
 
@@ -43,40 +41,36 @@ impl WalWriter {
         };
 
         // Use pwrite to write at the exact offset, retrying on short writes.
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = self.file.as_raw_fd();
-            let mut remaining = data;
-            let mut write_offset = self.file_offset;
-            while !remaining.is_empty() {
-                let written = unsafe {
-                    libc::pwrite(
-                        fd,
-                        remaining.as_ptr() as *const libc::c_void,
-                        remaining.len(),
-                        write_offset as libc::off_t,
-                    )
-                };
-                if written < 0 {
-                    return Err(write_error(
-                        "WAL segment append",
-                        write_offset,
-                        remaining.len() as u64,
-                    ));
-                }
-                let n = written as usize;
-                if n == 0 {
-                    // A zero-length write makes no progress; retrying would
-                    // spin forever.
-                    return Err(WalError::Io(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "WAL pwrite made no progress",
-                    )));
-                }
-                remaining = &remaining[n..];
-                write_offset += n as u64;
+        let fd = self.file.as_raw_fd();
+        let mut remaining = data;
+        let mut write_offset = self.file_offset;
+        while !remaining.is_empty() {
+            let written = unsafe {
+                libc::pwrite(
+                    fd,
+                    remaining.as_ptr() as *const libc::c_void,
+                    remaining.len(),
+                    write_offset as libc::off_t,
+                )
+            };
+            if written < 0 {
+                return Err(write_error(
+                    "WAL segment append",
+                    write_offset,
+                    remaining.len() as u64,
+                ));
             }
+            let n = written as usize;
+            if n == 0 {
+                // A zero-length write makes no progress; retrying would
+                // spin forever.
+                return Err(WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "WAL pwrite made no progress",
+                )));
+            }
+            remaining = &remaining[n..];
+            write_offset += n as u64;
         }
 
         self.file_offset += data.len() as u64;
@@ -97,19 +91,12 @@ impl WalWriter {
 /// writes rather than treat it as a passing error. `offset` and `pending` say
 /// where the batch stalled and how much of it never reached the file, which is
 /// what a report needs to describe the write that could not complete.
-///
-/// Gated to match its only call site: the `pwrite` loop is unix-only, so on
-/// other targets (wasm32) this would be dead code and a `-D warnings` build
-/// would reject it.
-#[cfg(unix)]
 fn write_error(context: &'static str, offset: u64, pending: u64) -> WalError {
     let err = std::io::Error::last_os_error();
-    #[cfg(unix)]
     if err.raw_os_error() == Some(libc::ENOSPC) {
         let out_of_space = WalError::OutOfSpace { context };
         crate::diag::out_of_space(&out_of_space, context, offset, pending);
         return out_of_space;
     }
-    let _ = (context, offset, pending);
     WalError::Io(err)
 }

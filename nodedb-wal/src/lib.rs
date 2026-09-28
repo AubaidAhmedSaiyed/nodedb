@@ -22,55 +22,88 @@
 //!
 //! Sustain 100,000+ async writes/sec with sub-millisecond p99 latency.
 //! `free -m` cached memory must not move during the benchmark.
+//!
+//! ## Targets
+//!
+//! On wasm32 the crate builds only [`crypto`], the key and envelope code it
+//! needs, [`error`], and the record-header constants in [`record::header`].
+//! The writer, readers, segments, double-write buffer, replay, and recovery
+//! build only on native targets.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod align;
 pub mod crypto;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod diag;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod double_write;
 pub mod error;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod lazy_reader;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mmap_reader;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod preamble;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod reader;
 pub mod record;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod recovery;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod replay;
 pub mod secure_mem;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod segment;
 mod segment_envelope;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod segmented;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod temporal_purge;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tombstone;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod torn_tail;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub mod uring_writer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod writer;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use double_write::{
     DoubleWriteBuffer, DwbDegradation, DwbMirror, DwbMode, DwbProtection, DwbSkipReason,
     wal_dwb_bytes_written_total, wal_dwb_degradations_total, wal_dwb_unprotected_records_total,
 };
 pub use error::{Result, WalError};
+#[cfg(not(target_arch = "wasm32"))]
 pub use lazy_reader::LazyWalReader;
+#[cfg(not(target_arch = "wasm32"))]
 pub use preamble::{
     CIPHER_AES_256_GCM, PREAMBLE_SIZE, PREAMBLE_VERSION, SEG_PREAMBLE_MAGIC, SegmentPreamble,
     WAL_PREAMBLE_MAGIC,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use reader::{StopReason, WalReader};
+#[cfg(not(target_arch = "wasm32"))]
 pub use record::{
-    CalvinAppliedPayload, FtsDeletePayload, FtsIndexPayload, NO_EVENT_SOURCE, RecordHeader,
-    RecordStamp, RecordTarget, RecordType, SpatialDeletePayload, SpatialPutPayload, WalRecord,
-    WalRecordArgs, WriteAbortedPayload,
+    CalvinAppliedPayload, FtsDeletePayload, FtsIndexPayload, RecordStamp, RecordTarget, RecordType,
+    SpatialDeletePayload, SpatialPutPayload, WalRecord, WalRecordArgs, WriteAbortedPayload,
 };
+pub use record::{NO_EVENT_SOURCE, RecordHeader};
+#[cfg(not(target_arch = "wasm32"))]
 pub use recovery::{RecoveryInfo, recover};
+#[cfg(not(target_arch = "wasm32"))]
 pub use replay::{
     AbortedWrites, DatabaseTombstones, ReplayFilters, TombstoneSet, drop_aborted_records,
     extract_replay_filters, extract_tombstones,
 };
 pub use secure_mem::SecureKey;
+#[cfg(not(target_arch = "wasm32"))]
 pub use segmented::{SegmentedWal, SegmentedWalConfig};
+#[cfg(not(target_arch = "wasm32"))]
 pub use temporal_purge::{TemporalPurgeEngine, TemporalPurgePayload};
+#[cfg(not(target_arch = "wasm32"))]
 pub use tombstone::{CollectionTombstonePayload, MAX_COLLECTION_NAME_LEN};
+#[cfg(not(target_arch = "wasm32"))]
 pub use torn_tail::{TailVerdict, verify_committed_prefix};
+#[cfg(not(target_arch = "wasm32"))]
 pub use writer::WalWriter;

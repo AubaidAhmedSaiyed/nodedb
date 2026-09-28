@@ -4,9 +4,8 @@
 //! did before it existed.
 //!
 //! The report sites sit on error paths that must keep working for embedders who
-//! never enable `diagnostics`, including wasm32 builds where the feature is
-//! inert even when it is on. A recorder that changed an error, swallowed one, or
-//! panicked at a detection site would be worse than no recorder at all.
+//! never enable `diagnostics`. A recorder that changed an error, swallowed one,
+//! or panicked at a detection site would be worse than no recorder at all.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;

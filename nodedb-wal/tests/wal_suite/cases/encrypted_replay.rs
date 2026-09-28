@@ -9,11 +9,11 @@
 //! and the free `replay_*` drivers) rather than decrypting by hand, so they pin
 //! the behaviour where consumers actually observe it.
 
+use nodedb_types::{CollectionKey, DatabaseId};
 use nodedb_wal::crypto::{KeyRing, WalEncryptionKey};
 use nodedb_wal::mmap_reader::replay_segments_mmap;
 use nodedb_wal::record::RecordType;
 use nodedb_wal::segmented::{SegmentedWal, SegmentedWalConfig, replay_all_segments};
-use nodedb_types::{CollectionKey, DatabaseId};
 use nodedb_wal::{CollectionTombstonePayload, WalError, extract_tombstones};
 
 const KEY_BYTES: [u8; 32] = [0x3Cu8; 32];
