@@ -42,7 +42,7 @@ pub(super) async fn fire_sync_after_triggers(
     .await
     .into_result()
     {
-        return Some(Err(ddl_err("XX000", &format!("trigger error: {e}"))));
+        return Some(Err(DdlError::from_error_in_context("trigger error", &e)));
     }
     None
 }
@@ -84,7 +84,7 @@ pub(super) async fn fire_sync_after_update_triggers(
     .await
     .into_result()
     {
-        return Some(Err(ddl_err("XX000", &format!("trigger error: {e}"))));
+        return Some(Err(DdlError::from_error_in_context("trigger error", &e)));
     }
     None
 }
@@ -120,7 +120,7 @@ pub(super) async fn fire_instead_triggers(
             }]))
         }
         Ok(crate::control::trigger::fire_instead::InsteadOfResult::NoTrigger) => None,
-        Err(e) => Some(Err(ddl_err("XX000", &format!("trigger error: {e}")))),
+        Err(e) => Some(Err(DdlError::from_error_in_context("trigger error", &e))),
     }
 }
 
@@ -146,10 +146,9 @@ pub(super) async fn fire_before_triggers(
     .await
     {
         Ok(f) => Ok(f),
-        Err(e) => Err(Err(ddl_err("XX000", &format!("BEFORE trigger error: {e}")))),
+        Err(e) => Err(Err(DdlError::from_error_in_context(
+            "BEFORE trigger error",
+            &e,
+        ))),
     }
-}
-
-fn ddl_err(sqlstate: &str, msg: &str) -> DdlError {
-    DdlError::new(sqlstate, msg)
 }

@@ -5,14 +5,26 @@
 use nodedb_types::Surrogate;
 
 use super::lifecycle::VectorCollection;
+use crate::error::{VectorError, check_dim};
 
 impl VectorCollection {
-    /// Insert a vector. Returns the global vector ID.
-    pub fn insert(&mut self, vector: Vec<f32>) -> u32 {
+    /// Insert a vector. Returns the global vector ID. A trained IVF-PQ
+    /// collection inserts into its IVF index, every other collection into
+    /// the growing segment.
+    ///
+    /// A vector without the collection dimension fails with
+    /// [`VectorError::DimensionMismatch`] and changes nothing.
+    pub fn insert(&mut self, vector: Vec<f32>) -> Result<u32, VectorError> {
+        check_dim(self.dim, vector.len())?;
         let id = self.next_id;
-        self.growing.insert(vector);
+        match &mut self.ivf {
+            Some(ivf) => ivf.insert_with_id(id, vector)?,
+            None => {
+                self.growing.insert(vector)?;
+            }
+        }
         self.next_id += 1;
-        id
+        Ok(id)
     }
 
     /// Insert a vector with an associated surrogate. The surrogate is
@@ -24,31 +36,69 @@ impl VectorCollection {
     /// re-insert never leaves an unreachable node scoring in searches.
     /// The caller owns the payload bitmap entries of the old node and
     /// removes them with [`Self::local_for_surrogate`] before this call.
-    pub fn insert_with_surrogate(&mut self, vector: Vec<f32>, surrogate: Surrogate) -> u32 {
+    ///
+    /// A vector without the collection dimension fails with
+    /// [`VectorError::DimensionMismatch`] before the old binding is touched.
+    pub fn insert_with_surrogate(
+        &mut self,
+        vector: Vec<f32>,
+        surrogate: Surrogate,
+    ) -> Result<u32, VectorError> {
+        check_dim(self.dim, vector.len())?;
         if surrogate != Surrogate::ZERO
             && let Some(old) = self.surrogate_to_local.get(&surrogate).copied()
         {
             self.delete_inner(old);
             self.surrogate_map.remove(&old);
         }
-        let id = self.insert(vector);
+        let id = self.insert(vector)?;
         if surrogate != Surrogate::ZERO {
             self.surrogate_map.insert(id, surrogate);
             self.surrogate_to_local.insert(surrogate, id);
         }
-        id
+        Ok(id)
+    }
+
+    /// Insert a batch of vectors, the `i`-th bound to `surrogates[i]`
+    /// ([`Surrogate::ZERO`] when the slice is shorter). Returns the global ids
+    /// in batch order.
+    ///
+    /// Every vector is checked against the collection dimension before any is
+    /// inserted, so a mismatch fails with [`VectorError::DimensionMismatch`]
+    /// and inserts none.
+    pub fn insert_batch_with_surrogates(
+        &mut self,
+        vectors: &[Vec<f32>],
+        surrogates: &[Surrogate],
+    ) -> Result<Vec<u32>, VectorError> {
+        for v in vectors {
+            check_dim(self.dim, v.len())?;
+        }
+        let mut ids = Vec::with_capacity(vectors.len());
+        for (i, v) in vectors.iter().enumerate() {
+            let surrogate = surrogates.get(i).copied().unwrap_or(Surrogate::ZERO);
+            ids.push(self.insert_with_surrogate(v.clone(), surrogate)?);
+        }
+        Ok(ids)
     }
 
     /// Insert multiple vectors for a single document (ColBERT-style).
     /// All N vectors are bound to the same `document_surrogate`.
+    ///
+    /// Every vector is checked against the collection dimension before any
+    /// is inserted, so a mismatch fails with
+    /// [`VectorError::DimensionMismatch`] and inserts none.
     pub fn insert_multi_vector(
         &mut self,
         vectors: &[&[f32]],
         document_surrogate: Surrogate,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>, VectorError> {
+        for v in vectors {
+            check_dim(self.dim, v.len())?;
+        }
         let mut ids = Vec::with_capacity(vectors.len());
         for &v in vectors {
-            let id = self.insert(v.to_vec());
+            let id = self.insert(v.to_vec())?;
             if document_surrogate != Surrogate::ZERO {
                 self.surrogate_map.insert(id, document_surrogate);
             }
@@ -57,7 +107,7 @@ impl VectorCollection {
         if document_surrogate != Surrogate::ZERO {
             self.multi_doc_map.insert(document_surrogate, ids.clone());
         }
-        ids
+        Ok(ids)
     }
 
     /// Delete all vectors belonging to a multi-vector document.
@@ -96,6 +146,11 @@ impl VectorCollection {
     }
 
     pub(super) fn delete_inner(&mut self, id: u32) -> bool {
+        if let Some(ivf) = &mut self.ivf
+            && ivf.contains(id)
+        {
+            return ivf.delete(id);
+        }
         if id >= self.growing_base_id {
             let local = id - self.growing_base_id;
             if (local as usize) < self.growing.len() {
@@ -124,6 +179,11 @@ impl VectorCollection {
     /// The live FP32 vector stored under global `id`, whichever segment
     /// holds it. `None` for an unknown or soft-deleted id.
     pub fn vector_for_id(&self, id: u32) -> Option<Vec<f32>> {
+        if let Some(ivf) = &self.ivf
+            && ivf.contains(id)
+        {
+            return ivf.get_vector(id).map(<[f32]>::to_vec);
+        }
         if id >= self.growing_base_id {
             let local = id - self.growing_base_id;
             if (local as usize) < self.growing.len() {
@@ -168,13 +228,16 @@ impl VectorCollection {
 
     /// Un-delete a previously soft-deleted vector (for transaction rollback).
     ///
-    /// Symmetric to [`Self::delete_inner`]: the vector may live in the growing
-    /// segment (the common case for a just-inserted vector), a sealed HNSW
-    /// segment, or an in-flight building segment — reverse the tombstone
-    /// wherever it landed. Only clearing sealed tombstones (the prior behavior)
-    /// silently failed to restore growing/building vectors, leaving a
-    /// rolled-back delete permanently unsearchable.
+    /// Symmetric to [`Self::delete_inner`]: the vector may live in the IVF
+    /// index, the growing segment (the common case for a just-inserted
+    /// vector), a sealed HNSW segment, or an in-flight building segment. The
+    /// tombstone is reversed wherever it landed.
     pub fn undelete(&mut self, id: u32) -> bool {
+        if let Some(ivf) = &mut self.ivf
+            && ivf.contains(id)
+        {
+            return ivf.undelete(id);
+        }
         if id >= self.growing_base_id {
             let local = id - self.growing_base_id;
             if (local as usize) < self.growing.len() {
@@ -204,7 +267,7 @@ impl VectorCollection {
 /// The FP32 vector at `local` in a sealed segment: the mmap tier when the
 /// segment lives there, else the HNSW node (decoded from a narrow dtype or
 /// fetched from the segment backing when the node holds no local copy).
-fn sealed_vector(seg: &super::segment::SealedSegment, local: u32) -> Option<Vec<f32>> {
+pub(super) fn sealed_vector(seg: &super::segment::SealedSegment, local: u32) -> Option<Vec<f32>> {
     if let Some(mmap) = &seg.mmap_vectors {
         return mmap.get_vector(local).map(<[f32]>::to_vec);
     }
@@ -233,8 +296,8 @@ mod tests {
     fn re_insert_under_the_same_surrogate_leaves_one_live_node() {
         let mut coll = collection();
         let s = Surrogate::new(7);
-        let first = coll.insert_with_surrogate(vec![1.0, 0.0], s);
-        let second = coll.insert_with_surrogate(vec![0.0, 1.0], s);
+        let first = coll.insert_with_surrogate(vec![1.0, 0.0], s).unwrap();
+        let second = coll.insert_with_surrogate(vec![0.0, 1.0], s).unwrap();
         assert_ne!(first, second);
         assert_eq!(coll.live_count(), 1, "the old node must be tombstoned");
         assert_eq!(coll.local_for_surrogate(s), Some(second));
@@ -246,10 +309,10 @@ mod tests {
     fn delete_then_insert_under_the_same_surrogate_leaves_one_live_node() {
         let mut coll = collection();
         let s = Surrogate::new(9);
-        let first = coll.insert_with_surrogate(vec![1.0, 0.0], s);
+        let first = coll.insert_with_surrogate(vec![1.0, 0.0], s).unwrap();
         assert!(coll.delete_by_surrogate(s));
         assert_eq!(coll.local_for_surrogate(s), None);
-        let second = coll.insert_with_surrogate(vec![0.0, 1.0], s);
+        let second = coll.insert_with_surrogate(vec![0.0, 1.0], s).unwrap();
         assert_ne!(first, second);
         assert_eq!(coll.live_count(), 1);
         assert_eq!(coll.local_for_surrogate(s), Some(second));
@@ -260,7 +323,7 @@ mod tests {
     fn delete_by_surrogate_is_idempotent() {
         let mut coll = collection();
         let s = Surrogate::new(3);
-        coll.insert_with_surrogate(vec![1.0, 0.0], s);
+        coll.insert_with_surrogate(vec![1.0, 0.0], s).unwrap();
         assert!(coll.delete_by_surrogate(s));
         assert!(!coll.delete_by_surrogate(s));
         assert_eq!(coll.live_count(), 0);
@@ -270,7 +333,7 @@ mod tests {
     fn vector_for_surrogate_reads_the_growing_segment_and_hides_deletes() {
         let mut coll = collection();
         let s = Surrogate::new(11);
-        coll.insert_with_surrogate(vec![0.5, 0.25], s);
+        coll.insert_with_surrogate(vec![0.5, 0.25], s).unwrap();
         assert_eq!(coll.vector_for_surrogate(s), Some(vec![0.5, 0.25]));
         assert!(coll.delete_by_surrogate(s));
         assert_eq!(coll.vector_for_surrogate(s), None);

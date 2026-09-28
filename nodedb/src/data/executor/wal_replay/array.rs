@@ -2,21 +2,24 @@
 
 //! Array engine WAL replay: rebuilds tile state after crash.
 //!
-//! ## The durable watermark
+//! ## The replay stamp
 //!
-//! Each array's manifest carries a `durable_lsn` — the highest LSN whose cells
-//! are already inside a flushed, on-disk segment (`Manifest::add_segment`
-//! raises it). Replay skips every record at or below it, which is what makes
-//! replaying the same retained tail twice a no-op and, more importantly, what
-//! stops a cell version that a bitemporal audit purge physically removed from a
-//! segment being re-materialised out of a still-retained `ArrayPut`. Without
-//! the gate the purge is silently undone on the next boot.
+//! Each array's manifest carries the `ReplayStamp` of its newest flush: the
+//! records whose cells are already inside a flushed, on-disk segment. Replay
+//! skips exactly the records that stamp names (`array_replay_skips`). A
+//! record in flight when the flush ran is not named, even when a higher LSN
+//! is, so it replays once.
 //!
-//! Records ABOVE the watermark are the tail the segments have not absorbed and
-//! must be re-applied into the memtable.
+//! Re-applying a named record would write its tile version into a second
+//! segment on the next flush. After a bitemporal audit purge it would also
+//! re-materialise the cell version the purge removed from a segment.
+//!
+//! Replay never flushes. Its records land in the memtable, and the first
+//! live threshold flush or checkpoint flush after replay writes them with a
+//! stamp that names them.
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::replay_abort::abort_replay;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use std::sync::Arc;
 
 /// Outcome of preparing an array's store for replay.
@@ -63,14 +66,66 @@ impl CoreLoop {
         Ok(ArrayOpen::Ready)
     }
 
-    /// The LSN this array's flushed segments are already durable through.
-    ///
-    /// `0` when the store is not open, which gates nothing — the safe
-    /// direction, matching every other engine's unset replay floor.
-    fn array_durable_lsn(&self, array_id: &nodedb_array::types::ArrayId) -> u64 {
+    /// In the install pass of a committed-redo apply, record the memtable
+    /// tiles a cell write touches and the sync high-water mark it advances.
+    /// Returns `false` when the tiles cannot be read; the error is kept on
+    /// the apply.
+    fn record_array_tiles_undo<'a>(
+        &mut self,
+        array_id: &nodedb_array::types::ArrayId,
+        cells: impl IntoIterator<Item = (&'a [nodedb_array::types::coord::value::CoordValue], i64)>,
+        provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
+    ) -> bool {
+        let captured = self
+            .array_engine
+            .snapshot_tiles(array_id, cells)
+            .map_err(|e| crate::Error::Internal {
+                detail: format!(
+                    "reading the memtable tiles of array '{}': {e}",
+                    array_id.name
+                ),
+            })
+            .map(|snapshot| {
+                std::iter::once(UndoEntry::ArrayTiles {
+                    array_id: array_id.clone(),
+                    snapshot,
+                })
+                .chain(self.capture_sync_hwm_undo(provenance))
+            });
+        self.record_redo_capture(captured)
+    }
+
+    /// Whether restart replay skips the record at `record_lsn` for
+    /// `array_id`: the stamp in the array's manifest names it. A
+    /// committed-redo apply never skips (`replay_watermark_skips`).
+    pub(in crate::data::executor) fn array_replay_skips(
+        &self,
+        array_id: &nodedb_array::types::ArrayId,
+        record_lsn: u64,
+    ) -> bool {
+        self.replay_watermark_skips(self.array_stamp_names(array_id, record_lsn))
+    }
+
+    /// Whether the stamp in `array_id`'s manifest names the record at
+    /// `record_lsn`. An array whose store is not open names nothing, which
+    /// replays the record: the safe direction.
+    pub(in crate::data::executor) fn array_stamp_names(
+        &self,
+        array_id: &nodedb_array::types::ArrayId,
+        record_lsn: u64,
+    ) -> bool {
         self.array_engine
             .store(array_id)
-            .map_or(0, |store| store.manifest().durable_lsn)
+            .is_ok_and(|store| store.manifest().replay.skips(record_lsn))
+    }
+
+    /// Whether `array_id`'s manifest stamp names an LSN above `record_lsn`.
+    /// A replayed record it holds was in flight when the flush that wrote the
+    /// stamp ran.
+    fn array_stamp_passes(&self, array_id: &nodedb_array::types::ArrayId, record_lsn: u64) -> bool {
+        self.array_engine
+            .store(array_id)
+            .is_ok_and(|store| store.manifest().replay.highest() > record_lsn)
     }
 
     pub fn replay_array_wal(
@@ -85,6 +140,8 @@ impl CoreLoop {
         let mut puts = 0usize;
         let mut deletes = 0usize;
         let mut skipped = 0usize;
+        // Records replayed below the highest LSN their array's stamp names.
+        let mut in_flight = 0usize;
 
         for record in records {
             let logical_type = record.logical_record_type();
@@ -111,18 +168,24 @@ impl CoreLoop {
             if is_put {
                 let payload = match decode_put_with_version(&record.payload) {
                     Ok(p) => p,
-                    Err(e) => abort_replay(
-                        "array",
-                        "decode_put",
-                        self.core_id,
-                        record_lsn,
-                        &format!("ArrayPut payload could not be decoded: {e}"),
-                    ),
+                    Err(e) => {
+                        self.replay_record_unapplied(
+                            "array",
+                            "decode_put",
+                            record_lsn,
+                            &format!("ArrayPut payload could not be decoded: {e}"),
+                        );
+                        skipped += 1;
+                        continue;
+                    }
                 };
-                if tombstones.is_tombstoned(
-                    record.header.database_id,
+                // An array names itself by its bare name and its own database.
+                if tombstones.is_key_tombstoned(
+                    nodedb_types::CollectionKey::from_bare(
+                        payload.array_id.database_id,
+                        &payload.array_id.name,
+                    ),
                     tenant_id,
-                    &payload.array_id.name,
                     record_lsn,
                 ) {
                     skipped += 1;
@@ -131,43 +194,68 @@ impl CoreLoop {
                 match self.ensure_array_open_for_replay(&payload.array_id) {
                     Ok(ArrayOpen::Ready) => {}
                     Ok(ArrayOpen::NoCatalogEntry) => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            array = %payload.array_id.name,
-                            lsn = record_lsn,
-                            "WAL array replay: no catalog entry for this array; \
-                             skipping its retained cells"
+                        self.replay_record_rejected(
+                            "array",
+                            record_lsn,
+                            None,
+                            &format!(
+                                "array '{}' has no catalog entry; its retained cells are skipped",
+                                payload.array_id.name
+                            ),
                         );
                         skipped += 1;
                         continue;
                     }
-                    Err(e) => abort_replay(
-                        "array",
-                        "open",
-                        self.core_id,
-                        record_lsn,
-                        &format!("array '{}' could not be opened: {e}", payload.array_id.name),
-                    ),
+                    Err(e) => {
+                        self.replay_record_unapplied(
+                            "array",
+                            "open",
+                            record_lsn,
+                            &format!("array '{}' could not be opened: {e}", payload.array_id.name),
+                        );
+                        skipped += 1;
+                        continue;
+                    }
                 }
-                if record_lsn <= self.array_durable_lsn(&payload.array_id) {
+                if self.array_replay_skips(&payload.array_id, record_lsn) {
+                    skipped += 1;
+                    continue;
+                }
+                if self.claim_for_validation() {
+                    continue;
+                }
+                if self.recording_redo_undo()
+                    && !self.record_array_tiles_undo(
+                        &payload.array_id,
+                        payload
+                            .cells
+                            .iter()
+                            .map(|c| (c.coord.as_slice(), c.system_from_ms)),
+                        payload.provenance.as_ref(),
+                    )
+                {
                     skipped += 1;
                     continue;
                 }
                 let cell_count = payload.cells.len();
                 let prov = payload.provenance.clone();
-                if let Err(e) =
+                let passed = self.array_stamp_passes(&payload.array_id, record_lsn);
+                let stamped =
                     self.array_engine
-                        .put_cells(&payload.array_id, payload.cells, record_lsn)
-                {
-                    abort_replay(
+                        .put_cells(&payload.array_id, payload.cells, record_lsn);
+                if let Err(e) = stamped {
+                    self.replay_record_unapplied(
                         "array",
                         "put_cells",
-                        self.core_id,
                         record_lsn,
                         &format!("committed cells could not be re-applied: {e}"),
                     );
+                    skipped += 1;
+                    continue;
                 }
                 puts += cell_count;
+                in_flight += usize::from(passed);
+                self.note_redo_array_written(&payload.array_id);
                 // Rebuild the per-core HWM frontier from the WAL record's
                 // provenance. No fence check here — replay records are already
                 // durable and ordered; just advance the frontier.
@@ -179,18 +267,23 @@ impl CoreLoop {
 
             let payload = match decode_delete_with_version(&record.payload) {
                 Ok(p) => p,
-                Err(e) => abort_replay(
-                    "array",
-                    "decode_delete",
-                    self.core_id,
-                    record_lsn,
-                    &format!("ArrayDelete payload could not be decoded: {e}"),
-                ),
+                Err(e) => {
+                    self.replay_record_unapplied(
+                        "array",
+                        "decode_delete",
+                        record_lsn,
+                        &format!("ArrayDelete payload could not be decoded: {e}"),
+                    );
+                    skipped += 1;
+                    continue;
+                }
             };
-            if tombstones.is_tombstoned(
-                record.header.database_id,
+            if tombstones.is_key_tombstoned(
+                nodedb_types::CollectionKey::from_bare(
+                    payload.array_id.database_id,
+                    &payload.array_id.name,
+                ),
                 tenant_id,
-                &payload.array_id.name,
                 record_lsn,
             ) {
                 skipped += 1;
@@ -199,43 +292,68 @@ impl CoreLoop {
             match self.ensure_array_open_for_replay(&payload.array_id) {
                 Ok(ArrayOpen::Ready) => {}
                 Ok(ArrayOpen::NoCatalogEntry) => {
-                    tracing::warn!(
-                        core = self.core_id,
-                        array = %payload.array_id.name,
-                        lsn = record_lsn,
-                        "WAL array replay: no catalog entry for this array; \
-                         skipping its retained tombstones"
+                    self.replay_record_rejected(
+                        "array",
+                        record_lsn,
+                        None,
+                        &format!(
+                            "array '{}' has no catalog entry; its retained tombstones are skipped",
+                            payload.array_id.name
+                        ),
                     );
                     skipped += 1;
                     continue;
                 }
-                Err(e) => abort_replay(
-                    "array",
-                    "open",
-                    self.core_id,
-                    record_lsn,
-                    &format!("array '{}' could not be opened: {e}", payload.array_id.name),
-                ),
+                Err(e) => {
+                    self.replay_record_unapplied(
+                        "array",
+                        "open",
+                        record_lsn,
+                        &format!("array '{}' could not be opened: {e}", payload.array_id.name),
+                    );
+                    skipped += 1;
+                    continue;
+                }
             }
-            if record_lsn <= self.array_durable_lsn(&payload.array_id) {
+            if self.array_replay_skips(&payload.array_id, record_lsn) {
+                skipped += 1;
+                continue;
+            }
+            if self.claim_for_validation() {
+                continue;
+            }
+            if self.recording_redo_undo()
+                && !self.record_array_tiles_undo(
+                    &payload.array_id,
+                    payload
+                        .cells
+                        .iter()
+                        .map(|c| (c.coord.as_slice(), c.system_from_ms)),
+                    payload.provenance.as_ref(),
+                )
+            {
                 skipped += 1;
                 continue;
             }
             let cell_count = payload.cells.len();
             let prov = payload.provenance.clone();
-            if let Err(e) =
+            let passed = self.array_stamp_passes(&payload.array_id, record_lsn);
+            let stamped =
                 self.array_engine
-                    .delete_cells(&payload.array_id, payload.cells, record_lsn)
-            {
-                abort_replay(
+                    .delete_cells(&payload.array_id, payload.cells, record_lsn);
+            if let Err(e) = stamped {
+                self.replay_record_unapplied(
                     "array",
                     "delete_cells",
-                    self.core_id,
                     record_lsn,
                     &format!("committed tombstones could not be re-applied: {e}"),
                 );
+                skipped += 1;
+                continue;
             }
             deletes += cell_count;
+            in_flight += usize::from(passed);
+            self.note_redo_array_written(&payload.array_id);
             if let Some(p) = &prov {
                 self.sync_commit(p);
             }
@@ -247,6 +365,7 @@ impl CoreLoop {
                 puts,
                 deletes,
                 skipped,
+                in_flight,
                 "WAL array replay complete"
             );
         }

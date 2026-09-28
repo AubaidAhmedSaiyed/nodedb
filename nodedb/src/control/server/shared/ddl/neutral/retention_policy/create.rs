@@ -125,7 +125,7 @@ pub async fn create_retention_policy(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| err("XX000", "system clock error".to_string()))?
+        .map_err(|_| DdlError::internal("system clock error"))?
         .as_secs();
 
     let def = RetentionPolicyDef {
@@ -170,15 +170,18 @@ pub async fn create_retention_policy(
         // Roll back through the same replicated path that created it, so the
         // policy disappears on every node, not only on this one.
         if let Err(rollback) = propose_delete(state, &def) {
-            return Err(err(
-                "XX000",
-                format!(
-                    "failed to auto-wire aggregates: {e}; rollback left the policy in place: {}",
+            return Err(DdlError::from_error_in_context(
+                &format!(
+                    "rollback left the policy in place: {}; failed to auto-wire aggregates",
                     rollback.message
                 ),
+                &e,
             ));
         }
-        return Err(err("XX000", format!("failed to auto-wire aggregates: {e}")));
+        return Err(DdlError::from_error_in_context(
+            "failed to auto-wire aggregates",
+            &e,
+        ));
     }
 
     state.audit_record(

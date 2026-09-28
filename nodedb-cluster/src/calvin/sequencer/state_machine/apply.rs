@@ -70,6 +70,12 @@ impl SequencerStateMachine {
         // committed at `index` regardless, so it is a safe replay upper bound.
         self.last_committed_index = index;
 
+        // A membership change of the sequencer group commits in its log too.
+        // It is no sequencer entry, and the Raft layer applied it already.
+        if crate::conf_change::ConfChange::is_conf_change(data) {
+            return;
+        }
+
         let entry: SequencerEntry = match zerompk::from_msgpack(data) {
             Ok(e) => e,
             Err(err) => {
@@ -82,8 +88,25 @@ impl SequencerStateMachine {
             SequencerEntry::EpochBatch { mut batch } => {
                 // Re-derive the participating_vshards field which is skipped
                 // during serialization (it is computed from write_set collection names).
+                // A class whose participants cannot be derived makes the entry
+                // as unusable as one that fails to decode, so it is skipped the
+                // same way.
                 for txn in &mut batch.txns {
-                    txn.tx_class.restore_derived();
+                    if let Err(err) = txn.tx_class.restore_derived() {
+                        error!(
+                            epoch = batch.epoch,
+                            raft_index = index,
+                            error = %err,
+                            "sequencer state machine: epoch batch carries a transaction \
+                             with underivable participants; skipping entry"
+                        );
+                        crate::diag::sequencer_participants_underivable(
+                            batch.epoch,
+                            index,
+                            &err.to_string(),
+                        );
+                        return;
+                    }
                 }
 
                 // A halted state machine has already diverged from the log;
@@ -268,8 +291,15 @@ impl SequencerStateMachine {
                 position,
                 vshard_id,
             } => {
+                let txn = crate::calvin::TxnId::new(epoch, position);
+                self.completion_registry.note_completion_ack(txn, vshard_id);
                 self.completion_registry
-                    .note_completion_ack(crate::calvin::TxnId::new(epoch, position), vshard_id);
+                    .applied_acks
+                    .record(crate::calvin::AppliedCompletionAck {
+                        index,
+                        txn,
+                        vshard_id,
+                    });
             }
             // Broadcast the OLLP predicate-mismatch signal to ALL replicas so the
             // coordinator's registry fires wherever it lives (including remote nodes).
@@ -387,6 +417,34 @@ impl SequencerStateMachine {
                     }
                 }
             }
+            // Fan a backup's cut marker out to every vShard scheduler this
+            // node hosts. Same `try_send` discipline as `ReserveRead`: a
+            // dropped marker is recovered by the scheduler's catch-up drain,
+            // which replays it in log order.
+            SequencerEntry::CutMarker { hlc } => {
+                for (&vshard, sender) in &self.vshard_senders {
+                    match sender.try_send(SchedulerInput::CutMarker { hlc }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                vshard,
+                                hlc,
+                                "sequencer apply: vshard channel full (backpressure); \
+                                 dropping cut marker"
+                            );
+                            self.record_catch_up(vshard, index);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!(
+                                vshard,
+                                "sequencer apply: vshard sender gone; \
+                                 scheduler may have exited (cut marker)"
+                            );
+                            self.record_catch_up(vshard, index);
+                        }
+                    }
+                }
+            }
             // Fan a reservation release out to its owning vShard's scheduler.
             // Same `try_send` discipline as `ReserveRead`.
             SequencerEntry::ReleaseReservation {
@@ -434,14 +492,16 @@ mod tests {
     };
     use nodedb_types::{
         TenantId,
-        id::{DatabaseId, VShardId},
+        id::{CollectionKey, DatabaseId},
     };
 
     fn find_two_distinct_collections() -> (String, String) {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..512 {
             let name = format!("col_{i}");
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             if let Some((ref fname, fv)) = first {
                 if fv != vshard {
                     return (fname.clone(), name);
@@ -460,8 +520,12 @@ mod tests {
         // We'll use find_two_distinct_collections and use whatever vshards they hash to.
         let (col_a, col_b) = find_two_distinct_collections();
         let _ = (vshard_a, vshard_b); // actual vshard ids come from the collection hash
-        let real_va = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_a).as_u32();
-        let real_vb = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_b).as_u32();
+        let real_va = CollectionKey::from_bare(DatabaseId::DEFAULT, &col_a)
+            .vshard()
+            .as_u32();
+        let real_vb = CollectionKey::from_bare(DatabaseId::DEFAULT, &col_b)
+            .vshard()
+            .as_u32();
         let write_set = ReadWriteSet::new(vec![
             EngineKeySet::Document {
                 collection: col_a,

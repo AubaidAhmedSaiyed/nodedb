@@ -19,7 +19,7 @@ use common::cluster_harness::TestCluster;
 
 use std::time::Duration;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 
 /// Source and target, chosen for readability rather than for their hashes — the
 /// homing assertion below is what makes the choice meaningful.
@@ -84,8 +84,8 @@ async fn declare_binding(cluster: &TestCluster) {
 /// vShard, so every balance below travels on its own task.
 #[test]
 fn source_and_target_home_to_different_vshards() {
-    let source = VShardId::from_collection_in_database(DatabaseId::DEFAULT, SOURCE);
-    let target = VShardId::from_collection_in_database(DatabaseId::DEFAULT, TARGET);
+    let source = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE).vshard();
+    let target = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, TARGET).vshard();
     assert_ne!(
         source, target,
         "this file tests the CROSS-SHARD path; '{SOURCE}' and '{TARGET}' must not be co-resident"

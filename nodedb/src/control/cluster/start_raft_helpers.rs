@@ -9,9 +9,10 @@ use nodedb_cluster::vshard_handler::{DispatchTarget, dispatch_by_type};
 use nodedb_cluster::wire::VShardEnvelope;
 
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
-use crate::control::cluster::calvin::scheduler::read_applied_recovery;
+use crate::control::cluster::calvin::scheduler::recover_applied;
 use crate::control::cluster::calvin::{
-    ReadResultEvent, Scheduler, SchedulerConfig, SchedulerParams,
+    RaftSequencerProposer, ReadResultEvent, Scheduler, SchedulerConfig, SchedulerParams,
+    SequencerProposer,
 };
 use crate::control::cluster::handle::ClusterHandle;
 use crate::control::state::SharedState;
@@ -114,6 +115,8 @@ struct ReconcileSchedulersParams<'a> {
     routing: &'a Arc<RwLock<nodedb_cluster::RoutingTable>>,
     shared: &'a Arc<SharedState>,
     raft_loop_handle: &'a Arc<Mutex<nodedb_cluster::multi_raft::MultiRaft>>,
+    /// One proposer per node, so its forward limit bounds the whole node.
+    sequencer_proposer: &'a Arc<dyn SequencerProposer>,
     sequencer_state_machine: &'a Arc<Mutex<SequencerStateMachine>>,
     calvin_read_result_senders: &'a ReadResultSenders,
     calvin_completion_registry: &'a Arc<CalvinCompletionRegistry>,
@@ -138,6 +141,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
         routing,
         shared,
         raft_loop_handle,
+        sequencer_proposer,
         sequencer_state_machine,
         calvin_read_result_senders,
         calvin_completion_registry,
@@ -155,7 +159,10 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             continue;
         }
 
-        let recovery = read_applied_recovery(&shared.wal, vshard_id)?;
+        // The applied state the last checkpoint saved, with the markers the
+        // WAL still holds: a checkpoint deletes the segments that held older
+        // markers, and the sequencer log delivers their entries again.
+        let recovery = recover_applied(&shared.wal, shared.credentials.catalog(), vshard_id)?;
         let (sequenced_tx, sequenced_rx) =
             tokio::sync::mpsc::channel(scheduler_config.channel_capacity);
 
@@ -197,13 +204,14 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
 
         // The deterministic lock table is shared between this scheduler and the
         // Control-Plane write-admission gate: build it once and register the
-        // SAME `Arc` in `calvin_lock_managers` so a fast-path point write and
+        // SAME `Arc` in `CalvinLocalState::lock_managers` so a fast-path point write and
         // this scheduler's validation contend on one mutex.
         let lock_manager = Arc::new(Mutex::new(
             crate::control::cluster::calvin::scheduler::lock_manager::LockManager::new(),
         ));
         shared
-            .calvin_lock_managers
+            .calvin
+            .lock_managers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(vshard_id, Arc::clone(&lock_manager));
@@ -217,7 +225,8 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
         // synchronous `Drop` that must not block.
         let (promotion_tx, promotion_rx) = tokio::sync::mpsc::unbounded_channel();
         shared
-            .calvin_promotion_senders
+            .calvin
+            .promotion_senders
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(vshard_id, promotion_tx);
@@ -237,6 +246,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             receiver: sequenced_rx,
             shared: Arc::clone(shared),
             multi_raft: raft_loop_handle.clone(),
+            sequencer_proposer: Arc::clone(sequencer_proposer),
             sequencer_state_machine: Arc::clone(sequencer_state_machine),
             fully_applied_epoch: recovery.fully_applied_epoch,
             applied_tail: recovery.applied_tail,
@@ -321,6 +331,20 @@ pub(super) fn spawn_vshard_schedulers(
 
     let node_id = handle.node_id;
     let routing = Arc::clone(&handle.routing);
+    let sequencer_proposer: Arc<dyn SequencerProposer> = Arc::new(RaftSequencerProposer::new(
+        node_id,
+        Arc::clone(&raft_loop_handle),
+        shared,
+    ));
+    // A backup's cut proposes its marker through the same proposer.
+    if shared
+        .calvin
+        .sequencer_proposer
+        .set(Arc::clone(&sequencer_proposer))
+        .is_err()
+    {
+        tracing::warn!("calvin: the sequencer proposer was set already; keeping the first");
+    }
 
     // Initial reconcile: schedulers for vShards this node already knows it hosts.
     reconcile_vshard_schedulers(ReconcileSchedulersParams {
@@ -328,6 +352,7 @@ pub(super) fn spawn_vshard_schedulers(
         routing: &routing,
         shared,
         raft_loop_handle: &raft_loop_handle,
+        sequencer_proposer: &sequencer_proposer,
         sequencer_state_machine,
         calvin_read_result_senders,
         calvin_completion_registry,
@@ -362,6 +387,7 @@ pub(super) fn spawn_vshard_schedulers(
                             routing: &routing,
                             shared: &shared_task,
                             raft_loop_handle: &raft_loop_handle,
+                            sequencer_proposer: &sequencer_proposer,
                             sequencer_state_machine: &sm_task,
                             calvin_read_result_senders: &rr_task,
                             calvin_completion_registry: &registry_task,

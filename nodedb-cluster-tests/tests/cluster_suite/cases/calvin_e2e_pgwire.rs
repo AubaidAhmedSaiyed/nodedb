@@ -20,15 +20,12 @@ use std::time::Duration;
 
 use nodedb_cluster::calvin::{
     sequencer::{SequencerConfig, new_inbox},
-    types::{EngineKeySet, ReadWriteSet, SequencedTxn, SortedVec, TxClass, VersionedReadSet},
+    types::{EngineKeySet, ReadWriteSet, SchedulerInput, SortedVec, TxClass, VersionedReadSet},
 };
-use nodedb_types::{
-    TenantId,
-    id::{DatabaseId, VShardId},
-};
+use nodedb_types::{TenantId, id::DatabaseId};
 use tokio::sync::mpsc;
 
-use super::cluster_common::{spawn_with_sequencer, wait_for_sequencer_leader};
+use super::cluster_common::{spawn_with_sequencer, try_recv_txn, wait_for_sequencer_leader};
 
 /// Find two collection names that hash to distinct vshards.
 ///
@@ -38,7 +35,9 @@ fn two_distinct_vshard_collections() -> (String, String) {
     let mut first: Option<(String, u32)> = None;
     for i in 0u32..512 {
         let name = format!("orders_{i}");
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+            .vshard()
+            .as_u32();
         if let Some((ref fname, fv)) = first {
             if fv != vshard {
                 return (fname.clone(), name);
@@ -96,11 +95,15 @@ async fn multi_vshard_insert_via_sequencer_admitted_and_replicated() {
 
     // Wire per-vshard fan-out receivers on every node.
     let (col_a, col_b) = two_distinct_vshard_collections();
-    let va = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_a).as_u32();
-    let vb = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_b).as_u32();
+    let va = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &col_a)
+        .vshard()
+        .as_u32();
+    let vb = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &col_b)
+        .vshard()
+        .as_u32();
 
-    let mut fan_out_rxs_a: Vec<mpsc::Receiver<SequencedTxn>> = Vec::new();
-    let mut fan_out_rxs_b: Vec<mpsc::Receiver<SequencedTxn>> = Vec::new();
+    let mut fan_out_rxs_a: Vec<mpsc::Receiver<SchedulerInput>> = Vec::new();
+    let mut fan_out_rxs_b: Vec<mpsc::Receiver<SchedulerInput>> = Vec::new();
     for node in &nodes {
         let (tx_a, rx_a) = mpsc::channel(64);
         let (tx_b, rx_b) = mpsc::channel(64);
@@ -153,8 +156,8 @@ async fn multi_vshard_insert_via_sequencer_admitted_and_replicated() {
         .zip(fan_out_rxs_b.iter_mut())
         .enumerate()
     {
-        let got_a = rx_a.try_recv().is_ok();
-        let got_b = rx_b.try_recv().is_ok();
+        let got_a = try_recv_txn(rx_a).is_some();
+        let got_b = try_recv_txn(rx_b).is_some();
         assert!(
             got_a || got_b,
             "replica {i}: neither vshard fan-out channel received the txn"

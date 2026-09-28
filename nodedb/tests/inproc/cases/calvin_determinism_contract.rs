@@ -94,10 +94,8 @@ fn send_one(
     rx: &mut Consumer<BridgeResponse>,
     plan: PhysicalPlan,
 ) -> nodedb::bridge::envelope::Response {
-    tx.try_push(BridgeRequest {
-        inner: make_request(plan),
-    })
-    .unwrap();
+    tx.try_push(BridgeRequest::unfloored(make_request(plan)))
+        .unwrap();
     core.tick();
     rx.try_pop().unwrap().inner
 }
@@ -179,6 +177,7 @@ fn kv_no_ttl_byte_identical() {
                 surrogate: nodedb_types::Surrogate::new(i),
                 returning: None,
                 rls_filters: Vec::new(),
+                provenance: None,
             })
         })
         .collect();
@@ -363,6 +362,7 @@ fn kv_with_ttl_byte_identical() {
                 surrogate: nodedb_types::Surrogate::new(i),
                 returning: None,
                 rls_filters: Vec::new(),
+                provenance: None,
             })
         })
         .collect();

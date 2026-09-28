@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use crate::bridge::envelope::{PhysicalPlan, Response};
+use crate::control::server::dispatch_utils::minted::MintedRecords;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 
 /// Who owns this write's durable redo record.
@@ -20,16 +21,58 @@ pub(crate) enum WalDurability {
     /// is what makes WAL-LSN order equal dispatcher-enqueue order per key; the
     /// strict-FIFO per-database WFQ then makes apply order follow enqueue
     /// order, so restart replay (in LSN order) cannot diverge from live state.
-    AppendHere { now_override: Option<u64> },
+    ///
+    /// `apply_key` is the idempotency key of the replicated proposal this
+    /// write applies, `0` for a write no proposal carries. Every record the
+    /// funnel appends for the write carries it in its header, so the record
+    /// names the proposal it applied in the same durable write.
+    ///
+    /// `commit_hlc` is the HLC wall time, in nanoseconds, at which the write
+    /// committed upstream: the proposer's stamp on a replicated entry. `None`
+    /// when this append is the commit, so the funnel stamps the instant of the
+    /// append itself.
+    AppendHere {
+        now_override: Option<u64>,
+        apply_key: u64,
+        commit_hlc: Option<u64>,
+    },
     /// The caller already recorded this write's durability elsewhere — COMMIT's
     /// single `Transaction` record, the procedural batch flush, a trigger /
     /// sync path that owns its own funnel — and supplies the LSN it minted.
     /// The funnel appends nothing and stamps these values through unchanged;
     /// the supplied LSN names the record that replays this write.
+    ///
+    /// `minted` holds the records the caller appended for this write under
+    /// their outcome-floor window. The funnel closes the window from the
+    /// write's outcome: it cancels the records on a refusal that applied
+    /// nothing, and on a Calvin route that applies the write from its own
+    /// records.
     CallerSupplied {
         wal_lsn: Option<Lsn>,
         resolved_now_ms: Option<u64>,
+        minted: Option<MintedRecords>,
     },
+}
+
+impl WalDurability {
+    /// Whether the caller supplied records it appended for this write.
+    pub(crate) fn has_minted(&self) -> bool {
+        matches!(
+            self,
+            Self::CallerSupplied {
+                minted: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Take the caller's minted records out, leaving `None` in their place.
+    pub(crate) fn take_minted(&mut self) -> Option<MintedRecords> {
+        match self {
+            Self::AppendHere { .. } => None,
+            Self::CallerSupplied { minted, .. } => minted.take(),
+        }
+    }
 }
 
 /// Where this write's ordering was decided.

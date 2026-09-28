@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! WAL appends for node-global metadata: temporal-purge audit, surrogate
-//! allocation/binding, Calvin epoch tracking, and sync watermarks.
+//! allocation/binding, Calvin epoch tracking, applied Raft proposals, and
+//! sync watermarks.
 
 use nodedb_wal::record::RecordType;
 
-use super::core::WalManager;
+use super::appender::WalAppender;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
-impl WalManager {
+impl WalAppender<'_> {
     /// Append a `TemporalPurge` audit record. Emitted by the
     /// Control Plane's bitemporal-retention scheduler after a successful
     /// dispatch of `MetaOp::TemporalPurge*` to the Data Plane, providing
@@ -108,6 +109,31 @@ impl WalManager {
             DatabaseId::DEFAULT,
             &payload,
         )
+    }
+
+    /// Append a payload-free `ProposalApplied` marker carrying this
+    /// appender's apply key. An apply that writes no record of its own
+    /// appends it in place of its forward record, so the proposal's key still
+    /// reaches the WAL.
+    ///
+    /// Returns `None` and appends nothing for an appender with no apply key.
+    pub fn append_proposal_applied(
+        &self,
+        tenant_id: TenantId,
+        vshard_id: VShardId,
+        database_id: DatabaseId,
+    ) -> crate::Result<Option<Lsn>> {
+        if self.apply_key() == super::appender::NO_APPLY_KEY {
+            return Ok(None);
+        }
+        self.append_record(
+            RecordType::ProposalApplied,
+            tenant_id,
+            vshard_id,
+            database_id,
+            &[],
+        )
+        .map(Some)
     }
 
     /// Append a `SyncSeqAdvance` watermark record. Emitted by the Data Plane sync

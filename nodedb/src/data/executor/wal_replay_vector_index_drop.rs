@@ -32,7 +32,6 @@ impl CoreLoop {
             CoreLoop::vector_index_key(database_id, tenant_id, &collection, &field_name);
         let (db, tenant, _) = index_key.clone();
         self.vector_collections.remove(&index_key);
-        self.ivf_indexes.remove(&index_key);
         self.vector_params.remove(&index_key);
         self.index_configs.remove(&index_key);
         self.declared_dims.remove(&index_key);

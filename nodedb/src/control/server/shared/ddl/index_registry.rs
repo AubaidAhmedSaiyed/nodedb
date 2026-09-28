@@ -15,10 +15,6 @@ use crate::types::{DatabaseId, TenantId};
 
 use super::result::DdlError;
 
-fn registry_err(message: String) -> DdlError {
-    DdlError::new("XX000", message)
-}
-
 /// The identity of one index, as its creating statement declared it.
 pub struct IndexRegistration<'a> {
     pub database_id: DatabaseId,
@@ -45,13 +41,13 @@ pub fn propose_index_record(
     };
     let entry = CatalogEntry::PutIndexRecord(Box::new(record.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| registry_err(format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()
             .put_index_record(&record)
-            .map_err(|e| registry_err(format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
     }
     Ok(())
 }
@@ -71,13 +67,13 @@ pub fn propose_delete_index_record(
         collection: collection.to_string(),
     };
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| registry_err(format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()
             .delete_index_record(database_id.as_u64(), tenant_id.as_u64(), name)
-            .map_err(|e| registry_err(format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
     }
     Ok(())
 }

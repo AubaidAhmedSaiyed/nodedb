@@ -17,7 +17,10 @@ pub mod graph_cdc;
 pub mod kafka;
 pub mod metrics;
 pub mod plane;
+pub mod progress;
+pub mod record_numbering;
 pub mod scheduler;
+pub mod sink_ledger;
 pub mod slab_budget;
 pub mod streaming_mv;
 #[cfg(test)]
@@ -27,6 +30,7 @@ pub mod trigger;
 pub mod types;
 pub mod wal_replay;
 pub mod wal_replay_parse;
+pub mod wal_replay_scope;
 pub mod watermark;
 pub mod watermark_tracker;
 pub mod webhook;

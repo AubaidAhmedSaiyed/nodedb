@@ -57,7 +57,7 @@ pub fn drop_procedure(
     // a clean no-op that never touches raft.
     let exists_before = catalog
         .get_procedure_in_database(database_id, tenant_id, &name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .is_some();
     if !exists_before && !if_exists {
         return Err(DdlError::new(
@@ -75,11 +75,11 @@ pub fn drop_procedure(
         name: name.clone(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         let _ = catalog
             .delete_procedure_in_database(database_id, tenant_id, &name)
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
     }
 
     // Broadcast deletion to connected Lite sessions.

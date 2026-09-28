@@ -96,7 +96,7 @@ pub async fn crdt_state(
         },
     )
     .await
-    .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     let columns = vec!["crdt_state".to_string()];
 
@@ -162,8 +162,12 @@ pub async fn crdt_apply(
 
     let surrogate = state
         .surrogate_assigner
-        .assign(database_id, tenant_id, collection, document_id.as_bytes())
-        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+        .assign(
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
+            tenant_id,
+            document_id.as_bytes(),
+        )
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),
@@ -179,7 +183,7 @@ pub async fn crdt_apply(
     });
     let task = PhysicalTask {
         tenant_id,
-        vshard_id: crate::types::VShardId::from_collection_in_database(database_id, collection),
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
         database_id,
         plan,
         post_set_op: PostSetOp::None,
@@ -196,7 +200,7 @@ pub async fn crdt_apply(
     .into_tasks()
     .into_iter()
     .next()
-    .ok_or_else(|| DdlError::new("XX000", "authorization returned no capability"))?;
+    .ok_or_else(|| DdlError::internal("authorization returned no capability"))?;
 
     // Route through the Raft proposer gate so the delta is quorum-durable under
     // replication. A local-only dispatch would land the delta on the receiving
@@ -219,14 +223,14 @@ pub async fn crdt_apply(
         state,
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
             authorized,
-            collection,
+            collection: &qualified_collection,
             timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,
             policy: &policy,
         },
     )
     .await
-    .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     let columns = vec!["result".to_string()];
     let mut row = Map::new();

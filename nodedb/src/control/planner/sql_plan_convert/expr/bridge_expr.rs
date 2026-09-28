@@ -235,31 +235,99 @@ fn convert_expr_inner(expr: &SqlExpr, qualify: bool) -> crate::bridge::expr_eval
             }
         }
 
-        // `ARRAY['a', 'b', ...]` — lower each element and, when all resolve to
-        // `BExpr::Literal`, fold into a single `Value::Array` literal so that
-        // functions like `pg_json_has_any_key` / `pg_json_has_all_keys` receive
-        // a proper `Value::Array` argument rather than `Value::Null`.
+        // `ARRAY[a, b, ...]`: an array of literals folds to one `Value::Array`
+        // literal, so functions like `pg_json_has_any_key` receive a real
+        // array argument. An array with any other element lowers to a
+        // `make_array` call, which builds the array per row from the
+        // evaluated elements.
         SqlExpr::ArrayLiteral(elems) => {
-            let mut values = Vec::with_capacity(elems.len());
-            let mut all_literal = true;
-            for elem in elems {
-                match convert_expr_inner(elem, qualify) {
-                    BExpr::Literal(v) => values.push(v),
-                    other => {
-                        all_literal = false;
-                        // Non-literal element: fall back to Null for that slot.
-                        let _ = other;
-                        values.push(nodedb_types::Value::Null);
+            let lowered: Vec<BExpr> = elems
+                .iter()
+                .map(|elem| convert_expr_inner(elem, qualify))
+                .collect();
+            let literals: Option<Vec<nodedb_types::Value>> = lowered
+                .iter()
+                .map(|elem| {
+                    if let BExpr::Literal(v) = elem {
+                        Some(v.clone())
+                    } else {
+                        None
                     }
-                }
-            }
-            if all_literal {
-                BExpr::Literal(nodedb_types::Value::Array(values))
-            } else {
-                BExpr::Literal(nodedb_types::Value::Null)
+                })
+                .collect();
+            match literals {
+                Some(values) => BExpr::Literal(nodedb_types::Value::Array(values)),
+                None => BExpr::Function {
+                    name: "make_array".into(),
+                    args: lowered,
+                },
             }
         }
 
         _ => BExpr::Literal(nodedb_types::Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use nodedb_sql::types::SqlValue;
+    use nodedb_types::Value;
+
+    use super::*;
+
+    fn col(name: &str) -> SqlExpr {
+        SqlExpr::Column {
+            table: None,
+            name: name.into(),
+        }
+    }
+
+    fn row() -> Value {
+        Value::Object(HashMap::from([
+            ("n".to_string(), Value::Integer(7)),
+            ("name".to_string(), Value::String("Alice".into())),
+        ]))
+    }
+
+    #[test]
+    fn an_array_with_a_column_element_is_built_per_row() {
+        let expr = SqlExpr::ArrayLiteral(vec![col("n"), SqlExpr::Literal(SqlValue::Int(1))]);
+        let lowered = sql_expr_to_bridge_expr(&expr);
+        assert_eq!(
+            lowered.eval(&row()).expect("eval"),
+            Value::Array(vec![Value::Integer(7), Value::Integer(1)])
+        );
+    }
+
+    #[test]
+    fn an_array_of_literals_folds_to_one_literal() {
+        let expr = SqlExpr::ArrayLiteral(vec![
+            SqlExpr::Literal(SqlValue::Int(1)),
+            SqlExpr::Literal(SqlValue::Int(2)),
+        ]);
+        assert_eq!(
+            sql_expr_to_bridge_expr(&expr),
+            crate::bridge::expr_eval::SqlExpr::Literal(Value::Array(vec![
+                Value::Integer(1),
+                Value::Integer(2)
+            ]))
+        );
+    }
+
+    #[test]
+    fn like_and_not_like_evaluate_through_the_like_function() {
+        let like = |negated, case_insensitive, pattern: &str| SqlExpr::Like {
+            expr: Box::new(col("name")),
+            pattern: Box::new(SqlExpr::Literal(SqlValue::String(pattern.into()))),
+            negated,
+            case_insensitive,
+        };
+        let eval = |e: SqlExpr| sql_expr_to_bridge_expr(&e).eval(&row()).expect("eval");
+        assert_eq!(eval(like(false, false, "Al%")), Value::Bool(true));
+        assert_eq!(eval(like(true, false, "Al%")), Value::Bool(false));
+        assert_eq!(eval(like(false, true, "al%")), Value::Bool(true));
+        assert_eq!(eval(like(false, false, "al%")), Value::Bool(false));
     }
 }

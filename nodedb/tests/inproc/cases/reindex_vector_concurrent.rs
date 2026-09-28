@@ -12,8 +12,10 @@
 //!   4. the query p99 stayed a small share of the rebuild window — the
 //!      signature of a rebuild that took an exclusive lock instead of
 //!      running concurrently
-//!   5. exactly one `atomic_cutover` tracing event was emitted by the
-//!      `nodedb::reindex` target during the rebuild phase
+//!   5. exactly one HNSW `atomic_cutover` tracing event was emitted by the
+//!      `nodedb::reindex` target during the rebuild phase. REINDEX rebuilds
+//!      each sealed segment and swaps it in on its own, one event per
+//!      segment, so the test force-seals its rows into one segment first.
 //!
 //! Why no p99 ratio: this test asserted `rebuild_p99 <= 2.0 * baseline_p99`,
 //! and the dataset had been shrunk to the point where the rebuild finished
@@ -40,29 +42,36 @@ use nodedb_test_support::pgwire_harness::TestServer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-// ── Tracing layer that counts `atomic_cutover` events ────────────────────────
+// ── Tracing layer that counts HNSW `atomic_cutover` events ─────────────────
 
 struct CutoverCounter(Arc<AtomicU64>);
 
-/// Visitor that checks whether the `message` field equals "atomic_cutover".
-struct MessageVisitor(bool);
+/// Visitor that reads the `message` and `index` fields of an event.
+#[derive(Default)]
+struct CutoverVisitor {
+    is_cutover: bool,
+    index: Option<String>,
+}
 
-impl tracing::field::Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            let s = format!("{value:?}");
-            // Debug formatting wraps strings in quotes; strip them.
-            let trimmed = s.trim_matches('"');
-            if trimmed == "atomic_cutover" {
-                self.0 = true;
-            }
+impl CutoverVisitor {
+    fn record_text(&mut self, field: &tracing::field::Field, text: &str) {
+        match field.name() {
+            "message" => self.is_cutover |= text == "atomic_cutover",
+            "index" => self.index = Some(text.to_string()),
+            _ => {}
         }
+    }
+}
+
+impl tracing::field::Visit for CutoverVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let s = format!("{value:?}");
+        // Debug formatting wraps strings in quotes; strip them.
+        self.record_text(field, s.trim_matches('"'));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" && value == "atomic_cutover" {
-            self.0 = true;
-        }
+        self.record_text(field, value);
     }
 }
 
@@ -77,9 +86,11 @@ where
     ) {
         let meta = event.metadata();
         if meta.target().contains("reindex") {
-            let mut visitor = MessageVisitor(false);
+            let mut visitor = CutoverVisitor::default();
             event.record(&mut visitor);
-            if visitor.0 {
+            // REINDEX without an index name also rebuilds any full-text or
+            // CSR index the collection has; only HNSW cutovers count here.
+            if visitor.is_cutover && visitor.index.as_deref() == Some("hnsw") {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -125,6 +136,21 @@ async fn nn_query(server: &TestServer, query_vec: &[f32]) -> Duration {
     let t = Instant::now();
     server.exec(&sql).await.expect("baseline query failed");
     t.elapsed()
+}
+
+/// One numeric property of `SHOW VECTOR INDEX status ON vecs10k.emb`.
+async fn vector_index_status(server: &TestServer, property: &str) -> u64 {
+    let rows = server
+        .query_rows("SHOW VECTOR INDEX status ON vecs10k.emb")
+        .await
+        .expect("SHOW VECTOR INDEX failed");
+    let row = rows
+        .iter()
+        .find(|r| r[0] == property)
+        .unwrap_or_else(|| panic!("SHOW VECTOR INDEX must report {property}: {rows:?}"));
+    row[1]
+        .parse()
+        .unwrap_or_else(|e| panic!("{property} must be a number, got {:?}: {e}", row[1]))
 }
 
 /// Compute the p99 of a slice of `Duration` values (must be non-empty).
@@ -232,6 +258,28 @@ async fn reindex_vector_concurrent_p99() {
         server.exec(&sql).await.unwrap();
     }
 
+    // ── Seal: REINDEX rebuilds sealed segments only ─────────────────────────
+    // The rows sit in the growing segment, far below the default seal
+    // threshold. Force-seal them into one segment and wait for its first
+    // build, so REINDEX has exactly one sealed segment to rebuild.
+    server
+        .exec("ALTER VECTOR INDEX ON vecs10k.emb SEAL")
+        .await
+        .unwrap();
+    let seal_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let sealed = vector_index_status(&server, "sealed_segments").await;
+        let building = vector_index_status(&server, "building_segments").await;
+        if sealed == 1 && building == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < seal_deadline,
+            "the sealed segment did not build: sealed={sealed} building={building}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     // ── Baseline phase: 200 sequential queries, record latencies ────────────
     let mut baseline_latencies: Vec<Duration> = Vec::with_capacity(BASELINE_QUERIES);
     let mut qseed: u64 = 0xCAFE_F00D_ABCD_EF01;
@@ -320,8 +368,9 @@ async fn reindex_vector_concurrent_p99() {
     });
 
     // Issue REINDEX CONCURRENTLY on the main client.
-    // This returns as soon as the background thread is started; the atomic
-    // cutover is applied on a later tick() — so we must wait for it.
+    // This returns once the segment's rebuild is queued on the core's builder
+    // thread. The core swaps the rebuilt segment in on a later tick, so the
+    // test waits for the cutover event.
     let rebuild_started = Instant::now();
     server.exec("REINDEX CONCURRENTLY vecs10k").await.unwrap();
 

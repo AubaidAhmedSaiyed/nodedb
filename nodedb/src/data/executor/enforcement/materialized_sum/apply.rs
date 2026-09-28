@@ -128,17 +128,19 @@ impl CoreLoop {
         images: &RowImages<'_>,
     ) -> crate::Result<Vec<TargetWrite>> {
         let mut writes: Vec<TargetWrite> = Vec::new();
+        // The source's canonical key, de-qualified from the plan's name once.
+        let source = nodedb_types::CollectionKey::from_qualified_str(
+            DatabaseId::new(ctx.database_id),
+            ctx.collection,
+        )?;
         for binding in bindings {
             // Whether one core owns both rows. The Control Plane asked the SAME
             // question, from the same plane-neutral function, when it decided
             // whether the balance could ride this transaction — so the two
             // cannot disagree about which bindings this core is responsible
             // for.
-            let co_resident = crate::query::sum_target_is_co_resident(
-                DatabaseId::new(ctx.database_id),
-                ctx.collection,
-                &binding.target_collection,
-            );
+            let co_resident =
+                crate::query::sum_target_is_co_resident(source, &binding.target_collection);
             // A binding the plan DEFERRED is applied by its own
             // `ApplyBalanceDelta` task on the target's core. Applying it here as
             // well would double-count it — and this transaction belongs to the
@@ -384,11 +386,17 @@ mod tests {
     #[test]
     fn the_local_fixture_is_co_resident() {
         assert!(
-            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                TARGET,
+            ),
             "'{SOURCE}' and '{TARGET}' must share a vShard for the inline fold to be observable"
         );
         assert!(
-            !crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, REMOTE_TARGET),
+            !crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                REMOTE_TARGET,
+            ),
             "'{REMOTE_TARGET}' must NOT share '{SOURCE}'s vShard; it pins the deferred path"
         );
     }
@@ -777,13 +785,19 @@ mod tests {
     #[test]
     fn the_local_fixture_is_co_resident_for_path_level_tests() {
         assert!(
-            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                TARGET,
+            ),
             "'{SOURCE}' and '{TARGET}' must share a vShard: the inline fold writes the target \
              inside the source's transaction, on the source's core, and each core opens its own \
              document store"
         );
         assert!(
-            !crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, REMOTE_TARGET),
+            !crate::query::sum_target_is_co_resident(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                REMOTE_TARGET,
+            ),
             "'{REMOTE_TARGET}' must NOT share '{SOURCE}'s vShard; it pins the deferred rule"
         );
     }
@@ -1375,8 +1389,10 @@ mod tests {
                 if [SOURCE, TARGET, JOIN_SOURCE].contains(&candidate.as_str()) {
                     continue;
                 }
-                if crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, &candidate)
-                {
+                if crate::query::sum_target_is_co_resident(
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                    &candidate,
+                ) {
                     return candidate;
                 }
             }
@@ -1458,7 +1474,10 @@ mod tests {
         // path instead and leave the collision this test exists for uncovered.
         for target in [TARGET, second_target.as_str()] {
             assert!(
-                crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, target),
+                crate::query::sum_target_is_co_resident(
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE),
+                    target,
+                ),
                 "'{target}' must share '{SOURCE}'s vShard for its inline fold to be observable"
             );
         }
@@ -1529,12 +1548,10 @@ mod tests {
     /// The CALVIN apply path honours a deferral, and it is the only path that ever
     /// sees one.
     ///
-    /// `execute_calvin_flush` replays every staged plan through
-    /// `execute_transaction_batch`, which intercepts `PointInsert` for undo
-    /// tracking instead of re-dispatching it. That interception must forward both
-    /// `resolved_sum_targets` and `deferred_sum_targets`; dropping the latter lets
-    /// the source core fold a balance the Control Plane already shipped on its own
-    /// `ApplyBalanceDelta` task, moving the total twice.
+    /// A committed Calvin transaction installs its redo record with the
+    /// transaction's resolved and deferred sum targets. Dropping the deferral
+    /// lets the source core fold a balance the Control Plane already shipped on
+    /// its own `ApplyBalanceDelta` task, moving the total twice.
     ///
     /// A dropped marker is invisible under two compounding conditions: a deferral
     /// is only ever set on a CROSS-SHARD statement, and a cross-shard statement
@@ -1542,11 +1559,8 @@ mod tests {
     /// carries the marker, and never on a write that could notice. The
     /// direct-dispatch path forwards it correctly, which is why a regression here
     /// leaves every single-shard test green.
-    ///
-    /// Asserted through `execute_transaction_batch` rather than through the funnel:
-    /// the funnel was never where the field was lost.
     #[test]
-    fn the_transaction_batch_path_honours_a_deferred_binding() {
+    fn the_calvin_path_honours_a_deferred_binding() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut core, _req, _resp) = make_core_with_dir(dir.path());
         register_collections_onto(&mut core, REMOTE_TARGET);
@@ -1576,7 +1590,7 @@ mod tests {
         )];
 
         let task = make_default_task();
-        let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);
+        let response = core.calvin_commit_for_test(&task, TID, &plans, 1, 100);
         assert_eq!(
             response.status,
             Status::Ok,
@@ -1606,12 +1620,12 @@ mod tests {
 
     /// The same path, with the deferral ABSENT, must still apply the balance.
     ///
-    /// Without this the fix above could be "never fold on the transaction batch
-    /// path", which would silently drop every CO-RESIDENT balance committed through
+    /// Without this the fix above could be "never fold on the Calvin path",
+    /// which would silently drop every CO-RESIDENT balance committed through
     /// Calvin — a wrong total in the other direction, and one no cross-shard test
     /// would catch.
     #[test]
-    fn the_transaction_batch_path_still_folds_an_undeferred_binding() {
+    fn the_calvin_path_still_folds_an_undeferred_binding() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut core, _req, _resp) = make_core_with_dir(dir.path());
         register_collections(&mut core);
@@ -1634,7 +1648,7 @@ mod tests {
         )];
 
         let task = make_default_task();
-        let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);
+        let response = core.calvin_commit_for_test(&task, TID, &plans, 2, 101);
         assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
         assert_eq!(
             balance_of(&core, SURROGATE_A),
@@ -1643,25 +1657,19 @@ mod tests {
         );
     }
 
-    /// A source write replayed on the transaction-batch path reports its
-    /// affected-row count.
+    /// A source write committed through Calvin reports its affected-row count.
     ///
-    /// `execute_calvin_flush` replays a participant's staged plans through
-    /// `execute_transaction_batch` and returns the LAST sub-plan's payload as that
-    /// participant's applied response. The scheduler deposits it, and the
-    /// coordinator shapes the statement's `INSERT <n>` tag from it — so a bare `Ok`
-    /// from the sub-plan leaves an autocommit CROSS-SHARD insert with no count at
-    /// all and the statement fails with "write response carried no affected-row
-    /// count".
+    /// The flush answers with the reply the transaction's last plan computed
+    /// when it staged. The scheduler deposits it, and the coordinator shapes
+    /// the statement's `INSERT <n>` tag from it — so a bare `Ok` leaves an
+    /// autocommit CROSS-SHARD insert with no count at all and the statement
+    /// fails with "write response carried no affected-row count".
     ///
-    /// It stayed hidden because the other consumer of this payload is the
-    /// single-shard COMMIT flush, whose tag is `COMMIT` and which discards the
-    /// count entirely. The cross-shard materialized-sum pair is the first shape
-    /// that makes a ONE-STATEMENT autocommit write commit through Calvin, and it
-    /// only appeared to work while the sibling balance participant — whose handler
-    /// does report a count — happened to win the race to deposit first.
+    /// The single-shard COMMIT answers with the `COMMIT` tag and discards the
+    /// count. The cross-shard materialized-sum pair is the shape that makes a
+    /// ONE-STATEMENT autocommit write commit through Calvin.
     #[test]
-    fn the_transaction_batch_path_reports_its_affected_count() {
+    fn the_calvin_path_reports_its_affected_count() {
         use crate::control::server::shared::sql::staging_predicates::require_affected_count;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1686,13 +1694,13 @@ mod tests {
         )];
 
         let task = make_default_task();
-        let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);
+        let response = core.calvin_commit_for_test(&task, TID, &plans, 3, 102);
         assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
         assert_eq!(
             require_affected_count(response.payload.as_bytes())
-                .expect("a batch whose last sub-plan renders an INSERT tag must carry its count"),
+                .expect("a flush whose last plan renders an INSERT tag must carry its count"),
             1,
-            "one row was inserted, so the batch's applied response reports one"
+            "one row was inserted, so the flush reports one"
         );
     }
 }

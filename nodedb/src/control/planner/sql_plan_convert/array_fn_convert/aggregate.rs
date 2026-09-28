@@ -8,7 +8,7 @@ use nodedb_sql::temporal::TemporalScope;
 use nodedb_sql::types_array::ArrayReducerAst;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::{ArrayOp, ClusterArrayOp};
 
 use super::super::convert::ConvertContext;
@@ -54,7 +54,7 @@ pub(crate) fn convert_agg(
         super::helpers::resolve_array_temporal(temporal, "ARRAY_AGG")?;
     let mapped = map_reducer(reducer);
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
 
     let plan = if ctx.cluster_enabled {
         // Encode the reducer for the wire. The coordinator decodes it

@@ -11,6 +11,7 @@ use std::collections::{BinaryHeap, HashSet};
 use nodedb_codec::vector_quant::codec::VectorCodec;
 
 use super::graph::{HnswCodecIndex, NodeC};
+use crate::error::{VectorError, check_dim};
 
 /// Ordered pair for priority queues (dist, node_idx in `nodes` vec).
 #[derive(Clone, Copy, PartialEq)]
@@ -41,8 +42,10 @@ impl<C: VectorCodec> HnswCodecIndex<C> {
     /// Insert a vector with the given caller-supplied `id`.
     ///
     /// Encodes `v` via `codec.encode`, assigns a random layer, and runs the
-    /// standard HNSW neighbour-selection algorithm.
-    pub fn insert(&mut self, id: u32, v: &[f32]) {
+    /// standard HNSW neighbour-selection algorithm. A vector without the
+    /// index dimension fails with [`VectorError::DimensionMismatch`].
+    pub fn insert(&mut self, id: u32, v: &[f32]) -> Result<(), VectorError> {
+        check_dim(self.dim, v.len())?;
         let quantized = self.codec.encode(v);
         let node_layer = self.random_layer();
 
@@ -64,7 +67,7 @@ impl<C: VectorCodec> HnswCodecIndex<C> {
             // First node: it becomes the entry point.
             self.entry_point = Some(new_idx);
             self.max_layer = node_layer;
-            return;
+            return Ok(());
         };
 
         // Phase 1: greedy descent from max_layer down to node_layer + 1.
@@ -124,6 +127,7 @@ impl<C: VectorCodec> HnswCodecIndex<C> {
             self.entry_point = Some(new_idx);
             self.max_layer = node_layer;
         }
+        Ok(())
     }
 
     /// Greedy descent: starting at `ep_idx`, find the single nearest node to
@@ -262,14 +266,14 @@ mod tests {
             .map(|i| (0..dim).map(|d| (i * dim + d) as f32 * 0.1).collect())
             .collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        Sq8Codec::calibrate(&refs, dim)
+        Sq8Codec::calibrate(&refs, dim).unwrap()
     }
 
     #[test]
     fn insert_sets_entry_point() {
         let codec = make_sq8(4, 10);
         let mut idx: HnswCodecIndex<Sq8Codec> = HnswCodecIndex::new(4, 8, 50, codec, 1);
-        idx.insert(0, &[0.1, 0.2, 0.3, 0.4]);
+        idx.insert(0, &[0.1, 0.2, 0.3, 0.4]).unwrap();
         assert!(idx.entry_point.is_some());
         assert_eq!(idx.len(), 1);
     }
@@ -280,7 +284,7 @@ mod tests {
         let mut idx: HnswCodecIndex<Sq8Codec> = HnswCodecIndex::new(4, 8, 50, codec, 42);
         for i in 0..20u32 {
             let v: Vec<f32> = (0..4).map(|d| (i as usize * 4 + d) as f32).collect();
-            idx.insert(i, &v);
+            idx.insert(i, &v).unwrap();
         }
         assert_eq!(idx.len(), 20);
         assert!(idx.entry_point.is_some());

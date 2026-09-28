@@ -16,6 +16,8 @@ mod math;
 pub(crate) mod shared;
 mod string;
 mod system;
+mod text_chunk;
 mod types;
+mod vector;
 
 pub use eval::eval_function;

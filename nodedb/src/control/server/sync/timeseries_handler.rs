@@ -15,6 +15,7 @@ use tracing::{debug, error};
 
 use super::session::SyncSession;
 use super::wire::*;
+use crate::control::server::dispatch_utils::RecordOwner;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
 // ── Dispatcher trait ─────────────────────────────────────────────────────────
@@ -92,18 +93,29 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
 
         // Allocate a WAL LSN on the Control Plane before dispatching to the
         // Data Plane. This is the canonical LSN for dedup tracking.
-        let appended_lsn = wal_append_timeseries(
-            &self.shared.wal,
-            TimeseriesWalAppendContext {
-                tenant_id,
-                vshard_id: vshard,
-                database_id,
-                collection: &collection,
-            },
-            &payload_bytes,
-            Some(&prov),
-            Some(&self.shared.credentials),
-        )?;
+        let owner = RecordOwner {
+            tenant_id,
+            database_id,
+            vshard_id: vshard,
+        };
+        // The record's outcome-floor window opens before the append and
+        // closes from the dispatch's outcome.
+        let (minted, appended_lsn) =
+            super::raft_dispatch::append_under_window(self.shared, owner, |wal| {
+                wal_append_timeseries(
+                    wal,
+                    TimeseriesWalAppendContext {
+                        tenant_id,
+                        vshard_id: vshard,
+                        database_id,
+                        collection: &collection,
+                    },
+                    &payload_bytes,
+                    Some(&prov),
+                    Some(&self.shared.credentials),
+                )
+            })
+            .await?;
         let wal_lsn = appended_lsn.map(|lsn| lsn.as_u64());
 
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
@@ -121,21 +133,28 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             rls_filters: Vec::new(),
         });
 
-        let authorized = super::raft_dispatch::authorize_sync_task(
+        let authorized = match super::raft_dispatch::authorize_sync_task(
             self.shared,
             self.identity,
             tenant_id,
             database_id,
             vshard,
             plan,
-        )?;
+        ) {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                // A refused authorization reaches no core.
+                minted.cancel(&self.shared.wal, owner, 0).await?;
+                return Err(error);
+            }
+        };
         super::raft_dispatch::dispatch_write_replicated(
             self.shared,
             &collection,
             authorized,
             std::time::Duration::from_secs(self.shared.tuning.network.default_deadline_secs),
             crate::event::EventSource::CrdtSync,
-            appended_lsn,
+            Some(minted),
         )
         .await
     }
@@ -234,7 +253,7 @@ impl SyncSession {
             "timeseries push decoded, dispatching to Data Plane"
         );
 
-        let vshard = VShardId::from_collection_in_database(database_id, &msg.collection);
+        let vshard = nodedb_types::CollectionKey::from_bare(database_id, &msg.collection).vshard();
 
         match dispatcher
             .dispatch_ingest(
@@ -620,7 +639,7 @@ mod tests {
         assert_eq!(calls[0].1, database_id);
         assert_eq!(
             calls[0].2,
-            VShardId::from_collection_in_database(database_id, "metrics")
+            nodedb_types::CollectionKey::from_bare(database_id, "metrics").vshard()
         );
     }
 
@@ -644,7 +663,7 @@ mod tests {
         assert_eq!(calls[0].1, DatabaseId::DEFAULT);
         assert_eq!(
             calls[0].2,
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "metrics")
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "metrics").vshard()
         );
         assert_eq!(calls[0].3, "metrics");
         // ILP payload must contain the collection name and lite_id.

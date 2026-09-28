@@ -29,7 +29,7 @@ pub(crate) fn propose_put_model(
     let catalog_entry = CatalogEntry::PutVectorModel(Box::new(entry.clone()));
     propose_and_apply(state, &catalog_entry, || {
         apply::put_model(entry, state.credentials.catalog())
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))
     })
 }
 
@@ -59,7 +59,7 @@ pub(crate) fn propose_delete_model(
             column,
             state.credentials.catalog(),
         )
-        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))
+        .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))
     })
 }
 
@@ -75,7 +75,7 @@ pub(crate) fn propose_put_params(
     let catalog_entry = CatalogEntry::PutVectorIndexParams(Box::new(entry.clone()));
     propose_and_apply_outcome(state, &catalog_entry, || {
         apply::put_params(entry, state.credentials.catalog())
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))
     })
 }
 
@@ -105,6 +105,6 @@ pub(crate) fn propose_delete_params(
             field_name,
             state.credentials.catalog(),
         )
-        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))
+        .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))
     })
 }

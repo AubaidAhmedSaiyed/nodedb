@@ -22,6 +22,7 @@
 use std::collections::BinaryHeap;
 
 use crate::distance::distance;
+use crate::error::VectorError;
 use nodedb_types::vector_distance::DistanceMetric;
 
 /// Per-collection Matryoshka configuration.
@@ -124,21 +125,39 @@ impl Ord for HeapEntry {
 /// by ascending full-dim distance.
 ///
 /// # Notes
-/// - `candidates` yields `(id, full_dim_vector)` pairs. Vectors shorter than
-///   `full_dim` are accepted; truncation clips to available length.
+/// - `candidates` yields `(id, vector)` pairs; each vector carries at least
+///   `full_dim` components, and components past `full_dim` are ignored.
 /// - When `coarse_dim == full_dim` the method degenerates to a single-pass
 ///   top-k scan with one distance call per candidate (no duplicated work).
+///
+/// # Errors
+/// - [`VectorError::InvalidInput`] when `coarse_dim` exceeds `full_dim`.
+/// - [`VectorError::DimensionMismatch`] when `query` has fewer than
+///   `full_dim` components.
+/// - [`VectorError::StoredDimensionMismatch`] when a candidate vector has
+///   fewer than `full_dim` components.
 pub fn matryoshka_search<'a, I>(
     candidates: I,
     query: &[f32],
     options: &MatryoshkaSearchOptions,
     metric: DistanceMetric,
-) -> Vec<(u32, f32)>
+) -> Result<Vec<(u32, f32)>, VectorError>
 where
     I: Iterator<Item = (u32, &'a [f32])>,
 {
     let coarse = options.coarse_dim as usize;
     let full = options.full_dim as usize;
+    if coarse > full {
+        return Err(VectorError::InvalidInput {
+            detail: format!("Matryoshka coarse dimension {coarse} exceeds full dimension {full}"),
+        });
+    }
+    if query.len() < full {
+        return Err(VectorError::DimensionMismatch {
+            expected: full,
+            got: query.len(),
+        });
+    }
     let pool_size = (options.oversample as usize).max(1) * options.k.max(1);
 
     let query_coarse = truncate(query, coarse);
@@ -151,6 +170,12 @@ where
     let mut survivor_vecs: Vec<Vec<f32>> = Vec::with_capacity(pool_size);
 
     for (id, vec) in candidates {
+        if vec.len() < full {
+            return Err(VectorError::StoredDimensionMismatch {
+                expected: full,
+                got: vec.len(),
+            });
+        }
         let vec_coarse = truncate(vec, coarse);
         let d = distance(query_coarse, vec_coarse, metric);
 
@@ -163,7 +188,7 @@ where
 
         if should_insert {
             let vec_idx = survivor_vecs.len();
-            survivor_vecs.push(vec[..full.min(vec.len())].to_vec());
+            survivor_vecs.push(truncate(vec, full).to_vec());
 
             coarse_heap.push(HeapEntry {
                 dist: d,
@@ -193,7 +218,7 @@ where
 
     reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     reranked.truncate(options.k);
-    reranked
+    Ok(reranked)
 }
 
 #[cfg(test)]
@@ -288,7 +313,7 @@ mod tests {
             k: 10,
         };
 
-        let results = matryoshka_search(candidates, &query, &opts, DistanceMetric::L2);
+        let results = matryoshka_search(candidates, &query, &opts, DistanceMetric::L2).unwrap();
         assert_eq!(results.len(), 10, "expected exactly k=10 results");
     }
 
@@ -317,7 +342,7 @@ mod tests {
             oversample: 1,
             k: 10,
         };
-        let mrl = matryoshka_search(candidates, &query, &opts, DistanceMetric::L2);
+        let mrl = matryoshka_search(candidates, &query, &opts, DistanceMetric::L2).unwrap();
 
         // Same IDs in same order.
         let direct_ids: Vec<u32> = direct.iter().map(|(id, _)| *id).collect();
@@ -326,5 +351,52 @@ mod tests {
             direct_ids, mrl_ids,
             "coarse==full should equal direct search"
         );
+    }
+
+    #[test]
+    fn short_query_or_candidate_is_a_typed_error() {
+        let vecs = make_vecs(4, 8);
+        let opts = MatryoshkaSearchOptions {
+            coarse_dim: 4,
+            full_dim: 8,
+            oversample: 2,
+            k: 2,
+        };
+        let candidates = vecs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, v.as_slice()));
+        assert!(matches!(
+            matryoshka_search(candidates, &[0.0; 6], &opts, DistanceMetric::L2),
+            Err(VectorError::DimensionMismatch {
+                expected: 8,
+                got: 6
+            })
+        ));
+
+        let short = [0.0_f32; 5];
+        let candidates = std::iter::once((0_u32, &short[..]));
+        assert!(matches!(
+            matryoshka_search(candidates, &[0.0; 8], &opts, DistanceMetric::L2),
+            Err(VectorError::StoredDimensionMismatch {
+                expected: 8,
+                got: 5
+            })
+        ));
+
+        let inverted = MatryoshkaSearchOptions {
+            coarse_dim: 16,
+            full_dim: 8,
+            oversample: 2,
+            k: 2,
+        };
+        let candidates = vecs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, v.as_slice()));
+        assert!(matches!(
+            matryoshka_search(candidates, &[0.0; 8], &inverted, DistanceMetric::L2),
+            Err(VectorError::InvalidInput { .. })
+        ));
     }
 }

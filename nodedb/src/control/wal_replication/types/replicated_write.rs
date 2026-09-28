@@ -5,13 +5,14 @@ use super::aliases::{
     default_columnar_ingest_format, default_columnar_insert_intent, default_ivf_cells,
     default_ivf_nprobe, default_pq_m,
 };
+use super::transaction_redo_wire::{ReplicatedEventSource, ReplicatedIdentity};
 use super::wire_shapes::{
     ColumnarResolvedRow, ConstraintChangeOp, DocumentResolvedMutationWire, KvResolvedMutationWire,
     ReplicatedBatchEdge, ReplicatedSumTarget,
 };
 use nodedb_physical::physical_plan::document::MergeClauseOp;
 use nodedb_physical::physical_plan::{
-    ColumnarInsertIntent, CrdtWriteVerb, UpdateValue, VectorDirectWriteIntent,
+    ColumnarInsertIntent, CrdtWriteVerb, KvCounterShape, UpdateValue, VectorDirectWriteIntent,
     VectorResolvedMutation, VectorWriteTargets,
 };
 use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
@@ -299,6 +300,10 @@ pub enum ReplicatedWrite {
         format: String,
         /// Leader-assigned global surrogates, parallel to the rows in `payload`.
         surrogates: Vec<u32>,
+        /// The timestamp, in epoch milliseconds, of every row that carries
+        /// none. The proposer reads its clock once, and every replica stores
+        /// the same instant.
+        default_timestamp_ms: i64,
         /// Sync provenance encoded as zerompk bytes.
         #[serde(default)]
         provenance: Option<Vec<u8>>,
@@ -397,6 +402,9 @@ pub enum ReplicatedWrite {
         /// See `ReplicatedWrite::PointPut::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Sync provenance of a Lite KV push, encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
     },
     KvDelete {
         collection: String,
@@ -407,6 +415,9 @@ pub enum ReplicatedWrite {
         /// See `ReplicatedWrite::PointPut::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Sync provenance of a Lite KV push, encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
     },
     KvInsert {
         collection: String,
@@ -488,12 +499,17 @@ pub enum ReplicatedWrite {
         surrogate: u32,
         /// See `KvPut::resolved_now_ms`.
         resolved_now_ms: Option<u64>,
+        /// The row an absent key becomes.
+        shape: KvCounterShape,
     },
     KvIncrFloat {
         collection: String,
         key: Vec<u8>,
-        delta: f64,
+        /// The client's decimal text.
+        delta: String,
         surrogate: u32,
+        /// The row an absent key becomes.
+        shape: KvCounterShape,
     },
     KvCas {
         collection: String,
@@ -986,6 +1002,34 @@ pub enum ReplicatedWrite {
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
         /// See `PointUpdate::declared_primary_key`.
         declared_primary_key: Option<String>,
+    },
+    /// One committed transaction's resolved post-images for one vShard.
+    ///
+    /// Every replica, the proposer included, appends `redo` to its own WAL
+    /// and applies it through the WAL replay arms, in Raft log order. The
+    /// record is resolved once, on the proposer; no replica re-derives it.
+    /// `redo.calvin_stamp` names the Calvin `(epoch, position)` the record
+    /// applies, when a Calvin flush produced it.
+    TransactionRedo {
+        redo: crate::wal::RedoRecord,
+        /// Every collection the transaction wrote, for the collection-floor
+        /// write versions.
+        collections: Vec<String>,
+        /// Materialized-sum resolution the document writes fold into their
+        /// targets, keyed by source collection.
+        sum_targets: Vec<nodedb_physical::physical_plan::RedoSumTargets>,
+        /// Identities every replica binds before the apply.
+        identities: Vec<ReplicatedIdentity>,
+        event_source: ReplicatedEventSource,
+        /// Which commit-boundary checks every replica's apply runs.
+        origin: nodedb_physical::physical_plan::RedoOrigin,
+    },
+    /// A backup's consistent cut through this group's log. It writes no
+    /// data. Every entry before it applies before the backup snapshots, and
+    /// every entry after it records a commit HLC above `hlc`, the backup's
+    /// watermark, so a restore of that backup refuses it.
+    CutBarrier {
+        hlc: u64,
     },
 }
 

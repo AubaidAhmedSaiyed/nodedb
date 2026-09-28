@@ -38,9 +38,10 @@ impl CoreLoop {
         if self.vector_collections.contains_key(&index_key) {
             return self.response_error(
                 task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: "cannot change index params after creation; drop and recreate the collection".into(),
+                ErrorCode::Unsupported {
+                    detail: "changing vector index params after the index holds vectors is not \
+                             supported; drop and recreate the collection"
+                        .into(),
                 },
             );
         }
@@ -84,9 +85,8 @@ impl CoreLoop {
             _ => {
                 return self.response_error(
                     task,
-                    ErrorCode::RejectedConstraint {
-                        detail: String::new(),
-                        constraint: format!(
+                    ErrorCode::DataException {
+                        detail: format!(
                             "unknown metric '{resolved_metric_str}'; supported: l2, cosine, inner_product, manhattan, chebyshev, hamming, jaccard, pearson"
                         ),
                     },
@@ -105,9 +105,8 @@ impl CoreLoop {
                 None => {
                     return self.response_error(
                         task,
-                        ErrorCode::RejectedConstraint {
-                            detail: String::new(),
-                            constraint: format!(
+                        ErrorCode::DataException {
+                            detail: format!(
                                 "unknown index_type '{index_type}'; supported: hnsw, hnsw_pq, ivf_pq"
                             ),
                         },
@@ -171,6 +170,11 @@ impl CoreLoop {
             declared_dim: resolved_dim,
         };
 
+        if resolved_dim > 0
+            && let Err(e) = super::vector_settle::check_ivf_dim(&config, resolved_dim)
+        {
+            return self.response_error(task, e);
+        }
         if resolved_dim > 0 {
             self.declared_dims.insert(index_key.clone(), resolved_dim);
         }

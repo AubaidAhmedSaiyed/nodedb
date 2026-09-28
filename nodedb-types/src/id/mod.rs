@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod collection;
+pub mod collection_key;
 pub mod database;
 pub mod document;
 pub mod edge;
@@ -15,6 +16,7 @@ pub mod txn;
 pub mod vshard;
 
 pub use collection::CollectionId;
+pub use collection_key::{CollectionKey, CollectionKeyError};
 pub use database::DatabaseId;
 pub use document::DocumentId;
 pub use edge::{EdgeId, EdgeIdParseError};

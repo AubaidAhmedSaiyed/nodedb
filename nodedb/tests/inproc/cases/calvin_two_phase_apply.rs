@@ -3,9 +3,10 @@
 //! Staged Calvin apply on the Data Plane: `MetaOp::CalvinExecuteStatic`
 //! VALIDATES + STAGES a transaction's write plans into the commit-pending
 //! buffer WITHOUT mutating base, returning the local commit vote on
-//! `read_set_valid`. A subsequent `MetaOp::CalvinFlush` replays the staged
-//! plans to base (making the write visible), or `MetaOp::CalvinDrop` discards
-//! them (leaving base unchanged).
+//! `read_set_valid`. `MetaOp::CalvinResolve` then resolves the staged plans
+//! into the transaction's redo record, and `MetaOp::CalvinFlush` installs it
+//! at its LSN (making the write visible), or `MetaOp::CalvinDrop` discards
+//! the staged state (leaving base unchanged).
 //!
 //! These drive a `CoreLoop` directly through the SPSC ring so the atomicity
 //! seam is observed without any scheduler timing: nothing a stage writes is
@@ -78,12 +79,108 @@ fn send(
     vshard: u32,
     wal_lsn: Option<Lsn>,
 ) -> Response {
-    tx.try_push(BridgeRequest {
-        inner: make_request(plan, vshard, wal_lsn),
-    })
+    tx.try_push(BridgeRequest::unfloored(make_request(
+        plan, vshard, wal_lsn,
+    )))
     .unwrap();
     core.tick();
     rx.try_pop().unwrap().inner
+}
+
+/// Resolve the transaction staged at `(epoch, 0)` on `vshard` and build the
+/// flush that installs its redo record.
+fn resolved_flush(
+    core: &mut CoreLoop,
+    tx: &mut Producer<BridgeRequest>,
+    rx: &mut Consumer<BridgeResponse>,
+    epoch: u64,
+    vshard: u32,
+) -> PhysicalPlan {
+    let resolved = send(
+        core,
+        tx,
+        rx,
+        PhysicalPlan::Meta(MetaOp::CalvinResolve { epoch, position: 0 }),
+        vshard,
+        None,
+    );
+    assert_eq!(
+        resolved.status,
+        Status::Ok,
+        "resolve must succeed: {resolved:?}"
+    );
+    PhysicalPlan::Meta(MetaOp::CalvinFlush {
+        epoch,
+        position: 0,
+        redo: resolved.payload.to_vec(),
+        collections: Vec::new(),
+        sum_targets: Vec::new(),
+    })
+}
+
+/// A write committed through the Calvin path to seed a write version.
+struct CalvinSeed<'a> {
+    epoch: u64,
+    vshard: u32,
+    /// The collection `plans` write; the install records its floor at `lsn`.
+    collection: &'a str,
+    plans: Vec<PhysicalPlan>,
+    lsn: u64,
+}
+
+/// Commit `seed.plans` as the Calvin transaction at `(seed.epoch, 0)` on
+/// `seed.vshard` and install its redo record at `seed.lsn`: the path a
+/// committed multi-shard write takes. The install records each written key
+/// and the collection floor at that LSN.
+fn commit_calvin(
+    core: &mut CoreLoop,
+    tx: &mut Producer<BridgeRequest>,
+    rx: &mut Consumer<BridgeResponse>,
+    seed: CalvinSeed<'_>,
+) -> Response {
+    let staged = send(
+        core,
+        tx,
+        rx,
+        stage_static(seed.epoch, 0, seed.plans, Vec::new()),
+        seed.vshard,
+        None,
+    );
+    assert_eq!(
+        staged.status,
+        Status::Ok,
+        "seed stage must succeed: {staged:?}"
+    );
+    let resolved = send(
+        core,
+        tx,
+        rx,
+        PhysicalPlan::Meta(MetaOp::CalvinResolve {
+            epoch: seed.epoch,
+            position: 0,
+        }),
+        seed.vshard,
+        None,
+    );
+    assert_eq!(
+        resolved.status,
+        Status::Ok,
+        "seed resolve must succeed: {resolved:?}"
+    );
+    send(
+        core,
+        tx,
+        rx,
+        PhysicalPlan::Meta(MetaOp::CalvinFlush {
+            epoch: seed.epoch,
+            position: 0,
+            redo: resolved.payload.to_vec(),
+            collections: vec![seed.collection.to_string()],
+            sum_targets: Vec::new(),
+        }),
+        seed.vshard,
+        Some(Lsn::new(seed.lsn)),
+    )
 }
 
 fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
@@ -95,6 +192,7 @@ fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
         surrogate: nodedb_types::Surrogate::ZERO,
         returning: None,
         rls_filters: Vec::new(),
+        provenance: None,
     })
 }
 
@@ -183,17 +281,15 @@ fn flush_makes_staged_calvin_write_visible() {
         "staged write must NOT be visible before flush; got {before:?}"
     );
 
-    // Flush replays the staged plans to base.
+    // The flush installs the resolved redo record to base.
+    let flush_plan = resolved_flush(&mut core, &mut tx, &mut rx, 6, 0);
     let flush = send(
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::CalvinFlush {
-            epoch: 6,
-            position: 0,
-        }),
+        flush_plan,
         0,
-        None,
+        Some(Lsn::new(60)),
     );
     assert_eq!(flush.status, Status::Ok, "flush must succeed: {flush:?}");
 
@@ -225,23 +321,25 @@ fn drop_discards_invalid_staged_calvin_write() {
 
     // Seed a committed write to `dropcoll` at LSN 100 so its collection write
     // version floor is 100. The seed carries a WAL LSN so the version records.
-    let seed = send(
+    let seed = commit_calvin(
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::TransactionBatch {
-            txn_id: None,
+        CalvinSeed {
+            epoch: 1,
+            vshard: 0,
+            collection: "dropcoll",
             plans: vec![kv_put("dropcoll", b"seed", b"v")],
-        }),
-        0,
-        Some(Lsn::new(100)),
+            lsn: 100,
+        },
     );
     assert_eq!(seed.status, Status::Ok, "seed write must commit: {seed:?}");
 
     // The read entry's collection must home to the staged request's vShard for
     // the read-set check to consider it.
-    let read_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "dropcoll").as_u32();
+    let read_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "dropcoll")
+        .vshard()
+        .as_u32();
 
     // A read of `dropcoll` observed at LSN 50 — stale against the seed's write
     // at LSN 100 → the read-set is no longer current → abort vote.
@@ -328,21 +426,23 @@ fn point_read_at_write_lsn_commits_and_flush_applies() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
     // Seed a committed write to key `pk` in `pointcoll` at LSN 10.
-    let seed = send(
+    let seed = commit_calvin(
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::TransactionBatch {
-            txn_id: None,
+        CalvinSeed {
+            epoch: 1,
+            vshard: 0,
+            collection: "pointcoll",
             plans: vec![kv_put("pointcoll", b"pk", b"v1")],
-        }),
-        0,
-        Some(Lsn::new(10)),
+            lsn: 10,
+        },
     );
     assert_eq!(seed.status, Status::Ok, "seed write must commit: {seed:?}");
 
-    let point_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "pointcoll").as_u32();
+    let point_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "pointcoll")
+        .vshard()
+        .as_u32();
 
     // A Point read of the exact same key observed at LSN 10 (== the write) is
     // still current: no write happened AFTER the read.
@@ -373,16 +473,14 @@ fn point_read_at_write_lsn_commits_and_flush_applies() {
         "a read at or after the last write LSN must be current -> commit vote"
     );
 
+    let flush_plan = resolved_flush(&mut core, &mut tx, &mut rx, 8, point_vshard);
     let flush = send(
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::CalvinFlush {
-            epoch: 8,
-            position: 0,
-        }),
+        flush_plan,
         point_vshard,
-        None,
+        Some(Lsn::new(80)),
     );
     assert_eq!(flush.status, Status::Ok, "flush must succeed: {flush:?}");
 
@@ -411,21 +509,23 @@ fn stale_point_read_of_kv_key_aborts_stage_and_drop_discards() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
     // Seed a committed write to key `pk` in `stalecoll` at LSN 10.
-    let seed = send(
+    let seed = commit_calvin(
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::TransactionBatch {
-            txn_id: None,
+        CalvinSeed {
+            epoch: 1,
+            vshard: 0,
+            collection: "stalecoll",
             plans: vec![kv_put("stalecoll", b"pk", b"v1")],
-        }),
-        0,
-        Some(Lsn::new(10)),
+            lsn: 10,
+        },
     );
     assert_eq!(seed.status, Status::Ok, "seed write must commit: {seed:?}");
 
-    let stale_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "stalecoll").as_u32();
+    let stale_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "stalecoll")
+        .vshard()
+        .as_u32();
 
     // A Point read of the exact same key observed at LSN 5 — stale against the
     // write at LSN 10 → the read-set is no longer current → abort vote.
@@ -510,8 +610,9 @@ fn stale_point_read_of_kv_key_aborts_stage_and_drop_discards() {
 fn absent_kv_key_phantom_insert_causes_abort() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
-    let phantom_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "phantomkv").as_u32();
+    let phantom_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "phantomkv")
+        .vshard()
+        .as_u32();
 
     // The key was absent when read at (the then-current watermark) LSN 5 — no
     // write is seeded yet.
@@ -523,12 +624,14 @@ fn absent_kv_key_phantom_insert_causes_abort() {
     };
 
     // Concurrently, the exact same key is inserted and commits at LSN 8.
-    let insert = send(
+    let insert = commit_calvin(
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::TransactionBatch {
-            txn_id: None,
+        CalvinSeed {
+            epoch: 1,
+            vshard: phantom_vshard,
+            collection: "phantomkv",
             plans: vec![PhysicalPlan::Kv(KvOp::Insert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "phantomkv"),
                 key: b"newkey".to_vec(),
@@ -538,9 +641,8 @@ fn absent_kv_key_phantom_insert_causes_abort() {
                 returning: None,
                 rls_filters: Vec::new(),
             })],
-        }),
-        phantom_vshard,
-        Some(Lsn::new(8)),
+            lsn: 8,
+        },
     );
     assert_eq!(
         insert.status,
@@ -585,8 +687,9 @@ fn absent_kv_key_phantom_insert_causes_abort() {
 fn absent_document_phantom_insert_is_caught() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
-    let doc_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "phantomdocs").as_u32();
+    let doc_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "phantomdocs")
+        .vshard()
+        .as_u32();
 
     // The document was absent when read: capture degraded the miss to a
     // collection-scoped predicate on "phantomdocs" at read_lsn 5.
@@ -602,20 +705,21 @@ fn absent_document_phantom_insert_is_caught() {
     // at LSN 8. Its collection floor advance (phantomdocs -> 8) is what the
     // predicate read validates against.
     const NEWLY_ALLOCATED_SURROGATE: u32 = 42;
-    let insert = send(
+    let insert = commit_calvin(
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::TransactionBatch {
-            txn_id: None,
+        CalvinSeed {
+            epoch: 1,
+            vshard: doc_vshard,
+            collection: "phantomdocs",
             plans: vec![doc_insert(
                 "phantomdocs",
                 "the-doc-id",
                 NEWLY_ALLOCATED_SURROGATE,
             )],
-        }),
-        doc_vshard,
-        Some(Lsn::new(8)),
+            lsn: 8,
+        },
     );
     assert_eq!(
         insert.status,
@@ -658,8 +762,9 @@ fn absent_document_phantom_insert_is_caught() {
 fn absent_document_read_without_matching_insert_still_commits() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
-    let doc_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "phantomdocs").as_u32();
+    let doc_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "phantomdocs")
+        .vshard()
+        .as_u32();
 
     let absent_doc_read = VersionedReadEntry {
         engine: EngineTag::Document,
@@ -671,16 +776,17 @@ fn absent_document_read_without_matching_insert_still_commits() {
     // A concurrent insert into a DIFFERENT collection commits at LSN 8. It
     // advances only "othercoll"'s floor; phantomdocs is untouched.
     const UNRELATED_SURROGATE: u32 = 42;
-    let insert = send(
+    let insert = commit_calvin(
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::TransactionBatch {
-            txn_id: None,
+        CalvinSeed {
+            epoch: 1,
+            vshard: doc_vshard,
+            collection: "othercoll",
             plans: vec![doc_insert("othercoll", "other-id", UNRELATED_SURROGATE)],
-        }),
-        doc_vshard,
-        Some(Lsn::new(8)),
+            lsn: 8,
+        },
     );
     assert_eq!(
         insert.status,
@@ -709,5 +815,73 @@ fn absent_document_read_without_matching_insert_still_commits() {
         Some(true),
         "an absent-document read must NOT over-abort when no insert lands in its \
          collection"
+    );
+}
+
+/// Push one prebuilt request through the ring and return its response.
+fn send_request(
+    core: &mut CoreLoop,
+    tx: &mut Producer<BridgeRequest>,
+    rx: &mut Consumer<BridgeResponse>,
+    request: Request,
+) -> Response {
+    tx.try_push(BridgeRequest::unfloored(request)).unwrap();
+    core.tick();
+    rx.try_pop().unwrap().inner
+}
+
+/// Calvin sub-operations are already ordered: every replica must run them.
+/// A stage and a flush whose envelope deadline has already passed still
+/// execute, and the write becomes visible. They never answer
+/// `DeadlineExceeded`.
+#[test]
+fn already_ordered_stage_and_flush_run_past_their_deadline() {
+    let (mut core, mut tx, mut rx, _dir) = make_core();
+    let already_ordered = |plan: PhysicalPlan| Request {
+        deadline: Instant::now() - Duration::from_secs(1),
+        admission: nodedb::bridge::envelope::Admission::Exempt(
+            nodedb::bridge::envelope::ExemptReason::AlreadyOrdered,
+        ),
+        ..make_request(plan, 0, None)
+    };
+
+    let staged = send_request(
+        &mut core,
+        &mut tx,
+        &mut rx,
+        already_ordered(stage_static(
+            9,
+            0,
+            vec![kv_put("latecoll", b"lk", b"lv")],
+            Vec::new(),
+        )),
+    );
+    assert_eq!(staged.status, Status::Ok, "late stage must run: {staged:?}");
+    assert_eq!(staged.read_set_valid, Some(true));
+
+    let flush_plan = resolved_flush(&mut core, &mut tx, &mut rx, 9, 0);
+    let flush = send_request(
+        &mut core,
+        &mut tx,
+        &mut rx,
+        Request {
+            wal_lsn: Some(Lsn::new(90)),
+            ..already_ordered(flush_plan)
+        },
+    );
+    assert_eq!(flush.status, Status::Ok, "late flush must run: {flush:?}");
+
+    let after = send(
+        &mut core,
+        &mut tx,
+        &mut rx,
+        kv_get("latecoll", b"lk"),
+        0,
+        None,
+    );
+    assert_eq!(after.status, Status::Ok, "read after flush: {after:?}");
+    assert!(
+        !after.payload.is_empty(),
+        "the late flush must make the staged write visible"
     );
 }

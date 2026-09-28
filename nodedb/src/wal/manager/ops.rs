@@ -61,6 +61,7 @@ impl WalManager {
 mod tests {
     use super::*;
     use crate::types::{DatabaseId, TenantId, VShardId};
+    use crate::wal::manager::NO_APPLY_KEY;
 
     #[test]
     fn next_lsn_continues_after_reopen() {
@@ -69,20 +70,24 @@ mod tests {
 
         {
             let wal = WalManager::open_for_testing(&path).unwrap();
-            wal.append_put(
-                TenantId::new(1),
-                VShardId::new(0),
-                DatabaseId::DEFAULT,
-                b"a",
-            )
-            .unwrap();
-            wal.append_put(
-                TenantId::new(1),
-                VShardId::new(0),
-                DatabaseId::DEFAULT,
-                b"b",
-            )
-            .unwrap();
+            wal.appender(NO_APPLY_KEY)
+                .with_event_source(crate::event::EventSource::User)
+                .append_put(
+                    TenantId::new(1),
+                    VShardId::new(0),
+                    DatabaseId::DEFAULT,
+                    b"a",
+                )
+                .unwrap();
+            wal.appender(NO_APPLY_KEY)
+                .with_event_source(crate::event::EventSource::User)
+                .append_put(
+                    TenantId::new(1),
+                    VShardId::new(0),
+                    DatabaseId::DEFAULT,
+                    b"b",
+                )
+                .unwrap();
             wal.sync().unwrap();
         }
 
@@ -90,6 +95,8 @@ mod tests {
         assert_eq!(wal.next_lsn(), Lsn::new(3));
 
         let lsn = wal
+            .appender(NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
             .append_put(
                 TenantId::new(1),
                 VShardId::new(0),
@@ -112,7 +119,9 @@ mod tests {
         let db = DatabaseId::DEFAULT;
 
         for i in 0..10u32 {
-            wal.append_put(t, v, db, format!("val-{i}").as_bytes())
+            wal.appender(NO_APPLY_KEY)
+                .with_event_source(crate::event::EventSource::User)
+                .append_put(t, v, db, format!("val-{i}").as_bytes())
                 .unwrap();
         }
         wal.sync().unwrap();
@@ -130,13 +139,15 @@ mod tests {
         let path = dir.path().join("wal_dir");
 
         let wal = WalManager::open_for_testing(&path).unwrap();
-        wal.append_put(
-            TenantId::new(1),
-            VShardId::new(0),
-            DatabaseId::DEFAULT,
-            b"data",
-        )
-        .unwrap();
+        wal.appender(NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
+            .append_put(
+                TenantId::new(1),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                b"data",
+            )
+            .unwrap();
         wal.sync().unwrap();
 
         let size = wal.total_size_bytes().unwrap();

@@ -7,7 +7,7 @@ use nodedb_sql::planner::bitmap_emit::predicate::BitmapHint;
 use nodedb_sql::types::SqlPlan;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::*;
 
 use super::super::aggregate::{
@@ -176,7 +176,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
     let left_bitmap = raw_left_bm.and_then(|h| bitmap_hint_to_plan(&h, db_id));
     let right_bitmap = raw_right_bm.and_then(|h| bitmap_hint_to_plan(&h, db_id));
 
-    let vshard = VShardId::from_collection_in_database(p.ctx.database_id, &left_collection);
+    let vshard =
+        nodedb_types::CollectionKey::from_qualified_str(p.ctx.database_id, &left_collection)?
+            .vshard();
 
     // Shuffle eligibility. A whole-join shuffle is only *structurally* valid
     // when BOTH sides are plain sharded user collections scanned by name — i.e.

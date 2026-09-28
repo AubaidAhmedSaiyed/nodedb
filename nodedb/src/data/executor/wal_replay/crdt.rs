@@ -151,7 +151,7 @@ impl CoreLoop {
                                 &payload.bytes,
                                 nodedb_types::Surrogate::new(surrogate),
                                 document_id,
-                                0,
+                                payload.peer_id,
                                 crate::engine::crdt::tenant_state::DeltaSigningAdmission {
                                     auth: nodedb_crdt::CrdtAuthContext {
                                         user_id: signing.auth_user_id,
@@ -169,7 +169,7 @@ impl CoreLoop {
                                 &payload.bytes,
                                 nodedb_types::Surrogate::new(surrogate),
                                 document_id,
-                                0,
+                                payload.peer_id,
                             ),
                         },
                         Err(e) => {
@@ -231,6 +231,7 @@ impl CoreLoop {
                             // The committed record remains a deterministic no-op
                             // whose collection floor advances on every replica.
                             warn!(core = self.core_id, tenant = tid.as_u64(), %collection, %reason, "CRDT WAL delta rejected during replay");
+                            self.store_replayed_dead_letter(database_id, tid, record.header.lsn);
                             None
                         }
                         crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Malformed => {
@@ -270,7 +271,7 @@ impl CoreLoop {
                             &payload.bytes,
                             nodedb_types::Surrogate::ZERO,
                             "",
-                            0,
+                            payload.peer_id,
                         ) {
                             crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Clean {
                                 ..
@@ -279,6 +280,7 @@ impl CoreLoop {
                                 reason,
                             ) => {
                                 warn!(core = self.core_id, tenant = tid.as_u64(), %collection, %reason, "legacy CRDT WAL delta rejected during replay");
+                                self.store_replayed_dead_letter(database_id, tid, record.header.lsn);
                                 None
                             }
                             crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Malformed => {
@@ -695,10 +697,20 @@ mod crdt_replay_tests {
     #[test]
     fn replay_crdt_wal_honors_database_scoped_collection_tombstones() {
         let tid = TenantId::new(7);
-        let dropped = make_crdt_record(1, tid, 0, "notes", "dropped-row");
-        let retained = make_crdt_record(2, tid, 0, "notes", "retained-row");
+        let dropped_db = crate::types::DatabaseId::new(1);
+        let retained_db = crate::types::DatabaseId::new(2);
+        // Records in a named database carry the database-qualified name.
+        let dropped_name = nodedb_types::QualifiedCollection::new(dropped_db, "notes");
+        let retained_name = nodedb_types::QualifiedCollection::new(retained_db, "notes");
+        let dropped = make_crdt_record(1, tid, 0, dropped_name.as_str(), "dropped-row");
+        let retained = make_crdt_record(2, tid, 0, retained_name.as_str(), "retained-row");
+        // The tombstone names the collection by its bare catalog name.
         let mut tombstones = nodedb_wal::TombstoneSet::new();
-        tombstones.insert(1, tid.as_u64(), "notes".to_string(), 2);
+        tombstones.insert(
+            nodedb_types::CollectionKey::from_bare(dropped_db, "notes"),
+            tid.as_u64(),
+            2,
+        );
 
         let mut h = make_core(0);
         h.core.replay_crdt_wal(&[dropped, retained], 1, &tombstones);
@@ -707,12 +719,12 @@ mod crdt_replay_tests {
             .core
             .get_crdt_engine(crate::types::DatabaseId::new(1), tid)
             .expect("dropped database engine");
-        assert!(!dropped_engine.row_exists("notes", "dropped-row"));
+        assert!(!dropped_engine.row_exists(dropped_name.as_str(), "dropped-row"));
         let retained_engine = h
             .core
             .get_crdt_engine(crate::types::DatabaseId::new(2), tid)
             .expect("retained database engine");
-        assert!(retained_engine.row_exists("notes", "retained-row"));
+        assert!(retained_engine.row_exists(retained_name.as_str(), "retained-row"));
     }
 
     #[test]
@@ -733,6 +745,97 @@ mod crdt_replay_tests {
         assert!(
             !engine.row_exists("notes", "row1"),
             "core 0 must not replay a record routed to core 1"
+        );
+    }
+
+    /// A `users` row record at `lsn` whose delta sets `email`.
+    fn email_record(
+        tid: TenantId,
+        row_id: &str,
+        email: &str,
+        peer: u64,
+        lsn: u64,
+    ) -> nodedb_wal::WalRecord {
+        let state = nodedb_crdt::state::CrdtState::new(peer).expect("state");
+        state
+            .upsert(
+                "users",
+                row_id,
+                &[("email", LoroValue::String(email.into()))],
+            )
+            .expect("upsert");
+        let payload = crate::wal::CrdtDeltaWalPayload::new(
+            state.export_snapshot().expect("snapshot"),
+            Some("users".into()),
+            None,
+            None,
+            Some(row_id.to_owned()),
+            Some(0),
+        )
+        .with_peer_id(peer);
+        nodedb_wal::WalRecord::new(nodedb_wal::WalRecordArgs {
+            record_type: RecordType::CrdtDelta as u32,
+            lsn,
+            tenant_id: tid.as_u64(),
+            vshard_id: 0,
+            database_id: DatabaseId::DEFAULT.as_u64(),
+            payload: payload.encode().expect("encode"),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("record")
+    }
+
+    /// A record whose delta a constraint rejects leaves one stored entry,
+    /// however often it replays.
+    #[test]
+    fn a_replayed_rejection_stores_one_dead_letter_for_its_record() {
+        let tid = TenantId::new(7);
+        let mut h = make_core(0);
+        {
+            let engine = h
+                .core
+                .get_crdt_engine(DatabaseId::DEFAULT, tid)
+                .expect("engine");
+            assert!(engine.set_collection_constraints(
+                "users",
+                1,
+                vec![nodedb_crdt::Constraint {
+                    name: "users_email_unique".into(),
+                    collection: "users".into(),
+                    field: "email".into(),
+                    kind: nodedb_crdt::ConstraintKind::Unique,
+                }],
+            ));
+            engine.set_collection_policy_typed(
+                "users",
+                nodedb_crdt::policy::CollectionPolicy::strict(),
+            );
+        }
+        let tombstones = nodedb_wal::TombstoneSet::new();
+        let records = [
+            email_record(tid, "a", "x@y.com", 2, 19),
+            email_record(tid, "b", "x@y.com", 3, 20),
+        ];
+        h.core.replay_crdt_wal(&records, 1, &tombstones);
+        h.core.replay_crdt_wal(&records[1..], 1, &tombstones);
+
+        let entries: Vec<_> = h
+            .core
+            .get_crdt_engine(DatabaseId::DEFAULT, tid)
+            .expect("engine")
+            .dead_letters()
+            .cloned()
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_lsn, Some(20));
+        assert_eq!(entries[0].peer_id, 3, "the entry names the producing peer");
+        assert_eq!(
+            h.core
+                .sparse
+                .load_crdt_dead_letters(DatabaseId::DEFAULT.as_u64(), tid.as_u64())
+                .expect("load"),
+            entries
         );
     }
 }

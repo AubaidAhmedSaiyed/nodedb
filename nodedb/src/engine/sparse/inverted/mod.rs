@@ -16,15 +16,23 @@
 mod compaction;
 mod core;
 mod corpus_stats;
+mod doc_image;
 mod doc_terms;
 mod errors;
 mod indexing;
+mod rebuild_install;
+mod rebuild_journal;
+mod rebuild_snapshot;
 mod removal;
 mod search;
 mod synonyms;
 
 pub use core::InvertedIndex;
+pub use doc_image::FtsDocImage;
 pub use indexing::IndexDocScope;
 pub use nodedb_fts::FtsSearchParams;
 pub use nodedb_fts::posting::{MatchOffset, Posting, QueryMode, TextSearchResult};
+pub use rebuild_install::{FtsInstallOutcome, FtsRebuildRefusal};
+pub use rebuild_journal::FTS_REBUILD_JOURNAL_MAX_DOCS;
+pub use rebuild_snapshot::{FtsRebuildTicket, FtsRebuilt, FtsSnapshot};
 pub use search::PhraseSearchParams;

@@ -73,9 +73,8 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
         for (coll, pk) in &inserts {
             let s = assigner
                 .assign(
-                    nodedb_types::DatabaseId::DEFAULT,
+                    nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, coll),
                     nodedb_types::TenantId::new(0),
-                    coll,
                     pk,
                 )
                 .unwrap();
@@ -120,9 +119,8 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
         assert_eq!(
             catalog
                 .get_surrogate_for_pk(
-                    nodedb_types::DatabaseId::DEFAULT,
+                    nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, coll),
                     nodedb_types::TenantId::new(0),
-                    coll,
                     pk
                 )
                 .unwrap(),
@@ -132,9 +130,8 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
         assert_eq!(
             catalog
                 .get_pk_for_surrogate(
-                    nodedb_types::DatabaseId::DEFAULT,
+                    nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, coll),
                     nodedb_types::TenantId::new(0),
-                    coll,
                     *surrogate
                 )
                 .unwrap(),
@@ -189,9 +186,11 @@ fn kill_restart_after_hwm_flush_threshold_recovers_via_alloc_record() {
             last_surrogate = Some(
                 assigner
                     .assign(
-                        nodedb_types::DatabaseId::DEFAULT,
+                        nodedb_types::CollectionKey::from_bare(
+                            nodedb_types::DatabaseId::DEFAULT,
+                            "users",
+                        ),
                         nodedb_types::TenantId::new(0),
-                        "users",
                         pk.as_bytes(),
                     )
                     .unwrap(),

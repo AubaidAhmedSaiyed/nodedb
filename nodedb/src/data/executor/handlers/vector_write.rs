@@ -5,7 +5,7 @@
 //! Extracted from `vector.rs` to keep file sizes within the 500-line limit.
 
 use nodedb_types::Surrogate;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -27,38 +27,21 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, %collection, dim, count = vectors.len(), "vector batch insert");
         let database_id = task.request.database_id.as_u64();
+        // Every vector is checked before any is inserted, so a dimension
+        // refusal applies nothing.
+        if let Some(bad) = vectors.iter().find(|vector| vector.len() != dim) {
+            return self.response_error(task, super::vector::dimension_mismatch(dim, bad.len()));
+        }
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, "");
+        // A committed-redo install seals once the whole record landed.
+        let defer_seal = self.recording_redo_undo();
         match self.get_or_create_vector_index(database_id, tid, collection, dim, "") {
             Ok(collection_ref) => {
-                for (i, vector) in vectors.iter().enumerate() {
-                    if vector.len() != dim {
-                        return self.response_error(
-                            task,
-                            ErrorCode::RejectedConstraint {
-                                detail: String::new(),
-                                constraint: format!(
-                                    "dimension mismatch in batch: expected {dim}, got {}",
-                                    vector.len()
-                                ),
-                            },
-                        );
-                    }
-                    let s = surrogates.get(i).copied().unwrap_or(Surrogate::ZERO);
-                    collection_ref.insert_with_surrogate(vector.clone(), s);
+                if let Err(e) = collection_ref.insert_batch_with_surrogates(vectors, surrogates) {
+                    return self.response_error(task, crate::Error::from(e));
                 }
-                // Advance the checkpoint watermark so a later vector checkpoint
-                // records these writes as absorbed; startup replay then skips the
-                // straddling WAL records instead of appending duplicate nodes.
-                if let Some(lsn) = task.wal_lsn() {
-                    collection_ref.note_checkpoint_lsn(lsn.as_u64());
-                }
-                let seal_key = CoreLoop::vector_build_key(&index_key);
-                if collection_ref.needs_seal()
-                    && let Some(req) = collection_ref.seal(&seal_key)
-                    && let Some(tx) = &self.build_tx
-                    && let Err(e) = tx.send(req)
-                {
-                    warn!(core = self.core_id, error = %e, "failed to send HNSW build request");
+                if !defer_seal {
+                    self.settle_vector_collection(&index_key);
                 }
                 self.checkpoint_coordinator
                     .mark_dirty("vector", vectors.len());
@@ -254,6 +237,28 @@ mod tests {
         })
     }
 
+    /// The funnel cancels the batch's record on a dimension refusal, so the
+    /// refusal must leave no vector of the batch behind.
+    #[test]
+    fn a_wrong_dimension_late_in_the_batch_inserts_no_vector() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(12);
+        let vectors = vec![vec![1.0, 2.0], vec![3.0, 4.0, 5.0]];
+        let surrogates = vec![Surrogate::new(1), Surrogate::new(2)];
+
+        let response =
+            h.core
+                .execute_vector_batch_insert(&task, 1, "docs", &vectors, 2, &surrogates);
+
+        assert_eq!(response.status, Status::Error);
+        let key = CoreLoop::vector_index_key(0, 1, "docs", "");
+        assert_eq!(
+            h.core.vector_collections.get(&key).map_or(0, |c| c.len()),
+            0,
+            "the vector before the bad one is not inserted"
+        );
+    }
+
     #[test]
     fn vector_delete_populates_collection_floor_only_not_vector_id_as_surrogate() {
         let mut h = make_core();
@@ -266,6 +271,7 @@ mod tests {
                 .get_or_create_vector_index(0, 1, "docs", 2, "")
                 .expect("create index");
             coll.insert_with_surrogate(vec![1.0, 2.0], surrogate)
+                .unwrap()
         };
         // The internal node id must differ from the surrogate for this test
         // to actually distinguish the two key spaces.

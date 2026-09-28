@@ -148,7 +148,7 @@ mod tests {
             .expect("build");
 
         let idx = coll.get(&"tenant_id=1".to_string()).unwrap();
-        let results = idx.search(&[2.0, 2.0, 2.0], 2, 32);
+        let results = idx.search(&[2.0, 2.0, 2.0], 2, 32).unwrap();
         assert!(!results.is_empty());
     }
 }

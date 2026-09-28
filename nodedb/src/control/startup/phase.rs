@@ -15,7 +15,7 @@ use std::fmt;
 
 /// Total number of phases. Kept in sync with the enum below by
 /// the `phase_order_matches_u8` unit test.
-pub const PHASE_COUNT: usize = 12;
+pub const PHASE_COUNT: usize = 13;
 
 /// Startup phase. Ordered — use `Ord` / `PartialOrd` to compare.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -52,9 +52,13 @@ pub enum StartupPhase {
     WarmPeers = 8,
     /// Health monitor running.
     HealthLoopStart = 9,
-    /// Listeners may now process accepted requests.
-    /// `StartupGate::await_phase(GatewayEnable)` resolves.
+    /// Cluster readiness completed: the node holds its first authorization
+    /// lease and its gateway is installed. Listener accept loops may process
+    /// requests once they exist. The client protocols do not listen yet.
     GatewayEnable = 10,
+    /// The client protocols listen and every HTTP route answers. The final
+    /// phase: the node is ready, and `/healthz` reports `ok`.
+    Serving = 11,
     /// Terminal state — entered via [`StartupSequencer::fail`] or
     /// when a [`ReadyGate`] is dropped without firing. All
     /// [`StartupGate::await_phase`] waiters wake with an error.
@@ -62,7 +66,7 @@ pub enum StartupPhase {
     /// [`StartupSequencer::fail`]: super::startup_sequencer::StartupSequencer::fail
     /// [`ReadyGate`]: super::gate::ReadyGate
     /// [`StartupGate::await_phase`]: super::gate::StartupGate::await_phase
-    Failed = 11,
+    Failed = 12,
 }
 
 impl StartupPhase {
@@ -81,6 +85,7 @@ impl StartupPhase {
             Self::WarmPeers => "warm_peers",
             Self::HealthLoopStart => "health_loop_start",
             Self::GatewayEnable => "gateway_enable",
+            Self::Serving => "serving",
             Self::Failed => "failed",
         }
     }
@@ -98,7 +103,8 @@ impl StartupPhase {
             Self::TransportBind => Some(Self::WarmPeers),
             Self::WarmPeers => Some(Self::HealthLoopStart),
             Self::HealthLoopStart => Some(Self::GatewayEnable),
-            Self::GatewayEnable => None,
+            Self::GatewayEnable => Some(Self::Serving),
+            Self::Serving => None,
             Self::Failed => None,
         }
     }
@@ -118,7 +124,8 @@ impl StartupPhase {
             8 => Some(Self::WarmPeers),
             9 => Some(Self::HealthLoopStart),
             10 => Some(Self::GatewayEnable),
-            11 => Some(Self::Failed),
+            11 => Some(Self::Serving),
+            12 => Some(Self::Failed),
             _ => None,
         }
     }
@@ -155,6 +162,7 @@ mod tests {
             StartupPhase::WarmPeers,
             StartupPhase::HealthLoopStart,
             StartupPhase::GatewayEnable,
+            StartupPhase::Serving,
             StartupPhase::Failed,
         ];
         assert_eq!(ordered.len(), PHASE_COUNT);
@@ -169,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn next_chain_terminates_at_gateway() {
+    fn next_chain_terminates_at_serving() {
         let mut cur = StartupPhase::Boot;
         let mut count = 1;
         while let Some(n) = cur.next() {
@@ -179,7 +187,7 @@ mod tests {
                 panic!("phase chain failed to terminate");
             }
         }
-        assert_eq!(cur, StartupPhase::GatewayEnable);
+        assert_eq!(cur, StartupPhase::Serving);
     }
 
     #[test]

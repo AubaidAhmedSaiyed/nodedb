@@ -17,6 +17,7 @@ use nodedb_types::vector_distance::DistanceMetric;
 use super::plaid::PlaidPruner;
 use super::scoring::budgeted_maxsim;
 use super::storage::MultiVectorStore;
+use crate::error::{VectorError, check_dim};
 
 /// Search a `MultiVectorStore` using budgeted MaxSim with optional PLAID
 /// candidate pruning.
@@ -30,7 +31,9 @@ use super::storage::MultiVectorStore;
 /// * `metric` — distance metric (Cosine recommended for MetaEmbed).
 ///
 /// # Returns
-/// A `Vec<(doc_id, score)>` sorted descending by score, length ≤ `k`.
+/// A `Vec<(doc_id, score)>` sorted descending by score, length ≤ `k`, or
+/// [`VectorError::DimensionMismatch`] when a query vector does not have the
+/// store dimension.
 pub fn meta_embed_search(
     store: &MultiVectorStore,
     plaid: Option<&PlaidPruner>,
@@ -38,9 +41,12 @@ pub fn meta_embed_search(
     budget: u8,
     k: usize,
     metric: DistanceMetric,
-) -> Vec<(u32, f32)> {
+) -> Result<Vec<(u32, f32)>, VectorError> {
+    for v in query {
+        check_dim(store.dim, v.len())?;
+    }
     if k == 0 || query.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Effective budget: 0 means use all query vectors.
@@ -52,7 +58,7 @@ pub fn meta_embed_search(
 
     // Determine candidate set.
     let candidate_ids: Vec<u32> = match plaid {
-        Some(pruner) => pruner.candidates(query),
+        Some(pruner) => pruner.candidates(query)?,
         None => store.iter().map(|doc| doc.doc_id).collect(),
     };
 
@@ -70,7 +76,7 @@ pub fn meta_embed_search(
     // Sort descending by score.
     scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
-    scored
+    Ok(scored)
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +114,8 @@ mod tests {
     fn search_returns_at_most_k_results() {
         let store = build_store(10, 4, 2);
         let query = vec![vec![1.0f32, 0.0, 0.0, 0.0]];
-        let results = meta_embed_search(&store, None, &query, 2, 3, DistanceMetric::Cosine);
+        let results =
+            meta_embed_search(&store, None, &query, 2, 3, DistanceMetric::Cosine).unwrap();
         assert!(results.len() <= 3);
     }
 
@@ -116,7 +123,8 @@ mod tests {
     fn search_results_sorted_descending() {
         let store = build_store(8, 4, 2);
         let query = vec![vec![1.0f32, 0.0, 0.0, 0.0]];
-        let results = meta_embed_search(&store, None, &query, 2, 8, DistanceMetric::Cosine);
+        let results =
+            meta_embed_search(&store, None, &query, 2, 8, DistanceMetric::Cosine).unwrap();
         for w in results.windows(2) {
             assert!(w[0].1 >= w[1].1, "not sorted: {:?}", results);
         }
@@ -130,9 +138,10 @@ mod tests {
         let pruner = PlaidPruner::train(&store, 3, 10, 99);
 
         let query = vec![vec![1.0f32, 0.0f32]];
-        let unfiltered = meta_embed_search(&store, None, &query, 2, 9, DistanceMetric::Cosine);
+        let unfiltered =
+            meta_embed_search(&store, None, &query, 2, 9, DistanceMetric::Cosine).unwrap();
         let filtered =
-            meta_embed_search(&store, Some(&pruner), &query, 2, 9, DistanceMetric::Cosine);
+            meta_embed_search(&store, Some(&pruner), &query, 2, 9, DistanceMetric::Cosine).unwrap();
 
         let unfiltered_ids: std::collections::HashSet<u32> =
             unfiltered.iter().map(|(id, _)| *id).collect();
@@ -148,7 +157,7 @@ mod tests {
     #[test]
     fn search_empty_query_returns_empty() {
         let store = build_store(5, 4, 2);
-        let results = meta_embed_search(&store, None, &[], 2, 5, DistanceMetric::Cosine);
+        let results = meta_embed_search(&store, None, &[], 2, 5, DistanceMetric::Cosine).unwrap();
         assert!(results.is_empty());
     }
 
@@ -156,7 +165,8 @@ mod tests {
     fn search_k_zero_returns_empty() {
         let store = build_store(5, 4, 2);
         let query = vec![vec![1.0f32, 0.0, 0.0, 0.0]];
-        let results = meta_embed_search(&store, None, &query, 2, 0, DistanceMetric::Cosine);
+        let results =
+            meta_embed_search(&store, None, &query, 2, 0, DistanceMetric::Cosine).unwrap();
         assert!(results.is_empty());
     }
 
@@ -166,8 +176,29 @@ mod tests {
         // Query is also in direction 0 — doc 0 should rank first.
         let store = build_store(4, 4, 1);
         let query = vec![vec![1.0f32, 0.0, 0.0, 0.0]];
-        let results = meta_embed_search(&store, None, &query, 1, 1, DistanceMetric::Cosine);
+        let results =
+            meta_embed_search(&store, None, &query, 1, 1, DistanceMetric::Cosine).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0, "expected doc_id=0 to be top result");
+    }
+
+    #[test]
+    fn wrong_dimension_query_is_a_typed_error() {
+        let store = build_store(4, 4, 2);
+        let pruner = PlaidPruner::train(&store, 2, 3, 7);
+        let query = vec![vec![1.0f32, 0.0, 0.0]];
+        for plaid in [None, Some(&pruner)] {
+            let result = meta_embed_search(&store, plaid, &query, 1, 2, DistanceMetric::Cosine);
+            assert!(
+                matches!(
+                    result,
+                    Err(VectorError::DimensionMismatch {
+                        expected: 4,
+                        got: 3
+                    })
+                ),
+                "{result:?}"
+            );
+        }
     }
 }

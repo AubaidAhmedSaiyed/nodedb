@@ -75,7 +75,7 @@ pub use adaptive_filter::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use builder::{BuildSender, CompleteReceiver};
 #[cfg(not(target_arch = "wasm32"))]
-pub use collection::{BuildComplete, BuildRequest, StorageTier, VectorCollection};
+pub use collection::{BuildComplete, BuildKind, BuildRequest, StorageTier, VectorCollection};
 pub use flat::FlatIndex;
 pub use index_config::{IndexConfig, IndexType};
 pub use ivf::{IvfPqIndex, IvfPqParams};

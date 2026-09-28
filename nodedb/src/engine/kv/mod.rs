@@ -4,7 +4,6 @@ mod batch_put;
 mod clock;
 pub mod engine;
 pub mod engine_atomic;
-pub mod engine_atomic_compute;
 mod engine_helpers;
 mod engine_index;
 mod engine_rename;
@@ -22,9 +21,13 @@ pub mod sorted_index;
 
 pub use batch_put::KvBatchPutParams;
 pub use clock::current_ms;
-pub use engine::{KvEngine, RestoreCompositeIndexParams, RestoreFieldIndexParams};
-pub use engine_atomic::{AtomicError, AtomicKeyCtx, CasResult, IncrAdmission, admit_any};
-pub use engine_atomic_compute as atomic_compute;
+pub use engine::{
+    KvEngine, KvEntryImage, KvKeyRef, RestoreCompositeIndexParams, RestoreFieldIndexParams,
+};
+pub use engine_atomic::{
+    AtomicAdmission, AtomicError, AtomicKeyCtx, CasResult, GetSetResult, IncrStep, Incremented,
+    admit_any,
+};
 pub use engine_index::RegisterIndexParams;
 pub use engine_rename::RenameCollectionParams;
 pub use engine_sorted::SortedIndexRangeParams;

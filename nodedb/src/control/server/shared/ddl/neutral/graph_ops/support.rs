@@ -36,11 +36,14 @@ pub(super) fn data_plane_verdict(
     if response.status != crate::bridge::envelope::Status::Error {
         return Ok(());
     }
-    let (_, sqlstate, message) = match response.error_code.as_deref() {
-        Some(code) => super::super::super::sqlstate::error_code_to_sqlstate(code),
-        None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-    };
-    Err(ddl_err(sqlstate, message))
+    Err(match response.error_code.as_deref() {
+        Some(code) => {
+            let (_, sqlstate, message) =
+                super::super::super::sqlstate::error_code_to_sqlstate(code);
+            ddl_err(sqlstate, message)
+        }
+        None => DdlError::internal("unknown data plane error"),
+    })
 }
 
 /// Gate a named collection on catalog `is_active`: a plain `DROP COLLECTION`

@@ -27,6 +27,41 @@ pub(in crate::data::executor) fn sort_rows(
     sort_rows_by_expression(rows, sort_keys)
 }
 
+/// Sort decoded document rows by the ORDER BY terms, with the same ordering
+/// rules [`sort_rows`] applies to stored rows.
+///
+/// A scan with window functions sorts after the window pass, so ORDER BY can
+/// name a window alias; its rows are decoded by then. Each row is encoded
+/// once under its position, sorted by [`sort_rows`], and taken back in the
+/// sorted order.
+pub(in crate::data::executor) fn sort_decoded_rows(
+    rows: Vec<(String, serde_json::Value)>,
+    sort_keys: &[SortKeySpec],
+) -> crate::Result<Vec<(String, serde_json::Value)>> {
+    if sort_keys.is_empty() {
+        return Ok(rows);
+    }
+    let mut keyed: Vec<(String, Vec<u8>)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (_, doc))| (i.to_string(), nodedb_types::json_to_msgpack_or_empty(doc)))
+        .collect();
+    sort_rows(&mut keyed, sort_keys)?;
+    let mut slots: Vec<Option<(String, serde_json::Value)>> = rows.into_iter().map(Some).collect();
+    keyed
+        .iter()
+        .map(|(position, _)| {
+            position
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| slots.get_mut(i).and_then(Option::take))
+                .ok_or_else(|| crate::Error::Internal {
+                    detail: format!("sort_decoded_rows: row position {position} is not a live row"),
+                })
+        })
+        .collect()
+}
+
 /// Zero-decode path: every key names a stored field, so ordering is decided
 /// straight from the msgpack bytes.
 fn sort_rows_by_column(
@@ -175,6 +210,21 @@ mod tests {
         sort_rows(&mut rows, &[col("val", true)]).expect("sort_rows failed");
         let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(order, vec!["b", "c", "a"], "ASC by val: 10, 20, 30");
+    }
+
+    /// Decoded rows sort on a field the window pass appended, and keep their
+    /// document ids.
+    #[test]
+    fn sort_decoded_rows_orders_by_an_appended_column() {
+        let rows = vec![
+            ("a".to_string(), serde_json::json!({"id": "a", "rn": 3})),
+            ("b".to_string(), serde_json::json!({"id": "b", "rn": 1})),
+            ("c".to_string(), serde_json::json!({"id": "c", "rn": 2})),
+        ];
+        let sorted = sort_decoded_rows(rows, &[col("rn", true)]).expect("sort_decoded_rows");
+        let order: Vec<&str> = sorted.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, vec!["b", "c", "a"]);
+        assert_eq!(sorted[0].1, serde_json::json!({"id": "b", "rn": 1}));
     }
 
     #[test]

@@ -21,7 +21,6 @@ use crate::data::executor::response_codec::{
     flatten_hybrid_hits_to_relational_rows, flatten_to_relational_rows,
     flatten_vector_hits_to_relational_rows,
 };
-use crate::types::VShardId;
 
 use super::dispatch::{ResolveCtx, resolve_exchange};
 use super::entry::Resolved;
@@ -214,7 +213,7 @@ pub(super) async fn materialize_child_rows(
             tenant_id,
             database_id,
             child,
-            VShardId::from_collection_in_database(database_id, ""),
+            nodedb_types::CollectionKey::from_bare(database_id, "").vshard(),
             trace_id,
             txn_id,
         )

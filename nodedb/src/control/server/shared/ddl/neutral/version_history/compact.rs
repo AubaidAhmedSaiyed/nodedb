@@ -49,7 +49,7 @@ pub async fn compact_history(
     );
     let record = catalog
         .get_checkpoint(doc, &checkpoint_name)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| {
             err(
                 "42704",
@@ -61,7 +61,7 @@ pub async fn compact_history(
     // row count, and the audit line names how many rows it removes.
     let deleted = catalog
         .count_checkpoints_before(doc, record.created_at)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     let outcome = super::replicate::propose_compact_history(
         state,
         doc,

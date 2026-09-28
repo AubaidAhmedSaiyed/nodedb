@@ -67,14 +67,15 @@ impl nodedb_cluster::AssignRemoteSurrogate for RegistryAssignRemoteSurrogate {
     async fn on_assign_surrogate(&self, req: AssignSurrogateRequest) -> AssignSurrogateResponse {
         let database_id = DatabaseId::from(req.database_id);
         let tenant_id = TenantId::new(req.tenant_id);
+        // The request carries the bare catalog name.
+        let key = nodedb_types::CollectionKey::from_bare(database_id, &req.collection);
 
         if req.lookup_only == Some(true) {
-            return match self.state.surrogate_assigner.lookup(
-                database_id,
-                tenant_id,
-                &req.collection,
-                &req.pk,
-            ) {
+            return match self
+                .state
+                .surrogate_assigner
+                .lookup(key, tenant_id, &req.pk)
+            {
                 Ok(Some(surrogate)) => AssignSurrogateResponse {
                     surrogate: surrogate.as_u32(),
                     error: None,
@@ -99,7 +100,7 @@ impl nodedb_cluster::AssignRemoteSurrogate for RegistryAssignRemoteSurrogate {
         match self
             .state
             .surrogate_assigner
-            .assign(database_id, tenant_id, &req.collection, &req.pk)
+            .assign(key, tenant_id, &req.pk)
         {
             Ok(surrogate) => AssignSurrogateResponse {
                 surrogate: surrogate.as_u32(),

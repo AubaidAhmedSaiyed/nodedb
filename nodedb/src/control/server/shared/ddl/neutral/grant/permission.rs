@@ -33,7 +33,9 @@ use super::support::{require_tenant_admin, status};
 /// names that resolve to neither, so unresolved typos don't sink into the
 /// store as silently unenforceable rows.
 fn canonicalize_grantee(state: &SharedState, raw: &str) -> Result<String, DdlError> {
-    if state.credentials.get_user(raw).is_some() {
+    // Users and roles the statement sees: created earlier in the
+    // transaction counts, dropped earlier in it does not.
+    if super::super::role_checks::visible_user(state, raw).is_some() {
         return Ok(format!("user:{raw}"));
     }
     let parsed: Role = match raw.parse() {
@@ -41,7 +43,7 @@ fn canonicalize_grantee(state: &SharedState, raw: &str) -> Result<String, DdlErr
         Err(e) => match e {},
     };
     let is_known_role = match &parsed {
-        Role::Custom(name) => state.roles.get_role(name).is_some(),
+        Role::Custom(name) => super::super::role_checks::visible_roles(state).contains_key(name),
         _ => true,
     };
     if is_known_role {
@@ -65,13 +67,13 @@ fn propose_grant(
         .prepare_permission(target, grantee, perm, granted_by);
     let entry = CatalogEntry::PutPermission(Box::new(stored.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .put_permission(&stored)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state.permissions.install_replicated_permission(&stored);
     }
@@ -91,13 +93,13 @@ fn propose_revoke(
         permission: perm_str.clone(),
     };
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .delete_permission(target, grantee, &perm_str)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
         state
             .permissions
@@ -117,7 +119,7 @@ fn resolve_tenant_id(state: &SharedState, name: &str) -> Result<TenantId, DdlErr
     let catalog = state.credentials.catalog();
     let tenants = catalog
         .load_all_tenants()
-        .map_err(|e| DdlError::new("XX000", format!("tenant lookup: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("tenant lookup", &e))?;
     tenants
         .into_iter()
         .find(|t| t.name.eq_ignore_ascii_case(name))

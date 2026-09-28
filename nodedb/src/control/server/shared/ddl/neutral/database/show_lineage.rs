@@ -42,7 +42,7 @@ pub fn show_database_lineage(
 
     let start_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     // Walk the parent_clone chain, bounded by MAX_CLONE_DEPTH to prevent
@@ -54,12 +54,12 @@ pub fn show_database_lineage(
     for _ in 0..max_hops {
         let desc = catalog
             .get_database(current_id)
-            .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?
+            .map_err(|e| DdlError::from_error_in_context("catalog read failed", &e))?
             .ok_or_else(|| {
-                ddl_err(
-                    "XX000",
-                    format!("database id {} descriptor missing", current_id.as_u64()),
-                )
+                DdlError::internal(format!(
+                    "database id {} descriptor missing",
+                    current_id.as_u64()
+                ))
             })?;
 
         let (as_of_lsn, clone_created_at_lsn) = match &desc.parent_clone {

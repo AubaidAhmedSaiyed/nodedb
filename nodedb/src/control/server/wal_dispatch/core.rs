@@ -5,13 +5,14 @@
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::credential::CredentialStore;
 use crate::types::{DatabaseId, TenantId, VShardId};
-use crate::wal::manager::WalManager;
+use crate::wal::manager::{NO_APPLY_KEY, WalAppender, WalManager};
 
 use super::super::wal_dispatch_kv;
 
 /// Outcome of [`wal_append_if_write`] / [`wal_append_if_write_with_creds`]:
 /// the allocated WAL LSN (if a durable record was appended) and, for a
-/// TTL-bearing KV write, the wall-clock instant resolved at append time.
+/// TTL-bearing KV write or a timeseries ingest, the wall-clock instant
+/// resolved at append time.
 ///
 /// `resolved_now_ms` mirrors `lsn`'s cross-plane contract: the caller stamps
 /// it onto the dispatched `Request` (via `WriteDispatch` / `DataPlaneDispatch`)
@@ -29,8 +30,8 @@ pub struct WalAppendOutcome {
     /// WAL-bypassed writes.
     pub lsn: Option<crate::types::Lsn>,
     /// Wall-clock instant (ms since epoch) resolved for a TTL-bearing KV
-    /// write's `expire_at_ms`. `None` for every non-KV plan and every KV write
-    /// without a TTL.
+    /// write's `expire_at_ms`, or a timeseries ingest's untimed rows. `None`
+    /// for every other write.
     pub resolved_now_ms: Option<u64>,
 }
 
@@ -38,7 +39,12 @@ pub struct WalAppendOutcome {
 /// redo record is to be encoded, and the two optional knobs only some callers
 /// need.
 pub struct WalAppendRequest<'a> {
-    pub wal: &'a WalManager,
+    /// The appender, which names the apply key every appended record carries.
+    pub wal: WalAppender<'a>,
+    /// The event source the write runs with. Every row-write record it
+    /// appends carries it, so WAL replay rebuilds the event the live write
+    /// emits.
+    pub event_source: crate::event::EventSource,
     pub tenant_id: TenantId,
     pub vshard_id: VShardId,
     pub database_id: DatabaseId,
@@ -46,19 +52,23 @@ pub struct WalAppendRequest<'a> {
     /// Credential store for the timeseries `wal=false` bypass check.
     pub credentials: Option<&'a CredentialStore>,
     /// Wall-clock instant (ms since epoch) to resolve a TTL-bearing KV write's
-    /// `expire_at_ms` against, instead of reading this node's clock. `Some`
-    /// only when the instant was decided elsewhere and the durable record must
-    /// carry that exact value: a Raft-committed entry carries the instant the
-    /// proposing node resolved, and every replica's redo record — like every
-    /// replica's live apply — must install it verbatim, or a replica's WAL
-    /// replay resurrects a different `expire_at_ms` than its peers.
+    /// `expire_at_ms`, or a timeseries ingest's untimed rows, against, instead
+    /// of reading this node's clock. `Some` only when the instant was decided
+    /// elsewhere and the durable record must carry that exact value: a
+    /// Raft-committed entry carries the instant the proposing node resolved,
+    /// and every replica's redo record — like every replica's live apply —
+    /// must install it verbatim, or a replica's WAL replay resurrects a
+    /// different value than its peers.
     pub now_override: Option<u64>,
 }
 
-/// Append a write operation to the WAL for single-node durability.
+/// Append a client autocommit write to the WAL for single-node durability.
 ///
 /// Serializes the write as MessagePack and appends to the appropriate
 /// WAL record type. Read operations are no-ops (return Ok immediately).
+/// The records carry no apply key: no replicated proposal owns them. Row-write
+/// records carry `EventSource::User`. Any other write goes through
+/// [`wal_append`] and names its own source.
 ///
 /// Returns the WAL LSN allocated for writes it appended (`Some`), or `None`
 /// for reads / control ops that need no WAL record. The caller stamps the
@@ -87,7 +97,9 @@ pub fn wal_append_if_write_with_creds(
     credentials: Option<&CredentialStore>,
 ) -> crate::Result<WalAppendOutcome> {
     wal_append(WalAppendRequest {
-        wal,
+        wal: wal.appender(NO_APPLY_KEY),
+        // This entry point appends a client autocommit write.
+        event_source: crate::event::EventSource::User,
         tenant_id,
         vshard_id,
         database_id,
@@ -105,6 +117,7 @@ pub fn wal_append_if_write_with_creds(
 pub fn wal_append(req: WalAppendRequest<'_>) -> crate::Result<WalAppendOutcome> {
     let WalAppendRequest {
         wal,
+        event_source,
         tenant_id,
         vshard_id,
         database_id,
@@ -112,6 +125,7 @@ pub fn wal_append(req: WalAppendRequest<'_>) -> crate::Result<WalAppendOutcome> 
         credentials,
         now_override,
     } = req;
+    let wal = wal.with_event_source(event_source);
     let mut resolved_now_ms: Option<u64> = None;
     // Every engine routes through one exhaustive per-engine match (no `_`
     // catch-all anywhere, enforced by `deny(wildcard_enum_match_arm)`), so a
@@ -133,16 +147,24 @@ pub fn wal_append(req: WalAppendRequest<'_>) -> crate::Result<WalAppendOutcome> 
         PhysicalPlan::Columnar(op) => {
             super::columnar::wal_append_columnar_op(wal, tenant_id, vshard_id, database_id, op)?
         }
-        PhysicalPlan::Timeseries(op) => super::timeseries::wal_append_timeseries_op(
-            wal,
-            tenant_id,
-            vshard_id,
-            database_id,
-            op,
-            credentials,
-        )?,
-        // KV write operations — delegated to wal_dispatch_kv. The only engine
-        // that resolves a wall-clock instant (TTL `expire_at_ms`), threaded back
+        // A timeseries ingest resolves the instant its untimed rows take,
+        // threaded back out via `resolved_now_ms`.
+        PhysicalPlan::Timeseries(op) => {
+            let outcome =
+                super::timeseries::wal_append_timeseries_op(super::timeseries::TimeseriesAppend {
+                    wal,
+                    tenant_id,
+                    vshard_id,
+                    database_id,
+                    op,
+                    credentials,
+                    now_override,
+                })?;
+            resolved_now_ms = outcome.resolved_now_ms;
+            outcome.lsn
+        }
+        // KV write operations — delegated to wal_dispatch_kv. A TTL-bearing
+        // write resolves a wall-clock instant (`expire_at_ms`), threaded back
         // out via `resolved_now_ms`.
         PhysicalPlan::Kv(kv_op) => {
             let outcome = wal_dispatch_kv::wal_append_kv_op(
@@ -165,6 +187,12 @@ pub fn wal_append(req: WalAppendRequest<'_>) -> crate::Result<WalAppendOutcome> 
         PhysicalPlan::Spatial(op) => {
             super::spatial::wal_append_spatial_op(wal, tenant_id, vshard_id, database_id, op)?
         }
+        // A committed transaction's redo record: one `TransactionRedo` WAL
+        // record per apply, on every replica, in apply order.
+        PhysicalPlan::Meta(nodedb_physical::physical_plan::MetaOp::ApplyTransactionRedo {
+            redo,
+            ..
+        }) => Some(wal.append_transaction_redo_bytes(tenant_id, vshard_id, database_id, redo)?),
         // NotAWrite — reads / query ops / control commands. `Meta` durable
         // writes (WAL append, transaction batch, Calvin apply) are logged on
         // their own dedicated paths, never through this autocommit oracle;
@@ -208,6 +236,40 @@ mod tests {
                     == Some(record_type)
             })
             .expect("expected record of this type")
+    }
+
+    #[test]
+    fn committed_redo_apply_appends_its_redo_record_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let redo = crate::wal::RedoRecord {
+            version: 1,
+            ops: Vec::new(),
+            calvin_stamp: None,
+        }
+        .to_bytes()
+        .expect("encode redo");
+        let plan = PhysicalPlan::Meta(
+            nodedb_physical::physical_plan::MetaOp::ApplyTransactionRedo {
+                redo: redo.clone(),
+                collections: Vec::new(),
+                sum_targets: Vec::new(),
+                origin: nodedb_physical::physical_plan::RedoOrigin::Commit,
+            },
+        );
+
+        let outcome = wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append");
+        assert!(outcome.lsn.is_some(), "the redo apply must mint an LSN");
+
+        let record = last_record_of_type(&wal, nodedb_wal::record::RecordType::TransactionRedo);
+        assert_eq!(record.payload, redo);
     }
 
     #[test]

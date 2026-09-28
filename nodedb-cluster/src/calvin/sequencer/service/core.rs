@@ -509,6 +509,7 @@ fn entry_txn_count(entry: &SequencerEntry) -> usize {
         SequencerEntry::AbortVerdict { .. } => 0,
         SequencerEntry::ReserveRead { .. } => 0,
         SequencerEntry::ReleaseReservation { .. } => 0,
+        SequencerEntry::CutMarker { .. } => 0,
     }
 }
 
@@ -531,14 +532,16 @@ mod tests {
     use crate::routing::RoutingTable;
     use nodedb_types::{
         TenantId,
-        id::{DatabaseId, VShardId},
+        id::{CollectionKey, DatabaseId},
     };
 
     fn find_two_distinct_collections() -> (String, String) {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..512 {
             let name = format!("col_{i}");
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             if let Some((ref fname, fv)) = first {
                 if fv != vshard {
                     return (fname.clone(), name);

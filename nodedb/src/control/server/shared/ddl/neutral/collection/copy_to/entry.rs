@@ -127,9 +127,9 @@ fn check_collection_exists(
             "42P01",
             format!("COPY TO: collection \"{collection}\" does not exist"),
         )),
-        Err(e) => Err(ddl_err(
-            "XX000",
-            format!("COPY TO: catalog lookup failed: {e}"),
+        Err(e) => Err(DdlError::from_error_in_context(
+            "COPY TO: catalog lookup failed",
+            &e,
         )),
     }
 }
@@ -194,7 +194,7 @@ async fn execute_and_collect(
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| ddl_err("XX000", format!("COPY TO: dispatch failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("COPY TO: dispatch failed", &e))?;
 
         if resp.payload.is_empty() {
             continue;
@@ -224,12 +224,8 @@ fn extract_json_rows(
     if json.is_empty() {
         return Ok(());
     }
-    let mut parsed: serde_json::Value = sonic_rs::from_str(json).map_err(|e| {
-        ddl_err(
-            "XX000",
-            format!("COPY TO: failed to decode result rows: {e}"),
-        )
-    })?;
+    let mut parsed: serde_json::Value = sonic_rs::from_str(json)
+        .map_err(|e| DdlError::internal(format!("COPY TO: failed to decode result rows: {e}")))?;
     redact_decoded_value(Some(redaction), store, &mut parsed);
     match parsed {
         serde_json::Value::Array(items) => {

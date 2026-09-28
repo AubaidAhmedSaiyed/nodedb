@@ -4,6 +4,7 @@
 
 mod apply;
 mod authorize;
+mod compensation;
 mod outcome;
 mod peer_identity;
 mod signature;

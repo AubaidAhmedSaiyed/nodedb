@@ -5,7 +5,7 @@
 //! Separated from `vector.rs` (write handlers) by concern:
 //! write handlers deal with inserts/deletes, these deal with index management.
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -42,44 +42,11 @@ impl CoreLoop {
         );
 
         let Some(coll) = self.vector_collections.get(&index_key) else {
-            // Check IVF index as fallback.
-            if let Some(ivf) = self.ivf_indexes.get(&index_key) {
-                let stats = nodedb_types::VectorIndexStats {
-                    sealed_count: 0,
-                    building_count: 0,
-                    growing_vectors: ivf.len(),
-                    sealed_vectors: 0,
-                    live_count: ivf.len(),
-                    tombstone_count: 0,
-                    tombstone_ratio: 0.0,
-                    quantization: nodedb_types::VectorIndexQuantization::Pq,
-                    memory_bytes: 0,
-                    disk_bytes: 0,
-                    build_in_progress: false,
-                    index_type: nodedb_types::VectorIndexType::IvfPq,
-                    hnsw_m: 0,
-                    hnsw_m0: 0,
-                    hnsw_ef_construction: 0,
-                    metric: "l2".into(),
-                    dimensions: ivf.dim(),
-                    seal_threshold: 0,
-                    mmap_segment_count: 0,
-                    arena_bytes: None,
-                };
-                return match zerompk::to_msgpack_vec(&stats) {
-                    Ok(bytes) => self.response_with_payload(task, bytes),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("serialize stats: {e}"),
-                        },
-                    ),
-                };
-            }
             return self.response_error(task, ErrorCode::NotFound);
         };
 
         let mut stats = coll.stats();
+        stats.builds_queued = self.vector_builds.pending_for(&index_key);
         // Populate arena_bytes from the per-collection arena registry.
         // Only set when the collection was assigned a dedicated arena
         // (vector-primary collections) and the registry is wired.
@@ -100,7 +67,7 @@ impl CoreLoop {
         }
     }
 
-    /// Force-seal the growing segment, triggering background HNSW build.
+    /// Force-seal the growing segment and queue its HNSW build.
     pub(in crate::data::executor) fn execute_vector_seal(
         &mut self,
         task: &ExecutionTask,
@@ -128,12 +95,8 @@ impl CoreLoop {
         let seal_key = CoreLoop::vector_build_key(&index_key);
         match coll.seal(&seal_key) {
             Some(req) => {
-                if let Some(tx) = &self.build_tx
-                    && let Err(e) = tx.send(req)
-                {
-                    warn!(core = self.core_id, error = %e, "failed to send HNSW build request after seal");
-                }
-                info!(core = self.core_id, key = %seal_key, "growing segment sealed, HNSW build dispatched");
+                self.queue_sealed_build(&index_key, req);
+                info!(core = self.core_id, key = %seal_key, "growing segment sealed, HNSW build queued");
                 self.checkpoint_coordinator.mark_dirty("vector", 1);
                 self.response_ok(task)
             }
@@ -192,7 +155,7 @@ impl CoreLoop {
         &mut self,
         params: VectorRebuildParams<'_>,
     ) -> Response {
-        use crate::engine::vector::hnsw::{HnswIndex, HnswParams};
+        use crate::engine::vector::hnsw::HnswParams;
 
         let VectorRebuildParams {
             task,
@@ -232,80 +195,22 @@ impl CoreLoop {
             metric: current.metric,
             dtype: current.dtype,
         };
-
         coll.set_params(new_params.clone());
+        self.vector_params
+            .insert(index_key.clone(), new_params.clone());
 
-        // Rebuild each sealed segment in-place with the new params.
-        // Each segment is rebuilt atomically: new index is constructed fully
-        // before swapping, so a failure leaves the old segment intact.
-        let mut rebuilt_count = 0usize;
-        for seg in coll.sealed_segments_mut() {
-            let vectors = match seg.index.export_vectors() {
-                Ok(v) => v,
-                Err(e) => {
-                    // Leave the segment on the old params rather than rebuild
-                    // it from vectors we could not read.
-                    warn!(
-                        core = self.core_id,
-                        key = &index_key.2,
-                        error = %e,
-                        "rebuild: vector export failed, skipping segment"
-                    );
-                    continue;
-                }
-            };
-            if vectors.is_empty() {
-                continue;
-            }
-            let dim = seg.index.dim();
-            let expected_count = vectors.len();
-            let mut new_index = HnswIndex::new(dim, new_params.clone());
-            for v in &vectors {
-                new_index
-                    .insert(v.clone())
-                    .unwrap_or_else(|e| tracing::error!(error = %e, "HNSW rebuild insert failed"));
-            }
-            // Verify all vectors were inserted before swapping.
-            if new_index.len() != expected_count {
-                warn!(
-                    core = self.core_id,
-                    key = &index_key.2,
-                    expected = expected_count,
-                    actual = new_index.len(),
-                    "rebuild: vector count mismatch, skipping segment"
-                );
-                continue;
-            }
-            seg.index = new_index;
-            // Rebuild SQ8 for the new index.
-            seg.sq8 = super::super::handlers::vector_lifecycle::rebuild_sq8(&seg.index);
-            rebuilt_count += 1;
-        }
-
+        // Each sealed segment is rebuilt on the builder thread with its ids
+        // kept, then swapped in on this core; search reads the old graph until
+        // then. Segments sealed later build under the new params too.
+        let queued = self.queue_vector_rebuild(&index_key);
         info!(
             core = self.core_id,
             key = &index_key.2,
-            rebuilt_count,
+            queued,
             m = new_params.m,
             ef = new_params.ef_construction,
-            "vector index rebuild complete"
+            "vector index rebuild queued"
         );
-
-        self.checkpoint_coordinator
-            .mark_dirty("vector", rebuilt_count);
-
-        // Also update the stored params for this key.
-        self.vector_params.insert(index_key, new_params);
-
         self.response_ok(task)
     }
-}
-
-/// Rebuild SQ8 quantized data for an HNSW index.
-///
-/// Public within the handler module so `execute_vector_rebuild` can call it.
-pub(in crate::data::executor) fn rebuild_sq8(
-    index: &crate::engine::vector::hnsw::HnswIndex,
-) -> Option<(crate::engine::vector::quantize::sq8::Sq8Codec, Vec<u8>)> {
-    crate::engine::vector::collection::VectorCollection::build_sq8_for_index(index)
 }

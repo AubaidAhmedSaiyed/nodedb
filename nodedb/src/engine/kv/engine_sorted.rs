@@ -52,9 +52,22 @@ impl KvEngine {
             .entry(tkey)
             .or_insert_with(|| collection.to_string());
 
-        // Collect existing entries from the hash table for backfill.
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-            .tables
+        let entries = self.collection_rows(database_id, tenant_id, collection, now_ms);
+        self.sorted_indexes
+            .register(database_id, tenant_id, def, entries.into_iter())
+    }
+
+    /// Every live `(key, value)` row of one collection, the rows a sorted
+    /// index is built from. Empty when the collection holds no rows.
+    pub fn collection_rows(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        now_ms: u64,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let tkey = table_key(database_id, tenant_id, collection);
+        self.tables
             .get(&tkey)
             .map(|t| {
                 let (entries, _) = t.scan(0, usize::MAX, now_ms, None);
@@ -63,10 +76,7 @@ impl KvEngine {
                     .map(|(k, v)| (k.to_vec(), v.to_vec()))
                     .collect()
             })
-            .unwrap_or_default();
-
-        self.sorted_indexes
-            .register(database_id, tenant_id, def, entries.into_iter())
+            .unwrap_or_default()
     }
 
     /// Drop a sorted index. Returns `true` if it existed.
@@ -348,9 +358,14 @@ mod tests {
             // `ttl_ms == 0` preserves whatever TTL the key already has, so the
             // increment under test is the only thing this write changes.
             0,
+            &nodedb_physical::physical_plan::KvCounterShape::Raw,
             &admit_any,
         );
-        assert_eq!(updated.ok(), Some(99), "p1's score must become 10 + 89");
+        assert_eq!(
+            updated.ok().map(|result| result.value),
+            Some(99),
+            "p1's score must become 10 + 89"
+        );
 
         assert_eq!(
             ranked_keys(e.sorted_index_top_k(0, 1, "lb", 10, n)),

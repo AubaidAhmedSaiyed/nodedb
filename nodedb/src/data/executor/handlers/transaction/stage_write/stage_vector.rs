@@ -12,8 +12,9 @@
 //! same-transaction point read or scan renders the sidecar. Each op decides
 //! its outcome against BASE ∪ OVERLAY with the live handler's own rules:
 //! a duplicate key refuses, `ON CONFLICT DO NOTHING` skips, a conflict
-//! patch merges through the live handler's merge. COMMIT replays the
-//! buffered plan through the live handler, which stays the durable apply.
+//! patch merges through the live handler's merge. COMMIT resolves the staged
+//! row into the transaction's redo record (`resolve::vector_primary`), and
+//! every replica installs exactly that row.
 
 use std::collections::HashMap;
 
@@ -276,13 +277,9 @@ impl CoreLoop {
         if let Some(dim) = declared_dim
             && dim != spec.dim
         {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!(
-                    "vector dimension mismatch: collection declares {dim}, got {}",
-                    spec.dim
-                ),
-            });
+            return Err(crate::data::executor::handlers::vector::dimension_mismatch(
+                dim, spec.dim,
+            ));
         }
         Ok(CoreLoop::vector_index_key(
             ctx.database_id,

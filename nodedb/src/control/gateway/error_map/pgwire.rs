@@ -34,15 +34,15 @@ mod tests {
     #[test]
     fn pgwire_deadline() {
         let (code, _) = GatewayErrorMap::to_pgwire(&deadline());
-        assert_eq!(code, sqlstate::QUERY_CANCELED);
+        assert_eq!(code, sqlstate::QUERY_CANCELED.0);
     }
 
-    /// Both paths answer `INTERNAL_ERROR` from the shared table, with the
-    /// variant's own message naming the descriptor.
+    /// Both paths answer `SERIALIZATION_FAILURE`, the SQLSTATE a client
+    /// retries on, with the variant's own message naming the descriptor.
     #[test]
     fn pgwire_schema_changed() {
         let (code, msg) = GatewayErrorMap::to_pgwire(&schema_changed());
-        assert_eq!(code, sqlstate::INTERNAL_ERROR);
+        assert_eq!(code, sqlstate::SERIALIZATION_FAILURE);
         assert!(msg.contains("users"));
     }
 
@@ -106,6 +106,9 @@ mod tests {
                 column: "x".into(),
             },
             Error::DivisionByZero,
+            Error::DataException {
+                detail: "vector_distance(): vector dimension mismatch: expected 3, got 2".into(),
+            },
             Error::InvalidLimitValue {
                 clause: "LIMIT",
                 value: "-1".into(),
@@ -159,6 +162,12 @@ mod tests {
                 actual: 2,
             },
             Error::BackupKeyMismatch,
+            Error::DispatchCapacity {
+                scope: crate::DispatchCapacityScope::QueueFull {
+                    core_id: 0,
+                    capacity: 4,
+                },
+            },
         ];
 
         for err in samples {

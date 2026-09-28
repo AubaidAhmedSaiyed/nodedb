@@ -11,7 +11,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
@@ -51,7 +51,7 @@ pub async fn verify_balance(
     let catalog = state.credentials.catalog();
     let coll = catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)
-        .map_err(|e| err("XX000", &e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{collection}' not found")))?;
 
     let Some(mat_def) = coll
@@ -70,7 +70,7 @@ pub async fn verify_balance(
     gate.refuse_if_any_redaction(&mat_def.source_collection, "the balance verification")?;
 
     // Scan all target rows.
-    let target_vshard = VShardId::from_collection_in_database(database_id, &collection);
+    let target_vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
     let mut target_scan =
         PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
             collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
@@ -96,7 +96,7 @@ pub async fn verify_balance(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| err("XX000", &format!("target scan failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("target scan failed", &e))?;
     let target_json =
         crate::data::executor::response_codec::decode_payload_to_json(&target_resp.payload);
     let target_docs: Vec<serde_json::Value> = sonic_rs::from_str(&target_json)
@@ -107,7 +107,7 @@ pub async fn verify_balance(
 
     // Scan all source rows.
     let source_vshard =
-        VShardId::from_collection_in_database(database_id, &mat_def.source_collection);
+        nodedb_types::CollectionKey::from_bare(database_id, &mat_def.source_collection).vshard();
     let mut source_scan =
         PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
             collection: nodedb_types::QualifiedCollection::new(
@@ -136,7 +136,7 @@ pub async fn verify_balance(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| err("XX000", &format!("source scan failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("source scan failed", &e))?;
     let source_json =
         crate::data::executor::response_codec::decode_payload_to_json(&source_resp.payload);
     let source_docs: Vec<serde_json::Value> = sonic_rs::from_str(&source_json)

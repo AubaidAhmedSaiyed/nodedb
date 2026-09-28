@@ -16,6 +16,11 @@ pub enum CalvinError {
     )]
     SingleVshardTxn { vshard: u32 },
 
+    /// A key-set collection name lacks the qualifier of the transaction's
+    /// database, so its vShard cannot be derived.
+    #[error("calvin key set: {0}")]
+    CollectionKey(#[from] nodedb_types::CollectionKeyError),
+
     /// A sequencer-layer error. See [`crate::calvin::sequencer::error::SequencerError`]
     /// for the full variant set.
     #[error("sequencer error: {0}")]
@@ -106,12 +111,22 @@ pub enum ClusterError {
     /// `dispatch_remote_stream`). `detail` is the `Debug` rendering for logs.
     #[error("streaming execution terminal error: {detail}")]
     StreamTerminal {
-        error: crate::rpc_codec::TypedClusterError,
+        error: Box<crate::rpc_codec::TypedClusterError>,
         detail: String,
     },
 
     #[error("storage error: {detail}")]
     Storage { detail: String },
+
+    /// A shard's Data Plane refused the request with a typed verdict.
+    ///
+    /// The code crosses the node hop verbatim as `RaftRpc::VShardRefusal`, so
+    /// the coordinator renders the SQLSTATE a single-node execution renders.
+    /// The message uses the code's `Debug` form for logs only.
+    #[error("data plane refused the request: {code:?}")]
+    DataPlane {
+        code: crate::rpc_codec::DataPlaneErrorCode,
+    },
 
     #[error("codec error: {detail}")]
     Codec { detail: String },
@@ -213,4 +228,20 @@ pub enum ClusterError {
 
     #[error("timeseries gather error: {0}")]
     TsGather(#[from] crate::distributed_timeseries::TsGatherError),
+
+    /// A remote node answered with an error whose type has no wire mirror.
+    /// `detail` is that error's message.
+    #[error("remote error: {detail}")]
+    RemoteUntyped { detail: String },
+
+    /// A shard's local execution failed with a classified error.
+    ///
+    /// `error` is the typed wire form of that error, so the coordinator
+    /// rebuilds the error and renders the SQLSTATE a single-node execution
+    /// renders. `detail` is the message with the shard's context, for logs.
+    #[error("shard execution error: {detail}")]
+    ShardExecution {
+        error: Box<crate::rpc_codec::TypedClusterError>,
+        detail: String,
+    },
 }

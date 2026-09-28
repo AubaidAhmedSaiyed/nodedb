@@ -54,10 +54,9 @@ pub fn create_api_key(
         require_tenant_admin(identity, "create API keys for other users")?;
     }
 
-    // Look up the target user.
-    let target_user = state
-        .credentials
-        .get_user(target_username)
+    // Look up the target user as this statement sees it: a user created
+    // earlier in the transaction counts, one dropped in it does not.
+    let target_user = super::super::role_checks::visible_user(state, target_username)
         .ok_or_else(|| err("42704", format!("user '{target_username}' not found")))?;
 
     // Parse optional EXPIRES.
@@ -119,19 +118,19 @@ pub fn create_api_key(
             .prepare_key(crate::control::security::apikey::CreateKeyParams {
                 username: target_username,
                 user_id: target_user.user_id,
-                tenant_id: target_user.tenant_id,
+                tenant_id: crate::types::TenantId::new(target_user.tenant_id),
                 expires_secs,
                 scope: key_scopes,
                 accessible_databases,
             });
     let entry = crate::control::catalog_entry::CatalogEntry::PutApiKey(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         catalog
             .put_api_key(&stored)
-            .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         state.api_keys.install_replicated_key(&stored);
     }
 

@@ -2,6 +2,7 @@
 
 //! Protocol-neutral collection DML: INSERT INTO / UPSERT INTO.
 
+mod indexed_vector_fields;
 mod insert;
 mod parse;
 mod triggers;

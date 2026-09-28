@@ -2,17 +2,22 @@
 
 mod accessors;
 mod bitemporal_time;
+pub(in crate::data::executor) mod calvin_fence;
+pub(in crate::data::executor) mod calvin_state;
 pub(in crate::data::executor) mod checkpoint_floors;
 mod columnar_schema_seed;
 pub(in crate::data::executor) mod commit_pending;
+mod crdt_dead_letters;
 mod decode_stored;
 pub(in crate::data::executor) mod deferred;
 mod doc_config_seed;
 pub(in crate::data::executor) mod event_emit;
+pub(in crate::data::executor) mod fail_stop;
 pub(in crate::data::executor) mod filter_match;
 mod graph_partition;
 pub(in crate::data::executor) mod index_value_versions;
 pub(in crate::data::executor) mod maintenance;
+pub(in crate::data::executor) mod maintenance_state;
 mod open;
 pub mod pressure;
 pub(in crate::data::executor) mod priority_queues;
@@ -22,10 +27,12 @@ mod state;
 mod test_governor;
 mod tick;
 mod ts_declared_schema;
+pub(in crate::data::executor) mod vector_build_queue;
 mod vector_index_rebuild;
 mod vector_index_seed;
 pub(in crate::data::executor) mod write_index;
 
+pub(in crate::data::executor) use crdt_dead_letters::crdt_rejection;
 pub use doc_config_seed::DocConfigSeedEntry;
 pub(in crate::data::executor) use segment_keks::SegmentKeks;
 pub use state::CoreLoop;

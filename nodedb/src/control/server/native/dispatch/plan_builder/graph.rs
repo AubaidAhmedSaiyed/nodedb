@@ -193,15 +193,13 @@ pub(crate) fn build_edge_put(
         None => String::new(),
     };
     let src_surrogate = ctx.state.surrogate_assigner.assign(
-        ctx.database_id(),
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
         ctx.tenant_id(),
-        collection,
         src.as_bytes(),
     )?;
     let dst_surrogate = ctx.state.surrogate_assigner.assign(
-        ctx.database_id(),
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
         ctx.tenant_id(),
-        collection,
         dst.as_bytes(),
     )?;
     Ok(PhysicalPlan::Graph(GraphOp::EdgePut {
@@ -247,15 +245,13 @@ pub(crate) fn build_edge_delete(
     // returns the existing node identities) so a cross-shard delete dual-homes
     // and locks against a concurrent insert of the same edge.
     let src_surrogate = ctx.state.surrogate_assigner.assign(
-        ctx.database_id(),
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
         ctx.tenant_id(),
-        collection,
         src.as_bytes(),
     )?;
     let dst_surrogate = ctx.state.surrogate_assigner.assign(
-        ctx.database_id(),
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
         ctx.tenant_id(),
-        collection,
         dst.as_bytes(),
     )?;
     Ok(PhysicalPlan::Graph(GraphOp::EdgeDelete {

@@ -104,7 +104,7 @@ pub fn create_alert(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| err("XX000", "system clock error".to_string()))?
+        .map_err(|_| DdlError::internal("system clock error"))?
         .as_secs();
 
     let def = AlertDef {

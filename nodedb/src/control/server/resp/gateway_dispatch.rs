@@ -2,7 +2,7 @@
 
 //! RESP gateway dispatch helpers.
 //!
-//! Routes KV operations through `Gateway::execute` when the gateway is
+//! Routes KV operations through `Gateway::execute_response` when the gateway is
 //! available (cluster-aware routing), falling back to direct local SPSC
 //! dispatch on single-node boot.
 //!
@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
+use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -21,7 +21,7 @@ use crate::control::server::shared::clone_write::CloneCheckedOutcome;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, RequestId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::session::RespSession;
@@ -44,7 +44,7 @@ pub(super) async fn dispatch_kv(
     // `RequestAuthScope::builder` so the dispatched task and `$auth.database_id`
     // resolve from the same value and cannot drift apart.
     let database_id = DatabaseId::DEFAULT;
-    let vshard = VShardId::from_collection_in_database(database_id, &session.collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &session.collection).vshard();
     // Extracted before `plan` is moved into `authorize_resp_task`, which
     // consumes it for RLS injection and task construction — metering needs
     // the collection/engine shape after dispatch succeeds below, and by then
@@ -74,12 +74,11 @@ pub(super) async fn dispatch_kv(
                 database_id: checked.database_id(),
                 txn_id: None,
             };
-            gw.execute(&gw_ctx, checked)
+            gw.execute_response(&gw_ctx, checked)
                 .await
                 .map_err(|e| crate::Error::Bridge {
                     detail: GatewayErrorMap::to_resp(&e),
                 })
-                .map(gateway_payloads_to_response)
         }
         None => dispatch_utils::dispatch_authorized_to_data_plane(state, checked, TraceId::ZERO)
             .await
@@ -109,7 +108,7 @@ pub(super) async fn dispatch_kv_write(
     // DatabaseId::DEFAULT is deliberate here, resolved once and threaded
     // through `authorize_resp_task` via `RequestAuthScope::builder`.
     let database_id = DatabaseId::DEFAULT;
-    let vshard = VShardId::from_collection_in_database(database_id, &session.collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &session.collection).vshard();
     // See `dispatch_kv` above: extracted before `authorize_resp_task` moves
     // `plan`, since metering needs the plan shape after dispatch succeeds.
     let plan_metering_info = state
@@ -136,14 +135,13 @@ pub(super) async fn dispatch_kv_write(
                 database_id: checked.database_id(),
                 txn_id: None,
             };
-            gw.execute(&gw_ctx, checked)
+            gw.execute_response(&gw_ctx, checked)
                 .await
                 .map_err(|e| crate::Error::Bridge {
                     detail: GatewayErrorMap::to_resp(&e),
                 })
-                .map(gateway_payloads_to_response)
         }
-        None => dispatch_utils::dispatch_authorized_autocommit_write(state, checked, TraceId::ZERO)
+        None => dispatch_utils::dispatch_authorized_durable_write(state, checked, TraceId::ZERO)
             .await
             .map_err(map_busy_error),
     };
@@ -341,31 +339,6 @@ fn resp_auth_scope<'a, 'p>(
     ClientRequestScope::for_database(identity, stores, database_id, peer_addr)
 }
 
-/// Convert gateway `Vec<Vec<u8>>` payloads into a synthetic `Response`.
-///
-/// The RESP sub-handlers inspect `resp.status` and `resp.payload`; we
-/// synthesise a `Status::Ok` response carrying the first payload so that all
-/// existing sub-handler logic continues to work without modification.
-fn gateway_payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
-    let payload = payloads
-        .into_iter()
-        .next()
-        .map(Payload::from_vec)
-        .unwrap_or_else(Payload::empty);
-    Response {
-        request_id: RequestId::new(0),
-        status: Status::Ok,
-        attempt: 0,
-        partial: false,
-        payload,
-        watermark_lsn: Lsn::new(0),
-        error_code: None,
-        read_set_valid: None,
-        read_version_lsn: crate::types::Lsn::ZERO,
-        write_set: Vec::new(),
-    }
-}
-
 /// Map bridge/dispatch errors to a BUSY error for Redis client compatibility.
 ///
 /// When the SPSC ring buffer is full or the Data Plane core is overloaded,
@@ -373,7 +346,9 @@ fn gateway_payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
 /// which Redis clients handle with automatic retry (same as Redis Cluster BUSY).
 fn map_busy_error(e: crate::Error) -> crate::Error {
     match &e {
-        crate::Error::Bridge { .. } | crate::Error::Dispatch { .. } => crate::Error::Bridge {
+        crate::Error::Bridge { .. }
+        | crate::Error::Dispatch { .. }
+        | crate::Error::DispatchCapacity { .. } => crate::Error::Bridge {
             detail: "BUSY NodeDB is processing requests, retry later".into(),
         },
         _ => e,
@@ -382,11 +357,12 @@ fn map_busy_error(e: crate::Error) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
+    use crate::bridge::envelope::{Payload, Status};
     use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
     use crate::control::security::metering::quota::QuotaManager;
     use crate::control::security::request_scope::AuthStores;
     use crate::control::security::scope::grant::ScopeGrantStore;
-    use crate::types::TenantId;
+    use crate::types::{Lsn, TenantId};
 
     use super::*;
 
@@ -478,7 +454,8 @@ mod tests {
             surrogate_ceiling: None,
         });
         let vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &session.collection)
+                .vshard();
 
         let result = authorize_resp_task(
             &state,

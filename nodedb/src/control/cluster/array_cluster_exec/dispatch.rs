@@ -145,6 +145,12 @@ impl NexarArrayDispatch {
                     detail: "array shard response: failed to decode VShardEnvelope".into(),
                 }
             }),
+            // The shard's handler failed with a typed error. It is rebuilt as
+            // the error the local short-circuit returns, so `WrongOwner`
+            // reaches the fan-out's reroute retry.
+            RaftRpc::VShardRefusal(refusal) => {
+                Err(nodedb_cluster::error::ClusterError::from(refusal.error))
+            }
             other => Err(nodedb_cluster::error::ClusterError::Transport {
                 detail: format!(
                     "array shard RPC: unexpected response type {:?}",

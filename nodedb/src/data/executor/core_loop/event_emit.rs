@@ -46,6 +46,65 @@ impl CoreLoop {
         }
     }
 
+    /// Emit a KV write event. Both row images are shaped into the
+    /// `{key, value}` row every KV read returns (`msgpack_scan::kv_row_msgpack`),
+    /// so the Event Plane decodes a KV row the same way as any other row.
+    /// `new_stored` and `old_stored` are the bodies as the engine stores them.
+    pub(in crate::data::executor) fn emit_kv_write_event(
+        &mut self,
+        task: &super::super::task::ExecutionTask,
+        collection: &str,
+        op: crate::event::WriteOp,
+        key: &[u8],
+        new_stored: Option<&[u8]>,
+        old_stored: Option<&[u8]>,
+    ) {
+        let key_str = String::from_utf8_lossy(key);
+        let new_row = new_stored.map(|body| msgpack_scan::kv_row_msgpack(&key_str, body));
+        let old_row = old_stored.map(|body| msgpack_scan::kv_row_msgpack(&key_str, body));
+        self.emit_write_event(
+            task,
+            collection,
+            op,
+            crate::engine::document::store::RowIdentity::from_user_key(key_str.as_ref()),
+            new_row.as_deref(),
+            old_row.as_deref(),
+        );
+    }
+
+    /// A stored document row as the Event Plane reads it. A strict Binary
+    /// Tuple becomes MessagePack. A schemaless body gains its `id`.
+    pub(in crate::data::executor) fn stored_event_image(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        identity: &str,
+        stored: &[u8],
+    ) -> Vec<u8> {
+        match self.resolve_event_payload(database_id, tid, collection, stored) {
+            Some(converted) => converted,
+            None => self.body_event_image(database_id, tid, collection, identity, stored),
+        }
+    }
+
+    /// A MessagePack document body as the Event Plane reads it. A schemaless
+    /// body gains its `id`, the identity every read injects.
+    pub(in crate::data::executor) fn body_event_image(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        identity: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        if self.is_schemaless_document_collection(database_id, tid, collection) {
+            msgpack_scan::inject_str_field(body, "id", identity)
+        } else {
+            body.to_vec()
+        }
+    }
+
     /// Whether `collection` is a schemaless document collection.
     ///
     /// A schemaless body carries no storage key of its own, so its `id` field
@@ -182,7 +241,9 @@ impl CoreLoop {
         labels: &[String],
         op: crate::event::WriteOp,
     ) {
-        if let Some(lsn) = task.wal_lsn()
+        // A committed-redo apply moves the watermark once the record settled.
+        if self.redo_apply.scope.is_none()
+            && let Some(lsn) = task.wal_lsn()
             && lsn > self.watermark
         {
             self.watermark = lsn;
@@ -274,22 +335,24 @@ impl CoreLoop {
         new_value: Option<&[u8]>,
         old_value: Option<&[u8]>,
     ) {
-        let producer = match self.event_producer.as_mut() {
-            Some(p) => p,
-            None => return, // Event Plane not configured.
-        };
-
-        self.event_sequence += 1;
+        if self.event_producer.is_none() {
+            return; // Event Plane not configured.
+        }
 
         let (system_time_ms, valid_time_ms) =
             crate::event::bitemporal_extract::extract_stamps(new_value.or(old_value));
 
         let event = crate::event::WriteEvent {
-            sequence: self.event_sequence,
+            // Assigned when the event is sent, so a held event never leaves
+            // a gap in the sequence.
+            sequence: 0,
             collection: Arc::from(collection),
             op,
             row_id,
             lsn: self.watermark,
+            record: task
+                .wal_lsn()
+                .map(crate::event::types::RecordPosition::first),
             database_id: task.request.database_id,
             tenant_id: task.request.tenant_id,
             vshard_id: task.request.vshard_id,
@@ -302,6 +365,28 @@ impl CoreLoop {
             statement_digest: task.request.statement_digest.clone(),
         };
 
+        // The install pass of a committed-redo apply holds its events until
+        // the whole record landed. A rolled-back install sends none.
+        if let Some(scope) = self.redo_apply.scope.as_mut()
+            && scope.pass
+                == crate::data::executor::handlers::transaction::redo_apply::RedoApplyPass::Install
+        {
+            scope.pending_events.push(event);
+            return;
+        }
+        self.send_write_event(event);
+    }
+
+    /// Number `event` with the next sequence and hand it to the Event Plane.
+    pub(in crate::data::executor) fn send_write_event(
+        &mut self,
+        mut event: crate::event::WriteEvent,
+    ) {
+        let Some(producer) = self.event_producer.as_mut() else {
+            return;
+        };
+        self.event_sequence += 1;
+        event.sequence = self.event_sequence;
         producer.emit(event);
     }
 
@@ -326,6 +411,7 @@ impl CoreLoop {
             // watermark = last committed LSN. Correct for heartbeats: uncommitted
             // writes should NOT advance the Event Plane's watermark.
             lsn: self.watermark,
+            record: None,
             // Heartbeats are synthetic core-liveness markers rather than data writes,
             // so they have no database owner and are excluded from CDC routing.
             database_id: crate::types::DatabaseId::DEFAULT,

@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use super::super::histogram::{AtomicHistogram, WAL_FSYNC_BUCKETS_US};
 use super::super::purge::PurgeMetrics;
+use super::core_fail_stop::CoreFailStops;
 use super::heartbeat::CoreHeartbeats;
 use crate::data::executor::core_loop::pressure::ThrottleMetrics;
 use crate::data::io::IoMetrics;
@@ -62,6 +63,16 @@ pub struct SystemMetrics {
     pub vector_collections: AtomicU64,
     pub vector_vectors_stored: AtomicU64,
     pub vector_query_seconds: AtomicHistogram,
+    /// HNSW builds sent to a builder thread.
+    pub vector_builds_started: AtomicU64,
+    /// HNSW builds installed on their core.
+    pub vector_builds_completed: AtomicU64,
+    /// HNSW builds that failed or could not be read.
+    pub vector_builds_failed: AtomicU64,
+    /// Times a core found its builder queue full and kept the job waiting.
+    pub vector_builds_deferred: AtomicU64,
+    /// HNSW builds waiting for or running on a builder, across all cores.
+    pub vector_build_pending: AtomicU64,
 
     pub graph_traversals: AtomicU64,
     pub graph_nodes: AtomicU64,
@@ -219,6 +230,9 @@ pub struct SystemMetrics {
     /// that stops advancing is the only evidence a core has stopped
     /// completing iterations.
     pub core_heartbeats: CoreHeartbeats,
+    /// Cores that fail-stopped because their state is unknown. A core records
+    /// itself here once, as it stops.
+    pub core_fail_stops: CoreFailStops,
 }
 
 impl SystemMetrics {

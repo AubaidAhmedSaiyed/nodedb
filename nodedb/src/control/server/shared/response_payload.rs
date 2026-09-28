@@ -14,8 +14,8 @@ use crate::bridge::envelope::{Response, Status};
 /// the detail.
 ///
 /// Shared by every door that returns bytes rather than a `Response`: the
-/// replicated sync write, the user DDL/DSL dispatch, and the version-history
-/// read. One copy so a response a clone hook served and a response the Data
+/// replicated sync write, the user DDL/DSL dispatch, the system dispatch, and
+/// the version-history read. One copy so a response a clone hook served and a response the Data
 /// Plane returned cannot be reported differently.
 pub(crate) fn payload_or_typed_error(response: Response) -> crate::Result<Vec<u8>> {
     if response.status != Status::Ok {
@@ -27,4 +27,45 @@ pub(crate) fn payload_or_typed_error(response: Response) -> crate::Result<Vec<u8
         });
     }
     Ok(response.payload.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::{ErrorCode, Payload};
+    use crate::types::{Lsn, RequestId};
+
+    fn refusal(code: Option<ErrorCode>, payload: &[u8]) -> Response {
+        Response {
+            request_id: RequestId::new(1),
+            status: Status::Error,
+            attempt: 1,
+            partial: false,
+            payload: Payload::from_vec(payload.to_vec()),
+            watermark_lsn: Lsn::ZERO,
+            error_code: code.map(Box::new),
+            read_set_valid: None,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_coded_refusal_keeps_its_code() {
+        let code = ErrorCode::Unsupported {
+            detail: "not on this engine".into(),
+        };
+        match payload_or_typed_error(refusal(Some(code.clone()), b"")) {
+            Err(crate::Error::DataPlane(kept)) => assert_eq!(kept, code),
+            other => panic!("expected the typed refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refusal_with_no_code_reports_its_payload() {
+        match payload_or_typed_error(refusal(None, b"handler detail")) {
+            Err(crate::Error::Internal { detail }) => assert_eq!(detail, "handler detail"),
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
 }

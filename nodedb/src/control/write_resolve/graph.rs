@@ -82,8 +82,8 @@ impl EngineWriteResolver for GraphWriteResolver {
     }
 
     /// Key-homed on the source endpoint, where the forward edge row lives.
-    fn vshard(&self, _database_id: DatabaseId) -> VShardId {
-        VShardId::from_key(self.src_id.as_bytes())
+    fn vshard(&self, _database_id: DatabaseId) -> crate::Result<VShardId> {
+        Ok(VShardId::from_key(self.src_id.as_bytes()))
     }
 
     fn build_resolve_op(&self) -> PhysicalPlan {
@@ -103,7 +103,7 @@ impl EngineWriteResolver for GraphWriteResolver {
             state,
             ctx.tenant_id,
             ctx.database_id,
-            self.vshard(ctx.database_id),
+            self.vshard(ctx.database_id)?,
             op,
             None,
         )

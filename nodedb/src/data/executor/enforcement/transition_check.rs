@@ -25,16 +25,15 @@ pub fn check_transition_predicates(
     let old_val = nodedb_types::Value::from(old_doc.clone());
     let new_val = nodedb_types::Value::from(new_doc.clone());
     for check in checks {
-        // A division/modulo-by-zero inside the predicate is neither a PASS
-        // nor an ordinary FAIL — it's an evaluation error. `eval_with_old`
-        // can only fail with `EvalError::DivisionByZero`, so it surfaces as
-        // SQLSTATE 22012 (`ErrorCode::DivisionByZero`), matching generated
-        // columns / materialized-sum enforcement and Postgres, rather than
-        // being reported under this check's own 23xxx violation code.
+        // An evaluation error inside the predicate is neither a PASS nor an
+        // ordinary FAIL. It surfaces under its own SQLSTATE (22012 for a
+        // division by zero, 42883 for an unknown function), matching
+        // generated columns / materialized-sum enforcement and Postgres,
+        // rather than under this check's own 23xxx violation code.
         let result = check
             .predicate
             .eval_with_old(&new_val, &old_val)
-            .map_err(|_e| ErrorCode::DivisionByZero)?;
+            .map_err(ErrorCode::from)?;
         let passed = match result {
             nodedb_types::Value::Bool(b) => b,
             nodedb_types::Value::Null => false, // NULL treated as FALSE for constraint purposes.

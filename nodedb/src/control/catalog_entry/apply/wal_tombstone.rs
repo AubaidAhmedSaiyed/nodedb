@@ -41,6 +41,8 @@ mod tests {
     fn record_wal_tombstone_entry_applies_and_is_monotone() {
         let (store, _tmp) = make_catalog();
         let catalog = store.catalog();
+        let users =
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::new(7), "users");
 
         // Apply via the top-level apply_to path (entry → apply_to_inner → wal_tombstone::record).
         let entry = CatalogEntry::RecordWalTombstone {
@@ -53,7 +55,7 @@ mod tests {
 
         let set = catalog.load_wal_tombstones().expect("load");
         assert_eq!(
-            set.purge_lsn(7, 1, "users"),
+            set.purge_lsn(users, 1),
             Some(100),
             "initial tombstone not recorded"
         );
@@ -68,7 +70,7 @@ mod tests {
         apply_to(&entry_lower, catalog).expect("apply record_wal_tombstone (lower)");
         let set = catalog.load_wal_tombstones().expect("load after lower");
         assert_eq!(
-            set.purge_lsn(7, 1, "users"),
+            set.purge_lsn(users, 1),
             Some(100),
             "lower purge_lsn must not regress stored tombstone"
         );
@@ -83,7 +85,7 @@ mod tests {
         apply_to(&entry_higher, catalog).expect("apply record_wal_tombstone (higher)");
         let set = catalog.load_wal_tombstones().expect("load after higher");
         assert_eq!(
-            set.purge_lsn(7, 1, "users"),
+            set.purge_lsn(users, 1),
             Some(200),
             "higher purge_lsn must raise stored tombstone"
         );

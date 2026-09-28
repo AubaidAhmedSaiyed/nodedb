@@ -64,19 +64,17 @@ impl CoreLoop {
         if count == 0 || dim == 0 {
             return self.response_error(
                 task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: "multi-vector count and dim must be > 0".into(),
+                ErrorCode::DataException {
+                    detail: "multi-vector count and dim must be > 0".into(),
                 },
             );
         }
         if vectors_flat.len() != count * dim {
             return self.response_error(
                 task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: format!(
-                        "data length mismatch: expected {} ({}×{}), got {}",
+                ErrorCode::DataException {
+                    detail: format!(
+                        "multi-vector data length mismatch: expected {} ({}×{}), got {}",
                         count * dim,
                         count,
                         dim,
@@ -89,39 +87,13 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
-        // Validate dimension compatibility before taking mutable reference.
-        if let Some(existing) = self.vector_collections.get(&index_key)
-            && existing.dim() != dim
-        {
-            return self.response_error(
-                task,
-                ErrorCode::RejectedConstraint {
-                    detail: String::new(),
-                    constraint: format!(
-                        "dimension mismatch: index has {}, got {dim}",
-                        existing.dim()
-                    ),
-                },
-            );
-        }
-
-        // Get or create the vector collection.
-        let core_id = self.core_id;
-        let params = self
-            .vector_params
-            .get(&index_key)
-            .cloned()
-            .unwrap_or_default();
-        let coll = self
-            .vector_collections
-            .entry(index_key.clone())
-            .or_insert_with(|| {
-                debug!(
-                    core = core_id,
-                    dim, "creating vector collection for multi-vector"
-                );
-                crate::engine::vector::collection::VectorCollection::new(dim, params)
-            });
+        // A committed-redo install seals once the whole record landed.
+        let defer_seal = self.recording_redo_undo();
+        let coll =
+            match self.get_or_create_vector_index(database_id, tid, collection, dim, field_name) {
+                Ok(coll) => coll,
+                Err(err) => return self.response_error(task, err),
+            };
 
         // Build vector slices from flat data.
         let vector_slices: Vec<&[f32]> = (0..count)
@@ -132,23 +104,13 @@ impl CoreLoop {
         coll.delete_multi_vector(document_surrogate);
 
         // Insert all vectors with shared surrogate.
-        let ids = coll.insert_multi_vector(&vector_slices, document_surrogate);
-        // Advance the checkpoint watermark to this write's WAL LSN so a later
-        // checkpoint records these nodes as absorbed; startup replay then skips
-        // the straddling WAL record instead of appending duplicate HNSW nodes.
-        // `None` (unassigned LSN) leaves the watermark untouched.
-        if let Some(lsn) = task.wal_lsn() {
-            coll.note_checkpoint_lsn(lsn.as_u64());
-        }
+        let ids = match coll.insert_multi_vector(&vector_slices, document_surrogate) {
+            Ok(ids) => ids,
+            Err(e) => return self.response_error(task, crate::Error::from(e)),
+        };
 
-        // Auto-seal if needed.
-        let seal_key = CoreLoop::vector_build_key(&index_key);
-        if coll.needs_seal()
-            && let Some(req) = coll.seal(&seal_key)
-            && let Some(tx) = &self.build_tx
-            && let Err(e) = tx.send(req)
-        {
-            warn!(core = self.core_id, error = %e, "failed to send HNSW build after multi-vector insert");
+        if !defer_seal {
+            self.settle_vector_collection(&index_key);
         }
 
         self.checkpoint_coordinator.mark_dirty("vector", ids.len());
@@ -190,12 +152,6 @@ impl CoreLoop {
         };
 
         let deleted = coll.delete_multi_vector(document_surrogate);
-        // Advance the watermark to this delete's WAL LSN (single per-collection
-        // value covering inserts and deletes), so a checkpoint records the
-        // removal as absorbed and replay does not re-run it below the mark.
-        if let Some(lsn) = task.wal_lsn() {
-            coll.note_checkpoint_lsn(lsn.as_u64());
-        }
         if deleted > 0 {
             self.checkpoint_coordinator.mark_dirty("vector", deleted);
             // Record this write's version keyed by the shared document
@@ -240,9 +196,8 @@ impl CoreLoop {
             None => {
                 return self.response_error(
                     task,
-                    ErrorCode::RejectedConstraint {
-                        detail: String::new(),
-                        constraint: format!(
+                    ErrorCode::DataException {
+                        detail: format!(
                             "unknown score mode '{mode_str}'; supported: max_sim, avg_sim, sum_sim"
                         ),
                     },
@@ -270,7 +225,10 @@ impl CoreLoop {
             over_fetch.saturating_mul(2).max(64)
         };
 
-        let candidates = coll.search(query_vector, over_fetch, ef);
+        let candidates = match coll.search(query_vector, over_fetch, ef) {
+            Ok(candidates) => candidates,
+            Err(e) => return self.response_error(task, crate::Error::from(e)),
+        };
 
         // Group by surrogate. For distance metrics where lower = better
         // (L2, cosine) we convert similarity = 1 / (1 + distance) so

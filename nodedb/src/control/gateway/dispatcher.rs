@@ -12,16 +12,20 @@ use std::sync::Arc;
 use nodedb_cluster::rpc_codec::TypedClusterError;
 
 use crate::Error;
-use crate::bridge::envelope::PhysicalPlan;
+use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
+use crate::control::local_dispatch::reject_data_plane_error;
 use crate::control::server::dispatch_utils::{
-    dispatch_to_data_plane_with_txn, reject_data_plane_error,
+    AutocommitWrite, dispatch_autocommit_write, dispatch_to_data_plane_with_txn,
+    extract_write_change_set, publish_change_set_with_lsn,
 };
 use crate::control::server::result_stream::ResultStream;
+use crate::control::server::shared::write_admission::plan_is_write;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 
 use super::dispatch_remote::{RemoteDispatchArgs, dispatch_remote, dispatch_remote_stream};
 use super::route::{RouteDecision, TaskRoute};
+use super::router::is_task_vshard_scoped;
 use super::version_check::check_descriptor_versions;
 use super::version_set::GatewayVersionSet;
 
@@ -40,6 +44,11 @@ pub struct DispatchOutcome {
     /// read targets one collection, so one non-zero value survives — for
     /// cross-shard OCC read validation.
     pub read_version_lsn: Lsn,
+    /// The owning core refused the task with `ErrorCode::NotFound`.
+    ///
+    /// A fan-out reads it as a shard that holds no slice. A single-route
+    /// task reports it as the Data Plane's verdict on that task.
+    pub not_found: bool,
 }
 
 /// Parameters for [`dispatch_route`]. `txn_id` is session-transaction
@@ -270,15 +279,15 @@ async fn dispatch_local(
         let resp = shared
             .vshard_admission_sequencer
             .run(vshard_id, || async {
-                dispatch_to_data_plane_with_txn(
+                dispatch_local_plan(LocalPlan {
                     shared,
                     tenant_id,
                     database_id,
                     vshard_id,
-                    route.plan,
+                    plan: route.plan,
                     trace_id,
-                    None,
-                )
+                    txn_id: None,
+                })
                 .await
             })
             .await?;
@@ -287,6 +296,7 @@ async fn dispatch_local(
             payloads: vec![resp.payload.to_vec()],
             shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
             read_version_lsn: resp.read_version_lsn,
+            not_found: is_not_found(&resp),
         });
     }
 
@@ -302,24 +312,34 @@ async fn dispatch_local(
         let (payload, write_version) =
             crate::control::wal_replication::propose_replicated_entry(shared, proposer, entry)
                 .await?;
+        // Replicas apply with `ChangeFeedOwner::Unowned`. This node proposed
+        // the write once, so it publishes the change event.
+        publish_change_set_with_lsn(
+            shared,
+            tenant_id,
+            database_id,
+            extract_write_change_set(&route.plan, tenant_id),
+            write_version,
+        );
         return Ok(DispatchOutcome {
             payloads: vec![payload],
             // A write carries no read watermark (Lsn::ZERO); its post-write
             // `coll_write_lsn` is surfaced via `read_version_lsn` instead.
             shard_watermarks: vec![(vshard_id, Lsn::ZERO)],
             read_version_lsn: write_version,
+            not_found: false,
         });
     }
 
-    let resp = dispatch_to_data_plane_with_txn(
+    let resp = dispatch_local_plan(LocalPlan {
         shared,
         tenant_id,
         database_id,
         vshard_id,
-        route.plan,
+        plan: route.plan,
         trace_id,
         txn_id,
-    )
+    })
     .await?;
     // The remote sibling turns `ExecuteResponse.error` into `Err`; the local
     // route must reject its own error status the same way. Keeping only the
@@ -330,7 +350,72 @@ async fn dispatch_local(
         payloads: vec![resp.payload.to_vec()],
         shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
         read_version_lsn: resp.read_version_lsn,
+        not_found: is_not_found(&resp),
     })
+}
+
+/// One plan this node applies on its own cores.
+struct LocalPlan<'a> {
+    shared: &'a Arc<SharedState>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    vshard_id: VShardId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    txn_id: Option<TxnId>,
+}
+
+/// Dispatch a plan to this node's cores on the route its class needs.
+///
+/// A base-state write enters the funnel with `AppendHere`, which appends its
+/// redo record under the write-admission guard. It reaches here when no Raft
+/// proposal carries it: a standalone node, a plan with no replicated
+/// encoding, or a write a transaction cannot buffer. The transaction meta-ops
+/// own their durability, and a staged write is logged at COMMIT, so both take
+/// the read route with everything else.
+async fn dispatch_local_plan(local: LocalPlan<'_>) -> Result<Response, Error> {
+    let LocalPlan {
+        shared,
+        tenant_id,
+        database_id,
+        vshard_id,
+        plan,
+        trace_id,
+        txn_id,
+    } = local;
+    if plan_is_write(&plan) && !is_task_vshard_scoped(&plan) {
+        return dispatch_autocommit_write(
+            shared,
+            AutocommitWrite {
+                tenant_id,
+                database_id,
+                vshard_id,
+                plan,
+                trace_id,
+                event_source: crate::event::EventSource::User,
+                txn_id,
+            },
+        )
+        .await;
+    }
+    dispatch_to_data_plane_with_txn(
+        shared,
+        tenant_id,
+        database_id,
+        vshard_id,
+        plan,
+        trace_id,
+        txn_id,
+    )
+    .await
+}
+
+/// Whether the core refused the task with `ErrorCode::NotFound`.
+///
+/// `reject_data_plane_error` passes this refusal as an empty success.
+/// The flag keeps the verdict for a caller that needs it.
+fn is_not_found(resp: &Response) -> bool {
+    resp.status == Status::Error && resp.error_code.as_deref() == Some(&ErrorCode::NotFound)
 }
 
 /// Map a [`TypedClusterError`] to an internal [`Error`].
@@ -383,7 +468,10 @@ pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) ->
             constraint,
             detail,
         },
-        TypedClusterError::Internal { message, .. } => Error::Internal { detail: message },
+        // A numeric class crosses as `Error::RemoteTyped`, so the client sees
+        // the SQLSTATE the executing node gave it. Only a code of 0 (no class)
+        // decodes as `Error::Internal`.
+        internal @ TypedClusterError::Internal { .. } => Error::from(internal),
     }
 }
 
@@ -428,6 +516,21 @@ mod tests {
         match map_typed_cluster_error(err, 0) {
             Error::RetryableSchemaChanged { descriptor } => assert_eq!(descriptor, "orders"),
             other => panic!("expected RetryableSchemaChanged, got {other:?}"),
+        }
+    }
+
+    /// A remote error with a numeric class keeps it, never `Internal`.
+    #[test]
+    fn map_internal_keeps_its_numeric_class() {
+        let err = TypedClusterError::Internal {
+            code: u32::from(nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED.0),
+            message: "permission denied on orders".into(),
+        };
+        match map_typed_cluster_error(err, 0) {
+            Error::RemoteTyped { code, .. } => {
+                assert_eq!(code, nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED);
+            }
+            other => panic!("expected RemoteTyped, got {other:?}"),
         }
     }
 

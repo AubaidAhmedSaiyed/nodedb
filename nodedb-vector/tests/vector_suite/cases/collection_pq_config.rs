@@ -40,7 +40,7 @@ fn make_built_collection_with_pq_config() -> VectorCollection {
         for (d, slot) in v.iter_mut().enumerate() {
             *slot = ((i as f32) * 0.01 + (d as f32) * 0.1).sin();
         }
-        coll.insert(v);
+        coll.insert(v).unwrap();
     }
     let req = coll.seal("pq").expect("seal produced request");
     let mut idx = HnswIndex::new(req.dim, req.params.clone());

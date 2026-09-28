@@ -6,7 +6,7 @@
 use nodedb_sql::types::{AggregateExpr, SqlExpr, SqlPlan};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -242,7 +242,7 @@ pub(in crate::control::planner::sql_plan_convert) fn build_input_sourced_aggrega
         tenant_id,
         // Coordinator-local: empty collection keeps the task on the
         // coordinator vshard (the child's rows are not per-shard).
-        vshard_id: VShardId::from_collection_in_database(ctx.database_id, ""),
+        vshard_id: nodedb_types::CollectionKey::from_bare(ctx.database_id, "").vshard(),
         database_id: ctx.database_id,
         plan: PhysicalPlan::Query(QueryOp::Aggregate {
             collection: nodedb_types::QualifiedCollection::from_stored(raw_collection),

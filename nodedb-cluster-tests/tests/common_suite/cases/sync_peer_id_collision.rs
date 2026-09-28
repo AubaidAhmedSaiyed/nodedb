@@ -113,7 +113,7 @@ async fn row_is_readable(
             }
             Err(e)
                 if e.as_db_error()
-                    .is_some_and(|d| d.message().contains("NotFound")) =>
+                    .is_some_and(|d| d.code() == &tokio_postgres::error::SqlState::NO_DATA) =>
             {
                 return Ok(false);
             }

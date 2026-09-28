@@ -164,8 +164,8 @@ async fn rejects_random_bytes() {
 #[tokio::test]
 async fn rejects_unsupported_envelope_version() {
     // A plaintext envelope (no crypto block) must be rejected because
-    // the restore path only accepts encrypted envelopes. Both plaintext and
-    // encrypted envelopes now carry version = 1 in the header; the parser
+    // the restore path only accepts encrypted envelopes. Plaintext and
+    // encrypted envelopes carry the same version in the header; the parser
     // detects a non-encrypted envelope structurally (the crypto block is
     // absent, making the byte slice too short for parse_encrypted's minimum).
     // The server surfaces this as a generic format error.
@@ -192,7 +192,7 @@ async fn rejects_tenant_mismatch() {
     let server = TestServer::start().await;
     // Backup tenant 1, hand-craft encrypted envelope claiming tenant 99.
     // Must use finalize_encrypted so the path advances far enough to reach
-    // the tenant-mismatch gate (version-1 plaintext is now rejected earlier).
+    // the tenant-mismatch gate (a plaintext envelope is rejected earlier).
     let mut writer = EnvelopeWriter::new(EnvelopeMeta {
         tenant_id: 99,
         source_vshard_count: 1024,

@@ -14,10 +14,6 @@ use crate::event::alert::types::AlertDef;
 use super::super::super::result::DdlError;
 use super::super::replicate::propose_and_apply;
 
-fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError::new(sqlstate, message)
-}
-
 /// Propose the full alert record. CREATE and ALTER both re-put the row.
 ///
 /// The leader validates before proposing, so apply never rejects.
@@ -28,7 +24,7 @@ pub(super) fn propose_put(state: &SharedState, def: &AlertDef) -> Result<(), Ddl
             .credentials
             .catalog()
             .put_alert_rule(def)
-            .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         post_apply::put(def, state);
         Ok(())
     })
@@ -52,7 +48,7 @@ pub(super) fn propose_delete(
             .credentials
             .catalog()
             .delete_alert_rule(database_id, tenant_id, name)
-            .map_err(|e| err("XX000", format!("catalog delete: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
         post_apply::delete(database_id, tenant_id, name, state);
         Ok(())
     })

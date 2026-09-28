@@ -1,36 +1,53 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Post-install surrogate rebinding and tombstoned-collection warnings for
+//! Surrogate rebinding and tombstoned-collection warnings for
 //! [`super::restore_tenant`].
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use nodedb_types::Surrogate;
+use nodedb_types::{CollectionKey, Surrogate};
 
 use crate::Error;
+use crate::control::backup::snapshot_keys::{
+    extract_db_scoped_collection, extract_db_tenant_scoped_collection,
+};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, SurrogateBindEntry, TenantDataSnapshot, TenantId};
+use crate::engine::graph::edge_store::parse_versioned_edge_key;
+use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
 
-/// Rebind every PK→surrogate identity carried in the backup into the
-/// destination catalog so restored rows resolve by PK point-lookup.
+use super::super::target::DatabaseTarget;
+
+/// Bind every PK→surrogate identity the backup carries for one database on
+/// this node, before any re-issue, so a re-issued row keeps the surrogate it
+/// was stored under. Each bind names the bare collection, keyed in the
+/// destination database.
 ///
-/// No-op when the snapshot carried no bindings (e.g. an older backup created
-/// before the surrogate-pk section existed) or when the node has no catalog.
-/// Any catalog write failure is FATAL.
+/// Binding is first-wins: a key this node already binds keeps its surrogate,
+/// and the re-issue writes that row over it. Each bind also raises this
+/// node's surrogate high-water mark past the backup's surrogate, so no later
+/// allocation here reuses it. Every replica binds the identities a re-issued
+/// write carries as it applies the write. Any bind error is fatal.
 pub(super) fn rebind_surrogates(
     state: &Arc<SharedState>,
-    binds: Vec<SurrogateBindEntry>,
+    target: DatabaseTarget,
+    binds: &[SurrogateBindEntry],
 ) -> Result<(), Error> {
-    if binds.is_empty() {
-        return Ok(());
-    }
-    let catalog = state.credentials.catalog();
-    let database_id = crate::types::DatabaseId::DEFAULT;
-    for e in &binds {
-        catalog.put_surrogate(
-            database_id,
+    for e in binds {
+        if e.database_id != target.source.as_u64() {
+            return Err(Error::Internal {
+                detail: format!(
+                    "invalid backup format: a surrogate bind of '{}' names database {}, but \
+                     sits with database {}",
+                    e.collection,
+                    e.database_id,
+                    target.source.as_u64()
+                ),
+            });
+        }
+        state.surrogate_assigner.bind(
+            nodedb_types::CollectionKey::from_bare(target.dest, &e.collection),
             TenantId::new(e.tenant_id),
-            &e.collection,
             &e.pk,
             Surrogate::new(e.surrogate),
         )?;
@@ -41,6 +58,7 @@ pub(super) fn rebind_surrogates(
 pub(super) fn warn_on_tombstoned_restores(
     state: &Arc<SharedState>,
     tenant_id: u64,
+    target: DatabaseTarget,
     merged: &TenantDataSnapshot,
     snapshot_watermark: u64,
 ) {
@@ -52,25 +70,9 @@ pub(super) fn warn_on_tombstoned_restores(
         return;
     }
 
-    let mut names = std::collections::BTreeSet::new();
-    let sections: [&[(String, Vec<u8>)]; 6] = [
-        &merged.documents,
-        &merged.indexes,
-        &merged.vectors,
-        &merged.kv_tables,
-        &merged.timeseries,
-        &merged.edges,
-    ];
-    for section in sections {
-        for (key, _) in section {
-            if let Some(name) = collection_from_key(key) {
-                names.insert(name.to_string());
-            }
-        }
-    }
-
-    for name in &names {
-        let Some(purge_lsn) = tombstones.purge_lsn(DatabaseId::DEFAULT.as_u64(), tenant_id, name)
+    for name in &restored_collection_names(tenant_id, target, merged) {
+        let Some(purge_lsn) =
+            tombstones.purge_lsn(CollectionKey::from_bare(target.dest, name), tenant_id)
         else {
             continue;
         };
@@ -79,6 +81,7 @@ pub(super) fn warn_on_tombstoned_restores(
         }
         tracing::warn!(
             tenant_id,
+            database_id = target.dest.as_u64(),
             collection = %name,
             purge_lsn,
             snapshot_watermark,
@@ -89,39 +92,111 @@ pub(super) fn warn_on_tombstoned_restores(
             Some(TenantId::new(tenant_id)),
             "__restore",
             &format!(
-                "restore resurrected tombstoned collection '{name}' \
-                 (purge_lsn={purge_lsn}, snapshot_watermark={snapshot_watermark})"
+                "restore resurrected tombstoned collection '{name}' in database {} \
+                 (purge_lsn={purge_lsn}, snapshot_watermark={snapshot_watermark})",
+                target.dest.as_u64()
             ),
         );
     }
 }
 
-fn collection_from_key(key: &str) -> Option<&str> {
-    let tail = key.split_once(':')?.1;
-    tail.split([':', '\0']).next()
+/// The bare catalog name of every collection the backup restores rows into
+/// for one database, read from each section's key in that section's own
+/// format. A name that does not resolve in the source database is skipped
+/// here: the re-issue of its section refuses it.
+fn restored_collection_names(
+    tenant_id: u64,
+    target: DatabaseTarget,
+    merged: &TenantDataSnapshot,
+) -> BTreeSet<String> {
+    let mut stored: Vec<&str> = Vec::new();
+    let db_tenant_scoped: [&[(String, Vec<u8>)]; 5] = [
+        &merged.documents,
+        &merged.documents_versioned,
+        &merged.indexes,
+        &merged.vectors,
+        &merged.timeseries,
+    ];
+    for section in db_tenant_scoped {
+        for (key, _) in section {
+            stored.extend(extract_db_tenant_scoped_collection(key, tenant_id));
+        }
+    }
+    for (key, _) in merged.kv_tables.iter().chain(&merged.columnar_engines) {
+        stored.extend(extract_db_scoped_collection(key, tenant_id));
+    }
+    for (key, _) in &merged.edges {
+        if let Some((name, ..)) = parse_versioned_edge_key(key) {
+            stored.push(name);
+        }
+    }
+    stored
+        .into_iter()
+        .filter_map(|name| target.resolve(name).ok())
+        .map(|name| name.bare)
+        .collect()
 }
 
 #[cfg(test)]
-mod collection_key_tests {
-    use super::collection_from_key;
+mod collection_name_tests {
+    use super::*;
+    use crate::types::DatabaseId;
+
+    const DEFAULT_TARGET: DatabaseTarget = DatabaseTarget {
+        source: DatabaseId::DEFAULT,
+        dest: DatabaseId::DEFAULT,
+    };
 
     #[test]
-    fn extracts_collection_with_colon_separator() {
-        assert_eq!(collection_from_key("1:users:doc-1"), Some("users"));
+    fn every_section_names_its_collection() {
+        let snap = TenantDataSnapshot {
+            documents: vec![("0:7:users:0000002a".into(), vec![])],
+            documents_versioned: vec![(
+                "0:7:ledger:0000002a\x0000000000000000000001".into(),
+                vec![],
+            )],
+            vectors: vec![("0:7:embeddings".into(), vec![])],
+            kv_tables: vec![("0:7:sessions".into(), vec![])],
+            edges: vec![(
+                "follows\x00a\x00L\x00b\x0000000000000000000001".into(),
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let names: Vec<String> = restored_collection_names(7, DEFAULT_TARGET, &snap)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            names,
+            vec!["embeddings", "follows", "ledger", "sessions", "users"]
+        );
+    }
+
+    /// A named database's sections name qualified collections. The warning
+    /// reads the bare names the destination catalog keys its tombstones by.
+    #[test]
+    fn a_named_database_yields_bare_names() {
+        let target = DatabaseTarget {
+            source: DatabaseId::new(1025),
+            dest: DatabaseId::new(1030),
+        };
+        let snap = TenantDataSnapshot {
+            documents: vec![("1025:7:1025/users:0000002a".into(), vec![])],
+            kv_tables: vec![("1025:7:1025/sessions".into(), vec![])],
+            ..Default::default()
+        };
+        let names: Vec<String> = restored_collection_names(7, target, &snap)
+            .into_iter()
+            .collect();
+        assert_eq!(names, vec!["sessions", "users"]);
     }
 
     #[test]
-    fn extracts_collection_with_null_separator() {
-        assert_eq!(collection_from_key("1:src\0label\0"), Some("src"));
-    }
-
-    #[test]
-    fn vector_and_kv_key_shapes() {
-        assert_eq!(collection_from_key("1:events"), Some("events"));
-    }
-
-    #[test]
-    fn no_tenant_prefix_returns_none() {
-        assert_eq!(collection_from_key("no_colon"), None);
+    fn another_tenants_key_names_nothing() {
+        let snap = TenantDataSnapshot {
+            documents: vec![("0:8:users:0000002a".into(), vec![])],
+            ..Default::default()
+        };
+        assert!(restored_collection_names(7, DEFAULT_TARGET, &snap).is_empty());
     }
 }

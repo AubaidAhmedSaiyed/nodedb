@@ -179,10 +179,11 @@ pub(super) async fn try_typed(
 
         // USE DATABASE is intercepted in `execute_single_sql` before the DDL
         // router runs; reaching this arm means the intercept did not fire.
-        NodedbStatement::Database(DatabaseStmt::UseDatabase { name }) => Some(Err(DdlError::new(
-            "XX000",
-            format!("USE DATABASE {name}: reached router after expected intercept"),
-        ))),
+        NodedbStatement::Database(DatabaseStmt::UseDatabase { name }) => {
+            Some(Err(DdlError::internal(format!(
+                "USE DATABASE {name}: reached router after expected intercept"
+            ))))
+        }
 
         _ => None,
     }

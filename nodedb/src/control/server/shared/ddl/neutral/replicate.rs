@@ -16,7 +16,7 @@ use super::super::result::DdlError;
 
 /// Propose `entry`, then run `local` when this node owns the catalog write.
 ///
-/// A propose failure maps to SQLSTATE `XX000`.
+/// A propose failure keeps the SQLSTATE class of its typed error.
 pub(crate) fn propose_and_apply(
     state: &SharedState,
     entry: &CatalogEntry,
@@ -35,7 +35,7 @@ pub(crate) fn propose_and_apply_outcome(
     local: impl FnOnce() -> Result<(), DdlError>,
 ) -> Result<ProposeOutcome, DdlError> {
     let outcome = propose_catalog_entry(state, entry)
-        .map_err(|e| DdlError::new("XX000", format!("catalog propose failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
     if outcome.needs_local_apply() {
         local()?;
     }

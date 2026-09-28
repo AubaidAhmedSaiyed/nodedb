@@ -19,9 +19,11 @@ pub(super) fn resp_kv_surrogate(
     state
         .surrogate_assigner
         .assign(
-            crate::types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(
+                crate::types::DatabaseId::DEFAULT,
+                &session.collection,
+            ),
             session.tenant_id,
-            &session.collection,
             key,
         )
         .map_err(|e| RespValue::err(format!("ERR {e}")))

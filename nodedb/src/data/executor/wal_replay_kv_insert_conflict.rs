@@ -366,6 +366,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         let updates = vec![(
             "mana".to_string(),
@@ -459,6 +460,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
 
         let excluded = obj_bytes(&[("hp", 1)]);
@@ -491,13 +493,15 @@ mod tests {
             &put_p1,
         )
         .expect("wal append seed put");
-        wal.append_put(
-            TenantId::new(TID),
-            VShardId::new(0),
-            DatabaseId::DEFAULT,
-            &entry,
-        )
-        .expect("append raw kv_insert_on_conflict_update record");
+        wal.appender(crate::wal::manager::NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
+            .append_put(
+                TenantId::new(TID),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                &entry,
+            )
+            .expect("append raw kv_insert_on_conflict_update record");
         wal.sync().expect("wal sync");
         let records = wal.replay().expect("wal replay read");
 
@@ -547,6 +551,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         let upsert = PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "raw"),

@@ -45,13 +45,12 @@ pub fn grant_database(
 
     let db_id = catalog
         .get_database_id_by_name(db_name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog lookup: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup", &e))?
         .ok_or_else(|| DdlError::new("42704", format!("database '{db_name}' does not exist")))?;
 
-    // Resolve the target user_id from the grantee name.
-    let user_record = state
-        .credentials
-        .get_user(grantee)
+    // Resolve the target user_id from the grantee name, as this statement
+    // sees it: a user created earlier in the transaction counts.
+    let user_record = super::super::role_checks::visible_user(state, grantee)
         .ok_or_else(|| DdlError::new("42704", format!("user '{grantee}' does not exist")))?;
 
     let privileges: Vec<&str> = if privilege.eq_ignore_ascii_case("ALL") {
@@ -69,12 +68,12 @@ pub fn grant_database(
                 privilege: priv_name.to_string(),
             },
         )
-        .map_err(|e| DdlError::new("XX000", format!("catalog propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog propose", &e))?;
 
         if outcome.needs_local_apply() {
             catalog
                 .put_database_grant(db_id, user_record.user_id, priv_name)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
     }
 
@@ -102,12 +101,10 @@ pub fn revoke_database(
 
     let db_id = catalog
         .get_database_id_by_name(db_name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog lookup: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup", &e))?
         .ok_or_else(|| DdlError::new("42704", format!("database '{db_name}' does not exist")))?;
 
-    let user_record = state
-        .credentials
-        .get_user(grantee)
+    let user_record = super::super::role_checks::visible_user(state, grantee)
         .ok_or_else(|| DdlError::new("42704", format!("user '{grantee}' does not exist")))?;
 
     let privileges: Vec<&str> = if privilege.eq_ignore_ascii_case("ALL") {
@@ -125,12 +122,12 @@ pub fn revoke_database(
                 privilege: priv_name.to_string(),
             },
         )
-        .map_err(|e| DdlError::new("XX000", format!("catalog propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog propose", &e))?;
 
         if outcome.needs_local_apply() {
             catalog
                 .delete_database_grant(db_id, user_record.user_id, priv_name)
-                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         }
     }
 

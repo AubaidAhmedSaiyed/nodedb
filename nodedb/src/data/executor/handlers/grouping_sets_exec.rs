@@ -152,16 +152,16 @@ pub(super) fn execute_grouping_sets(
                     match ScanFilter::all_match_binary_indexed(&filter_predicates, raw, &idx) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => {
-                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        Err(e) => {
+                            return core.response_error(task, ErrorCode::from(e));
                         }
                     }
                 } else {
                     match ScanFilter::all_match_binary(&filter_predicates, raw) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => {
-                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        Err(e) => {
+                            return core.response_error(task, ErrorCode::from(e));
                         }
                     }
                 }
@@ -169,15 +169,14 @@ pub(super) fn execute_grouping_sets(
 
             let group_key = match msgpack_scan::build_group_key(raw, &active_specs) {
                 Ok(k) => k,
-                Err(_e) => return core.response_error(task, ErrorCode::DivisionByZero),
+                Err(e) => return core.response_error(task, ErrorCode::from(e)),
             };
-            if groups
+            if let Err(e) = groups
                 .entry(group_key)
                 .or_insert_with(|| GroupState::new(&real_agg_slice))
                 .feed(&real_agg_slice, raw)
-                .is_err()
             {
-                return core.response_error(task, ErrorCode::DivisionByZero);
+                return core.response_error(task, ErrorCode::from(e));
             }
         }
 
@@ -188,13 +187,13 @@ pub(super) fn execute_grouping_sets(
             for raw in &owned_docs {
                 match ScanFilter::all_match_binary(&filter_predicates, raw) {
                     Ok(true) => {
-                        if grand.feed(&real_agg_slice, raw).is_err() {
-                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        if let Err(e) = grand.feed(&real_agg_slice, raw) {
+                            return core.response_error(task, ErrorCode::from(e));
                         }
                     }
                     Ok(false) => {}
-                    Err(_e) => {
-                        return core.response_error(task, ErrorCode::DivisionByZero);
+                    Err(e) => {
+                        return core.response_error(task, ErrorCode::from(e));
                     }
                 }
             }
@@ -262,26 +261,26 @@ pub(super) fn execute_grouping_sets(
 
     // Apply HAVING.
     if !having_predicates.is_empty() {
-        // `Vec::retain`'s closure must return `bool`, so a division/modulo-
-        // by-zero in a HAVING predicate is captured via this `Cell`
-        // side-channel and checked once the retain finishes.
-        let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-            std::cell::Cell::new(None);
+        // `Vec::retain`'s closure must return `bool`, so an evaluation error
+        // in a HAVING predicate is captured via this side-channel and checked
+        // once the retain finishes.
+        let predicate_err: std::cell::RefCell<Option<nodedb_query::EvalError>> =
+            std::cell::RefCell::new(None);
         all_rows.retain(|row| {
-            if predicate_err.get().is_some() {
+            if predicate_err.borrow().is_some() {
                 return true;
             }
             let mp = nodedb_types::json_to_msgpack_or_empty(row);
             match ScanFilter::all_match_binary(&having_predicates, &mp) {
                 Ok(keep) => keep,
                 Err(e) => {
-                    predicate_err.set(Some(e));
+                    predicate_err.replace(Some(e));
                     true
                 }
             }
         });
-        if predicate_err.take().is_some() {
-            return core.response_error(task, ErrorCode::DivisionByZero);
+        if let Some(e) = predicate_err.take() {
+            return core.response_error(task, ErrorCode::from(e));
         }
     }
 

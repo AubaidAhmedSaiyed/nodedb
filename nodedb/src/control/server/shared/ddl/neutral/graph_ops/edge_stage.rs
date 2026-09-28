@@ -24,6 +24,7 @@
 //! vShard set records both homes so ROLLBACK tears down both.
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::pgwire::types::error_to_sqlstate;
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::server::shared::session::staging_gate::{
     InTxnRoute, StagingGateError, route_in_tx_write,
@@ -150,20 +151,25 @@ pub(super) async fn stage_edge_write_in_txn(
     match routed {
         Ok(InTxnRoute::Staged(outcome)) => Ok(outcome.affected as u64),
         // Edge writes are stageable (`is_stageable_write`), so inside a
-        // transaction block the gate always returns `Staged`. `Read` (not in a
-        // block) and `Buffered` (non-stageable write) cannot occur for a
-        // caller that already checked `InBlock`; there is no affected count to
-        // report for either, so treat them as a no-op tag rather than panicking.
-        Ok(InTxnRoute::Read(_)) | Ok(InTxnRoute::Buffered) => Ok(0),
-        Err(StagingGateError::Dispatch(e)) => Err(ddl_err("XX000", e.to_string())),
-        Err(StagingGateError::Rejected { code }) => {
-            let (_, sqlstate, message) = match code {
-                Some(code) => {
-                    crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code)
-                }
-                None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-            };
+        // transaction block the gate returns `Staged`. Any other route means
+        // the caller's `InBlock` check and the gate disagree. A report of zero
+        // rows drops the write silently, so the statement fails instead.
+        Ok(InTxnRoute::Read(_) | InTxnRoute::Autocommit(_) | InTxnRoute::Buffered) => {
+            Err(DdlError::internal(
+                "a graph edge write reached the transaction staging gate and was not staged",
+            ))
+        }
+        Err(StagingGateError::Dispatch(e)) => {
+            let (_, sqlstate, message) = error_to_sqlstate(&e);
             Err(ddl_err(sqlstate, message))
         }
+        Err(StagingGateError::Rejected { code }) => Err(match code {
+            Some(code) => {
+                let (_, sqlstate, message) =
+                    crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code);
+                ddl_err(sqlstate, message)
+            }
+            None => DdlError::internal("unknown data plane error"),
+        }),
     }
 }

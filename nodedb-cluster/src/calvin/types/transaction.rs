@@ -6,7 +6,7 @@
 //! representation submitted to the sequencer.
 
 use nodedb_types::TenantId;
-use nodedb_types::id::{DatabaseId, VShardId};
+use nodedb_types::id::{CollectionKey, DatabaseId, VShardId};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CalvinError;
@@ -58,12 +58,20 @@ impl ReadWriteSet {
     /// This derivation is re-run on decode rather than serialized, so the
     /// serialized bytes remain deterministic regardless of how `VShardId`
     /// is computed.
-    pub fn participating_vshards(&self) -> Vec<VShardId> {
+    pub fn participating_vshards(&self) -> Result<Vec<VShardId>, CalvinError> {
         self.participating_vshards_in_database(DatabaseId::DEFAULT)
     }
 
     /// Derive participants using database-scoped collection homes.
-    pub fn participating_vshards_in_database(&self, database_id: DatabaseId) -> Vec<VShardId> {
+    ///
+    /// Key-set collection names are database-qualified, because the Data
+    /// Plane reads storage by them. Each one is de-qualified into a
+    /// [`CollectionKey`] before hashing, so the participant set matches the
+    /// vShard every other path homes the collection to.
+    pub fn participating_vshards_in_database(
+        &self,
+        database_id: DatabaseId,
+    ) -> Result<Vec<VShardId>, CalvinError> {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         for engine_set in &self.0 {
@@ -80,7 +88,8 @@ impl ReadWriteSet {
                 | EngineKeySet::Vector { .. }
                 | EngineKeySet::Kv { .. } => {
                     let vshard =
-                        VShardId::from_collection_in_database(database_id, engine_set.collection());
+                        CollectionKey::from_qualified_str(database_id, engine_set.collection())?
+                            .vshard();
                     if seen.insert(vshard.as_u32()) {
                         result.push(vshard);
                     }
@@ -88,7 +97,7 @@ impl ReadWriteSet {
             }
         }
         result.sort_by_key(|v| v.as_u32());
-        result
+        Ok(result)
     }
 }
 
@@ -304,7 +313,7 @@ impl TxClass {
         if write_set.is_empty() {
             return Err(CalvinError::EmptyWriteSet);
         }
-        let mut participating_vshards = write_set.participating_vshards_in_database(database_id);
+        let mut participating_vshards = write_set.participating_vshards_in_database(database_id)?;
         let min_participants = if allow_single_vshard { 1 } else { 2 };
         // The participant FLOOR is computed from the WRITE set ONLY, and BEFORE
         // the read-set union below: a txn that writes a single shard but reads N
@@ -323,7 +332,7 @@ impl TxClass {
         // `new_checked` and `restore_derived` — `participating_vshards` is
         // `#[serde(skip)]` and re-derived on decode, so an encoded and a decoded
         // `TxClass` would disagree on their participant set if the two diverged.
-        for v in read_set.participating_vshards_in_database(database_id) {
+        for v in read_set.participating_vshards_in_database(database_id)? {
             if !participating_vshards
                 .iter()
                 .any(|e| e.as_u32() == v.as_u32())
@@ -393,17 +402,20 @@ impl TxClass {
     /// Re-derive fields skipped during serialization.
     ///
     /// Call this immediately after deserializing a `TxClass` that came off
-    /// the wire or out of the Raft log.
-    pub fn restore_derived(&mut self) {
+    /// the wire or out of the Raft log. Fails when a key-set collection name
+    /// lacks the qualifier of `database_id`. Construction rejects such a
+    /// class, so a failure here means the decoded bytes are not a class any
+    /// constructor built.
+    pub fn restore_derived(&mut self) -> Result<(), CalvinError> {
         let mut vshards = self
             .write_set
-            .participating_vshards_in_database(self.database_id);
+            .participating_vshards_in_database(self.database_id)?;
         // Union the read set's participating vShards — MUST match `new_checked`'s
         // union exactly so a decoded `TxClass` derives the identical participant
         // set the encoder computed (participants are not serialized).
         for v in self
             .read_set
-            .participating_vshards_in_database(self.database_id)
+            .participating_vshards_in_database(self.database_id)?
         {
             if !vshards.iter().any(|e| e.as_u32() == v.as_u32()) {
                 vshards.push(v);
@@ -419,6 +431,7 @@ impl TxClass {
         // Final stable sort after all unions — lockstep with `new_checked`.
         vshards.sort_by_key(|v| v.as_u32());
         self.participating_vshards = vshards;
+        Ok(())
     }
 
     /// Set the lock-table owner id propagated to `SequencedTxn.lock_owner`.
@@ -462,7 +475,9 @@ mod tests {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..512 {
             let name = format!("col_{i}");
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             if let Some((ref fname, fv)) = first {
                 if fv != vshard {
                     return (fname.clone(), name);
@@ -491,14 +506,14 @@ mod tests {
     #[test]
     fn read_write_set_participating_vshards_distinct() {
         let ws = multi_vshard_write_set();
-        let vshards = ws.participating_vshards();
+        let vshards = ws.participating_vshards().expect("participants");
         assert!(vshards.len() >= 2, "expected at least 2 distinct vShards");
     }
 
     #[test]
     fn read_write_set_participating_vshards_sorted() {
         let ws = multi_vshard_write_set();
-        let vshards = ws.participating_vshards();
+        let vshards = ws.participating_vshards().expect("participants");
         let ids: Vec<u32> = vshards.iter().map(|v| v.as_u32()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
@@ -509,7 +524,7 @@ mod tests {
     fn read_write_set_same_collection_counted_once() {
         // Two EngineKeySets for the same collection: still one vshard.
         let ws = ReadWriteSet::new(vec![doc_set("users", vec![1]), vec_set("users", vec![1])]);
-        let vshards = ws.participating_vshards();
+        let vshards = ws.participating_vshards().expect("participants");
         assert_eq!(vshards.len(), 1);
     }
 
@@ -611,7 +626,7 @@ mod tests {
         let first = sonic_rs::to_vec(&tc).unwrap();
 
         let mut restored: TxClass = sonic_rs::from_slice(&first).unwrap();
-        restored.restore_derived();
+        restored.restore_derived().expect("restore derived");
 
         let second = sonic_rs::to_vec(&restored).unwrap();
         assert_eq!(first, second);
@@ -624,7 +639,7 @@ mod tests {
         let tc = make_tx_class(multi_vshard_write_set());
         let bytes = zerompk::to_msgpack_vec(&tc).unwrap();
         let mut decoded: TxClass = zerompk::from_msgpack(&bytes).unwrap();
-        decoded.restore_derived();
+        decoded.restore_derived().expect("restore derived");
         assert_eq!(tc.tenant_id, decoded.tenant_id);
         assert_eq!(tc.plans, decoded.plans);
         assert_eq!(tc.write_set, decoded.write_set);
@@ -639,13 +654,19 @@ mod tests {
 
         // Pick a vshard id that's different from col_a and col_b.
         let passive_vshard_id = {
-            let a = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_a).as_u32();
-            let b = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &col_b).as_u32();
+            let a = CollectionKey::from_bare(DatabaseId::DEFAULT, &col_a)
+                .vshard()
+                .as_u32();
+            let b = CollectionKey::from_bare(DatabaseId::DEFAULT, &col_b)
+                .vshard()
+                .as_u32();
             // Find one that differs from both.
             let mut candidate = 9999u32;
             for i in 0u32..64 {
                 let name = format!("passive_col_{i}");
-                let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+                let v = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                    .vshard()
+                    .as_u32();
                 if v != a && v != b {
                     candidate = v;
                     break;
@@ -730,7 +751,7 @@ mod tests {
 
         let bytes = zerompk::to_msgpack_vec(&tx).expect("encode TxClass");
         let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode TxClass");
-        decoded.restore_derived();
+        decoded.restore_derived().expect("restore derived");
 
         // Every read_lsn and the Point/Predicate distinction survive exactly.
         assert_eq!(decoded.versioned_reads, reads);
@@ -771,7 +792,7 @@ mod tests {
         .expect("valid TxClass");
         let bytes = zerompk::to_msgpack_vec(&tx).expect("encode");
         let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode");
-        decoded.restore_derived();
+        decoded.restore_derived().expect("restore derived");
         assert_eq!(decoded.database_id, DatabaseId::new(9));
         assert_eq!(decoded.participating_vshards(), tx.participating_vshards());
     }
@@ -796,7 +817,7 @@ mod tests {
         let bytes = zerompk::to_msgpack_vec(&legacy).expect("encode legacy");
 
         let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode legacy as TxClass");
-        decoded.restore_derived();
+        decoded.restore_derived().expect("restore derived");
 
         assert!(decoded.versioned_reads.is_empty());
         assert!(decoded.dependent_reads.is_none());
@@ -832,7 +853,9 @@ mod tests {
 
         // Pick a collection name whose collection-homed vShard differs from
         // both endpoint homes, to prove routing ignores the collection.
-        let coll_v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, "follows").as_u32();
+        let coll_v = CollectionKey::from_bare(DatabaseId::DEFAULT, "follows")
+            .vshard()
+            .as_u32();
 
         let ws = ReadWriteSet::new(vec![EngineKeySet::Edge {
             collection: "follows".to_owned(),
@@ -842,6 +865,7 @@ mod tests {
 
         let mut got: Vec<u32> = ws
             .participating_vshards()
+            .expect("participants derive")
             .iter()
             .map(|v| v.as_u32())
             .collect();
@@ -867,8 +891,9 @@ mod tests {
             collection: "users".to_owned(),
             surrogates: SortedVec::new(vec![7u32]),
         }]);
-        let want_vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "users").as_u32();
+        let want_vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, "users")
+            .vshard()
+            .as_u32();
 
         // Strict path still rejects.
         let strict = TxClass::new(
@@ -914,7 +939,9 @@ mod tests {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..2048 {
             let name = format!("coll_{i}");
-            let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let v = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             if let Some((ref fname, fv)) = first {
                 if fv != v {
                     return (fname.clone(), name);
@@ -933,8 +960,12 @@ mod tests {
         // write-only floor still passes via the single-vshard opt-in), and the
         // union is reproduced identically on decode.
         let (wcoll, rcoll) = two_distinct_vshard_collections();
-        let wv = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &wcoll).as_u32();
-        let rv = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &rcoll).as_u32();
+        let wv = CollectionKey::from_bare(DatabaseId::DEFAULT, &wcoll)
+            .vshard()
+            .as_u32();
+        let rv = CollectionKey::from_bare(DatabaseId::DEFAULT, &rcoll)
+            .vshard()
+            .as_u32();
         assert_ne!(wv, rv);
 
         let write_set = ReadWriteSet::new(vec![EngineKeySet::Document {
@@ -975,7 +1006,7 @@ mod tests {
         // set (participants are `#[serde(skip)]`, re-derived in lockstep).
         let bytes = zerompk::to_msgpack_vec(&tx).expect("encode");
         let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode");
-        decoded.restore_derived();
+        decoded.restore_derived().expect("restore derived");
         assert_eq!(
             tx.participating_vshards(),
             decoded.participating_vshards(),
@@ -1020,9 +1051,27 @@ mod tests {
         }]);
         let got: Vec<u32> = ws
             .participating_vshards()
+            .expect("participants derive")
             .iter()
             .map(|v| v.as_u32())
             .collect();
         assert_eq!(got, vec![only]);
+    }
+
+    #[test]
+    fn participating_vshards_dequalify_named_database_collections() {
+        let db = DatabaseId::new(1024);
+        let qualified = nodedb_types::QualifiedCollection::new(db, "users");
+        let ws = ReadWriteSet::new(vec![doc_set(qualified.as_str(), vec![1])]);
+        let vshards = ws
+            .participating_vshards_in_database(db)
+            .expect("participants");
+        assert_eq!(
+            vshards,
+            vec![CollectionKey::from_bare(db, "users").vshard()]
+        );
+
+        let unqualified = ReadWriteSet::new(vec![doc_set("users", vec![1])]);
+        assert!(unqualified.participating_vshards_in_database(db).is_err());
     }
 }

@@ -7,14 +7,13 @@
 
 use nodedb_types::TenantId;
 
-use crate::bridge::envelope::{PhysicalPlan, Status};
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
 use crate::control::state::SharedState;
 use crate::control::target_identity::{
     bare_collection_name, derive_document_id, resolve_target_pk,
 };
 use crate::query::ResolvedUpdateRowWire;
-use crate::types::VShardId;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -67,8 +66,11 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
 
     // Recomputed rather than reusing the staged task's vShard, keeping dispatch
     // classification honest, like the MERGE / INSERT SELECT expanders.
-    let vshard_id =
-        VShardId::from_collection_in_database(task.database_id, target_collection.as_str());
+    let vshard_id = nodedb_types::CollectionKey::from_qualified_str(
+        task.database_id,
+        target_collection.as_str(),
+    )?
+    .vshard();
 
     // A join-column rewrite debits the target left and credits the one joined —
     // resolving post-images alone would leave the abandoned target overstated.
@@ -185,15 +187,10 @@ async fn resolve_update_rows(
         task.txn_id,
     )
     .await?;
-    if resolve_resp.status != Status::Ok {
-        return Err(crate::Error::Dispatch {
-            detail: format!(
-                "in-transaction UPDATE ... FROM resolve failed: {:?}",
-                resolve_resp.error_code
-            ),
-        });
-    }
-    decode_resolved_update_rows(&resolve_resp.payload)
+    // A refused resolve keeps its Data-Plane code.
+    let payload =
+        crate::control::server::shared::response_payload::payload_or_typed_error(resolve_resp)?;
+    decode_resolved_update_rows(&payload)
 }
 
 /// Decode the RESOLVE pass payload (a msgpack `Vec<ResolvedUpdateRowWire>`;

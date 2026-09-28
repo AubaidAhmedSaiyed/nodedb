@@ -108,7 +108,7 @@ pub(super) fn parse_with_databases(
     for name in raw_names {
         let resolved: Option<DatabaseId> = catalog
             .get_database_id_by_name(name)
-            .map_err(|e| err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
         match resolved {
             Some(id) => ids.push(id),
             None => {
@@ -120,17 +120,20 @@ pub(super) fn parse_with_databases(
     Ok(Some(ids))
 }
 
-/// Build the owner's `DatabaseSet` from a `UserRecord` for CREATE-time subset validation.
+/// Build the owner's `DatabaseSet` for CREATE-time subset validation, from
+/// the user as the statement sees it.
 pub(super) fn build_owner_database_set_for_user(
     state: &SharedState,
-    user: &crate::control::security::credential::record::UserRecord,
+    user: &crate::control::security::catalog::auth_types::user::StoredUser,
 ) -> Result<DatabaseSet, DdlError> {
     if user.is_superuser {
         return Ok(DatabaseSet::All);
     }
     if user.is_service_account && !user.accessible_databases.is_empty() {
         return Ok(DatabaseSet::Some(SmallVec::from_iter(
-            user.accessible_databases.iter().copied(),
+            user.accessible_databases
+                .iter()
+                .map(|&id| crate::types::DatabaseId::new(id)),
         )));
     }
     // Regular user or legacy service account: read from database_grants.
@@ -138,6 +141,6 @@ pub(super) fn build_owner_database_set_for_user(
         .credentials
         .catalog()
         .list_user_grant_databases(user.user_id)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     Ok(DatabaseSet::Some(SmallVec::from_iter(db_ids)))
 }

@@ -34,13 +34,15 @@ pub fn alter_database(
 
     let db_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
+    // A name row whose descriptor is gone is a database a concurrent DROP
+    // removed between the two reads.
     let mut descriptor = catalog
         .get_database(db_id)
-        .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?
-        .ok_or_else(|| ddl_err("XX000", format!("database '{name}' descriptor missing")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog read failed", &e))?
+        .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     match operation {
         AlterDatabaseOperation::Rename { new_name } => {
@@ -61,7 +63,7 @@ pub fn alter_database(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return Err(ddl_err("XX000", format!("catalog lookup failed: {e}")));
+                    return Err(DdlError::from_error_in_context("catalog lookup failed", &e));
                 }
             }
             descriptor.name = new_name.clone();
@@ -71,7 +73,7 @@ pub fn alter_database(
                 || {
                     catalog
                         .put_database(&descriptor)
-                        .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))
+                        .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))
                 },
             )?;
 
@@ -96,7 +98,7 @@ pub fn alter_database(
             // before/after diff so operators can reconstruct what changed.
             let before = catalog
                 .get_database_quota(db_id)
-                .map_err(|e| ddl_err("XX000", format!("quota read failed: {e}")))?
+                .map_err(|e| DdlError::from_error_in_context("quota read failed", &e))?
                 .unwrap_or(QuotaRecord::DEFAULT);
             let mut record = before.clone();
             record.merge(spec);
@@ -107,7 +109,7 @@ pub fn alter_database(
             let ceiling = state.quota_ceiling_snapshot();
             catalog
                 .check_database_quota(db_id, &record, &ceiling)
-                .map_err(|e| ddl_err("53400", format!("{e}")))?;
+                .map_err(|e| DdlError::from_error(&e))?;
 
             // Replicated: every node writes the row and installs the quota in
             // its live enforcement components via post-apply.
@@ -120,7 +122,7 @@ pub fn alter_database(
                 || {
                     catalog
                         .write_database_quota(db_id, &record)
-                        .map_err(|e| ddl_err("53400", format!("{e}")))?;
+                        .map_err(|e| DdlError::from_error(&e))?;
                     crate::control::catalog_entry::post_apply::quota::put_database(
                         db_id, &record, state,
                     );
@@ -175,7 +177,7 @@ pub fn alter_database(
                 || {
                     catalog
                         .put_database(&descriptor)
-                        .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))
+                        .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))
                 },
             )?;
 
@@ -208,7 +210,7 @@ pub fn alter_database(
                 || {
                     catalog
                         .put_database(&descriptor)
-                        .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))
+                        .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))
                 },
             )?;
 

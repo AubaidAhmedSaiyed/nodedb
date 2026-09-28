@@ -118,7 +118,7 @@ mod tests {
             .map(|i| vec![i as f32 * 0.1, -(i as f32) * 0.05, 1.0 + i as f32 * 0.02])
             .collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        Sq8Codec::calibrate(&refs, 3)
+        Sq8Codec::calibrate(&refs, 3).unwrap()
     }
 
     /// `encode` round-trip: packed_bits in the UQV must match the raw

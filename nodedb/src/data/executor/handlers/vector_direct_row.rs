@@ -35,7 +35,6 @@ pub(in crate::data::executor) struct VectorDirectIndexSpec<'a> {
 
 /// One row to store, for [`CoreLoop::write_vector_direct_row`].
 pub(in crate::data::executor) struct VectorDirectRowWrite<'a> {
-    pub task: &'a ExecutionTask,
     pub index_key: &'a VectorIndexKey,
     pub tid: u64,
     pub collection: &'a str,
@@ -77,20 +76,12 @@ impl CoreLoop {
             return Ok(None);
         };
         if existing.dim() != spec.dim {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!(
-                    "vector dimension mismatch: index has {}, got {}",
-                    existing.dim(),
-                    spec.dim
-                ),
-            });
+            return Err(super::vector::dimension_mismatch(existing.dim(), spec.dim));
         }
         let existing_dtype = existing.params().dtype;
         if existing_dtype != spec.storage_dtype {
-            return Err(ErrorCode::RejectedConstraint {
-                detail: String::new(),
-                constraint: format!(
+            return Err(ErrorCode::DataException {
+                detail: format!(
                     "vector storage_dtype mismatch: index has {existing_dtype}, got {}; \
                      dtype is immutable after collection creation",
                     spec.storage_dtype
@@ -239,7 +230,6 @@ impl CoreLoop {
         row: VectorDirectRowWrite<'_>,
     ) -> Result<(), ErrorCode> {
         let VectorDirectRowWrite {
-            task,
             index_key,
             tid,
             collection,
@@ -254,13 +244,9 @@ impl CoreLoop {
                 detail: format!("vector index for '{collection}' vanished during a direct write"),
             });
         };
-        let node_id = coll.insert_with_surrogate(vector.to_vec(), surrogate);
-        // Advance the checkpoint watermark so a later vector checkpoint records
-        // this write as absorbed; startup replay then skips the straddling WAL
-        // record instead of appending a duplicate node.
-        if let Some(lsn) = task.wal_lsn() {
-            coll.note_checkpoint_lsn(lsn.as_u64());
-        }
+        let node_id = coll
+            .insert_with_surrogate(vector.to_vec(), surrogate)
+            .map_err(|e| ErrorCode::from(crate::Error::from(e)))?;
         coll.payload.insert_row(node_id, fields);
 
         let key = StorageKey::for_surrogate(surrogate);
@@ -278,8 +264,8 @@ impl CoreLoop {
         Ok(())
     }
 
-    /// Bookkeeping every completed direct write runs once: seal the growing
-    /// segment when it is full, mark the checkpoint dirty, and record each
+    /// Bookkeeping every completed direct write runs once: seal a full growing
+    /// segment or train an IVF-PQ collection at its threshold, mark the checkpoint dirty, and record each
     /// touched surrogate's write version for cross-shard OCC validation.
     pub(in crate::data::executor) fn finish_vector_direct_write(
         &mut self,
@@ -289,18 +275,10 @@ impl CoreLoop {
         collection: &str,
         surrogates: &[Surrogate],
     ) {
-        let seal_key = CoreLoop::vector_build_key(index_key);
-        if let Some(coll) = self.vector_collections.get_mut(index_key)
-            && coll.needs_seal()
-            && let Some(req) = coll.seal(&seal_key)
-            && let Some(tx) = &self.build_tx
-            && let Err(e) = tx.send(req)
-        {
-            tracing::warn!(
-                core = self.core_id,
-                error = %e,
-                "failed to send HNSW build request"
-            );
+        // A committed-redo install seals once the whole record landed, so a
+        // rollback finds its inserts in the growing segment.
+        if !self.recording_redo_undo() {
+            self.settle_vector_collection(index_key);
         }
         self.checkpoint_coordinator.mark_dirty("vector", 1);
         for surrogate in surrogates {

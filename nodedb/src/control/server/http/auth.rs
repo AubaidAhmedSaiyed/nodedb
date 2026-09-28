@@ -320,6 +320,9 @@ pub enum ApiError {
         status: StatusCode,
         message: String,
         code: nodedb_types::error::ErrorCode,
+        /// The typed error that caused this one, such as the Data-Plane
+        /// refusal behind a DDL phase failure. `None` when there is none.
+        cause: Option<Box<nodedb_types::NodeDbError>>,
     },
 }
 
@@ -343,8 +346,13 @@ impl IntoResponse for ApiError {
                 status,
                 message,
                 code,
+                cause,
             } => {
                 let body = HttpError::with_code(message, code.to_string());
+                let body = match cause {
+                    Some(cause) => body.caused_by(&cause),
+                    None => body,
+                };
                 (status, axum::Json(body)).into_response()
             }
             other => {
@@ -424,22 +432,19 @@ impl FromRequestParts<AppState> for ResolvedAuth {
     }
 }
 
+/// The status and message come from the one gateway mapping,
+/// [`GatewayErrorMap::to_http`](crate::control::gateway::GatewayErrorMap::to_http).
+/// A rate refusal also carries its `Retry-After` hint.
 impl From<crate::Error> for ApiError {
     fn from(e: crate::Error) -> Self {
-        match &e {
-            crate::Error::RejectedAuthz { .. } => Self::Forbidden(e.to_string()),
-            crate::Error::RateExceeded { retry_after_ms, .. } => Self::RateLimited {
-                message: e.to_string(),
+        let (status, message) = crate::control::gateway::GatewayErrorMap::to_http(&e);
+        if let crate::Error::RateExceeded { retry_after_ms, .. } = &e {
+            return Self::RateLimited {
+                message,
                 retry_after_secs: retry_after_ms.div_ceil(1000).max(1),
-            },
-            crate::Error::BadRequest { .. }
-            | crate::Error::PlanError { .. }
-            | crate::Error::Config { .. } => Self::BadRequest(e.to_string()),
-            crate::Error::CollectionNotFound { .. } | crate::Error::DocumentNotFound { .. } => {
-                Self::BadRequest(e.to_string())
-            }
-            _ => Self::Internal(e.to_string()),
+            };
         }
+        Self::HttpStatus(status, message)
     }
 }
 
@@ -536,6 +541,90 @@ mod tests {
 
         assert_eq!(result.on_deny_override, context.on_deny_override);
         assert_authorization_fields_unchanged(&context, &result);
+    }
+
+    fn api_status(error: crate::Error) -> StatusCode {
+        ApiError::from(error).into_response().status()
+    }
+
+    /// Every error takes the status the gateway mapping gives it.
+    #[test]
+    fn api_errors_take_the_gateway_status() {
+        use crate::types::{RequestId, VShardId};
+
+        let cases = [
+            (
+                crate::Error::DataPlane(crate::bridge::envelope::ErrorCode::NotFound),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                crate::Error::DeadlineExceeded {
+                    request_id: RequestId::new(1),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                crate::Error::NotLeader {
+                    vshard_id: VShardId::new(1),
+                    leader_node: 2,
+                    leader_addr: "10.0.0.1:9000".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                crate::Error::ConflictRetry {
+                    collection: "orders".into(),
+                    document_id: "o1".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                crate::Error::CollectionNotFound {
+                    tenant_id: TenantId::new(1),
+                    collection: "orders".into(),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                crate::Error::RejectedAuthz {
+                    tenant_id: TenantId::new(1),
+                    resource: "orders".into(),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                crate::Error::BadRequest {
+                    detail: "bad".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (error, expected) in cases {
+            let label = format!("{error:?}");
+            let gateway = crate::control::gateway::GatewayErrorMap::to_http(&error).0;
+            let status = api_status(error);
+            assert_eq!(status, expected, "{label}");
+            assert_eq!(status.as_u16(), gateway, "{label}");
+        }
+    }
+
+    /// A rate refusal keeps its 429 and carries its `Retry-After` hint.
+    #[test]
+    fn a_rate_refusal_carries_retry_after() {
+        let response = ApiError::from(crate::Error::RateExceeded {
+            gate: "write".into(),
+            detail: "over budget".into(),
+            retry_after_ms: 1500,
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
     }
 
     #[test]

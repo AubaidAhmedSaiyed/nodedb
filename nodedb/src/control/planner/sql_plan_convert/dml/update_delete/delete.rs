@@ -5,7 +5,7 @@
 use nodedb_sql::types::{EngineType, Filter, SqlValue};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 
 use crate::control::planner::sql_plan_convert::convert::ConvertContext;
@@ -25,13 +25,14 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let collection_key = ctx.collection_key(collection);
     let coll_qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
         ctx.database_id,
         collection,
     );
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = collection_key.vshard();
 
     if matches!(engine, EngineType::KeyValue) {
         // A KV collection has no document store; a WHERE with no primary key
@@ -71,6 +72,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 // Attached by `inject_returning_spec` after plan conversion.
                 returning: None,
                 rls_filters: Vec::new(),
+                provenance: None,
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -167,7 +169,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             // runs, an unbound row_key affects 0 rows, and the clone CoW
             // resolver intercepts the ZERO sentinel), but a key this statement
             // never creates must never mint a binding.
-            let surrogate = ctx.surrogate_for_existing_pk(collection, &pk_bytes)?;
+            let surrogate = ctx.surrogate_for_existing_pk(collection_key, &pk_bytes)?;
             let plan = if is_crdt {
                 PhysicalPlan::Crdt(CrdtOp::DocDelete {
                     collection: qualified_collection.clone(),

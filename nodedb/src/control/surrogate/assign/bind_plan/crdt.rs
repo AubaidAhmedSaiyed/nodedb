@@ -21,7 +21,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut CrdtOp) -> crate::Resul
             document_id,
             surrogate,
             ..
-        } => binder.resolve_or_assign_in_place(collection.as_str(), document_id, surrogate),
+        } => binder.resolve_or_assign_in_place(
+            binder.plan_key(collection.as_str())?,
+            document_id,
+            surrogate,
+        ),
         CrdtOp::DocUpsert {
             collection,
             document_id,
@@ -57,7 +61,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut CrdtOp) -> crate::Resul
             document_id,
             surrogate,
             ..
-        } => binder.resolve_in_place(collection.as_str(), document_id.as_bytes(), surrogate),
+        } => binder.resolve_in_place(
+            binder.plan_key(collection.as_str())?,
+            document_id.as_bytes(),
+            surrogate,
+        ),
         // Reads, snapshots, constraints, policies and previews create no row.
         CrdtOp::Read { .. }
         | CrdtOp::ImportSnapshot { .. }

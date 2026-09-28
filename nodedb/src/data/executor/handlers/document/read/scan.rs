@@ -226,8 +226,8 @@ impl CoreLoop {
                     } else {
                         self.merge_overlay_into_scan(txn_id, &coll_key, &mut filtered, &matches);
                     }
-                    if predicate_err.take().is_some() {
-                        return self.response_error(task, ErrorCode::DivisionByZero);
+                    if let Some(e) = predicate_err.take() {
+                        return self.response_error(task, ErrorCode::from(e));
                     }
                 }
 
@@ -284,7 +284,10 @@ impl CoreLoop {
                         .collect()
                 };
 
-                let sorted = if sort_keys.is_empty() {
+                // With window functions the sort runs after the window pass
+                // (below), so ORDER BY can name a window alias, as the
+                // provider scan orders it.
+                let sorted = if sort_keys.is_empty() || !window_specs.is_empty() {
                     filtered
                 } else if filtered.len() <= self.query_tuning.sort_run_size {
                     let mut v = filtered;
@@ -366,6 +369,10 @@ impl CoreLoop {
                     ) {
                         return self.response_error(task, crate::Error::from(e));
                     }
+                    let decoded_rows = match sort::sort_decoded_rows(decoded_rows, sort_keys) {
+                        Ok(rows) => rows,
+                        Err(e) => return self.response_error(task, e),
+                    };
 
                     // Project first, then dedupe on the projected JSON value
                     // so `SELECT DISTINCT col` honours SQL semantics.

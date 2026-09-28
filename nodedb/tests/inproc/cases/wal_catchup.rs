@@ -12,7 +12,7 @@ use nodedb::control::security::audit::NoopAuditEmitter;
 use nodedb::control::state::SharedState;
 use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::types::*;
-use nodedb::wal::manager::WalManager;
+use nodedb::wal::manager::{NO_APPLY_KEY, WalManager};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -91,7 +91,8 @@ impl TestStack {
         let task = PhysicalTask {
             tenant_id,
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
+            vshard_id: nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection)
+                .vshard(),
             plan,
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -162,9 +163,10 @@ impl TestStack {
     fn write_to_wal(&self, collection: &str, payload: Vec<u8>) {
         let wal_payload = zerompk::to_msgpack_vec(&(collection.to_string(), payload)).unwrap();
         self.wal
+            .appender(NO_APPLY_KEY)
             .append_timeseries_batch(
                 TenantId::new(1),
-                VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection).vshard(),
                 DatabaseId::DEFAULT,
                 &wal_payload,
             )
@@ -513,13 +515,14 @@ fn startup_replay_recovers_all_wal_data() {
             1_700_000_000_000_000_000i64 + batch as i64 * rows_per_batch as i64 * 1_000_000;
         let payload = ilp_payload(collection, rows_per_batch, start_ts);
         let wal_payload = zerompk::to_msgpack_vec(&(collection.to_string(), payload)).unwrap();
-        wal.append_timeseries_batch(
-            TenantId::new(1),
-            VShardId::new(0),
-            DatabaseId::DEFAULT,
-            &wal_payload,
-        )
-        .unwrap();
+        wal.appender(NO_APPLY_KEY)
+            .append_timeseries_batch(
+                TenantId::new(1),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                &wal_payload,
+            )
+            .unwrap();
     }
     wal.sync().unwrap();
 
@@ -572,30 +575,28 @@ fn startup_replay_recovers_all_wal_data() {
     use nodedb::bridge::envelope::{Priority, Request};
 
     req_tx
-        .try_push(BridgeRequest {
-            inner: Request {
-                request_id: RequestId::new(1),
-                tenant_id: TenantId::new(1),
-                vshard_id: VShardId::new(0),
-                database_id: nodedb::types::DatabaseId::DEFAULT,
-                plan: scan_plan,
-                deadline: std::time::Instant::now() + Duration::from_secs(10),
-                priority: Priority::Normal,
-                trace_id: nodedb_types::TraceId::ZERO,
-                consistency: ReadConsistency::Strong,
-                idempotency_key: None,
-                event_source: nodedb::event::EventSource::User,
-                user_roles: Vec::new(),
-                user_id: None,
-                statement_digest: None,
-                txn_id: None,
-                wal_lsn: None,
-                resolved_now_ms: None,
-                admission: nodedb::bridge::envelope::Admission::Exempt(
-                    nodedb::bridge::envelope::ExemptReason::Read,
-                ),
-            },
-        })
+        .try_push(BridgeRequest::unfloored(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            vshard_id: VShardId::new(0),
+            database_id: nodedb::types::DatabaseId::DEFAULT,
+            plan: scan_plan,
+            deadline: std::time::Instant::now() + Duration::from_secs(10),
+            priority: Priority::Normal,
+            trace_id: nodedb_types::TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: nodedb::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: None,
+            resolved_now_ms: None,
+            admission: nodedb::bridge::envelope::Admission::Exempt(
+                nodedb::bridge::envelope::ExemptReason::Read,
+            ),
+        }))
         .unwrap();
     core.tick();
     let resp = resp_rx.try_pop().unwrap();

@@ -22,7 +22,7 @@ pub(super) fn propose_create(state: &SharedState, def: &ConsumerGroupDef) -> Res
     let entry = CatalogEntry::PutConsumerGroupIfAbsent(Box::new(def.clone()));
     propose_and_apply(state, &entry, || {
         apply::put_if_absent(def, state.credentials.catalog())
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         post_apply::put_if_absent(def, state);
         Ok(())
     })
@@ -52,7 +52,7 @@ pub(super) fn propose_delete(
             name,
             state.credentials.catalog(),
         )
-        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
         post_apply::delete(database_id, tenant_id, stream_name, name, state);
         Ok(())
     })
@@ -73,7 +73,7 @@ pub(super) fn propose_migrate(
     };
     propose_and_apply(state, &entry, || {
         apply::migrate_stream(def, legacy_stream, state.credentials.catalog())
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         post_apply::migrate_stream(def, legacy_stream, state);
         Ok(())
     })

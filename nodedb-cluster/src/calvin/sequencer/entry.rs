@@ -133,6 +133,12 @@ pub enum SequencerEntry {
         position: u32,
         reason: AbortReason,
     },
+    /// A backup's consistent-cut marker, carrying the backup's watermark
+    /// `hlc`. Every replica fans it out to each of its vShard schedulers in
+    /// log order. A scheduler reports the marker once every transaction
+    /// delivered to it before the marker finished, and gives every
+    /// transaction delivered after it a commit HLC above `hlc`.
+    CutMarker { hlc: u64 },
 }
 
 #[cfg(test)]
@@ -141,14 +147,16 @@ mod tests {
     use crate::calvin::types::{EngineKeySet, ReadWriteSet, SequencedTxn, SortedVec, TxClass};
     use nodedb_types::{
         TenantId,
-        id::{DatabaseId, VShardId},
+        id::{CollectionKey, DatabaseId},
     };
 
     fn find_two_distinct_collections() -> (String, String) {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..512 {
             let name = format!("col_{i}");
-            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            let vshard = CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+                .vshard()
+                .as_u32();
             if let Some((ref fname, fv)) = first {
                 if fv != vshard {
                     return (fname.clone(), name);

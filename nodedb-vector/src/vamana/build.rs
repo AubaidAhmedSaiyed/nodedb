@@ -15,6 +15,7 @@
 
 use nodedb_codec::vector_quant::codec::VectorCodec;
 
+use crate::error::{VectorError, check_dim};
 use crate::vamana::graph::VamanaGraph;
 use crate::vamana::prune::alpha_prune;
 
@@ -35,10 +36,12 @@ use crate::vamana::prune::alpha_prune;
 /// * `alpha` — pruning factor (typical: 1.2; must be > 1).
 /// * `l_build` — beam width during construction (typical: 100).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `vectors`, `ids`, and `quantized` do not all have the same
-/// length, or if `vectors` is empty.
+/// - [`VectorError::InvalidInput`] when `vectors` is empty, or `vectors`,
+///   `ids` and `quantized` differ in length.
+/// - [`VectorError::DimensionMismatch`] when a vector's length differs from
+///   the first vector's.
 pub fn build_vamana<C: VectorCodec>(
     vectors: &[Vec<f32>],
     ids: &[u64],
@@ -47,21 +50,28 @@ pub fn build_vamana<C: VectorCodec>(
     r: usize,
     alpha: f32,
     l_build: usize,
-) -> VamanaGraph {
-    assert_eq!(
-        vectors.len(),
-        ids.len(),
-        "vectors and ids must have equal length"
-    );
-    assert_eq!(
-        vectors.len(),
-        quantized.len(),
-        "vectors and quantized must have equal length"
-    );
-    assert!(!vectors.is_empty(), "cannot build from empty vector set");
+) -> Result<VamanaGraph, VectorError> {
+    let Some(first) = vectors.first() else {
+        return Err(VectorError::InvalidInput {
+            detail: "Vamana build needs at least one vector".into(),
+        });
+    };
+    if vectors.len() != ids.len() || vectors.len() != quantized.len() {
+        return Err(VectorError::InvalidInput {
+            detail: format!(
+                "Vamana build got {} vectors, {} ids and {} quantized vectors; the counts must match",
+                vectors.len(),
+                ids.len(),
+                quantized.len()
+            ),
+        });
+    }
+    let dim = first.len();
+    for v in vectors {
+        check_dim(dim, v.len())?;
+    }
 
     let n = vectors.len();
-    let dim = vectors[0].len();
     let l = l_build.max(r);
 
     // --- Construct graph skeleton ---
@@ -132,7 +142,7 @@ pub fn build_vamana<C: VectorCodec>(
         graph.set_neighbors(i, pruned);
     }
 
-    graph
+    Ok(graph)
 }
 
 // ------------------------------------------------------------------
@@ -375,7 +385,7 @@ mod tests {
         let ids: Vec<u64> = (0..n as u64).collect();
         let quantized: Vec<L2Q> = vecs.iter().map(|v| codec.encode(v)).collect();
 
-        let graph = build_vamana(&vecs, &ids, &codec, &quantized, 8, 1.2, 20);
+        let graph = build_vamana(&vecs, &ids, &codec, &quantized, 8, 1.2, 20).unwrap();
 
         assert_eq!(graph.len(), n);
 
@@ -402,7 +412,7 @@ mod tests {
         let ids: Vec<u64> = (0..n as u64).collect();
         let quantized: Vec<L2Q> = vecs.iter().map(|v| codec.encode(v)).collect();
 
-        let graph = build_vamana(&vecs, &ids, &codec, &quantized, r, 1.2, 15);
+        let graph = build_vamana(&vecs, &ids, &codec, &quantized, r, 1.2, 15).unwrap();
 
         for i in 0..n {
             assert!(

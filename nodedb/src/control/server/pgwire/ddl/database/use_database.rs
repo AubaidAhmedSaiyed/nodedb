@@ -19,7 +19,7 @@ use crate::control::server::shared::session::{
 };
 use crate::control::state::SharedState;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::types::{error_to_pg_in_context, sqlstate_error};
 
 /// Handle `USE DATABASE <name>`.
 ///
@@ -38,7 +38,7 @@ pub async fn handle_use_database(
     // Verify the named database exists.
     let db_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
+        .map_err(|e| error_to_pg_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| sqlstate_error("3D000", &format!("database '{name}' does not exist")))?;
 
     // Enforce `accessible_databases`: reject the switch if the identity does

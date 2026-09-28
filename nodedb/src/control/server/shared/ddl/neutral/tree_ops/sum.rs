@@ -15,7 +15,7 @@ use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
@@ -101,7 +101,7 @@ pub async fn tree_sum(
         },
     )
     .await
-    .map_err(|e| ddl_err("XX000", format!("BFS failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("BFS failed", &e))?;
 
     // Parse BFS result as JSON array of node IDs.
     let bfs_json =
@@ -136,12 +136,17 @@ pub async fn tree_sum(
     // Without it, we fall back to scanning all tenant collections (O(N×C)).
     for node_id in &all_ids {
         for coll_name in &collections_to_search {
-            let coll_vshard = VShardId::from_collection_in_database(database_id, coll_name);
+            let coll_vshard =
+                nodedb_types::CollectionKey::from_bare(database_id, coll_name).vshard();
             let pk_bytes = node_id.as_bytes().to_vec();
             let surrogate = state
                 .surrogate_assigner
-                .lookup(database_id, tenant_id, coll_name, &pk_bytes)
-                .map_err(|e| ddl_err("XX000", format!("surrogate lookup: {e}")))?
+                .lookup(
+                    nodedb_types::CollectionKey::from_bare(database_id, coll_name),
+                    tenant_id,
+                    &pk_bytes,
+                )
+                .map_err(|e| DdlError::from_error_in_context("surrogate lookup", &e))?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             let mut get_plan =
                 PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {

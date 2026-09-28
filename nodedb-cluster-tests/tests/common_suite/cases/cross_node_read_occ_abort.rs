@@ -54,7 +54,7 @@ use crate::common;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 use tokio_postgres::SimpleQueryMessage;
 
 use common::cluster_harness::{TestClusterNode, wait_for, wait_for_async};
@@ -84,14 +84,16 @@ fn admitted_total(node: &TestClusterNode) -> u64 {
 
 /// Three `document_schemaless` collection names whose vShard ids are pairwise
 /// distinct, so a transaction that writes two of them and reads the third is
-/// genuinely multi-vShard. Deterministic: `VShardId::from_collection_in_database`
+/// genuinely multi-vShard. Deterministic: `VShardId::from_collection`
 /// is a pure function of the database id + collection-name bytes, so the same
 /// scan picks the same names every run.
 fn distinct_vshard_triple() -> (String, String, String) {
     let mut chosen: Vec<(String, u32)> = Vec::new();
     for i in 0u32..1024 {
         let name = format!("occ_shard_{i}");
-        let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+        let v = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name)
+            .vshard()
+            .as_u32();
         if chosen.iter().all(|(_, cv)| *cv != v) {
             chosen.push((name, v));
             if chosen.len() == 3 {

@@ -54,7 +54,7 @@ pub(super) fn text_rows(
 ///
 /// Errors:
 /// - `42601` — empty token (after quote stripping).
-/// - `XX000` — catalog read failure.
+/// - a catalog read failure keeps its own SQLSTATE.
 ///
 /// Used by `DROP TENANT`, `ALTER TENANT SET QUOTA`, and `PURGE TENANT` to
 /// accept names in addition to numeric ids, parallel to the existing
@@ -78,7 +78,7 @@ pub(super) fn resolve_tenant_ref(
     let catalog = state.credentials.catalog();
     Ok(catalog
         .find_tenant_by_name(name)
-        .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .map(|stored| TenantId::new(stored.tenant_id)))
 }
 
@@ -90,7 +90,7 @@ pub(super) fn tenant_exists(state: &SharedState, tenant_id: TenantId) -> Result<
     let catalog = state.credentials.catalog();
     let present = catalog
         .load_all_tenants()
-        .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .iter()
         .any(|t| t.tenant_id == tenant_id.as_u64());
     Ok(present)

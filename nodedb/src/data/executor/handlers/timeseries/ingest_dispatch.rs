@@ -14,8 +14,21 @@ use crate::data::executor::task::ExecutionTask;
 /// Side-effect policy for a timeseries ingest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::data::executor) enum TimeseriesApplyMode {
+    /// A live write: one record, one sub-record. The memtable flushes before
+    /// the rows land when it cannot take them whole, and after they land
+    /// when it is over its budget.
     Immediate,
-    CommitDeferred,
+    /// Restart replay of one sub-record. The replay arm flushed before the
+    /// record's first sub-record when the memtable could not take the whole
+    /// record, and settles it once the last sub-record landed
+    /// (`group_flush`). No flush runs here: it would split the record.
+    Replay,
+    /// The install pass of a committed redo record. The replay arm flushed
+    /// before the record's first sub-record, as in `Replay`; the ingest
+    /// records the pre-image its undo restores. No flush, budget recharge or
+    /// timer update runs after the rows land: the apply settles those once
+    /// the whole record installed (`settle_redo_timeseries`).
+    RedoInstall,
 }
 
 /// Parameters for a timeseries ingest operation on the Data Plane.
@@ -108,57 +121,17 @@ impl CoreLoop {
         }
 
         let key = (task.request.database_id, tid, collection.to_string());
-        if mode == TimeseriesApplyMode::CommitDeferred {
-            let governor_pressure = self
-                .governor
-                .try_reserve(
-                    task.request.database_id,
-                    tid,
-                    nodedb_mem::EngineId::Timeseries,
-                    0,
-                )
-                .is_err();
-            let needs_flush = self.columnar_memtables.get(&key).is_some_and(|memtable| {
-                memtable.memory_bytes() >= self.ts_tuning.memtable_budget_bytes
-                    || memtable.memory_bytes() >= self.ts_tuning.memtable_hard_limit_bytes
-                    || governor_pressure
-            });
-            if needs_flush {
-                return self.response_error(
-                    task,
-                    ErrorCode::RejectedPrevalidation {
-                        reason: "transactional timeseries ingest requires a flush before mutation"
-                            .into(),
-                    },
-                );
-            }
-        }
-
-        let already_flushed = if let Some(lsn) = wal_lsn
-            && let Some(registry) = self.ts_registries.get(&key)
-        {
-            let max_flushed = registry
-                .iter()
-                .map(|(_, e)| e.meta.last_flushed_wal_lsn)
-                .max()
-                .unwrap_or(0);
-            max_flushed > 0 && lsn <= max_flushed
-        } else {
-            false
-        };
-        // A record written before a later truncate describes rows the
-        // truncate removed: the same "nothing to write" answer as a record
-        // already on disk.
-        let already_flushed = already_flushed
-            || wal_lsn.is_some_and(|lsn| {
-                self.ts_truncate_floors
-                    .get(&key)
-                    .is_some_and(|floor| lsn <= *floor)
-            });
+        // A record the collection's replay stamp names is already in a
+        // partition, or a truncate removed its rows: nothing to write. Every
+        // other record applies, including one below the highest named LSN,
+        // which was still on its way when that flush or truncate ran. A
+        // committed-redo apply installs its record once, whatever the stamp
+        // names (`replay_watermark_skips`).
+        let already_flushed = wal_lsn.is_some_and(|lsn| self.ts_replay_skips(&key, lsn));
 
         if already_flushed {
             if let Some(prov) = provenance
-                && mode == TimeseriesApplyMode::Immediate
+                && mode != TimeseriesApplyMode::RedoInstall
             {
                 self.sync_commit(prov);
                 let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
@@ -204,7 +177,12 @@ impl CoreLoop {
             };
         }
 
-        let now_ms = self.ingest_now_ms();
+        // The instant the write funnel resolved and the WAL record carries,
+        // so live apply and replay stamp untimed rows alike.
+        let now_ms = task
+            .resolved_now_ms()
+            .and_then(|ms| i64::try_from(ms).ok())
+            .unwrap_or_else(|| self.ingest_now_ms());
 
         let ingest_response = match format {
             "ilp" => self.execute_ilp_ingest(TimeseriesIngestParams {
@@ -267,13 +245,12 @@ impl CoreLoop {
 
         if let Some(prov) = provenance
             && ingest_response.status == Status::Ok
-            && mode == TimeseriesApplyMode::Immediate
         {
             self.sync_commit(prov);
             let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
             return self.sync_ack_response(task, AckStatus::Applied, applied_seq);
         }
-        if ingest_response.status == Status::Ok && mode == TimeseriesApplyMode::Immediate {
+        if ingest_response.status == Status::Ok {
             self.note_collection_write_lsn(task, collection);
         }
         ingest_response

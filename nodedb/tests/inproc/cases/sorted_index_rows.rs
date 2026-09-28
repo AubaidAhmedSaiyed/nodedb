@@ -21,7 +21,7 @@
 //! Authorization for these same functions is covered by
 //! `sorted_index_authorization.rs`.
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 use nodedb_test_support::pgwire_harness::TestServer;
 
 /// Data-Plane cores the test server runs. More than one is the point: it is
@@ -34,7 +34,10 @@ const INDEX: &str = "sidx_rows_lb";
 
 /// The core a name is routed to, mirroring `VShardRouter::round_robin`.
 fn owning_core(name: &str) -> usize {
-    VShardId::from_collection_in_database(DatabaseId::DEFAULT, name).as_u32() as usize % CORES
+    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, name)
+        .vshard()
+        .as_u32() as usize
+        % CORES
 }
 
 /// A leaderboard with `rows` already stored, then indexed. Returns the server.

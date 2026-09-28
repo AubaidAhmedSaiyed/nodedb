@@ -7,8 +7,8 @@
 //!    assert rows returned.
 //! 2. **Cross-node SELECT** — 3-node cluster, gateway on follower routes a
 //!    KV GET to the leaseholder; asserts success.
-//! 3. **Typed error → native code** — trigger `CollectionNotFound`, assert the
-//!    native error code matches `GatewayErrorMap::to_native` mapping (code 40).
+//! 3. **Typed error → native code** — map each error variant through
+//!    `GatewayErrorMap::to_native` and assert its stable `nodedb_types` code.
 
 use crate::common;
 
@@ -22,6 +22,7 @@ use nodedb::control::gateway::core::QueryContext;
 use nodedb::types::{RequestId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 use nodedb_types::QualifiedCollection;
+use nodedb_types::error::ErrorCode;
 
 use common::cluster_harness::{TestCluster, TestClusterNode};
 
@@ -77,6 +78,7 @@ async fn native_gateway_migration_single_node_select() {
         surrogate: nodedb_types::Surrogate::ZERO,
         returning: None,
         rls_filters: Vec::new(),
+        provenance: None,
     });
     let put_checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
     gateway
@@ -147,6 +149,7 @@ async fn native_gateway_migration_cross_node_select() {
         surrogate: nodedb_types::Surrogate::ZERO,
         returning: None,
         rls_filters: Vec::new(),
+        provenance: None,
     });
     let put_checked =
         common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, put_plan).await;
@@ -186,21 +189,17 @@ async fn native_gateway_migration_cross_node_select() {
 // Test 3: Typed error → native code mapping
 // ---------------------------------------------------------------------------
 //
-// `GatewayErrorMap::to_native` maps each error variant to a numeric code.
-// The migrated `direct_ops.rs` and `sql_gateway.rs` call this mapper.
-// These tests verify the codes align with the constants defined in error_map.rs.
+// `GatewayErrorMap::to_native` returns the stable `nodedb_types` error code
+// and the message the native error frame carries for each error variant.
 
 #[test]
-fn native_gateway_error_collection_not_found_is_code_40() {
+fn native_gateway_error_collection_not_found_code() {
     let err = Error::CollectionNotFound {
         tenant_id: TenantId::new(0),
         collection: "missing_native_col".into(),
     };
     let (code, msg) = GatewayErrorMap::to_native(&err);
-    assert_eq!(
-        code, 40,
-        "CollectionNotFound should map to code 40, got {code}"
-    );
+    assert_eq!(code, ErrorCode::COLLECTION_NOT_FOUND, "got {code}");
     assert!(
         msg.contains("missing_native_col"),
         "error message should name the collection: {msg}"
@@ -208,14 +207,14 @@ fn native_gateway_error_collection_not_found_is_code_40() {
 }
 
 #[test]
-fn native_gateway_error_not_leader_is_code_10() {
+fn native_gateway_error_not_leader_code() {
     let err = Error::NotLeader {
         vshard_id: VShardId::new(1),
         leader_node: 2,
         leader_addr: "10.0.0.1:9000".into(),
     };
     let (code, msg) = GatewayErrorMap::to_native(&err);
-    assert_eq!(code, 10, "NotLeader should map to code 10, got {code}");
+    assert_eq!(code, ErrorCode::NOT_LEADER, "got {code}");
     assert!(
         msg.contains("hint:"),
         "not-leader message should contain hint: {msg}"
@@ -223,50 +222,31 @@ fn native_gateway_error_not_leader_is_code_10() {
 }
 
 #[test]
-fn native_gateway_error_deadline_is_code_20() {
+fn native_gateway_error_deadline_code() {
     let err = Error::DeadlineExceeded {
         request_id: RequestId::new(1),
     };
     let (code, _msg) = GatewayErrorMap::to_native(&err);
-    assert_eq!(
-        code, 20,
-        "DeadlineExceeded should map to code 20, got {code}"
-    );
+    assert_eq!(code, ErrorCode::DEADLINE_EXCEEDED, "got {code}");
 }
 
 #[test]
-fn native_gateway_error_schema_changed_is_code_30() {
-    let err = Error::RetryableSchemaChanged {
-        descriptor: "users".into(),
-    };
-    let (code, msg) = GatewayErrorMap::to_native(&err);
-    assert_eq!(
-        code, 30,
-        "RetryableSchemaChanged should map to code 30, got {code}"
-    );
-    assert!(
-        msg.contains("users"),
-        "message should name descriptor: {msg}"
-    );
-}
-
-#[test]
-fn native_gateway_error_authz_is_code_50() {
+fn native_gateway_error_authz_code() {
     let err = Error::RejectedAuthz {
         tenant_id: TenantId::new(0),
         resource: "secret".into(),
     };
     let (code, _msg) = GatewayErrorMap::to_native(&err);
-    assert_eq!(code, 50, "RejectedAuthz should map to code 50, got {code}");
+    assert_eq!(code, ErrorCode::AUTHORIZATION_DENIED, "got {code}");
 }
 
 #[test]
-fn native_gateway_error_bad_request_is_code_60() {
+fn native_gateway_error_bad_request_code() {
     let err = Error::BadRequest {
         detail: "invalid plan".into(),
     };
     let (code, msg) = GatewayErrorMap::to_native(&err);
-    assert_eq!(code, 60, "BadRequest should map to code 60, got {code}");
+    assert_eq!(code, ErrorCode::BAD_REQUEST, "got {code}");
     assert!(
         msg.contains("invalid plan"),
         "message should contain detail: {msg}"
@@ -274,24 +254,21 @@ fn native_gateway_error_bad_request_is_code_60() {
 }
 
 #[test]
-fn native_gateway_error_constraint_is_code_70() {
+fn native_gateway_error_constraint_code() {
     let err = Error::RejectedConstraint {
         detail: "unique violation".into(),
         constraint: "pk".into(),
         collection: "orders".into(),
     };
     let (code, _msg) = GatewayErrorMap::to_native(&err);
-    assert_eq!(
-        code, 70,
-        "RejectedConstraint should map to code 70, got {code}"
-    );
+    assert_eq!(code, ErrorCode::CONSTRAINT_VIOLATION, "got {code}");
 }
 
 #[test]
-fn native_gateway_error_internal_is_code_99() {
+fn native_gateway_error_internal_code() {
     let err = Error::Internal {
         detail: "unexpected state".into(),
     };
     let (code, _msg) = GatewayErrorMap::to_native(&err);
-    assert_eq!(code, 99, "Internal should map to code 99, got {code}");
+    assert_eq!(code, ErrorCode::INTERNAL, "got {code}");
 }

@@ -6,7 +6,7 @@
 //! |-------------------|--------|-----------------------------|---------------|
 //! | `/healthz`        | GET    | Ready to serve traffic      | readiness     |
 //! | `/health/live`    | GET    | Process alive (always 200)  | liveness      |
-//! | `/health/ready`   | GET    | WAL recovered               | readiness alt |
+//! | `/health/ready`   | GET    | WAL recovered, serving      | readiness alt |
 //! | `/health/drain`   | POST   | Trigger graceful drain      | preStop hook  |
 
 use std::sync::atomic::Ordering;
@@ -34,13 +34,13 @@ pub async fn live() -> impl IntoResponse {
 
 /// GET /healthz — k8s-style readiness probe.
 ///
-/// Returns `200 OK` when the node has reached `GatewayEnable`, is
+/// Returns `200 OK` when the node has reached `Serving`, is
 /// serving traffic, is NOT draining/decommissioned, and — on a node that
 /// runs a Calvin sequencer — can actually sequence a cross-shard write.
 /// Returns `503 Service Unavailable` otherwise.
 ///
 /// Every condition is evaluated live on each call, not latched: sequencer
-/// leadership and the epoch seed can both be lost long after `GatewayEnable`.
+/// leadership and the epoch seed can both be lost long after `Serving`.
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     // The coordinator signals this canonical watch before progressing drain
     // phases, so readiness must fail immediately even before lifecycle state
@@ -109,6 +109,41 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
     }
 
+    // A halted Calvin scheduler holds one vShard's sequenced txns unapplied.
+    // The node serves everything else, so it reports degraded, like a halted
+    // sequencer.
+    if let Some(halt) = state.shared.sequencer_halt.apply_halt().report() {
+        let body = json!({
+            "status": "degraded",
+            "reason": "calvin_apply_halted",
+            "node_id": state.shared.node_id,
+            "vshard_id": halt.vshard_id,
+            "epoch": halt.epoch,
+            "position": halt.position,
+            "halt_reason": halt.reason,
+            "step": halt.step,
+            "error": halt.error,
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
+    }
+
+    // A fail-stopped core refuses every request routed to it: its state is
+    // unknown until restart. The other cores serve, so the node is degraded.
+    if let Some(stops) = state
+        .shared
+        .system_metrics
+        .as_ref()
+        .map(|metrics| &metrics.core_fail_stops)
+        && let Some(report) = stops.report()
+    {
+        let (status, mut body) = crate::control::metrics::system::core_fail_stop::to_http_response(
+            report,
+            stops.stopped_cores(),
+        );
+        body["node_id"] = json!(state.shared.node_id);
+        return (status, axum::Json(body));
+    }
+
     // A core that stops completing event-loop iterations panics nothing, so
     // the per-core panic watchdog stays quiet and every other check above
     // still passes. Fail readiness and name the cores: work routed to a
@@ -121,8 +156,27 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         return (status, axum::Json(body));
     }
 
+    // A write window open past the outcome-floor bound holds the floor, so
+    // no checkpoint on this node advances past it. The node serves, so it
+    // reports degraded.
+    if let Some(body) = outcome_floor_stuck_body(&state, outcome_floor_bound(&state)) {
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
+    }
+
     let health = crate::control::startup::health::observe(&state.shared.startup);
-    let (status, body) = crate::control::startup::health::to_http_response(&health);
+    let (status, mut body) = crate::control::startup::health::to_http_response(&health);
+    // A held window keeps the outcome floor below it by design, so it never
+    // degrades readiness. The count shows how many restart replay will reach.
+    body["held_windows"] = json!(state.shared.outcome_floor.held_windows());
+    // A node that lost its authorization lease refuses permission-checked
+    // statements until it renews, and serves everything else. Checked once
+    // the startup gate is green: boot holds the gateway until the first lease.
+    if status == StatusCode::OK
+        && let Some(body) = lease_invalid_body(&state)
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
+    }
+    body["authorization_lease"] = json!(lease_label(&state));
     // Checked only once the startup gate is otherwise green, so a node still
     // advancing through phases keeps reporting the phase it is stuck in.
     if status == StatusCode::OK
@@ -136,6 +190,76 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
     }
     (status, axum::Json(body))
+}
+
+/// The lease state `/healthz` reports: `valid`, `invalid`, `sole_voter` for
+/// a pinned lease, or `not_required` on a single node without a cluster.
+fn lease_label(state: &AppState) -> &'static str {
+    use crate::control::security::auth_lease::{LeaseStatus, lease_status};
+    match lease_status(&state.shared, std::time::Instant::now()) {
+        LeaseStatus::NotRequired => "not_required",
+        LeaseStatus::Valid { .. } => "valid",
+        LeaseStatus::SoleVoter => "sole_voter",
+        LeaseStatus::Invalid { .. } => "invalid",
+    }
+}
+
+/// The degraded body for a node that holds no valid authorization lease, or
+/// `None` when it holds one or needs none.
+fn lease_invalid_body(state: &AppState) -> Option<serde_json::Value> {
+    use crate::control::security::auth_lease::{LeaseStatus, lease_status};
+    match lease_status(&state.shared, std::time::Instant::now()) {
+        LeaseStatus::NotRequired | LeaseStatus::Valid { .. } | LeaseStatus::SoleVoter => None,
+        LeaseStatus::Invalid { expired_for } => Some(json!({
+            "status": "degraded",
+            "reason": "authorization_lease_invalid",
+            "detail": "this node holds no valid authorization lease; it refuses \
+                       permission-checked statements until it renews",
+            "node_id": state.shared.node_id,
+            "lease_expired_ms_ago": expired_for
+                .map(|expired| u64::try_from(expired.as_millis()).unwrap_or(u64::MAX)),
+        })),
+    }
+}
+
+/// The degraded body for an outcome floor held past `bound` by a window that
+/// is not held, or `None` when no such window exists.
+fn outcome_floor_stuck_body(
+    state: &AppState,
+    bound: std::time::Duration,
+) -> Option<serde_json::Value> {
+    let floor = &state.shared.outcome_floor;
+    let stuck = floor.stuck(bound)?;
+    Some(json!({
+        "status": "degraded",
+        "reason": "outcome_floor_stuck",
+        "node_id": state.shared.node_id,
+        "outcome_floor": stuck.floor.as_u64(),
+        "oldest_window_horizon": stuck.horizon.as_u64(),
+        "oldest_window_open_secs": stuck.open_for.as_secs(),
+        "open_windows": stuck.open_windows,
+        "leaked_windows": floor.leaked_windows(),
+        "held_windows": floor.held_windows(),
+    }))
+}
+
+/// How long a write window can hold the outcome floor before readiness reports
+/// it: the longest path from a window's open to its final outcome.
+///
+/// - A statement write reaches its outcome by the longest statement deadline,
+///   plus the wait the node gives a committed entry to apply.
+/// - A vector index install waits two core dispatch deadlines.
+///
+/// A window older than both is stuck.
+fn outcome_floor_bound(state: &AppState) -> std::time::Duration {
+    let network = &state.shared.tuning.network;
+    let statement = std::time::Duration::from_secs(
+        network
+            .default_deadline_secs
+            .max(network.copy_deadline_secs),
+    )
+    .saturating_add(crate::control::metadata_proposer::DEFAULT_PROPOSE_TIMEOUT);
+    statement.max(crate::control::catalog_entry::post_apply::vector_install_longest_core_wait())
 }
 
 /// Why a cross-shard Calvin write would be refused on this node right now,
@@ -179,16 +303,23 @@ fn sequencer_not_servable(
     None
 }
 
-/// GET /health/ready — readiness check (WAL recovered, cores initialized).
+/// GET /health/ready — readiness check: WAL recovered and the `Serving` phase reached.
+///
+/// Boot recovers the WAL long before it listens on the client protocols, so
+/// the WAL alone never makes the node ready.
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let wal_ready = state.shared.wal.next_lsn().as_u64() > 0;
-    let status = if wal_ready {
+    let serving = matches!(
+        crate::control::startup::health::observe(&state.shared.startup),
+        crate::control::startup::health::HealthState::Ok
+    );
+    let ready = serving && state.shared.wal.next_lsn().as_u64() > 0;
+    let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
     let body = json!({
-        "status": if wal_ready { "ready" } else { "not_ready" },
+        "status": if ready { "ready" } else { "not_ready" },
         "wal_lsn": state.shared.wal.next_lsn().as_u64(),
         "node_id": state.shared.node_id,
     });
@@ -251,4 +382,169 @@ pub async fn drain(
             "node_id": state.shared.node_id,
         })),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::config::auth::AuthMode;
+    use crate::control::cluster::CalvinApplyHalt;
+    use crate::control::state::SharedState;
+    use crate::wal::WalManager;
+
+    fn app_state(dir: &tempfile::TempDir) -> AppState {
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("health.wal")).expect("open WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let shared = SharedState::new(dispatcher, wal).expect("shared state");
+        AppState {
+            shutdown_bus: crate::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown))
+                .0,
+            query_ctx: Arc::new(crate::control::planner::context::QueryContext::for_state(
+                &shared,
+            )),
+            shared,
+            auth_mode: AuthMode::Trust,
+        }
+    }
+
+    async fn healthz_body(state: AppState) -> (StatusCode, serde_json::Value) {
+        let response = healthz(State(state)).await.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read healthz body");
+        let body = sonic_rs::from_slice::<serde_json::Value>(&bytes).expect("healthz body is JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_a_halted_calvin_scheduler_as_degraded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = app_state(&dir);
+        state
+            .shared
+            .sequencer_halt
+            .apply_halt()
+            .record(CalvinApplyHalt {
+                vshard_id: 12,
+                epoch: 40,
+                position: 3,
+                reason: "flush_failed",
+                step: "flush",
+                error: "CalvinFlush returned Error".to_string(),
+            });
+
+        let (status, body) = healthz_body(state).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["reason"], "calvin_apply_halted");
+        assert_eq!(body["vshard_id"], 12);
+        assert_eq!(body["epoch"], 40);
+        assert_eq!(body["position"], 3);
+        assert_eq!(body["halt_reason"], "flush_failed");
+        assert_eq!(body["step"], "flush");
+    }
+
+    #[tokio::test]
+    async fn a_node_without_a_valid_lease_reports_degraded_with_the_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = app_state(&dir);
+        assert!(
+            lease_invalid_body(&state).is_none(),
+            "a node without lease timing needs no lease"
+        );
+        let timing = crate::control::security::auth_lease::LeaseTiming::from_raft(
+            std::time::Duration::from_millis(1000),
+            std::time::Duration::from_millis(100),
+        )
+        .expect("timing");
+        assert!(state.shared.authorization_fence.install_timing(timing));
+
+        let body = lease_invalid_body(&state).expect("no lease was granted");
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["reason"], "authorization_lease_invalid");
+        assert!(body["lease_expired_ms_ago"].is_null());
+
+        state
+            .shared
+            .authorization_fence
+            .holder()
+            .install(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert!(lease_invalid_body(&state).is_none());
+    }
+
+    #[tokio::test]
+    async fn healthz_without_a_calvin_halt_names_no_calvin_halt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = app_state(&dir);
+
+        let (_status, body) = healthz_body(state).await;
+
+        assert_ne!(body["reason"], "calvin_apply_halted");
+    }
+
+    /// The bound covers the longest statement deadline plus the apply wait,
+    /// and the vector install's two core dispatch deadlines.
+    #[tokio::test]
+    async fn the_outcome_floor_bound_covers_every_path_to_a_final_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = app_state(&dir);
+        let network = &state.shared.tuning.network;
+        let statement = std::time::Duration::from_secs(
+            network
+                .default_deadline_secs
+                .max(network.copy_deadline_secs),
+        ) + crate::control::metadata_proposer::DEFAULT_PROPOSE_TIMEOUT;
+        let vector = crate::control::catalog_entry::post_apply::vector_install_longest_core_wait();
+
+        let bound = outcome_floor_bound(&state);
+
+        assert!(bound >= statement);
+        assert!(bound >= vector);
+        assert_eq!(bound, statement.max(vector));
+    }
+
+    /// A window open past the bound degrades readiness and names the floor
+    /// it holds.
+    #[tokio::test]
+    async fn a_window_open_past_the_bound_reports_a_stuck_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = app_state(&dir);
+        let window = state.shared.outcome_floor.open_write();
+        window.note_minted(crate::types::Lsn::new(7));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let body = outcome_floor_stuck_body(&state, std::time::Duration::ZERO)
+            .expect("the window is older than a zero bound");
+
+        assert_eq!(body["reason"], "outcome_floor_stuck");
+        assert_eq!(body["open_windows"], 1);
+        assert_eq!(body["oldest_window_horizon"], 1);
+        assert_eq!(body["held_windows"], 0);
+        window.settle();
+        assert!(outcome_floor_stuck_body(&state, std::time::Duration::ZERO).is_none());
+    }
+
+    /// A held window never degrades readiness. The healthz body counts it.
+    #[tokio::test]
+    async fn a_held_window_is_reported_without_degrading_readiness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = app_state(&dir);
+        let window = state.shared.outcome_floor.open_write();
+        window.note_minted(crate::types::Lsn::new(7));
+        window.hold();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        assert!(outcome_floor_stuck_body(&state, std::time::Duration::ZERO).is_none());
+        let (_status, body) = healthz_body(state).await;
+
+        assert_ne!(body["reason"], "outcome_floor_stuck");
+        assert_eq!(body["held_windows"], 1);
+    }
 }

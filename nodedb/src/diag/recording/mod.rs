@@ -11,12 +11,17 @@
 mod catalog;
 mod crdt;
 mod data_plane;
+mod index_rebuild;
 mod ingest;
+mod lease;
+mod outcome_floor;
 mod quota;
+mod raft_apply;
 mod recovery;
 mod retention;
 mod shared;
 mod vector;
+mod vector_build;
 
 pub use catalog::{
     catalog_apply_orphan_row, collection_purge_row_missing, consumer_group_offsets_retained,
@@ -24,12 +29,19 @@ pub use catalog::{
 };
 pub use crdt::history_compaction_not_applied;
 pub use data_plane::{
-    calvin_completion_timeout, data_plane_response_lost, data_plane_responses_lost,
+    calvin_apply_halted, calvin_completion_timeout, data_plane_core_fail_stopped,
+    data_plane_response_lost, data_plane_responses_lost,
 };
+pub use index_rebuild::{IndexRebuildTarget, index_rebuild_not_installed};
 pub use ingest::{ilp_invalid_utf8_drop, ilp_line_read_drop};
+pub use lease::descriptor_lease_not_renewed;
+pub use outcome_floor::{write_window_held, write_window_leaked};
 pub use quota::{
     quota_row_invalid, quota_row_undecodable, quota_row_write_failed, quota_scope_purge_incomplete,
     quota_scope_replay_aborted, scope_quota_not_installed,
+};
+pub use raft_apply::{
+    raft_entries_reapplied, raft_entry_reapplied, replicated_write_parked, replicated_writes_parked,
 };
 pub use recovery::{
     batch_insert_without_surrogates, fts_index_update_failed, orphaned_index_entry_after_delete,
@@ -39,3 +51,7 @@ pub use recovery::{
 pub use retention::retention_autowire_orphaned;
 pub use shared::entry_kind;
 pub use vector::vector_index_not_applied;
+pub use vector_build::{
+    VectorBuildTarget, vector_build_failed, vector_builder_disconnected,
+    vector_builder_spawn_failed, vector_rebuild_unreadable,
+};

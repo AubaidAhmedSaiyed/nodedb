@@ -17,19 +17,30 @@ use crate::control::server::dispatch_utils::{
     ChangeFeedOwner, SubmitWrite, WalDurability, WriteOrdering, submit_write,
 };
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
 
 /// Identifies a committed Raft entry within the apply loop.
 ///
-/// Groups the three fields that always travel together: the Raft group, the
-/// log index within that group, and the idempotency key extracted from the
-/// `ReplicatedEntry` header. All three are forwarded together to
-/// `ProposeTracker::complete` after each apply.
+/// Groups the fields that always travel together: the Raft group, the log
+/// index within that group, and the idempotency key extracted from the
+/// `ReplicatedEntry` header, all forwarded to `ProposeTracker::complete` after
+/// each apply, plus the entry's commit HLC.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AppliedPosition {
     pub group_id: u64,
     pub log_index: u64,
     pub applied_key: u64,
+    /// HLC wall time, in nanoseconds, the proposer stamped on the entry. `0`
+    /// when the entry carries none. It is the write's commit instant on the
+    /// tenant's observed write high-water, however late this replica applies.
+    pub commit_hlc: u64,
+}
+
+impl AppliedPosition {
+    /// The entry's commit HLC for the write funnel, `None` when it carries none.
+    pub(crate) fn carried_commit_hlc(&self) -> Option<u64> {
+        (self.commit_hlc != 0).then_some(self.commit_hlc)
+    }
 }
 
 /// One committed array write, ready for the Control-Plane write funnel.
@@ -43,6 +54,11 @@ pub(super) struct ArrayWriteSubmit {
     /// the entry carries none. Passed through as the redo record's
     /// `now_override` so this replica records the value its peers recorded.
     pub resolved_now_ms: Option<u64>,
+    /// The idempotency key of the committed entry, carried by the redo
+    /// record's header.
+    pub apply_key: u64,
+    /// The committed entry's commit HLC, `None` when it carries none.
+    pub commit_hlc: Option<u64>,
     /// Contextual label for the error surfaced to the propose waiter.
     pub op_label: &'static str,
 }
@@ -58,7 +74,9 @@ pub(super) struct ArrayWriteSubmit {
 ///
 /// An error-status response is surfaced as a typed error: a committed entry that
 /// failed to apply must reach the propose waiter as a failure, not an empty
-/// success, and must NOT advance the floor.
+/// success, and must NOT advance the floor. A coded refusal is
+/// `crate::Error::DataPlane`, so the waiter classifies it and a final refusal
+/// records its marker. The funnel's own errors keep their variant.
 pub(super) async fn submit_array_write(
     state: &Arc<SharedState>,
     params: ArrayWriteSubmit,
@@ -70,6 +88,8 @@ pub(super) async fn submit_array_write(
         plan,
         event_source,
         resolved_now_ms,
+        apply_key,
+        commit_hlc,
         op_label,
     } = params;
 
@@ -92,6 +112,8 @@ pub(super) async fn submit_array_write(
             // durability path than this record's replay.
             durability: WalDurability::AppendHere {
                 now_override: resolved_now_ms,
+                apply_key,
+                commit_hlc,
             },
             // Raft committed this entry at a fixed log index and every replica
             // applies it in that order; re-entering the write-admission gate
@@ -105,19 +127,11 @@ pub(super) async fn submit_array_write(
             change_feed: ChangeFeedOwner::Unowned,
         },
     )
-    .await
-    .map_err(|e| crate::Error::Internal {
-        detail: format!("{op_label}: {e}"),
-    })?;
+    .await?;
     let response = outcome.response;
 
     if response.status != Status::Ok {
-        let detail = response
-            .error_code
-            .as_ref()
-            .map(|c| format!("{op_label} error: {c:?}"))
-            .unwrap_or_else(|| format!("{op_label} returned error status"));
-        return Err(crate::Error::Internal { detail });
+        return Err(apply_refusal(op_label, &response));
     }
     // The response carries the write-version this replica stamped alongside the
     // payload; an array plan names no user collection, so it is `Lsn::ZERO` here
@@ -221,15 +235,16 @@ pub(super) async fn ensure_array_open(
         Err(poisoned) => poisoned.into_inner().dispatch(open_request),
     };
 
-    if let Err(e) = dispatch_result {
-        return Err(crate::Error::Internal {
-            detail: format!("ensure_array_open: dispatch failed: {e}"),
-        });
-    }
+    // A dispatch refusal, such as a capacity limit, keeps its own class.
+    dispatch_result?;
 
-    await_data_plane(async move { open_rx.recv().await.ok_or(()) }, "OpenArray")
-        .await
-        .map(|_| ())
+    await_data_plane(
+        async move { open_rx.recv().await.ok_or(()) },
+        open_request_id,
+        "OpenArray",
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Build a `Request` for an array apply/open with default deadline / priority.
@@ -268,27 +283,124 @@ pub(super) fn build_array_request(
     }
 }
 
-/// Await a Data Plane response, mapping timeout / channel-closed / error-status
-/// into `crate::Error::Internal` with a contextual `op_label`.
+/// How long [`await_data_plane`] waits for the Data Plane's response.
+const DATA_PLANE_AWAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Await the Data Plane response to request `request_id`. An error status
+/// becomes [`apply_refusal`]. A timeout is `crate::Error::DeadlineExceeded`
+/// (`57014`). A closed channel is `crate::Error::Internal` with `op_label`.
 pub(super) async fn await_data_plane(
     rx: impl std::future::Future<Output = Result<Response, ()>>,
+    request_id: RequestId,
     op_label: &str,
 ) -> ProposeResult {
-    match tokio::time::timeout(Duration::from_secs(30), rx).await {
+    match tokio::time::timeout(DATA_PLANE_AWAIT_TIMEOUT, rx).await {
         Ok(Ok(resp)) if resp.status == Status::Ok => Ok(AppliedWrite::from_response(&resp)),
-        Ok(Ok(resp)) => {
-            let detail = resp
-                .error_code
-                .as_ref()
-                .map(|c| format!("{op_label} error: {c:?}"))
-                .unwrap_or_else(|| format!("{op_label} returned error status"));
-            Err(crate::Error::Internal { detail })
-        }
+        Ok(Ok(resp)) => Err(apply_refusal(op_label, &resp)),
         Ok(Err(_)) => Err(crate::Error::Internal {
             detail: format!("{op_label}: response channel closed"),
         }),
-        Err(_) => Err(crate::Error::Internal {
-            detail: format!("{op_label}: deadline exceeded"),
-        }),
+        Err(_) => Err(crate::Error::DeadlineExceeded { request_id }),
+    }
+}
+
+/// The typed error for a Data-Plane response with a non-`Ok` status.
+///
+/// A coded refusal is `crate::Error::DataPlane` with its own code. Only a
+/// refusal with no code is `crate::Error::Internal`.
+pub(super) fn apply_refusal(op_label: &str, response: &Response) -> crate::Error {
+    match response.error_code.as_deref() {
+        Some(code) => crate::Error::DataPlane(code.clone()),
+        None => crate::Error::Internal {
+            detail: format!("{op_label} returned error status"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::{ErrorCode, Payload};
+    use crate::types::Lsn;
+
+    fn refusal(code: Option<ErrorCode>) -> Response {
+        Response {
+            request_id: RequestId::new(1),
+            status: Status::Error,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: Lsn::ZERO,
+            error_code: code.map(Box::new),
+            read_set_valid: None,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    /// A coded refusal of a committed array write keeps its code, so the
+    /// final-refusal check sees it.
+    #[test]
+    fn a_coded_refusal_keeps_its_code() {
+        let code = ErrorCode::RejectedPrevalidation {
+            reason: "cell out of bounds".into(),
+        };
+        let error = apply_refusal("array cell write", &refusal(Some(code.clone())));
+        match &error {
+            crate::Error::DataPlane(kept) => assert_eq!(kept, &code),
+            other => panic!("expected the typed refusal, got {other:?}"),
+        }
+        assert!(crate::control::server::dispatch_utils::error_is_final_refusal(&error));
+    }
+
+    #[test]
+    fn a_refusal_with_no_code_is_internal() {
+        match apply_refusal("OpenArray", &refusal(None)) {
+            crate::Error::Internal { detail } => assert!(detail.starts_with("OpenArray")),
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
+
+    /// The Data-Plane response await keeps the code as well.
+    #[tokio::test]
+    async fn awaiting_a_coded_refusal_keeps_its_code() {
+        let code = ErrorCode::Unsupported {
+            detail: "not on this engine".into(),
+        };
+        let response = refusal(Some(code.clone()));
+        let result = await_data_plane(
+            async move { Ok::<_, ()>(response) },
+            RequestId::new(1),
+            "OpenArray",
+        )
+        .await;
+        match result {
+            Err(crate::Error::DataPlane(kept)) => assert_eq!(kept, code),
+            other => panic!("expected the typed refusal, got {other:?}"),
+        }
+    }
+
+    /// A local timeout is the typed deadline error, `57014` on pgwire.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_timeout_is_a_typed_deadline() {
+        let result = await_data_plane(
+            std::future::pending::<Result<Response, ()>>(),
+            RequestId::new(7),
+            "OpenArray",
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a pending response must time out"),
+        };
+        assert!(
+            matches!(
+                &error,
+                crate::Error::DeadlineExceeded { request_id } if *request_id == RequestId::new(7)
+            ),
+            "expected a typed deadline, got {error:?}"
+        );
+        let (_, state, _) = crate::control::server::pgwire::types::error_to_sqlstate(&error);
+        assert_eq!(state, nodedb_types::error::sqlstate::QUERY_CANCELED.0);
     }
 }

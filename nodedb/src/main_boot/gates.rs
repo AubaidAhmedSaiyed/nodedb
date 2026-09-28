@@ -19,6 +19,8 @@ pub(crate) struct StartupGates {
     pub(crate) warm_peers_gate: ReadyGate,
     pub(crate) health_loop_gate: ReadyGate,
     pub(crate) gateway_enable_gate: ReadyGate,
+    /// Fired where the client protocols start listening.
+    pub(crate) serving_gate: ReadyGate,
 }
 
 /// Register all gates up-front so the sequencer knows every phase has
@@ -40,6 +42,7 @@ pub(crate) fn register_startup_gates(startup_seq: &StartupSequencer) -> StartupG
     let health_loop_gate = startup_seq.register_gate(StartupPhase::HealthLoopStart, "health-loop");
     let gateway_enable_gate =
         startup_seq.register_gate(StartupPhase::GatewayEnable, "gateway-enable");
+    let serving_gate = startup_seq.register_gate(StartupPhase::Serving, "client-listeners");
 
     StartupGates {
         wal_gate,
@@ -52,5 +55,6 @@ pub(crate) fn register_startup_gates(startup_seq: &StartupSequencer) -> StartupG
         warm_peers_gate,
         health_loop_gate,
         gateway_enable_gate,
+        serving_gate,
     }
 }

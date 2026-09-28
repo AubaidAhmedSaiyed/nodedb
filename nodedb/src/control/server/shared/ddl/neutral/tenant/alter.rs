@@ -91,7 +91,7 @@ pub fn alter_tenant(
     // operator set on an earlier statement.
     let before = catalog
         .get_tenant_quota(database_id, tenant_id)
-        .map_err(|e| ddl_err("XX000", format!("quota read failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("quota read failed", &e))?
         .unwrap_or(QuotaRecord::DEFAULT);
     let mut record = before.clone();
     match field.as_str() {
@@ -117,7 +117,7 @@ pub fn alter_tenant(
     // The catalog enforces the sum-of-tenant-quotas ≤ database-quota ceiling.
     catalog
         .check_tenant_quota(database_id, tenant_id, &record)
-        .map_err(|e| ddl_err("53400", format!("{e}")))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     // Replicated: every node writes the row and installs the cap in its live
     // enforcement components via post-apply.
@@ -131,7 +131,7 @@ pub fn alter_tenant(
         || {
             catalog
                 .write_tenant_quota(database_id, tenant_id, &record)
-                .map_err(|e| ddl_err("53400", format!("{e}")))?;
+                .map_err(|e| DdlError::from_error(&e))?;
             crate::control::catalog_entry::post_apply::quota::put_tenant(
                 database_id,
                 tenant_id,

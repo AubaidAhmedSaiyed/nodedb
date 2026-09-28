@@ -8,7 +8,7 @@
 //! exits 0 on a 2xx response, non-zero otherwise.
 //!
 //! `/healthz` is the readiness probe: it reports 503 while the node is
-//! draining or has not reached `GatewayEnable`, so a container runtime stops
+//! draining or has not yet admitted clients, so a container runtime stops
 //! routing to a node that cannot serve.
 //!
 //! Kept dependency-free (`std::net` only) so it's cheap to invoke from

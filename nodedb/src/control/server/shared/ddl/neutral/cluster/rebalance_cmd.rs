@@ -51,7 +51,7 @@ pub fn rebalance(
     let topo = topo.read().unwrap_or_else(|p| p.into_inner());
 
     let plan = nodedb_cluster::compute_plan(&routing, &topo)
-        .map_err(|e| ddl_err("XX000", format!("rebalance planning failed: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("rebalance planning failed: {e}")))?;
 
     if plan.is_empty() {
         let mut row = Map::new();

@@ -148,9 +148,6 @@ pub enum Error {
         detail: String,
     },
 
-    #[error("arithmetic overflow on {collection} key {key}")]
-    OverflowError { collection: String, key: String },
-
     #[error("insufficient balance on {collection} key {key}: {detail}")]
     InsufficientBalance {
         collection: String,
@@ -212,6 +209,11 @@ pub enum Error {
 
     #[error("CRDT Apply is not supported inside explicit transactions")]
     CrdtApplyForbiddenInTransaction,
+
+    /// A statement that applies at once and cannot be rolled back ran
+    /// inside an explicit transaction block. SQLSTATE 25001.
+    #[error("{statement} cannot run inside a transaction block")]
+    NotInTransactionBlock { statement: String },
 
     #[error("CRDT admission timed out on {vshard_id} after {timeout_ms}ms")]
     CrdtAdmissionTimeout {
@@ -341,6 +343,13 @@ pub enum Error {
     #[error("division by zero")]
     DivisionByZero,
 
+    /// A function received an argument it cannot compute on: vectors of
+    /// different dimensions, an argument of the wrong type, a malformed
+    /// JSONPath. `detail` names the function and the value. Rendered as
+    /// SQLSTATE `22000` (data_exception) at the pgwire layer.
+    #[error("{detail}")]
+    DataException { detail: String },
+
     /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
     /// The pgwire layer renders it as SQLSTATE `2201W`.
     #[error("invalid {clause} value: {value}")]
@@ -356,10 +365,41 @@ pub enum Error {
     )]
     RetryableLeaderChange { group_id: u64, log_index: u64 },
 
+    /// A Raft group has no reachable majority of its voters, so nothing can
+    /// commit in it. The operation that needed it applied nothing. It succeeds
+    /// once enough of `unreachable` rejoin.
+    #[error(
+        "raft group {group_id} has no reachable quorum: voters {voters:?}, unreachable \
+         {unreachable:?}; nothing was applied. Retry once a majority of its voters is reachable"
+    )]
+    GroupQuorumUnavailable {
+        group_id: u64,
+        voters: Vec<u64>,
+        unreachable: Vec<u64>,
+    },
+
+    /// RESTORE's staleness guard found no replica of a data group that
+    /// reported the tenant's write marks before the statement deadline. The
+    /// restore cannot prove it is not stale, so it applied nothing.
+    /// `refused_by` lists the nodes that answered that they do not replicate
+    /// the group.
+    #[error(
+        "restore: no replica of raft group {group_id} reported the tenant's write marks before \
+         the statement deadline (nodes that do not replicate it: {refused_by:?}); nothing was \
+         restored. Retry once the group's placement settles"
+    )]
+    GroupMarksUnavailable { group_id: u64, refused_by: Vec<u64> },
+
     /// No leader elected on the metadata group yet. Transient — an election
     /// is in progress — so callers can wait it out instead of failing.
     #[error("metadata raft group has no elected leader yet; retry needed")]
     MetadataLeaderUnavailable,
+
+    /// A statement cannot be planned yet: this node's roles, grants, policies
+    /// or permission trees may be behind a change already acknowledged, and
+    /// did not catch up before the deadline. Nothing ran; the client retries.
+    #[error("authorization state is not current on this node: {detail}; retry")]
+    AuthorizationStateBehind { detail: String },
 
     #[error("execution limit exceeded: {detail}")]
     ExecutionLimitExceeded { detail: String },
@@ -377,6 +417,13 @@ pub enum Error {
 
     #[error("dispatch error: {detail}")]
     Dispatch { detail: String },
+
+    /// The bridge dispatcher refused a request at a capacity limit. Nothing
+    /// was enqueued, so the caller retries once capacity frees.
+    #[error("dispatch refused at capacity: {scope}; the request was not enqueued and is retryable")]
+    DispatchCapacity {
+        scope: super::dispatch_capacity::DispatchCapacityScope,
+    },
 
     #[error("storage error ({engine}): {detail}")]
     Storage { engine: String, detail: String },
@@ -486,6 +533,14 @@ pub enum Error {
         dependents: Vec<(String, String)>,
     },
 
+    /// A DROP ROLE refused: users still hold the custom role, or other
+    /// roles inherit from it.
+    #[error("role \"{role}\" cannot be dropped because {dependents}")]
+    RoleInUse {
+        role: String,
+        dependents: crate::control::security::role_assignment::RoleDependents,
+    },
+
     /// Cascade graph cycle or depth cap blocks mutation.
     #[error(
         "cascade cycle or depth limit ({depth}) exceeded while enumerating \
@@ -542,6 +597,18 @@ pub enum Error {
     #[error("OIDC token rejected: authenticated provider tenant is unavailable")]
     OidcProviderTenantUnavailable { tenant_id: u64 },
 
+    /// An external identity (JWT or OIDC bearer) resolved to a custom role
+    /// that is not defined in its provider-bound tenant. The login is
+    /// refused: an identity holding an undefined role would hold nothing.
+    #[error(
+        "external identity '{subject}' claims role \"{role}\", which is not defined in tenant {tenant_id}"
+    )]
+    ExternalRoleUndefined {
+        subject: String,
+        role: String,
+        tenant_id: u64,
+    },
+
     /// OIDC bearer token rejected: claim mapping produced no default database.
     #[error("OIDC token rejected: claim mapping produced no default database for subject '{sub}'")]
     OidcNoDefaultDatabase { sub: String },
@@ -591,6 +658,13 @@ pub enum Error {
         /// Human-readable detail including actual lag if available.
         detail: String,
     },
+
+    /// A DDL error with its own SQLSTATE, code, details and cause. A DDL step
+    /// that fails at COMMIT, after its statement returned, reports through it
+    /// with the class the statement reports in autocommit. Boxed, so the
+    /// variant adds one pointer to `Error`.
+    #[error("{}", .0.message)]
+    Ddl(Box<crate::control::server::shared::ddl::DdlError>),
 }
 
 /// Result alias for NodeDB operations.
@@ -599,6 +673,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl From<nodedb_types::NodeDbError> for Error {
     fn from(error: nodedb_types::NodeDbError) -> Self {
         Error::Shaping(Box::new(error))
+    }
+}
+
+impl From<crate::control::server::shared::ddl::DdlError> for Error {
+    fn from(error: crate::control::server::shared::ddl::DdlError) -> Self {
+        Error::Ddl(Box::new(error))
     }
 }
 

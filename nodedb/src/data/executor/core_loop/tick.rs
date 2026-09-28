@@ -31,6 +31,9 @@ impl CoreLoop {
         // action for the core to take, so the flag is not acted on.
         let (_drained, _control_plane_gone) = self.request_rx.drain_into(&mut batch, depth);
         for br in batch {
+            self.floors
+                .applied_prefix
+                .observe_outcome_floor(br.outcome_floor);
             self.task_queue.push(ExecutionTask::new(br.inner));
         }
     }
@@ -54,8 +57,20 @@ impl CoreLoop {
         };
         self.io_metrics.record_wait(tier, wait_ns);
 
-        let mut task = qt.task;
+        // A write to a row a staged Calvin transaction owns waits for it.
+        // A plain REINDEX starts its rebuilds and waits for their cutovers.
+        if let Some(task) = self.park_if_calvin_owned(qt.task)
+            && let Some(task) = self.hold_plain_reindex(task)
+        {
+            self.run_task(task);
+        }
+        self.release_resolved_calvin_owners();
+        true
+    }
 
+    /// Execute `task` and send its response: an idempotent replay answers
+    /// from the cache, and an expired task answers that it never started.
+    pub(in crate::data::executor) fn run_task(&mut self, mut task: ExecutionTask) {
         if let Some(key) = task.request.idempotency_key
             && let Some(&succeeded) = self.idempotency_cache.get(&key)
         {
@@ -70,7 +85,7 @@ impl CoreLoop {
             {
                 warn!(core = self.core_id, error = %e, "failed to send idempotent response");
             }
-            return true;
+            return;
         }
 
         let response = if task.is_expired() {
@@ -82,7 +97,8 @@ impl CoreLoop {
                 partial: false,
                 payload: Payload::empty(),
                 watermark_lsn: self.watermark,
-                error_code: Some(Box::new(ErrorCode::DeadlineExceeded)),
+                // The task never started, so nothing it would write ran.
+                error_code: Some(Box::new(ErrorCode::ExpiredBeforeExecution)),
                 read_set_valid: None,
                 read_version_lsn: crate::types::Lsn::ZERO,
                 write_set: Vec::new(),
@@ -90,7 +106,28 @@ impl CoreLoop {
         } else {
             task.state = TaskState::Running;
             let resp = self.execute(&task);
+            // Every engine's next checkpoint, flush or manifest stamps what
+            // this core applied, so a record applied here is noted whichever
+            // engine applied it. A refused record carries a durable abort
+            // marker instead, and a stamp never names it.
+            if resp.status == Status::Ok
+                && let Some(lsn) = task.wal_lsn()
+            {
+                self.floors.applied_prefix.note_applied(lsn);
+            }
+            // A crash test kills the process here: one collection's logged
+            // write applied, and its response never leaves the core. A
+            // committed redo matches each collection it writes. A task with
+            // no WAL record never matches.
+            #[cfg(feature = "failpoints")]
+            if task.wal_lsn().is_some() {
+                for collection in task.plan().named_collections() {
+                    crate::fail_point!(&format!("core::after_apply::{collection}"));
+                }
+            }
             task.state = TaskState::Completed;
+            // A failed rollback leaves this core's state unknown.
+            self.fail_stop_on_rollback_failure(&resp);
             resp
         };
 
@@ -121,8 +158,6 @@ impl CoreLoop {
         {
             warn!(core = self.core_id, error = %e, "failed to send response — response queue full");
         }
-
-        true
     }
 
     /// Run one iteration of the event loop: drain requests, process tasks.
@@ -132,11 +167,19 @@ impl CoreLoop {
     pub fn tick(&mut self) -> usize {
         self.poll_build_completions();
         self.poll_pending_reindex();
+        self.answer_reindex_waiters();
         // Adjust SPSC read depth based on current memory pressure.
         self.apply_spsc_pressure();
         self.drain_requests();
+        self.expire_calvin_parked();
         let mut processed = 0;
         while !self.task_queue.is_empty() {
+            // A fail-stopped core serves nothing, including the rest of the
+            // queue behind the request that stopped it.
+            if self.fail_stop.is_stopped() {
+                processed += self.refuse_queued_while_stopped();
+                break;
+            }
             let batched = self.poll_write_batch();
             if batched > 0 {
                 processed += batched;
@@ -225,13 +268,42 @@ mod tests {
     }
 
     #[test]
-    fn expired_task_returns_deadline_exceeded() {
+    fn an_expired_task_answers_that_it_never_started() {
         let (mut core, mut req_tx, mut resp_rx, _dir) = make_core();
         req_tx
-            .try_push(BridgeRequest {
-                inner: Request {
-                    deadline: Instant::now() - Duration::from_secs(1),
-                    ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
+            .try_push(BridgeRequest::unfloored(Request {
+                deadline: Instant::now() - Duration::from_secs(1),
+                ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
+                    document_id: "y".into(),
+                    surrogate: nodedb_types::Surrogate::ZERO,
+                    pk_bytes: Vec::new(),
+                    rls_filters: Vec::new(),
+                    system_time: nodedb_types::SystemTimeScope::Current,
+                    valid_at_ms: None,
+                }))
+            }))
+            .unwrap();
+        core.tick();
+        let resp = resp_rx.try_pop().unwrap();
+        assert_eq!(resp.inner.status, Status::Error);
+        assert_eq!(
+            resp.inner.error_code.as_deref(),
+            Some(&ErrorCode::ExpiredBeforeExecution)
+        );
+    }
+
+    #[test]
+    fn a_fail_stopped_core_refuses_every_queued_request() {
+        let (mut core, mut req_tx, mut resp_rx, _dir) = make_core();
+        core.fail_stop_core(
+            crate::data::executor::core_loop::fail_stop::FailStopCause::RollbackFailed,
+            "undo entry 0: restore failed",
+        );
+        for _ in 0..2 {
+            req_tx
+                .try_push(BridgeRequest::unfloored(make_request(
+                    PhysicalPlan::Document(DocumentOp::PointGet {
                         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                         document_id: "y".into(),
                         surrogate: nodedb_types::Surrogate::ZERO,
@@ -239,17 +311,24 @@ mod tests {
                         rls_filters: Vec::new(),
                         system_time: nodedb_types::SystemTimeScope::Current,
                         valid_at_ms: None,
-                    }))
-                },
-            })
-            .unwrap();
-        core.tick();
-        let resp = resp_rx.try_pop().unwrap();
-        assert_eq!(resp.inner.status, Status::Error);
-        assert_eq!(
-            resp.inner.error_code.as_deref(),
-            Some(&ErrorCode::DeadlineExceeded)
-        );
+                    }),
+                )))
+                .expect("queue request");
+        }
+
+        assert_eq!(core.tick(), 2);
+        for _ in 0..2 {
+            let resp = resp_rx.try_pop().expect("refusal");
+            assert_eq!(resp.inner.status, Status::Error);
+            assert!(
+                matches!(
+                    resp.inner.error_code.as_deref(),
+                    Some(ErrorCode::RetryableRefusal { .. })
+                ),
+                "{:?}",
+                resp.inner.error_code
+            );
+        }
     }
 
     #[test]
@@ -266,8 +345,8 @@ mod tests {
             )
             .unwrap();
         req_tx
-            .try_push(BridgeRequest {
-                inner: make_request(PhysicalPlan::Document(DocumentOp::PointGet {
+            .try_push(BridgeRequest::unfloored(make_request(
+                PhysicalPlan::Document(DocumentOp::PointGet {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                     document_id: "y".into(),
                     surrogate: nodedb_types::Surrogate::ZERO,
@@ -275,8 +354,8 @@ mod tests {
                     rls_filters: Vec::new(),
                     system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
-                })),
-            })
+                }),
+            )))
             .unwrap();
         core.tick();
         let resp = resp_rx.try_pop().unwrap();
@@ -287,36 +366,32 @@ mod tests {
     fn cancel_removes_pending_task() {
         let (mut core, mut req_tx, _resp_rx, _dir) = make_core();
         req_tx
-            .try_push(BridgeRequest {
-                inner: Request {
-                    request_id: RequestId::new(10),
-                    deadline: Instant::now() + Duration::from_secs(60),
-                    ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
-                        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
-                        document_id: "y".into(),
-                        surrogate: nodedb_types::Surrogate::ZERO,
-                        pk_bytes: Vec::new(),
-                        rls_filters: Vec::new(),
-                        system_time: nodedb_types::SystemTimeScope::Current,
-                        valid_at_ms: None,
-                    }))
-                },
-            })
+            .try_push(BridgeRequest::unfloored(Request {
+                request_id: RequestId::new(10),
+                deadline: Instant::now() + Duration::from_secs(60),
+                ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
+                    document_id: "y".into(),
+                    surrogate: nodedb_types::Surrogate::ZERO,
+                    pk_bytes: Vec::new(),
+                    rls_filters: Vec::new(),
+                    system_time: nodedb_types::SystemTimeScope::Current,
+                    valid_at_ms: None,
+                }))
+            }))
             .unwrap();
         core.drain_requests();
         assert_eq!(core.pending_count(), 1);
 
         req_tx
-            .try_push(BridgeRequest {
-                inner: Request {
-                    request_id: RequestId::new(99),
-                    priority: Priority::Critical,
-                    consistency: ReadConsistency::Eventual,
-                    ..make_request(PhysicalPlan::Meta(MetaOp::Cancel {
-                        target_request_id: RequestId::new(10),
-                    }))
-                },
-            })
+            .try_push(BridgeRequest::unfloored(Request {
+                request_id: RequestId::new(99),
+                priority: Priority::Critical,
+                consistency: ReadConsistency::Eventual,
+                ..make_request(PhysicalPlan::Meta(MetaOp::Cancel {
+                    target_request_id: RequestId::new(10),
+                }))
+            }))
             .unwrap();
         // Cancel runs at Critical priority and is drained before the Normal-priority
         // target. The cancel removes id=10 from the queue, so only the Cancel itself
@@ -341,8 +416,8 @@ mod tests {
         let tagged = zerompk::to_msgpack_vec(&nodedb_types::Value::Object(obj)).unwrap();
 
         req_tx
-            .try_push(BridgeRequest {
-                inner: make_request(PhysicalPlan::Document(DocumentOp::PointPut {
+            .try_push(BridgeRequest::unfloored(make_request(
+                PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
                     document_id: "o1".into(),
                     value: tagged,
@@ -351,8 +426,8 @@ mod tests {
                     returning: None,
                     rls_filters: Vec::new(),
                     resolved_sum_targets: Vec::new(),
-                })),
-            })
+                }),
+            )))
             .unwrap();
         core.tick();
         let resp = resp_rx.try_pop().unwrap();
@@ -390,8 +465,8 @@ mod tests {
             );
             let bytes = zerompk::to_msgpack_vec(&nodedb_types::Value::Object(obj)).unwrap();
             req_tx
-                .try_push(BridgeRequest {
-                    inner: make_request(PhysicalPlan::Document(DocumentOp::PointPut {
+                .try_push(BridgeRequest::unfloored(make_request(
+                    PhysicalPlan::Document(DocumentOp::PointPut {
                         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "things"),
                         document_id: format!("doc_{sur_val}"),
                         value: bytes,
@@ -400,8 +475,8 @@ mod tests {
                         returning: None,
                         rls_filters: Vec::new(),
                         resolved_sum_targets: Vec::new(),
-                    })),
-                })
+                    }),
+                )))
                 .unwrap();
             core.tick();
             let _ = resp_rx.try_pop().unwrap();
@@ -412,8 +487,8 @@ mod tests {
 
         // Issue a scan with the prefilter.
         req_tx
-            .try_push(BridgeRequest {
-                inner: make_request(PhysicalPlan::Document(DocumentOp::Scan {
+            .try_push(BridgeRequest::unfloored(make_request(
+                PhysicalPlan::Document(DocumentOp::Scan {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "things"),
                     limit: 100,
                     offset: 0,
@@ -426,8 +501,8 @@ mod tests {
                     system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
                     prefilter: Some(prefilter),
-                })),
-            })
+                }),
+            )))
             .unwrap();
         core.tick();
 

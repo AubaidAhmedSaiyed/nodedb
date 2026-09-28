@@ -60,24 +60,26 @@ pub(in crate::data::executor) struct SpatialOverlayMergeParams<'a> {
 
 /// Decode a staged spatial-collection overlay body into a full (unprojected)
 /// `Value::Object`, handling both possible staged shapes (see module doc).
-/// Returns `Ok(None)` for a body that fails to decode, or a `Value::Array`
-/// staged row whose collection has no known columnar schema (defensively
-/// treated as "does not match" rather than surfacing a panic). Returns
-/// `Err` only when the row *does* decode but its computed-column projection
-/// hits a division/modulo-by-zero — `row_to_projected_value` is called with
-/// no computed columns here (`&[]`), so this is currently unreachable, but
-/// the `Result` return keeps the signature honest about what
-/// `row_to_projected_value` can do.
+/// Returns `Ok(None)` for a `Value::Array` staged row whose collection has no
+/// known columnar schema, and for a body of any other shape: neither is a
+/// row this search can match. A body that does not decode fails with
+/// `Serialization`: the transaction staged it, so it is corrupt. A
+/// computed-column projection error propagates.
 fn decode_staged_spatial_row(
     body: &[u8],
     schema: Option<&ColumnarSchema>,
 ) -> crate::Result<Option<Value>> {
-    Ok(match nodedb_types::value_from_msgpack(body).ok() {
-        Some(Value::Array(row)) => match schema {
+    let value =
+        nodedb_types::value_from_msgpack(body).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".to_string(),
+            detail: format!("staged spatial row does not decode: {e}"),
+        })?;
+    Ok(match value {
+        Value::Array(row) => match schema {
             Some(schema) => Some(row_to_projected_value(&row, schema, &[], &[], false)?),
             None => None,
         },
-        Some(obj @ Value::Object(_)) => Some(obj),
+        obj @ Value::Object(_) => Some(obj),
         _ => None,
     })
 }
@@ -168,9 +170,8 @@ impl CoreLoop {
                 Some(Staged::Put(body)) => {
                     let doc = match decode_staged_spatial_row(body, schema) {
                         Ok(Some(doc)) => doc,
-                        // A staged body that fails to decode carries no
-                        // usable row: drop it rather than surface stale
-                        // base data.
+                        // A staged row with no matchable shape: drop it
+                        // rather than surface stale base data.
                         Ok(None) => return false,
                         Err(e) => {
                             first_err = Some(e);

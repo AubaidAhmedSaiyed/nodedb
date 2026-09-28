@@ -130,6 +130,12 @@ pub struct WriteEvent {
     /// WAL LSN for this write. Enables replay from WAL on Event Plane restart.
     pub lsn: Lsn,
 
+    /// The WAL record this event reproduces, when the write has one. WAL
+    /// catch-up rebuilds the events of such a record, so the Event Plane names
+    /// an event by its record position and row to deliver it once. `None` for
+    /// a write the WAL does not carry: only its ring copy ever arrives.
+    pub record: Option<RecordPosition>,
+
     /// Database context. Producers will propagate the selected database in the
     /// next CDC scoping slice; existing construction sites use `DEFAULT`.
     pub database_id: DatabaseId,
@@ -178,6 +184,27 @@ pub struct WriteEvent {
     pub statement_digest: Option<Arc<str>>,
 }
 
+/// Where an event sits in the WAL record it reproduces.
+///
+/// A record can write one row more than once (a transaction's redo). The
+/// ring and WAL catch-up both number those events per row, in record order,
+/// so each names the same event the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecordPosition {
+    /// LSN of the WAL record.
+    pub lsn: Lsn,
+    /// How many earlier events of the same record name the same row and the
+    /// same kind of write (a delete, or an insert or update).
+    pub occurrence: u32,
+}
+
+impl RecordPosition {
+    /// The first event of record `lsn` on its row.
+    pub fn first(lsn: Lsn) -> Self {
+        Self { lsn, occurrence: 0 }
+    }
+}
+
 /// The type of write operation that generated this event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOp {
@@ -220,7 +247,11 @@ impl std::fmt::Display for WriteOp {
 
 /// Source of a write event. The Event Plane uses this to decide whether
 /// to fire AFTER triggers and other side effects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serde names match [`EventSource::as_str`]. CDC events carry the source
+/// under those names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventSource {
     /// User-originated DML. AFTER triggers should fire.
     User,
@@ -233,17 +264,89 @@ pub enum EventSource {
     /// Deferred trigger write. The Event Plane fires DEFERRED-mode triggers
     /// for these events (post-commit from transaction batch).
     Deferred,
+    /// A row a RESTORE re-issued from a backup. AFTER triggers do not fire:
+    /// they fired when the row was first written. CDC streams deliver the
+    /// event tagged `restore`. Consumers that keep derived state in step
+    /// with the base data process it.
+    Restore,
+}
+
+impl EventSource {
+    /// The source's stable name, as CDC events and logs show it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Trigger => "trigger",
+            Self::RaftFollower => "raft_follower",
+            Self::CrdtSync => "crdt_sync",
+            Self::Deferred => "deferred",
+            Self::Restore => "restore",
+        }
+    }
+
+    /// The source a committed transaction's document rows carry, for a
+    /// record whose writes ran with `self`.
+    ///
+    /// A client transaction's rows fire DEFERRED-mode triggers, so they carry
+    /// `Deferred`. Every other source keeps its own: a trigger's transaction
+    /// does not re-fire triggers, and a restored row fired its triggers when
+    /// it was first written. The live apply and WAL replay both use this.
+    pub const fn committed_row_source(self) -> Self {
+        match self {
+            Self::User => Self::Deferred,
+            Self::Trigger => Self::Trigger,
+            Self::RaftFollower => Self::RaftFollower,
+            Self::CrdtSync => Self::CrdtSync,
+            Self::Deferred => Self::Deferred,
+            Self::Restore => Self::Restore,
+        }
+    }
+
+    /// The source's code in a WAL record header. Code `0` is
+    /// `nodedb_wal::NO_EVENT_SOURCE`, a record with no row write, so no source
+    /// maps to it.
+    pub const fn wal_code(self) -> u8 {
+        match self {
+            Self::User => 1,
+            Self::Trigger => 2,
+            Self::RaftFollower => 3,
+            Self::CrdtSync => 4,
+            Self::Deferred => 5,
+            Self::Restore => 6,
+        }
+    }
+
+    /// The source a WAL record header code names. `None` for
+    /// `nodedb_wal::NO_EVENT_SOURCE` and for a code no source uses.
+    pub const fn from_wal_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::User),
+            2 => Some(Self::Trigger),
+            3 => Some(Self::RaftFollower),
+            4 => Some(Self::CrdtSync),
+            5 => Some(Self::Deferred),
+            6 => Some(Self::Restore),
+            _ => None,
+        }
+    }
+
+    /// The source named `name`, as [`Self::as_str`] spells it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "user" => Some(Self::User),
+            "trigger" => Some(Self::Trigger),
+            "raft_follower" => Some(Self::RaftFollower),
+            "crdt_sync" => Some(Self::CrdtSync),
+            "deferred" => Some(Self::Deferred),
+            "restore" => Some(Self::Restore),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for EventSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::User => write!(f, "user"),
-            Self::Trigger => write!(f, "trigger"),
-            Self::RaftFollower => write!(f, "raft_follower"),
-            Self::CrdtSync => write!(f, "crdt_sync"),
-            Self::Deferred => write!(f, "deferred"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -318,6 +421,62 @@ mod tests {
     fn event_source_display() {
         assert_eq!(EventSource::User.to_string(), "user");
         assert_eq!(EventSource::RaftFollower.to_string(), "raft_follower");
+        assert_eq!(EventSource::Restore.to_string(), "restore");
+    }
+
+    #[test]
+    fn every_event_source_name_round_trips_through_serde_and_from_name() {
+        for source in [
+            EventSource::User,
+            EventSource::Trigger,
+            EventSource::RaftFollower,
+            EventSource::CrdtSync,
+            EventSource::Deferred,
+            EventSource::Restore,
+        ] {
+            assert_eq!(EventSource::from_name(source.as_str()), Some(source));
+            let json = sonic_rs::to_string(&source).expect("encode source");
+            assert_eq!(json, format!("\"{}\"", source.as_str()));
+            let decoded: EventSource = sonic_rs::from_str(&json).expect("decode source");
+            assert_eq!(decoded, source);
+        }
+        assert_eq!(EventSource::from_name("unknown"), None);
+    }
+
+    #[test]
+    fn every_event_source_round_trips_through_its_wal_code() {
+        for source in [
+            EventSource::User,
+            EventSource::Trigger,
+            EventSource::RaftFollower,
+            EventSource::CrdtSync,
+            EventSource::Deferred,
+            EventSource::Restore,
+        ] {
+            assert_ne!(source.wal_code(), nodedb_wal::NO_EVENT_SOURCE);
+            assert_eq!(EventSource::from_wal_code(source.wal_code()), Some(source));
+        }
+        assert_eq!(
+            EventSource::from_wal_code(nodedb_wal::NO_EVENT_SOURCE),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_client_transaction_fires_deferred_triggers() {
+        assert_eq!(
+            EventSource::User.committed_row_source(),
+            EventSource::Deferred
+        );
+        for source in [
+            EventSource::Trigger,
+            EventSource::RaftFollower,
+            EventSource::CrdtSync,
+            EventSource::Deferred,
+            EventSource::Restore,
+        ] {
+            assert_eq!(source.committed_row_source(), source);
+        }
     }
 
     #[test]
@@ -328,6 +487,7 @@ mod tests {
             op: WriteOp::Insert,
             row_id: RowId::row(RowIdentity::from_user_key("order-1")),
             lsn: Lsn::new(100),
+            record: None,
             database_id: DatabaseId::DEFAULT,
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),

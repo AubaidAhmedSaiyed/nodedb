@@ -21,7 +21,13 @@ pub(crate) fn undefined_sequence(name: &str) -> SqlError {
 pub(crate) fn map_sequence_error(name: &str, error: SequenceError) -> SqlError {
     match error {
         SequenceError::NotFound { .. } => undefined_sequence(name),
-        other => SqlError::ObjectNotInPrerequisiteState {
+        other @ (SequenceError::Exhausted { .. }
+        | SequenceError::NotYetCalled { .. }
+        | SequenceError::OutOfRange { .. }
+        | SequenceError::AlreadyExists { .. }
+        | SequenceError::InvalidDefinition { .. }
+        | SequenceError::FormatParse { .. }
+        | SequenceError::InvalidResetScope { .. }) => SqlError::ObjectNotInPrerequisiteState {
             object: name.to_string(),
             detail: other.to_string(),
         },
@@ -40,7 +46,13 @@ pub(crate) fn sequence_error_to_error(name: &str, error: SequenceError) -> crate
             kind: "sequence",
             name: name.to_string(),
         },
-        other => crate::Error::ObjectNotInPrerequisiteState {
+        other @ (SequenceError::Exhausted { .. }
+        | SequenceError::NotYetCalled { .. }
+        | SequenceError::OutOfRange { .. }
+        | SequenceError::AlreadyExists { .. }
+        | SequenceError::InvalidDefinition { .. }
+        | SequenceError::FormatParse { .. }
+        | SequenceError::InvalidResetScope { .. }) => crate::Error::ObjectNotInPrerequisiteState {
             object: name.to_string(),
             detail: other.to_string(),
         },

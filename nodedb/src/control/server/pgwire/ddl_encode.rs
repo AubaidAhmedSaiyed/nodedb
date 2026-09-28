@@ -43,9 +43,23 @@ pub fn ddl_results_to_pgwire(
             sqlstate,
             code,
             message,
+            cause,
+            ..
         }) => {
             let mut info = ErrorInfo::new("ERROR".to_owned(), sqlstate, message);
             info.routine = Some(code.to_string());
+            // The typed cause travels in `detail`: its SQLSTATE, its numeric
+            // code, and its message.
+            info.detail = cause.map(|cause| {
+                format!(
+                    "caused by {} ({}): {}",
+                    crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(
+                        cause.code()
+                    ),
+                    cause.code(),
+                    cause.message()
+                )
+            });
             return Err(PgWireError::UserError(Box::new(info)));
         }
     };
@@ -174,6 +188,26 @@ mod tests {
     use pgwire::messages::response::ErrorResponse;
 
     use super::*;
+
+    /// A phase failure keeps its SQLSTATE, and the typed cause travels in
+    /// `detail` with its own SQLSTATE and code.
+    #[test]
+    fn ddl_phase_failure_names_its_cause_in_detail() {
+        let phase = nodedb_types::NodeDbError::move_tenant_snapshot_failed("7", "dispatch")
+            .with_cause(nodedb_types::NodeDbError::division_by_zero());
+        let result: Result<Vec<DdlResult>, DdlError> =
+            Err(DdlError::move_tenant_snapshot_failed(phase.message()).with_cause_of(&phase));
+
+        let err = ddl_results_to_pgwire(result).expect_err("must map to a pgwire error");
+        let PgWireError::UserError(info) = err else {
+            panic!("expected a UserError carrying ErrorInfo");
+        };
+        let info = *info;
+        assert_eq!(info.code, "XX000");
+        let detail = info.detail.expect("the cause travels in detail");
+        assert!(detail.contains("22012"), "{detail}");
+        assert!(detail.contains("NDB-1204"), "{detail}");
+    }
 
     /// Round-trips through the actual PostgreSQL wire bytes `ErrorResponse`
     /// encodes and a client's `pgwire` codec decodes — proving the code

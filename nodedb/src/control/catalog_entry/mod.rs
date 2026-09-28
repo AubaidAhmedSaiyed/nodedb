@@ -31,6 +31,7 @@
 //! compile error everywhere a caller needs to handle it.
 
 pub mod apply;
+pub mod authorization;
 pub mod codec;
 pub mod descriptor_stamp;
 pub mod descriptor_validate;
@@ -38,6 +39,7 @@ pub mod entry;
 pub mod kind;
 pub mod persist_collection;
 pub mod post_apply;
+pub mod role_rules;
 
 pub use codec::{decode, encode};
 pub use entry::CatalogEntry;

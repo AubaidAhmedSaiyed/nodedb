@@ -75,9 +75,8 @@ pub(crate) fn build_batch_insert(
     let mut surrogates = Vec::with_capacity(vectors.len());
     for _ in &vectors {
         surrogates.push(assigner.assign_anonymous(
-            ctx.database_id(),
+            nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
             ctx.tenant_id(),
-            collection,
         )?);
     }
 
@@ -109,15 +108,17 @@ pub(crate) fn build_insert(
     let (surrogate, pk_bytes) = match fields.document_id.as_deref() {
         Some(pk) if !pk.is_empty() => (
             assigner.assign(
-                ctx.database_id(),
+                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
                 ctx.tenant_id(),
-                collection,
                 pk.as_bytes(),
             )?,
             Some(pk.as_bytes().to_vec()),
         ),
         _ => (
-            assigner.assign_anonymous(ctx.database_id(), ctx.tenant_id(), collection)?,
+            assigner.assign_anonymous(
+                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+                ctx.tenant_id(),
+            )?,
             None,
         ),
     };
@@ -174,35 +175,5 @@ pub(crate) fn build_delete(
     Ok(PhysicalPlan::Vector(VectorOp::Delete {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
         vector_id,
-    }))
-}
-
-pub(crate) fn build_set_params(
-    ctx: &DispatchCtx<'_>,
-    fields: &TextFields,
-    collection: &str,
-) -> crate::Result<PhysicalPlan> {
-    let m = fields.m.unwrap_or(16) as usize;
-    let ef_construction = fields.ef_construction.unwrap_or(200) as usize;
-    let metric = fields
-        .metric
-        .clone()
-        .unwrap_or_else(|| "cosine".to_string());
-    let index_type = fields
-        .index_type
-        .clone()
-        .unwrap_or_else(|| "hnsw".to_string());
-
-    Ok(PhysicalPlan::Vector(VectorOp::SetParams {
-        collection: QualifiedCollection::new(ctx.database_id(), collection),
-        field_name: fields.field_name.clone().unwrap_or_default(),
-        dim: fields.vector_dim.unwrap_or(0) as usize,
-        m,
-        ef_construction,
-        metric,
-        index_type,
-        pq_m: 0,
-        ivf_cells: 0,
-        ivf_nprobe: 0,
     }))
 }

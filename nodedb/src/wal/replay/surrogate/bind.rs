@@ -22,9 +22,8 @@ pub fn apply_surrogate_bind(
     let parsed = SurrogateBindPayload::from_bytes(payload).map_err(crate::Error::Wal)?;
     let surrogate = Surrogate::new(parsed.surrogate);
     catalog.put_surrogate(
-        database_id,
+        nodedb_types::CollectionKey::from_bare(database_id, &parsed.collection),
         tenant_id,
-        &parsed.collection,
         &parsed.pk_bytes,
         surrogate,
     )?;
@@ -64,15 +63,18 @@ mod tests {
             .unwrap();
         apply_surrogate_bind(&payload, DatabaseId::DEFAULT, TenantId::new(0), &cat, &reg).unwrap();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, TenantId::new(0), "users", b"alice")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                TenantId::new(0),
+                b"alice"
+            )
+            .unwrap(),
             Some(Surrogate::new(7))
         );
         assert_eq!(
             cat.get_pk_for_surrogate(
-                DatabaseId::DEFAULT,
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
                 TenantId::new(0),
-                "users",
                 Surrogate::new(7)
             )
             .unwrap(),
@@ -90,8 +92,12 @@ mod tests {
         apply_surrogate_bind(&payload, DatabaseId::DEFAULT, TenantId::new(0), &cat, &reg).unwrap();
         apply_surrogate_bind(&payload, DatabaseId::DEFAULT, TenantId::new(0), &cat, &reg).unwrap();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, TenantId::new(0), "users", b"bob")
-                .unwrap(),
+            cat.get_surrogate_for_pk(
+                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                TenantId::new(0),
+                b"bob"
+            )
+            .unwrap(),
             Some(Surrogate::new(3))
         );
         assert_eq!(reg.read().unwrap().current_hwm(), 3);

@@ -30,10 +30,7 @@ pub fn evaluate_generated_columns(
         // A generated column's expression is write-path-shaped: a
         // division/modulo-by-zero fails the write instead of silently
         // materializing NULL into the stored column.
-        let result = spec
-            .expr
-            .eval(&doc_val)
-            .map_err(|_e| ErrorCode::DivisionByZero)?;
+        let result = spec.expr.eval(&doc_val).map_err(ErrorCode::from)?;
         let computed = serde_json::Value::from(result);
         if let Some(obj) = doc.as_object_mut() {
             obj.insert(spec.name.clone(), computed);
@@ -55,11 +52,11 @@ pub fn check_generated_readonly<V>(
     for (field, _) in update_fields {
         if specs.iter().any(|s| s.name == *field) {
             return Err(ErrorCode::RejectedConstraint {
-                constraint: format!(
+                constraint: "generated_always".into(),
+                detail: format!(
                     "cannot UPDATE generated column '{field}': \
                      generated columns are computed automatically"
                 ),
-                detail: String::new(),
             });
         }
     }
@@ -122,9 +119,10 @@ fn topological_sort(specs: &[GeneratedColumnSpec]) -> Result<Vec<usize>, ErrorCo
     }
 
     if order.len() != n {
-        return Err(ErrorCode::RejectedConstraint {
-            constraint: "cycle detected in generated column dependencies".into(),
-            detail: String::new(),
+        return Err(ErrorCode::Unsupported {
+            detail: "generated columns whose expressions depend on each other in a cycle \
+                     are not supported"
+                .into(),
         });
     }
 

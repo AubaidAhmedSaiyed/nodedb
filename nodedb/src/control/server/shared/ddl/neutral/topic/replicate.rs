@@ -22,7 +22,7 @@ pub(super) fn propose_create(state: &SharedState, def: &TopicDef) -> Result<(), 
     let entry = CatalogEntry::CreateTopicIfAbsent(Box::new(def.clone()));
     propose_and_apply(state, &entry, || {
         apply::create_if_absent(def, state.credentials.catalog())
-            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         post_apply::create_if_absent(def, state);
         Ok(())
     })
@@ -52,7 +52,7 @@ pub(super) fn propose_delete(
             name,
             state.credentials.catalog(),
         )
-        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
         post_apply::delete_with_consumer_groups(database_id, tenant_id, name, state);
         Ok(())
     })

@@ -7,6 +7,17 @@ use crate::data::executor::vector_string::floats_from_value;
 
 use super::types::{VectorFieldInsert, VectorIndexDelta, VectorIndexPutParams};
 
+/// A document vector field whose width differs from its index: the
+/// caller's data error, SQLSTATE `22000`, naming the field.
+fn field_dimension_mismatch(field_name: &str, expected: usize, got: usize) -> crate::Error {
+    crate::Error::DataException {
+        detail: format!(
+            "{field_name}: {}",
+            nodedb_vector::error::VectorError::DimensionMismatch { expected, got }
+        ),
+    }
+}
+
 impl CoreLoop {
     /// HNSW vector indexing side-effect: index declared strict-schema
     /// `Vector(dim)` columns, or (schemaless) fields matched by registered
@@ -65,43 +76,32 @@ impl CoreLoop {
                         Self::vector_index_key(database_id, tid, collection, field_name);
                     self.check_vector_width(&index_key, field_name, floats.len())?;
                     if floats.len() != *dim as usize {
-                        return Err(crate::Error::RejectedConstraint {
-                            collection: collection.to_string(),
-                            constraint: format!("vector dimension on '{field_name}'"),
-                            detail: format!("column declares {dim}, got {}", floats.len()),
-                        });
+                        return Err(field_dimension_mismatch(
+                            field_name,
+                            *dim as usize,
+                            floats.len(),
+                        ));
                     }
-                    let params = self
-                        .vector_params
-                        .get(&index_key)
-                        .cloned()
-                        .unwrap_or_default();
-                    let skip = {
-                        let coll = self
-                            .vector_collections
-                            .entry(index_key.clone())
-                            .or_insert_with(|| {
-                                nodedb_vector::VectorCollection::new(*dim as usize, params)
-                            });
-                        // Skip a straddling-segment record the restored
-                        // checkpoint already absorbed (replay only; a
-                        // live write always carries a higher, unseen
-                        // LSN).
-                        wal_lsn != 0 && wal_lsn <= coll.checkpoint_wal_lsn()
-                    };
+                    // Skip a record the restored vector checkpoint holds. Its
+                    // stamp names only records applied before the checkpoint,
+                    // all of them replayed before the core serves a request,
+                    // so a live write is never named.
+                    let skip = wal_lsn != 0 && self.vector_replay_skips(wal_lsn);
+                    self.ensure_vector_collection(&index_key, &index_key, *dim as usize)?;
                     if skip {
                         continue;
                     }
-                    if let Some(delta) = self.remove_then_insert_vector_field(VectorFieldInsert {
-                        database_id,
-                        tid,
-                        index_key,
-                        collection,
-                        field_name,
-                        storage_key,
-                        floats,
-                        wal_lsn,
-                    }) {
+                    if let Some(delta) =
+                        self.remove_then_insert_vector_field(VectorFieldInsert {
+                            database_id,
+                            tid,
+                            index_key,
+                            collection,
+                            field_name,
+                            storage_key,
+                            floats,
+                        })?
+                    {
                         inserts.push(delta);
                     }
                 }
@@ -150,46 +150,43 @@ impl CoreLoop {
                         },
                         None => continue,
                     };
-                    let params = self
-                        .vector_params
-                        .get(params_key)
-                        .cloned()
-                        .unwrap_or_default();
                     // Use field-qualified key so search can find it.
                     let store_key =
                         Self::vector_index_key(database_id, tid, collection, field_name);
                     self.check_vector_width(&store_key, field_name, floats.len())?;
                     let dim = floats.len();
-                    let skip = {
-                        let coll = self
-                            .vector_collections
-                            .entry(store_key.clone())
-                            .or_insert_with(|| nodedb_vector::VectorCollection::new(dim, params));
-                        // Skip a straddling-segment record the restored
-                        // checkpoint already absorbed (replay only; a
-                        // live write always carries a higher, unseen
-                        // LSN).
-                        wal_lsn != 0 && wal_lsn <= coll.checkpoint_wal_lsn()
-                    };
+                    // Same stamp gate as the strict arm above.
+                    let skip = wal_lsn != 0 && self.vector_replay_skips(wal_lsn);
+                    self.ensure_vector_collection(&store_key, params_key, dim)?;
                     if skip {
                         continue;
                     }
-                    if let Some(delta) = self.remove_then_insert_vector_field(VectorFieldInsert {
-                        database_id,
-                        tid,
-                        index_key: store_key,
-                        collection,
-                        field_name,
-                        storage_key,
-                        floats,
-                        wal_lsn,
-                    }) {
+                    if let Some(delta) =
+                        self.remove_then_insert_vector_field(VectorFieldInsert {
+                            database_id,
+                            tid,
+                            index_key: store_key,
+                            collection,
+                            field_name,
+                            storage_key,
+                            floats,
+                        })?
+                    {
                         inserts.push(delta);
                     }
                 }
             }
         }
 
+        // A full growing segment seals and queues its HNSW build, and an IVF-PQ
+        // collection at its threshold trains. A committed-redo install settles
+        // once the whole record landed, so a rollback finds its inserts in the
+        // growing segment.
+        if !self.recording_redo_undo() {
+            for delta in &inserts {
+                self.settle_vector_collection(&delta.index_key);
+            }
+        }
         Ok(inserts)
     }
 
@@ -205,22 +202,16 @@ impl CoreLoop {
         field_name: &str,
         got: usize,
     ) -> crate::Result<()> {
-        let mismatch = |expected: usize, source: &str| crate::Error::RejectedConstraint {
-            collection: index_key.2.clone(),
-            constraint: format!("vector dimension on '{field_name}'"),
-            detail: format!("index {source} {expected}, got {got}"),
-        };
-
         if let Some(&declared) = self.declared_dims.get(index_key)
             && declared != 0
             && declared != got
         {
-            return Err(mismatch(declared, "declares"));
+            return Err(field_dimension_mismatch(field_name, declared, got));
         }
         if let Some(existing) = self.vector_collections.get(index_key)
             && existing.dim() != got
         {
-            return Err(mismatch(existing.dim(), "has"));
+            return Err(field_dimension_mismatch(field_name, existing.dim(), got));
         }
         Ok(())
     }
@@ -239,13 +230,14 @@ impl CoreLoop {
     /// Binds the vector node to the document's global surrogate so
     /// cross-engine identity holds: a search hit resolves back to this row's
     /// surrogate (and thus its user PK at the response boundary) instead of
-    /// leaking a headless local node id. Returns `None` if `index_key`'s
+    /// leaking a headless local node id. Returns `Ok(None)` if `index_key`'s
     /// `VectorCollection` was somehow absent (defensive — it was just
-    /// populated via `entry().or_insert_with()` by the caller).
+    /// populated via `entry().or_insert_with()` by the caller), and the
+    /// collection's typed error when the vector does not fit it.
     fn remove_then_insert_vector_field(
         &mut self,
         params: VectorFieldInsert<'_>,
-    ) -> Option<VectorIndexDelta> {
+    ) -> crate::Result<Option<VectorIndexDelta>> {
         let VectorFieldInsert {
             database_id,
             tid,
@@ -254,7 +246,6 @@ impl CoreLoop {
             field_name,
             storage_key,
             floats,
-            wal_lsn,
         } = params;
         let _ = self.remove_document_vector_index_field(
             database_id,
@@ -263,9 +254,10 @@ impl CoreLoop {
             field_name,
             storage_key,
         );
-        let coll = self.vector_collections.get_mut(&index_key)?;
-        let vector_id = coll.insert_with_surrogate(floats, storage_key.surrogate());
-        coll.note_checkpoint_lsn(wal_lsn);
+        let Some(coll) = self.vector_collections.get_mut(&index_key) else {
+            return Ok(None);
+        };
+        let vector_id = coll.insert_with_surrogate(floats, storage_key.surrogate())?;
         self.vector_doc_map.insert(
             (
                 index_key.0,
@@ -276,13 +268,13 @@ impl CoreLoop {
             ),
             vector_id,
         );
-        Some(VectorIndexDelta {
+        Ok(Some(VectorIndexDelta {
             index_key,
             vector_id,
             collection: collection.to_string(),
             field: field_name.to_string(),
             doc_id: storage_key,
-        })
+        }))
     }
 }
 
@@ -482,6 +474,45 @@ mod tests {
         );
     }
 
+    /// A vector write over an indexed row replaces the node the document put
+    /// recorded. Deleting the row must remove the node that replaced it, or
+    /// the deleted row's vector keeps scoring in searches.
+    #[test]
+    fn deleting_a_row_removes_the_node_a_vector_write_bound_to_it() {
+        let mut harness = make_core();
+        let core = &mut harness.core;
+        let (db_id, tid, collection) = (0u64, 1u64, "docs");
+        let surrogate = Surrogate::new(1);
+        let storage_key = crate::engine::document::store::StorageKey::for_surrogate(surrogate);
+        register_bare_field(core, db_id, tid, collection);
+
+        let doc = doc_with_vectors(&[("embedding", &[1.0, 0.0, 0.0])]);
+        core.apply_point_put_vector_indexes(VectorIndexPutParams {
+            database_id: db_id,
+            tid,
+            collection,
+            storage_key,
+            value: &doc,
+            wal_lsn: 0,
+        })
+        .expect("vector indexing must accept this fixture");
+        let key = CoreLoop::vector_index_key(db_id, tid, collection, "embedding");
+        core.vector_collections
+            .get_mut(&key)
+            .expect("collection")
+            .insert_with_surrogate(vec![0.0, 1.0, 0.0], surrogate)
+            .expect("vector write");
+        assert_eq!(live_count(core, db_id, tid, collection, "embedding"), 1);
+
+        let removed = core.remove_document_vector_indexes(db_id, tid, collection, storage_key);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            live_count(core, db_id, tid, collection, "embedding"),
+            0,
+            "the node bound to the deleted row must be gone"
+        );
+    }
+
     /// A schemaless vector arriving as an SQL string literal must be parsed
     /// and indexed like an `ARRAY[...]` literal.
     ///
@@ -562,7 +593,7 @@ mod tests {
             });
 
             assert!(
-                matches!(res, Err(crate::Error::RejectedConstraint { .. })),
+                matches!(res, Err(crate::Error::DataException { .. })),
                 "malformed embedding '{bad}' must reject the put"
             );
             assert_eq!(
@@ -571,5 +602,43 @@ mod tests {
                 "malformed embedding '{bad}' must not be indexed"
             );
         }
+    }
+
+    /// A document put the restored vector checkpoint's stamp names is not
+    /// indexed again on replay; one it does not name is indexed.
+    #[test]
+    fn a_put_the_vector_stamp_names_is_not_indexed_again() {
+        let mut harness = make_core();
+        let core = &mut harness.core;
+        let (db_id, tid, collection) = (0u64, 1u64, "docs");
+        register_bare_field(core, db_id, tid, collection);
+        core.floors
+            .replay_floors
+            .vector
+            .set(crate::types::replay_stamp::ReplayStamp {
+                prefix: 5,
+                applied_above: vec![crate::types::replay_stamp::LsnRange { start: 10, end: 10 }],
+            });
+
+        for (surrogate, wal_lsn) in [(1, 10), (2, 7)] {
+            let storage_key = crate::engine::document::store::StorageKey::for_surrogate(
+                Surrogate::new(surrogate),
+            );
+            let doc = doc_with_vectors(&[("embedding", &[1.0, 0.0, 0.0])]);
+            core.apply_point_put_vector_indexes(VectorIndexPutParams {
+                database_id: db_id,
+                tid,
+                collection,
+                storage_key,
+                value: &doc,
+                wal_lsn,
+            })
+            .expect("vector indexing must accept this fixture");
+        }
+        assert_eq!(
+            physical_len(core, db_id, tid, collection, "embedding"),
+            1,
+            "the put at lsn 10 is held by the checkpoint; the in-flight put at lsn 7 is indexed"
+        );
     }
 }

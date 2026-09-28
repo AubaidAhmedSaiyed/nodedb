@@ -86,7 +86,18 @@ impl nodedb_cluster::CalvinSubmitInbox for RegistryCalvinSubmitInbox {
         };
         // Re-derive the participating-vshard set skipped during serialization
         // (the wire bytes carry only the read/write sets).
-        tx_class.restore_derived();
+        if let Err(e) = tx_class.restore_derived() {
+            return SubmitCalvinInboxResponse {
+                inbox_seq: 0,
+                epoch: 0,
+                position: 0,
+                participants: 0,
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: format!("calvin-inbox: TxClass participants underivable: {e}"),
+                }),
+            };
+        }
 
         let timeout = Duration::from_millis(req.deadline_remaining_ms.max(1));
         match submit_local_assign(&self.state, tx_class, timeout).await {

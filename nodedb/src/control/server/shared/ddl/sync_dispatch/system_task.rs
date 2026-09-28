@@ -17,7 +17,9 @@
 //! authorization instead.
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{DatabaseId, TenantId};
+use crate::control::server::dispatch_utils::MintedRecords;
+use crate::types::TenantId;
+use nodedb_types::CollectionKey;
 
 /// Why a Data-Plane dispatch carries no user identity.
 ///
@@ -62,15 +64,37 @@ impl SystemReason {
             Self::AdmittedContinuation => "admitted_continuation",
         }
     }
+
+    /// The source the task's write events carry into the Event Plane.
+    ///
+    /// A restore re-issues rows whose AFTER triggers fired when they were
+    /// first written, so its writes carry `Restore`. Every other reason
+    /// carries `User`.
+    pub(crate) fn event_source(self) -> crate::event::EventSource {
+        match self {
+            Self::BackupRestore => crate::event::EventSource::Restore,
+            Self::RetentionEnforcement
+            | Self::ClusterSnapshot
+            | Self::DdlApply
+            | Self::CatalogMaintenance
+            | Self::TenantLifecycle
+            | Self::EventPlane
+            | Self::AdmittedContinuation => crate::event::EventSource::User,
+        }
+    }
 }
 
 /// A Data-Plane dispatch with no user identity behind it.
 pub(crate) struct SystemTask<'a> {
     pub(super) reason: SystemReason,
     pub(super) tenant_id: TenantId,
-    pub(super) database_id: DatabaseId,
-    pub(super) collection: &'a str,
+    /// Canonical key of the collection the task homes to. Its database is the
+    /// task's database.
+    pub(super) collection: CollectionKey<'a>,
     pub(super) plan: PhysicalPlan,
+    /// Records the caller appended for this task, under their outcome-floor
+    /// window. `None` when the task appends nothing.
+    pub(super) minted: Option<MintedRecords>,
 }
 
 impl<'a> SystemTask<'a> {
@@ -82,16 +106,46 @@ impl<'a> SystemTask<'a> {
     pub(crate) fn new(
         reason: SystemReason,
         tenant_id: TenantId,
-        database_id: DatabaseId,
-        collection: &'a str,
+        collection: CollectionKey<'a>,
         plan: PhysicalPlan,
     ) -> Self {
         Self {
             reason,
             tenant_id,
-            database_id,
             collection,
             plan,
+            minted: None,
+        }
+    }
+
+    /// Attach the records the caller appended for this task. The dispatch
+    /// closes their outcome-floor window from the task's outcome.
+    pub(crate) fn with_minted(mut self, minted: MintedRecords) -> Self {
+        self.minted = Some(minted);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_restore_carries_the_restore_source() {
+        assert_eq!(
+            SystemReason::BackupRestore.event_source(),
+            crate::event::EventSource::Restore
+        );
+        for reason in [
+            SystemReason::RetentionEnforcement,
+            SystemReason::ClusterSnapshot,
+            SystemReason::DdlApply,
+            SystemReason::CatalogMaintenance,
+            SystemReason::TenantLifecycle,
+            SystemReason::EventPlane,
+            SystemReason::AdmittedContinuation,
+        ] {
+            assert_eq!(reason.event_source(), crate::event::EventSource::User);
         }
     }
 }

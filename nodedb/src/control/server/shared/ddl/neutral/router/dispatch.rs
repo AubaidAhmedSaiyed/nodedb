@@ -69,10 +69,10 @@ pub async fn try_dispatch(
         return Some(r);
     }
 
-    // Parse errors surface as a typed `DdlError` here: `UnsupportedConstraint`
-    // maps to `0A000` (feature_not_supported), every other parse error to
-    // `42601` (syntax error), with the parser's own `Display` text as the
-    // message. This is the sole parse-error gate for the DDL router; the
+    // Parse errors surface as a typed `DdlError` here, with the SQLSTATE the
+    // planner path gives the same `SqlError` (`UnsupportedConstraint` is
+    // `0A000`, a parse error `42601`) and the parser's own `Display` text as
+    // the message. This is the sole parse-error gate for the DDL router; the
     // GRAPH / MATCH / SHOW GRAPH STATS prefixed inputs that previously carried
     // their own parse-error reproduction are subsumed by this arm.
     //
@@ -86,14 +86,13 @@ pub async fn try_dispatch(
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
         Some(Ok(stmt)) => stmt,
         Some(Err(e)) => {
-            // UnsupportedConstraint / ConflictingEngineClause → 0A000 (feature_not_supported).
-            // All other parse errors → 42601 (syntax error).
-            let sqlstate = match &e {
-                nodedb_sql::SqlError::UnsupportedConstraint { .. }
-                | nodedb_sql::SqlError::ConflictingEngineClause { .. } => "0A000",
-                _ => "42601",
-            };
-            return Some(Err(DdlError::new(sqlstate, e.to_string())));
+            // The SQLSTATE the planner path renders for the same error, so a
+            // parse refusal answers one class wherever it is raised.
+            let message = e.to_string();
+            let (_, sqlstate, _) = crate::control::server::pgwire::types::error_to_sqlstate(
+                &crate::control::planner::plan_error_map::map_plan_error(e, identity.tenant_id),
+            );
+            return Some(Err(DdlError::new(sqlstate, message)));
         }
         None => {
             // Bulk import: `COPY <collection> FROM STDIN [WITH (...)]`. The

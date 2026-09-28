@@ -7,8 +7,8 @@
 //! `bm25_score(...)` call may still appear directly in the SELECT projection.
 //! The canonical shape `SELECT id, rrf_score(...) AS score FROM c WHERE ... LIMIT N`
 //! requires this entry path because there is no ORDER BY clause to inspect.
-//! Without it the score column resolves to NULL via scalar evaluation that
-//! has no implementation.
+//! A score call no search plan serves is refused at plan time
+//! (`planner::search_scope`): it has no per-row value.
 //!
 //! Text-search shape: `SELECT id, bm25_score(field, term) FROM c ORDER BY id`.
 //! The plan stays a Scan after ORDER BY (non-search sort key). This pass

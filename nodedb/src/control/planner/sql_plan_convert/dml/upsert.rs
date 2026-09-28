@@ -9,7 +9,7 @@
 use nodedb_sql::types::{SqlExpr, SqlValue, WriteRoute};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::ColumnarInsertIntent;
 use nodedb_physical::physical_plan::*;
 
@@ -49,10 +49,11 @@ pub(in super::super) fn convert_upsert(
         tenant_id,
         ctx,
     } = args;
+    let key = ctx.collection_key(collection);
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = key.vshard();
     let mut tasks = Vec::new();
 
     // Detect CRDT document collections once. An explicit `ON CONFLICT DO UPDATE
@@ -91,7 +92,7 @@ pub(in super::super) fn convert_upsert(
                 let value_bytes = row_to_msgpack(row)?;
                 let (doc_id, surrogate) = resolve_doc_identity_with_declared(
                     ctx,
-                    collection,
+                    key,
                     primary_key,
                     declared_pk.as_deref(),
                     row,
@@ -143,7 +144,7 @@ pub(in super::super) fn convert_upsert(
         let payload = rows_to_msgpack_array(&columnar_rows)?;
         let surrogates = columnar_row_surrogates(
             ctx,
-            collection,
+            key,
             &columnar_rows,
             primary_key,
             declared_pk.as_deref(),

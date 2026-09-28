@@ -9,16 +9,16 @@ use crate::bridge::envelope::Response;
 use crate::control::server::dispatch_utils;
 use crate::control::server::shared::session::TxnDataPlane;
 use crate::control::state::SharedState;
-use crate::types::{Lsn, TraceId};
+use crate::types::TraceId;
 use nodedb_physical::physical_task::PhysicalTask;
 
 /// Dispatches a system transaction's commit-time tasks straight to the core
 /// that owns their vShard.
 ///
 /// The gateway must NOT be used here: commit-time tasks carry `MetaOp` plans
-/// (`ResolveTxn`, `TransactionBatch`) with no named collection, so the
+/// (`ResolveTxn`, `ApplyTransactionRedo`) with no named collection, so the
 /// gateway's router cannot derive a route for them and falls back to vShard 0,
-/// durably applying the commit batch on the wrong core.
+/// durably applying the commit on the wrong core.
 pub(super) struct SystemTxnDataPlane<'a> {
     pub(super) state: &'a SharedState,
     /// Provenance stamped on the writes this transaction applies.
@@ -33,7 +33,6 @@ impl TxnDataPlane for SystemTxnDataPlane<'_> {
     fn dispatch_no_wal<'a>(
         &'a self,
         task: PhysicalTask,
-        wal_lsn: Option<Lsn>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
         let state = self.state;
         let event_source = self.event_source;
@@ -48,11 +47,16 @@ impl TxnDataPlane for SystemTxnDataPlane<'_> {
                     trace_id: TraceId::ZERO,
                     event_source,
                     txn_id: None,
-                    wal_lsn,
+                    wal_lsn: None,
                     resolved_now_ms: None,
+                    minted: None,
                 },
             )
             .await
         })
+    }
+
+    fn event_source(&self) -> crate::event::EventSource {
+        self.event_source
     }
 }

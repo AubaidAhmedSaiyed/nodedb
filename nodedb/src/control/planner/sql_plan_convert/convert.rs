@@ -80,9 +80,9 @@ pub struct ConvertContext {
     /// Per-tenant maximum vector dimension (0 = unlimited). Checked in
     /// `VectorPrimaryInsert` conversion before the task is built.
     pub max_vector_dim: u32,
-    /// Database scope for vShard computation. All `VShardId::from_collection_in_database`
-    /// calls must use this value so that collections in different databases are
-    /// routed to distinct shards and data-plane isolates them correctly.
+    /// Database scope for vShard computation. Every `CollectionKey` the
+    /// converter builds uses this value, so collections in different
+    /// databases route to distinct shards and the Data Plane isolates them.
     pub database_id: crate::types::DatabaseId,
     /// Tenant scope for surrogate identity. Threaded into every surrogate
     /// `assign`/`lookup` so two tenants with the same primary key in a
@@ -136,11 +136,17 @@ impl ConvertContext {
         self.purpose == PlanningPurpose::Metadata
     }
 
+    /// The canonical key of `bare`, a catalog collection name in this
+    /// context's database. Placement and surrogate identity use this key.
+    pub fn collection_key<'a>(&self, bare: &'a str) -> nodedb_types::CollectionKey<'a> {
+        nodedb_types::CollectionKey::from_bare(self.database_id, bare)
+    }
+
     /// Resolve an existing surrogate without creating a mapping while planning
     /// metadata. Execute planning retains the allocating assignment behavior.
     pub fn surrogate_for_pk(
         &self,
-        collection: &str,
+        key: nodedb_types::CollectionKey<'_>,
         pk_bytes: &[u8],
     ) -> crate::Result<nodedb_types::Surrogate> {
         let Some(assigner) = self.surrogate_assigner.as_ref() else {
@@ -148,10 +154,10 @@ impl ConvertContext {
         };
         if self.is_metadata() {
             return Ok(assigner
-                .lookup(self.database_id, self.tenant_id, collection, pk_bytes)?
+                .lookup(key, self.tenant_id, pk_bytes)?
                 .unwrap_or(nodedb_types::Surrogate::ZERO));
         }
-        assigner.assign(self.database_id, self.tenant_id, collection, pk_bytes)
+        assigner.assign(key, self.tenant_id, pk_bytes)
     }
 
     /// Resolve an EXISTING pk → surrogate binding read-only, yielding
@@ -160,14 +166,14 @@ impl ConvertContext {
     /// a node-local phantom binding for a key no replica agrees on.
     pub fn surrogate_for_existing_pk(
         &self,
-        collection: &str,
+        key: nodedb_types::CollectionKey<'_>,
         pk_bytes: &[u8],
     ) -> crate::Result<nodedb_types::Surrogate> {
         let Some(assigner) = self.surrogate_assigner.as_ref() else {
             return Ok(nodedb_types::Surrogate::ZERO);
         };
         Ok(assigner
-            .lookup(self.database_id, self.tenant_id, collection, pk_bytes)?
+            .lookup(key, self.tenant_id, pk_bytes)?
             .unwrap_or(nodedb_types::Surrogate::ZERO))
     }
 
@@ -180,7 +186,7 @@ impl ConvertContext {
     /// the same type the allocator renders through.
     pub fn fresh_surrogate(
         &self,
-        collection: &str,
+        key: nodedb_types::CollectionKey<'_>,
     ) -> crate::Result<(nodedb_types::Surrogate, String)> {
         let placeholder = || {
             let zero = nodedb_types::Surrogate::ZERO;
@@ -193,7 +199,7 @@ impl ConvertContext {
             return placeholder();
         }
         match self.surrogate_assigner.as_ref() {
-            Some(assigner) => assigner.assign_fresh(self.database_id, self.tenant_id, collection),
+            Some(assigner) => assigner.assign_fresh(key, self.tenant_id),
             None => placeholder(),
         }
     }
@@ -329,26 +335,43 @@ mod tests {
 
         assert_eq!(
             metadata
-                .surrogate_for_pk("users", b"new-user")
+                .surrogate_for_pk(metadata.collection_key("users"), b"new-user")
                 .unwrap()
                 .as_u32(),
             0
         );
-        assert_eq!(metadata.fresh_surrogate("users").unwrap().0.as_u32(), 0);
+        assert_eq!(
+            metadata
+                .fresh_surrogate(metadata.collection_key("users"))
+                .unwrap()
+                .0
+                .as_u32(),
+            0
+        );
         assert_eq!(
             assigner
-                .lookup(DatabaseId::DEFAULT, TenantId::new(1), "users", b"new-user")
+                .lookup(
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                    TenantId::new(1),
+                    b"new-user",
+                )
                 .unwrap(),
             None
         );
         assert_eq!(registry.read().expect("registry").current_hwm(), 0);
 
         let execute = context(PlanningPurpose::Execute, Arc::clone(&assigner));
-        let allocated = execute.surrogate_for_pk("users", b"new-user").unwrap();
+        let allocated = execute
+            .surrogate_for_pk(execute.collection_key("users"), b"new-user")
+            .unwrap();
         assert_ne!(allocated.as_u32(), 0);
         assert_eq!(
             assigner
-                .lookup(DatabaseId::DEFAULT, TenantId::new(1), "users", b"new-user")
+                .lookup(
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+                    TenantId::new(1),
+                    b"new-user",
+                )
                 .unwrap(),
             Some(allocated)
         );

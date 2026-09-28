@@ -24,8 +24,8 @@ use super::ingest_dispatch::{TimeseriesApplyMode, TimeseriesIngestParams};
 use super::rls_gate;
 
 impl CoreLoop {
-    /// Check every condition that could reject a commit-deferred ILP ingest
-    /// before it is allowed to cast a Calvin commit vote. The simulation is
+    /// Check every condition that could reject a staged ILP ingest before the
+    /// transaction is allowed to commit. The simulation is
     /// deliberately isolated from live state: schema evolution and dictionary
     /// probes run against an exact snapshot clone, so this cannot publish a
     /// schema, consume tag IDs, or create a memtable.
@@ -178,10 +178,36 @@ impl CoreLoop {
             return self.response_error(task, error);
         }
 
-        if mode == TimeseriesApplyMode::CommitDeferred
-            && let Err(error) = self.prevalidate_deferred_ilp_ingest(task, tid, collection, &lines)
+        // A `RETURNING` ingest must take every row or none, because its
+        // row set has no place to report a rejected row. The tag ceiling is
+        // the one rejection a flush cannot clear, so it is decided here,
+        // before the first write.
+        if returning.is_some()
+            && admission::exceeds_tag_ceiling(
+                &self.ts_symbol_columns_for_ingest(
+                    task.request.database_id,
+                    tid,
+                    collection,
+                    &lines,
+                ),
+                &lines,
+                self.ts_tuning.max_tag_cardinality,
+            )
         {
-            return self.response_error(task, error);
+            return self.response_error(
+                task,
+                ErrorCode::RejectedPrevalidation {
+                    reason: format!(
+                        "timeseries ingest with RETURNING carries more distinct tag values \
+                         than the tag cardinality limit ({}) allows",
+                        self.ts_tuning.max_tag_cardinality
+                    ),
+                },
+            );
+        }
+
+        if mode == TimeseriesApplyMode::RedoInstall {
+            self.record_redo_ts_pre_image(task.request.database_id, tid, collection);
         }
 
         let bitemporal =
@@ -216,45 +242,21 @@ impl CoreLoop {
 
         // The WAL has already committed this record, so the admission gate
         // resolves every possible mid-record stop before the first row lands.
-        let governor_pressure = self
-            .governor
-            .try_reserve(
-                task.request.database_id,
-                tid,
-                nodedb_mem::EngineId::Timeseries,
-                0,
-            )
-            .is_err();
+        // A replayed or installed sub-record never flushes here: the replay
+        // arm flushed before the record's first sub-record (`group_flush`),
+        // and a flush between two sub-records would split the record.
         let soft_limit = self.ts_tuning.memtable_budget_bytes;
-        let hard_limit = self.ts_tuning.memtable_hard_limit_bytes;
-        let max_tag_cardinality = self.ts_tuning.max_tag_cardinality;
-        let needs_flush = self.columnar_memtables.get(&key).is_some_and(|mt| {
-            let resident = mt.memory_bytes();
-            resident >= soft_limit
-                || resident >= hard_limit
-                || governor_pressure
-                || !admission::has_tag_headroom(mt, &lines, max_tag_cardinality)
-        });
-        if needs_flush {
-            if mode == TimeseriesApplyMode::CommitDeferred {
-                return self.response_error(
-                    task,
-                    ErrorCode::RejectedPrevalidation {
-                        reason: "transactional timeseries ingest requires a flush before mutation"
-                            .into(),
-                    },
-                );
-            }
-            if let Err(e) =
+        if mode == TimeseriesApplyMode::Immediate
+            && self.ts_ingest_needs_flush(&key, &lines)
+            && let Err(e) =
                 self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
-            {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("pre-ingest ts flush failed: {e}"),
-                    },
-                );
-            }
+        {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("pre-ingest ts flush failed: {e}"),
+                },
+            );
         }
 
         let Some(mt) = self.columnar_memtables.get_mut(&key) else {
@@ -284,6 +286,15 @@ impl CoreLoop {
         });
         let accepted = outcome.accepted;
         let rejected = outcome.rejected;
+        // The record's rows landed, whatever the response below says. A
+        // flush from here on names the record; the pre-ingest flush above ran
+        // before it and does not. A committed-redo install is noted by the
+        // apply once the whole record installed.
+        if mode != TimeseriesApplyMode::RedoInstall
+            && let Some(lsn) = wal_lsn
+        {
+            self.note_ts_record_applied(lsn);
+        }
 
         if rejected > 0 {
             tracing::warn!(
@@ -294,22 +305,20 @@ impl CoreLoop {
             );
         }
 
-        // A rejected row is a FAILURE, not a requested skip, and the two answer
-        // shapes report it differently: the count response below carries
-        // `rejected`, so a client can see rows were dropped, but a `RETURNING`
-        // response is a row set with nowhere to put that number — a short row
-        // set is indistinguishable from a complete one. Rather than tell the
-        // client less than the truth, a projecting ingest fails outright and
-        // names the count and the first reason. The non-projecting path keeps
-        // its counts unchanged because it already reports them honestly.
+        // A rejected row is a FAILURE, not a requested skip. The count
+        // response below reports `rejected`, but a `RETURNING` row set has no
+        // place for that number. The tag-ceiling check above refuses every
+        // rejection it can foresee before any row lands. A rejection that
+        // still reaches here follows accepted rows, so the error is
+        // `Internal`: a refusal code would claim nothing applied.
         if returning.is_some() && rejected > 0 {
             let reason = outcome
                 .first_rejection
                 .unwrap_or_else(|| "no reason recorded".to_string());
             return self.response_error(
                 task,
-                ErrorCode::RejectedPrevalidation {
-                    reason: format!(
+                ErrorCode::Internal {
+                    detail: format!(
                         "timeseries ingest with RETURNING rejected {rejected} of {} rows and \
                          cannot report them alongside a row set; first rejection: {reason}",
                         accepted + rejected
@@ -339,13 +348,6 @@ impl CoreLoop {
             None => Vec::new(),
         };
 
-        if accepted > 0
-            && let Some(lsn) = wal_lsn
-        {
-            let entry = self.ts_max_ingested_lsn.entry(key.clone()).or_insert(0);
-            *entry = (*entry).max(lsn);
-        }
-
         let Some(mt) = self.columnar_memtables.get(&key) else {
             return self.response_error(
                 task,
@@ -355,8 +357,9 @@ impl CoreLoop {
             );
         };
         let needs_flush = mt.memory_bytes() >= soft_limit;
-        if mode == TimeseriesApplyMode::Immediate {
-            if needs_flush
+        if mode != TimeseriesApplyMode::RedoInstall {
+            if mode == TimeseriesApplyMode::Immediate
+                && needs_flush
                 && let Err(e) =
                     self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
             {
@@ -369,7 +372,7 @@ impl CoreLoop {
             }
 
             if accepted > 0 {
-                // no-determinism: Instant::now runs only for the operational idle/checkpoint timer in Immediate mode and is skipped in Calvin staged apply.
+                // no-determinism: Instant::now runs only for the operational idle/checkpoint timer, outside a committed-redo install.
                 self.last_ts_ingest = Some(std::time::Instant::now());
             }
 

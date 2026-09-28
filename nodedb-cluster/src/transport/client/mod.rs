@@ -9,11 +9,14 @@
 //!
 //! [`RaftTransport`]: nodedb_raft::transport::RaftTransport
 
+pub mod close;
 pub mod pool;
 pub mod raft_impl;
 pub mod send;
 pub mod serve;
+pub mod sever;
+pub mod shuffle_push;
 pub mod transport;
 
-pub use send::ShufflePushStream;
+pub use shuffle_push::ShufflePushStream;
 pub use transport::{NexarTransport, TransportPeerSnapshot};

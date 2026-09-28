@@ -31,6 +31,9 @@ const FRONTIER_RETRY_LIMIT: usize = 8;
 
 pub struct AuthorizedCrdtApplyAdmissionRequest<'a> {
     pub authorized: AuthorizedTask,
+    /// The db-qualified collection (`QualifiedCollection::as_str`), the same
+    /// string the plan's `CrdtOp::Apply` carries. The preview and the apply
+    /// address the Data Plane by it, and the catalog lookup de-qualifies it.
     pub collection: &'a str,
     pub timeout: Duration,
     pub event_source: EventSource,
@@ -40,6 +43,8 @@ pub struct AuthorizedCrdtApplyAdmissionRequest<'a> {
 pub struct CrdtApplyAdmissionRequest<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
+    /// The db-qualified collection, equal to the plan's `CrdtOp::Apply`
+    /// collection.
     pub collection: &'a str,
     pub plan: PhysicalPlan,
     pub timeout: Duration,
@@ -70,6 +75,7 @@ impl CrdtAdmissionOutcome {
 pub struct CrdtRestoreAdmissionRequest<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
+    /// The db-qualified collection the generated restore ops address.
     pub collection: &'a str,
     pub document_id: &'a str,
     pub target_version_json: &'a str,
@@ -147,31 +153,35 @@ pub async fn dispatch_authorized_crdt_apply_admitted_outcome(
     .await
 }
 
+/// `collection` is db-qualified. The catalog keys collections by the bare
+/// name, so the lookup de-qualifies it first.
 fn enforce_external_signing_policy(
     state: &SharedState,
     authorized: &AuthorizedTask,
     collection: &str,
 ) -> crate::Result<()> {
+    let bare = crate::control::target_identity::naming::bare_collection_name(
+        authorized.database_id(),
+        collection,
+    );
     let stored = state
         .credentials
         .catalog()
         .get_collection(
             authorized.database_id(),
             authorized.tenant_id().as_u64(),
-            collection,
+            &bare,
         )?
         .ok_or_else(|| crate::Error::CollectionNotFound {
             tenant_id: authorized.tenant_id(),
-            collection: collection.to_owned(),
+            collection: bare.clone(),
         })?;
     if stored.crdt_signing_required
         && matches!(authorized.plan(), PhysicalPlan::Crdt(CrdtOp::Apply { .. }))
     {
         return Err(crate::Error::RejectedAuthz {
             tenant_id: authorized.tenant_id(),
-            resource: format!(
-                "collection:{collection}:unsigned_crdt_delta_requires_authenticated_sync"
-            ),
+            resource: format!("collection:{bare}:unsigned_crdt_delta_requires_authenticated_sync"),
         });
     }
     Ok(())
@@ -224,7 +234,9 @@ pub(crate) async fn dispatch_crdt_apply_admitted_outcome(
             });
         }
     };
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    // `collection` is the plan's database-qualified name.
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let workflow = CrdtAdmissionWorkflow {
         state,
         tenant_id,
@@ -286,8 +298,7 @@ async fn preview(
             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
                 workflow.tenant_id,
-                workflow.database_id,
-                workflow.collection,
+                nodedb_types::CollectionKey::from_qualified_str(workflow.database_id, workflow.collection)?,
                 PhysicalPlan::Crdt(CrdtOp::PreviewApply {
                     collection: nodedb_types::QualifiedCollection::from_stored(
                         workflow.collection.to_owned(),
@@ -415,7 +426,9 @@ pub(crate) async fn dispatch_crdt_restore_admitted(
         event_source,
         policy,
     } = request;
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    // `collection` is the plan's database-qualified name.
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let workflow = CrdtAdmissionWorkflow {
         state,
         tenant_id,
@@ -481,8 +494,7 @@ async fn generate_restore_delta(
             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
                 workflow.tenant_id,
-                workflow.database_id,
-                workflow.collection,
+                nodedb_types::CollectionKey::from_qualified_str(workflow.database_id, workflow.collection)?,
                 PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
                     collection: nodedb_types::QualifiedCollection::from_stored(
                         workflow.collection.to_owned(),
@@ -515,7 +527,10 @@ async fn apply_fenced(
         )?
         .ok_or(crate::Error::CrdtAdmissionInvalidPlan {
             reason: "admitted CRDT Apply has no replicated form",
-        })?;
+        })?
+        // Every replica gives the write the source this node dispatches it
+        // with.
+        .with_event_source(workflow.event_source);
         let outcome = tokio::time::timeout(
             workflow.timeout,
             crate::control::wal_replication::propose_replicated_entry(workflow.state, raw, entry),
@@ -525,9 +540,7 @@ async fn apply_fenced(
             vshard_id: workflow.vshard_id,
             timeout_ms: timeout_ms(workflow.timeout),
         })??;
-        workflow
-            .state
-            .advance_tenant_write_hlc(workflow.tenant_id.as_u64());
+        // This node's apply of the entry recorded its commit HLC.
         return Ok(CrdtAdmissionOutcome {
             payload: outcome.0,
             write_version: outcome.1,
@@ -777,12 +790,7 @@ mod tests {
         }));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let policy = RecordingPolicy { seen, reject: true };
-        let before_hlc = state
-            .tenant_write_hlc
-            .lock()
-            .expect("hlc lock")
-            .get(&1)
-            .copied();
+        let before_hlc = state.tenant_write_mark(1);
         let result = dispatch_crdt_apply_admitted(&state, admission_request(&policy)).await;
         responder.await.expect("responder completes");
         assert!(matches!(
@@ -790,12 +798,7 @@ mod tests {
             Err(crate::Error::CrdtAdmissionCallerFence)
         ));
         assert_eq!(
-            state
-                .tenant_write_hlc
-                .lock()
-                .expect("hlc lock")
-                .get(&1)
-                .copied(),
+            state.tenant_write_mark(1),
             before_hlc,
             "policy rejection must not advance the tenant write HLC"
         );
@@ -827,7 +830,7 @@ mod tests {
         let fenced = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&fenced);
         let raw: Arc<crate::control::wal_replication::AsyncRaftProposer> =
-            Arc::new(move |_shard, _key, bytes| {
+            Arc::new(move |_shard, _key, bytes, _deadline| {
                 let observed = Arc::clone(&observed);
                 Box::pin(async move {
                     let entry =
@@ -883,7 +886,7 @@ mod tests {
         let fences = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&fences);
         let raw: Arc<crate::control::wal_replication::AsyncRaftProposer> =
-            Arc::new(move |_shard, _key, _bytes| {
+            Arc::new(move |_shard, _key, _bytes, _deadline| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
                     if count.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -947,7 +950,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let raw: Arc<crate::control::wal_replication::AsyncRaftProposer> = {
             let attempts = Arc::clone(&attempts);
-            Arc::new(move |_shard, _key, _bytes| {
+            Arc::new(move |_shard, _key, _bytes, _deadline| {
                 let attempts = Arc::clone(&attempts);
                 Box::pin(async move {
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1015,7 +1018,7 @@ mod tests {
         let fenced_count = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&fenced_count);
         let raw: Arc<crate::control::wal_replication::AsyncRaftProposer> =
-            Arc::new(move |_shard, _key, _bytes| {
+            Arc::new(move |_shard, _key, _bytes, _deadline| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -1064,7 +1067,7 @@ mod tests {
         let task = nodedb_physical::physical_task::PhysicalTask {
             tenant_id,
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, "docs"),
+            vshard_id: nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs").vshard(),
             plan: apply_plan(),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,
@@ -1114,7 +1117,7 @@ mod tests {
         let task = nodedb_physical::physical_task::PhysicalTask {
             tenant_id,
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, "docs"),
+            vshard_id: nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs").vshard(),
             plan: apply_plan(),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,

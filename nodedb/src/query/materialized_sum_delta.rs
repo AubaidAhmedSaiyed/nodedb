@@ -45,10 +45,7 @@ pub fn binding_amount(
     doc: &serde_json::Value,
 ) -> crate::Result<Decimal> {
     let row = nodedb_types::Value::from(doc.clone());
-    let evaluated = binding
-        .value_expr
-        .eval(&row)
-        .map_err(|_e| crate::Error::DivisionByZero)?;
+    let evaluated = binding.value_expr.eval(&row).map_err(crate::Error::from)?;
     Ok(json_to_decimal(&serde_json::Value::from(evaluated)).unwrap_or(Decimal::ZERO))
 }
 

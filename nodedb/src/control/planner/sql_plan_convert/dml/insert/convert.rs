@@ -4,7 +4,7 @@ use nodedb_sql::types::{SqlValue, WriteRoute};
 use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::*;
 
 use super::super::super::convert::ConvertContext;
@@ -45,10 +45,11 @@ pub(in super::super::super) fn convert_insert(
         tenant_id,
         ctx,
     } = args;
+    let key = ctx.collection_key(collection);
     let coll_qualified = super::super::super::convert::db_qualified(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
+    let vshard = key.vshard();
     let mut tasks = Vec::new();
     let mut columnar_rows: Vec<&Vec<(String, SqlValue)>> = Vec::new();
 
@@ -106,7 +107,7 @@ pub(in super::super::super) fn convert_insert(
                 let value_bytes = row_to_msgpack(row)?;
                 let (doc_id, surrogate) = resolve_doc_identity_with_declared(
                     ctx,
-                    collection,
+                    key,
                     primary_key,
                     declared_pk.as_deref(),
                     row,
@@ -190,7 +191,7 @@ pub(in super::super::super) fn convert_insert(
         };
         let surrogates = columnar_row_surrogates(
             ctx,
-            collection,
+            key,
             &columnar_rows,
             primary_key,
             declared_pk.as_deref(),

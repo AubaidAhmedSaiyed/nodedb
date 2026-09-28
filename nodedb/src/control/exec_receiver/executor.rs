@@ -21,6 +21,7 @@ use crate::control::state::SharedState;
 use crate::control::trace_export::EmitSpanParams;
 use crate::types::DatabaseId;
 
+use super::backup_cut::take_backup_cut;
 use super::plan_decode::decode_plan;
 use super::request_validation::validate_request;
 use super::support::{PLAN_DECODE_FAILED, SinkOutcome, execution_error_to_typed};
@@ -108,7 +109,7 @@ impl LocalPlanExecutor {
     /// paths: validate deadline + descriptor versions, decode the plan, reject
     /// unresolved Exchange nodes.  Returns `(plan, database_id, deadline)` on
     /// success or a typed cluster error to surface to the caller.
-    fn validate_and_decode(
+    async fn validate_and_decode(
         &self,
         req: &ExecuteRequest,
     ) -> Result<
@@ -121,19 +122,37 @@ impl LocalPlanExecutor {
     > {
         let (deadline, database_id) = validate_request(&self.state, req)?;
         let plan = decode_plan(&self.state, database_id, req.tenant_id, &req.plan_bytes)?;
+        // A backup's snapshot plan takes the backup's cut on this node first.
+        let plan = take_backup_cut(&self.state, plan).await?;
         Ok((plan, database_id, deadline))
     }
 
     /// One-shot execution: validate + decode, fan across all local cores,
     /// merge, and return the merged payload.
     async fn execute_plan_inner(&self, req: ExecuteRequest) -> ExecuteResponse {
-        let (plan, database_id, deadline) = match self.validate_and_decode(&req) {
+        let (plan, database_id, deadline) = match self.validate_and_decode(&req).await {
             Ok(t) => t,
             Err(e) => return ExecuteResponse::err(e),
         };
 
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
         let trace_id = nodedb_types::TraceId(req.trace_id);
+
+        if let PhysicalPlan::ClusterEvent(
+            nodedb_physical::physical_plan::ClusterEventOp::TenantWriteMarks {
+                tenant_id: marks_tenant,
+                group_ids,
+            },
+        ) = &plan
+        {
+            return super::tenant_marks::answer_tenant_marks(
+                &self.state,
+                *marks_tenant,
+                group_ids,
+                deadline,
+            )
+            .await;
+        }
 
         if let PhysicalPlan::ClusterEvent(
             nodedb_physical::physical_plan::ClusterEventOp::PublishTopic {
@@ -260,14 +279,23 @@ impl LocalPlanExecutor {
         //
         // The vshard is not carried on the wire; re-derive it as a pure
         // function of the plan's primary collection, matching the gateway
-        // router's `CollectionHomed` arm (`vshard_for_collection`).
-        let vshard_id = crate::types::VShardId::new(
-            crate::control::gateway::version_set::touched_collections(&plan)
-                .into_iter()
-                .next()
-                .map(|name| nodedb_cluster::routing::vshard_for_collection(database_id, &name))
-                .unwrap_or(0),
-        );
+        // router's `CollectionHomed` arm (`vshard_for_collection`). The plan
+        // carries the database-qualified name, de-qualified into the
+        // canonical key before hashing.
+        let vshard_raw = match crate::control::gateway::version_set::touched_collections(&plan)
+            .into_iter()
+            .next()
+        {
+            Some(name) => match nodedb_types::CollectionKey::from_qualified_str(database_id, &name)
+            {
+                Ok(key) => nodedb_cluster::routing::vshard_for_collection(key),
+                Err(error) => {
+                    return ExecuteResponse::err(execution_error_to_typed(error.into()));
+                }
+            },
+            None => 0,
+        };
+        let vshard_id = crate::types::VShardId::new(vshard_raw);
         if let Err(error) = reject_unadmitted_crdt_apply(&plan) {
             return ExecuteResponse::err(error);
         }
@@ -307,7 +335,21 @@ impl LocalPlanExecutor {
                     {
                         // Replicated writes carry no read watermark → 0: it floors a
                         // session's later reads, and this RPC seam has no session.
-                        Ok((payload, _write_version)) => ExecuteResponse::ok(vec![payload], 0, 0),
+                        Ok((payload, write_version)) => {
+                            // Replicas apply with `ChangeFeedOwner::Unowned`. This
+                            // node proposed the write once, so it publishes the
+                            // change event.
+                            crate::control::server::dispatch_utils::publish_change_set_with_lsn(
+                                &self.state,
+                                tenant_id,
+                                database_id,
+                                crate::control::server::dispatch_utils::extract_write_change_set(
+                                    &plan, tenant_id,
+                                ),
+                                write_version,
+                            );
+                            ExecuteResponse::ok(vec![payload], 0, 0)
+                        }
                         // A replicated write's apply verdict is a Data-Plane
                         // verdict: carry its code, never flatten to internal.
                         Err(e) => ExecuteResponse::err(execution_error_to_typed(e)),
@@ -351,7 +393,7 @@ impl LocalPlanExecutor {
         req: ExecuteRequest,
         mut sink: impl ChunkSink,
     ) -> Option<TypedClusterError> {
-        let (plan, database_id, deadline) = match self.validate_and_decode(&req) {
+        let (plan, database_id, deadline) = match self.validate_and_decode(&req).await {
             Ok(t) => t,
             Err(e) => return Some(e),
         };

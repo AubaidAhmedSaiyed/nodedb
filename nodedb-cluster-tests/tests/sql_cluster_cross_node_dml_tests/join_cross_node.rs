@@ -53,8 +53,14 @@ async fn cross_node_join_returns_all_matches() {
     const FACT: &str = "fact";
     const DIM: &str = "dim";
     assert_ne!(
-        vshard_for_collection(DatabaseId::DEFAULT, FACT),
-        vshard_for_collection(DatabaseId::DEFAULT, DIM),
+        vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+            DatabaseId::DEFAULT,
+            FACT
+        )),
+        vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+            DatabaseId::DEFAULT,
+            DIM
+        )),
         "test collections must hash to different vShards to exercise cross-node join"
     );
 
@@ -177,8 +183,14 @@ async fn cross_node_join_compares_time_keys_in_one_unit() {
     const EVENTS: &str = "ts_events";
     const FEATURES: &str = "ts_features";
     assert_ne!(
-        vshard_for_collection(DatabaseId::DEFAULT, EVENTS),
-        vshard_for_collection(DatabaseId::DEFAULT, FEATURES),
+        vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+            DatabaseId::DEFAULT,
+            EVENTS
+        )),
+        vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+            DatabaseId::DEFAULT,
+            FEATURES
+        )),
         "test collections must hash to different vShards to exercise cross-node join"
     );
 

@@ -15,6 +15,8 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::index_registry::{
     IndexRegistration, propose_index_record,
 };
+use crate::control::server::shared::session::ddl_buffer;
+use crate::control::server::shared::session::ddl_effect::DeferredDdlEffect;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::TextOp;
@@ -130,7 +132,9 @@ async fn create_text_index(
         .credentials
         .catalog()
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
-        .map_err(|e| ddl_err("XX000", format!("{command}: read index registry: {e}")))?
+        .map_err(|e| {
+            DdlError::from_error_in_context(&format!("{command}: read index registry"), &e)
+        })?
     {
         if stmt.header.if_not_exists && taken.kind == IndexKind::FullText {
             return Ok(vec![DdlResult::Status {
@@ -183,16 +187,26 @@ async fn create_text_index(
             analyzer_name: analyzer_name.clone(),
             fuzzy_default,
         });
-        crate::control::server::shared::ddl::engine_apply::apply_in_engine(
-            state,
+        // Inside an explicit transaction the binding waits for COMMIT, after
+        // the buffered index record lands.
+        let deferred = ddl_buffer::defer_effect(DeferredDdlEffect::EngineApply {
             tenant_id,
             database_id,
-            &collection,
-            set_config_plan,
-            "58000",
-            command,
-        )
-        .await?;
+            collection: collection.clone(),
+            plan: set_config_plan.clone(),
+            context: command.to_string(),
+        });
+        if !deferred {
+            crate::control::server::shared::ddl::engine_apply::apply_in_engine(
+                state,
+                tenant_id,
+                database_id,
+                &collection,
+                set_config_plan,
+                command,
+            )
+            .await?;
+        }
 
         state.audit_record(
             crate::control::security::audit::AuditEvent::AdminAction,

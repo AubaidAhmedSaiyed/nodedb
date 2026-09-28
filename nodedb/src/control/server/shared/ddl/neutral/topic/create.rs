@@ -68,7 +68,7 @@ pub async fn create_topic(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError::new("XX000", "system clock error"))?
+        .map_err(|_| DdlError::internal("system clock error"))?
         .as_secs();
 
     let def = TopicDef {

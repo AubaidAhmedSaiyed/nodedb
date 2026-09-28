@@ -9,7 +9,7 @@
 
 use super::super::types::ReplicatedWrite;
 use super::kv;
-use super::kv::WireReturning;
+use super::kv::{WirePut, WireReturning};
 use nodedb_physical::physical_plan::KvOp;
 
 /// Encode a `KvOp` write variant, `Ok(None)` when not a single-shard replicated
@@ -25,16 +25,20 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             surrogate,
             returning,
             rls_filters,
+            provenance,
         } => kv::put(
-            collection.as_str(),
-            key,
-            value,
-            *ttl_ms,
-            surrogate.as_u32(),
+            WirePut {
+                collection: collection.as_str(),
+                key,
+                value,
+                ttl_ms: *ttl_ms,
+                surrogate: surrogate.as_u32(),
+            },
             WireReturning {
                 returning,
                 rls_filters,
             },
+            provenance,
         ),
         // The compiled RLS predicate is absent from the durable record, so a
         // replay re-applies the already-admitted write, not re-deciding it.
@@ -45,6 +49,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             rls_write_check: _,
             returning,
             rls_filters,
+            provenance,
         } => kv::delete(
             collection.as_str(),
             keys,
@@ -52,6 +57,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
                 returning,
                 rls_filters,
             },
+            provenance,
         ),
         KvOp::Insert {
             collection,
@@ -152,12 +158,14 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             ttl_ms,
             surrogate,
             rls_write_check: _,
+            shape,
         } => kv::incr(
             collection.as_str(),
             key,
             *delta,
             *ttl_ms,
             surrogate.as_u32(),
+            shape,
         ),
         // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
         KvOp::IncrFloat {
@@ -166,7 +174,8 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             delta,
             surrogate,
             rls_write_check: _,
-        } => kv::incr_float(collection.as_str(), key, *delta, surrogate.as_u32()),
+            shape,
+        } => kv::incr_float(collection.as_str(), key, delta, surrogate.as_u32(), shape),
         // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
         KvOp::Cas {
             collection,
@@ -347,7 +356,8 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
         | KvOp::SortedIndexTopK { .. }
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
-        | KvOp::SortedIndexScore { .. } => return Ok(None),
+        | KvOp::SortedIndexScore { .. }
+        | KvOp::SortedIndexTxnRead { .. } => return Ok(None),
     }))
 }
 

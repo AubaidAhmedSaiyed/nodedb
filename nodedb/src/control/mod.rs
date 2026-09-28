@@ -22,9 +22,12 @@ pub mod distributed_applier;
 pub mod event_action_error;
 pub mod event_trigger;
 pub mod exec_receiver;
+#[cfg(feature = "failpoints")]
+pub(crate) mod fail_gate;
 pub mod gateway;
 pub mod insert_select;
 pub mod lease;
+pub mod local_dispatch;
 pub mod lock_utils;
 pub mod maintenance;
 pub mod merge_orchestrator;
@@ -64,7 +67,7 @@ pub mod wal_replication;
 pub mod write_resolve;
 
 pub use exec_receiver::LocalPlanExecutor;
-pub use request_tracker::RequestTracker;
+pub use request_tracker::{RequestTracker, ResponseReceiver};
 pub use rolling_upgrade::ClusterVersionView;
 pub use state::SharedState;
 pub use wal_replication::{DistributedApplier, ProposeTracker, create_distributed_applier};

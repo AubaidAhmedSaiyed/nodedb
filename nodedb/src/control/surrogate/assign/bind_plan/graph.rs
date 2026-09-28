@@ -24,8 +24,16 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut GraphOp) -> crate::Resu
             dst_surrogate,
             ..
         } => {
-            binder.resolve_in_place(collection.as_str(), src_id.as_bytes(), src_surrogate)?;
-            binder.resolve_in_place(collection.as_str(), dst_id.as_bytes(), dst_surrogate)
+            binder.resolve_in_place(
+                binder.plan_key(collection.as_str())?,
+                src_id.as_bytes(),
+                src_surrogate,
+            )?;
+            binder.resolve_in_place(
+                binder.plan_key(collection.as_str())?,
+                dst_id.as_bytes(),
+                dst_surrogate,
+            )
         }
         GraphOp::EdgePutBatch { edges } | GraphOp::EdgeDeleteBatch { edges } => {
             for edge in edges.iter_mut() {
@@ -57,7 +65,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut GraphOp) -> crate::Resu
 }
 
 fn bind_edge(binder: &IdentityBinder<'_>, edge: &mut BatchEdge) -> crate::Result<()> {
-    let collection = edge.collection.as_str();
-    binder.resolve_in_place(collection, edge.src_id.as_bytes(), &mut edge.src_surrogate)?;
-    binder.resolve_in_place(collection, edge.dst_id.as_bytes(), &mut edge.dst_surrogate)
+    let key = binder.plan_key(edge.collection.as_str())?;
+    binder.resolve_in_place(key, edge.src_id.as_bytes(), &mut edge.src_surrogate)?;
+    binder.resolve_in_place(key, edge.dst_id.as_bytes(), &mut edge.dst_surrogate)
 }

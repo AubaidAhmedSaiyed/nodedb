@@ -210,7 +210,7 @@ pub fn assert_visible(
             collection,
             scope.auth(),
         )
-        .map_err(|e| DdlError::new("XX000", format!("rls compile: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("rls compile", &e))?;
 
     let visible = rls_bytes.is_some_and(|b| b.is_empty()); // No filters = visible.
 

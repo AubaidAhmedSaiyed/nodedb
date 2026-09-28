@@ -23,7 +23,7 @@ use super::support::{err, status};
 /// the expiry sweep and the DDL handlers cannot drift apart; this wrapper only
 /// translates the error into what pgwire reports.
 fn propose_scope_grant(state: &SharedState, stored: &StoredScopeGrant) -> Result<(), DdlError> {
-    propose_grant(state, stored).map_err(|e| err("XX000", e.to_string()))
+    propose_grant(state, stored).map_err(|e| DdlError::from_error(&e))
 }
 
 /// Replicate a scope-grant removal. Same dual path as [`propose_scope_grant`].
@@ -34,7 +34,7 @@ fn propose_scope_revoke(
     grantee_id: &str,
 ) -> Result<(), DdlError> {
     propose_revoke(state, scope_name, grantee_type, grantee_id)
-        .map_err(|e| err("XX000", e.to_string()))
+        .map_err(|e| DdlError::from_error(&e))
 }
 
 /// GRANT SCOPE '<scope>' TO <ORG|USER|ROLE> '<id>'
@@ -92,7 +92,7 @@ pub fn grant_scope(
             on_expire_action: &on_expire_action,
             conditions,
         })
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     propose_scope_grant(state, &stored)?;
 
     state.audit_record(
@@ -168,7 +168,7 @@ pub fn renew_scope(
     let outcome = state
         .scope_grants
         .prepare_renew(scope_name, &grantee_type, grantee_id, extend_secs)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     match outcome {
         RenewOutcome::NotFound => return Err(err("42704", "scope grant not found")),
         // Nothing to move: a permanent grant has no deadline to extend.

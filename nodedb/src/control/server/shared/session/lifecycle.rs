@@ -31,7 +31,8 @@ pub fn run_begin(
     // Last globally-applied Calvin epoch as the cross-shard snapshot anchor.
     // 0 in single-node / no-Calvin deployments (the atomic is never advanced).
     let snapshot_epoch = state
-        .last_applied_calvin_epoch
+        .calvin
+        .last_applied_epoch
         .load(std::sync::atomic::Ordering::Acquire);
     ddl_buffer::activate();
     sessions
@@ -141,7 +142,7 @@ mod tests {
     use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
     /// `run_begin` anchors the session's cross-shard snapshot to the last
-    /// globally-applied Calvin epoch from `SharedState::last_applied_calvin_epoch`.
+    /// globally-applied Calvin epoch from `CalvinLocalState::last_applied_epoch`.
     #[tokio::test]
     async fn run_begin_anchors_snapshot_epoch() {
         use std::sync::atomic::Ordering;
@@ -161,14 +162,14 @@ mod tests {
         store.ensure_session(addr);
 
         // Seed the applied epoch to 7 and BEGIN — the session anchors to 7.
-        state.last_applied_calvin_epoch.store(7, Ordering::Release);
+        state.calvin.last_applied_epoch.store(7, Ordering::Release);
         run_begin(&store, SessionId::from(&addr), &state).unwrap();
         assert_eq!(store.snapshot_epoch(addr), Some(7));
         store.commit(addr).unwrap();
         assert_eq!(store.snapshot_epoch(addr), None);
 
         // Unset (single-node / no-Calvin): BEGIN anchors to 0.
-        state.last_applied_calvin_epoch.store(0, Ordering::Release);
+        state.calvin.last_applied_epoch.store(0, Ordering::Release);
         run_begin(&store, SessionId::from(&addr), &state).unwrap();
         assert_eq!(store.snapshot_epoch(addr), Some(0));
     }
@@ -186,7 +187,6 @@ mod tests {
         fn dispatch_no_wal<'a>(
             &'a self,
             task: PhysicalTask,
-            _wal_lsn: Option<Lsn>,
         ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
             let vshard = task.vshard_id;
             let payload = if let PhysicalPlan::Meta(op) = &task.plan {
@@ -223,6 +223,10 @@ mod tests {
                     write_set: Vec::new(),
                 })
             })
+        }
+
+        fn event_source(&self) -> crate::event::EventSource {
+            crate::event::EventSource::User
         }
     }
 

@@ -24,7 +24,9 @@ pub(in crate::data::executor) struct TimeseriesIngestUndo {
     /// accounting after rollback.
     pub memtable_memory_bytes_before: Option<usize>,
     pub last_value_cache_before: Option<LastValueCache>,
-    pub max_ingested_lsn_before: Option<u64>,
+    /// The collection's series catalog. Ingest registers each new series in
+    /// it.
+    pub series_catalog_before: Option<nodedb_types::timeseries::SeriesCatalog>,
     pub last_ts_ingest_before: Option<std::time::Instant>,
     pub reservation_bytes_before: Option<usize>,
 }
@@ -61,16 +63,18 @@ pub(in crate::data::executor) type SpatialDocMapEntry = (
 /// renames it back and a commit removes it (`finalize_timeseries_truncates`).
 pub(in crate::data::executor) struct TimeseriesTruncateUndo {
     pub collection_key: (nodedb_types::DatabaseId, TenantId, String),
-    /// `(original, moved)` when the collection had a partition directory.
-    pub moved_dir: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// The collection's live directory. The truncate leaves a fresh one
+    /// holding only its replay stamp; the rollback removes it.
+    pub original_dir: std::path::PathBuf,
+    /// The aside name of the directory the collection had, if it had one.
+    pub moved_dir: Option<std::path::PathBuf>,
     pub memtable: Option<crate::engine::timeseries::columnar_memtable::ColumnarMemtable>,
     pub memtable_mem: Option<nodedb_mem::ReservationToken>,
     pub registry: Option<crate::engine::timeseries::partition_registry::PartitionRegistry>,
-    pub max_ingested_lsn: Option<u64>,
     pub last_value_cache: Option<LastValueCache>,
     pub series_catalog: Option<nodedb_types::timeseries::SeriesCatalog>,
-    /// `ts_truncate_floors[key]` before this truncate raised it.
-    pub truncate_floor: Option<u64>,
+    /// The collection's replay stamp before this truncate raised it.
+    pub replay_stamp: Option<crate::data::executor::timeseries_checkpoint::stamp::TsReplayStamp>,
 }
 
 /// Tracks a write operation for rollback purposes.
@@ -81,8 +85,6 @@ pub(in crate::data::executor) enum UndoEntry {
         /// The redb storage key. `.surrogate()` recovers the numeric surrogate
         /// FTS index rollback needs.
         document_id: nodedb_types::StorageKey,
-        /// The row's client identity, as the deferred event names it.
-        identity: nodedb_types::RowIdentity,
         /// `None` if the document didn't exist before (inserted); `Some(bytes)`
         /// if it was overwritten (updated).
         old_value: Option<Vec<u8>>,
@@ -114,8 +116,6 @@ pub(in crate::data::executor) enum UndoEntry {
         /// delete cascade removed this document's postings, and a
         /// rolled-back delete recomputes and re-inserts them under it.
         document_id: nodedb_types::StorageKey,
-        /// The row's client identity, as the deferred event names it.
-        identity: nodedb_types::RowIdentity,
         old_value: Vec<u8>,
         /// System-time key of the versioned tombstone row this op appended on a
         /// bitemporal collection. `None` = plain op → re-insert via the
@@ -186,102 +186,44 @@ pub(in crate::data::executor) enum UndoEntry {
         bbox: nodedb_types::BoundingBox,
         document_id: String,
     },
-    /// Undo an EdgePut by deleting the edge (or restoring old properties).
-    PutEdge {
-        collection: String,
-        src_id: String,
-        label: String,
-        dst_id: String,
-        /// `None` if edge didn't exist before (inserted); `Some(bytes)` if overwritten.
-        old_properties: Option<Vec<u8>>,
-    },
-    /// Undo an EdgeDelete by re-inserting the edge with its old properties.
-    DeleteEdge {
-        collection: String,
-        src_id: String,
-        label: String,
-        dst_id: String,
-        old_properties: Vec<u8>,
-    },
+    /// Undo a graph edge write: remove the version it added and put the CSR
+    /// back.
+    EdgeWrite(Box<super::edge_write::EdgeWriteUndo>),
     /// Undo a KV write (Put / Insert / InsertIfAbsent / InsertOnConflictUpdate /
-    /// FieldSet / Incr / IncrFloat / Cas / GetSet) by restoring the prior value.
+    /// FieldSet / Incr / IncrFloat / Cas / GetSet) by reinstating the key's
+    /// prior state.
     ///
-    /// `prior_value == None` means the key did not exist before — undo deletes it.
-    /// `prior_value == Some(bytes)` means the key was overwritten — undo restores it.
-    ///
-    /// The KV hash table preserves existing non-ZERO surrogate bindings on `put`,
-    /// so passing `Surrogate::ZERO` during undo is safe: the original surrogate
-    /// remains bound in the entry.
+    /// `prior == None` means the key did not exist before: undo deletes it.
+    /// `prior == Some(image)` reinstalls the value, the absolute expiry
+    /// instant and the surrogate the key held.
     KvPut {
         collection: String,
         key: Vec<u8>,
-        prior_value: Option<Vec<u8>>,
+        prior: Option<crate::engine::kv::KvEntryImage>,
     },
-    /// Undo a KV Delete by restoring one key's prior value.
+    /// Undo a KV Delete by reinstalling one key's prior state.
     ///
     /// One entry per key that was actually deleted. If a batch delete removed
     /// N keys, N `KvDelete` entries are pushed.
     KvDelete {
         collection: String,
         key: Vec<u8>,
-        prior_value: Vec<u8>,
+        prior: crate::engine::kv::KvEntryImage,
     },
-    /// Undo a KV BatchPut by restoring prior values for all affected keys.
+    /// Undo a KV `EXPIRE` / `PERSIST` by putting back the key's prior expiry.
+    /// The value is untouched: a TTL change writes only the expiry.
     ///
-    /// Each element is `(key, prior_value)` where `prior_value == None`
-    /// means the key was newly inserted.
-    KvBatchPut {
-        collection: String,
-        entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    },
-    /// Undo a KV Transfer (fungible) by restoring source and destination prior values.
-    KvTransfer {
-        collection: String,
-        source_key: Vec<u8>,
-        source_prior: Vec<u8>,
-        dest_key: Vec<u8>,
-        dest_prior: Option<Vec<u8>>,
-    },
-    /// Undo a KV TransferItem by restoring source and destination prior values.
-    KvTransferItem {
-        source_collection: String,
-        dest_collection: String,
-        item_key: Vec<u8>,
-        dest_key: Vec<u8>,
-        source_prior: Vec<u8>,
-        dest_prior: Option<Vec<u8>>,
-    },
-    /// Undo a KV `Expire`/`Persist` by restoring the key's prior TTL state.
-    ///
-    /// `prior_expiry == None` means the key had no TTL (persistent) before
-    /// the forward op; undo calls `KvEngine::persist`. `prior_expiry ==
-    /// Some(expire_at_ms)` means the key had a TTL expiring at that exact
-    /// absolute instant; undo calls `KvEngine::expire_with_absolute_expiry`
-    /// with it verbatim (not a freshly-derived `now_ms + ttl_ms`, which
-    /// would drift from the original instant by the elapsed time).
+    /// `prior_expire_at_ms` is the absolute instant the key expired at, or
+    /// [`NO_EXPIRY`](crate::engine::kv::entry::NO_EXPIRY) when it had none.
     KvTtl {
         collection: String,
         key: Vec<u8>,
-        prior_expiry: Option<u64>,
+        prior_expire_at_ms: u64,
     },
-    /// Undo a KV `RegisterSortedIndex`/`DropSortedIndex` by restoring the
-    /// index name's prior definition state.
-    ///
-    /// `prior_def == None` means no index existed under this name before
-    /// the forward op (a fresh `RegisterSortedIndex`); undo drops it.
-    /// `prior_def == Some(def)` means an index existed under this name
-    /// before the forward op (either overwritten by `RegisterSortedIndex`,
-    /// or removed by `DropSortedIndex`); undo re-registers `def`, which
-    /// rebuilds the order-statistic tree by backfilling from the KV
-    /// collection's CURRENT contents at undo time -- correct regardless of
-    /// undo-log ordering relative to sibling KV-write undos, since
-    /// `SortedIndexManager::register` always derives the tree fresh from
-    /// live table state rather than from a point-in-time snapshot.
-    SortedIndexDdl {
-        database_id: u64,
-        tenant_id: u64,
-        index_name: String,
-        prior_def: Option<crate::engine::kv::sorted_index::manager::SortedIndexDef>,
+    /// Undo a KV `TRUNCATE` by reinstalling every row the collection held.
+    KvTruncate {
+        collection: String,
+        rows: Vec<crate::engine::kv::hash_table::KvExportEntry>,
     },
     /// Undo a `mark_node_deleted` by removing the node from the in-memory
     /// deleted-nodes set (edge referential-integrity tracker).
@@ -299,6 +241,56 @@ pub(in crate::data::executor) enum UndoEntry {
         database_id: u64,
         tid: u64,
         node_id: String,
+    },
+    /// Undo a CRDT write by putting the collection's Loro document back.
+    CrdtCollection(Box<super::crdt_collection::CrdtCollectionUndo>),
+    /// Undo an array cell write by putting back the memtable tiles it
+    /// touched.
+    ArrayTiles {
+        array_id: nodedb_array::types::ArrayId,
+        snapshot: crate::engine::array::ArrayTileSnapshot,
+    },
+    /// Undo a vector write a committed redo record installed: withdraw the
+    /// nodes it inserted and put every binding, tombstone, sidecar and
+    /// bitmap entry back.
+    VectorWrite(Box<super::vector_write::VectorWriteUndo>),
+    /// Undo a sparse-vector write: put the document back to its prior entries
+    /// and the index's id counter back. `next_id == None` means the index did
+    /// not exist before the write.
+    SparseDoc {
+        key: (nodedb_types::DatabaseId, TenantId, String, String),
+        doc_id: String,
+        prior: Option<crate::engine::vector::sparse::SparseDocImage>,
+        next_id: Option<u32>,
+    },
+    /// Undo a vector-primary truncate: put the detached collection and every
+    /// sidecar row back.
+    VectorTruncate(Box<super::vector_truncate::VectorTruncateUndo>),
+    /// Undo a sync-ingested spatial write by reinstalling the row, the R-tree
+    /// entry and the reverse-map record it replaced.
+    SpatialRow(Box<super::spatial_row::SpatialRowUndo>),
+    /// Undo a sync-ingested full-text write by putting the document's index
+    /// footprint back.
+    FtsDocument(Box<super::fts_doc::FtsDocUndo>),
+    /// Undo the sync high-water-mark advance of a sync-ingested write. `prior
+    /// == None` means the stream had no mark before.
+    SyncHwm {
+        producer_id: u64,
+        stream_id: u64,
+        prior: Option<u64>,
+    },
+    /// Undo a node-label set or removal: each label the op touched goes back
+    /// to whether the node carried it before (`true` = it did). The label
+    /// names and the node the op interned are withdrawn.
+    NodeLabels {
+        database_id: u64,
+        tid: u64,
+        node_id: String,
+        prior: Vec<(String, bool)>,
+        /// Label names the op interned, in interning order.
+        interned_labels: Vec<String>,
+        /// Whether the op created the node in the CSR.
+        created_node: bool,
     },
     /// Undo a columnar insert by rolling back in-memory state.
     ///
@@ -345,6 +337,11 @@ pub(in crate::data::executor) enum UndoEntry {
     ColumnarDelete {
         collection_key: (nodedb_types::DatabaseId, TenantId, String),
         restored: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)>,
+    },
+    /// Undo the creation of a columnar engine by the write: the collection
+    /// held no engine before it.
+    ColumnarEngineCreated {
+        collection_key: (nodedb_types::DatabaseId, TenantId, String),
     },
     /// Undo a transaction-deferred timeseries ingest from its complete
     /// pre-image. Row-count truncation is insufficient: ingest can evolve

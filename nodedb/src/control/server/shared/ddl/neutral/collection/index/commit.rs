@@ -24,20 +24,20 @@ pub(super) async fn commit_collection_mutation(
 ) -> Result<(), DdlError> {
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .put_collection(database_id, coll)
-                .map_err(|e| err("XX000", e.to_string()))?;
+                .map_err(|e| DdlError::from_error(&e))?;
         }
         // Single-node path bypasses the applier post-apply hook, so the
         // Register refresh has to be fired here. In cluster mode the
         // applier's `put_async` does it on every node.
         super::super::dispatch_register_from_stored(state, coll)
             .await
-            .map_err(|e| err("XX000", e.to_string()))?;
+            .map_err(|e| DdlError::from_error(&e))?;
     }
     Ok(())
 }

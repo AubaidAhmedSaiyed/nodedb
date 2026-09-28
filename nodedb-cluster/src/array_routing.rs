@@ -36,7 +36,7 @@ pub const VSHARD_COUNT: u32 = 1024;
 ///
 /// Array-specific name-only fallback used by `array_sync` paths that route
 /// before a coordinate or tile extent is known. Uses the same DJB
-/// multiply-31 hash as `VShardId::from_collection_in_database`, but without
+/// multiply-31 hash as `VShardId::from_collection`, but without
 /// the database scope — array-sync messages carry their own scoping in the
 /// op-log header and route per-array by name.
 pub fn array_vshard_for_name(array_name: &str) -> u32 {

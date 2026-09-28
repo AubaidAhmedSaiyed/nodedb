@@ -40,7 +40,7 @@ fn send_txn(
         ..make_request(plan)
     };
     req_tx
-        .try_push(nodedb::bridge::dispatch::BridgeRequest { inner: request })
+        .try_push(nodedb::bridge::dispatch::BridgeRequest::unfloored(request))
         .unwrap();
     core.tick();
     resp_rx.try_pop().unwrap().inner
@@ -297,6 +297,7 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         }),
     );
 

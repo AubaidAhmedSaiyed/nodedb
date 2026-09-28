@@ -78,7 +78,7 @@ pub fn create_typeguard(
     let tenant_id = identity.tenant_id.as_u64();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| err("XX000", &e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
     if !coll.collection_type.is_schemaless() {
@@ -101,7 +101,7 @@ pub fn create_typeguard(
 
     coll.type_guards = guards;
     persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-        .map_err(|e| err("XX000", &e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
 
@@ -129,7 +129,7 @@ pub fn alter_typeguard_add(
     let tenant_id = identity.tenant_id.as_u64();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| err("XX000", &e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
     if !coll.collection_type.is_schemaless() {
@@ -153,7 +153,7 @@ pub fn alter_typeguard_add(
 
     coll.type_guards.push(guard);
     persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-        .map_err(|e| err("XX000", &e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
 
@@ -181,7 +181,7 @@ pub fn alter_typeguard_drop(
     let tenant_id = identity.tenant_id.as_u64();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| err("XX000", &e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
     let before_len = coll.type_guards.len();
@@ -195,7 +195,7 @@ pub fn alter_typeguard_drop(
     }
 
     persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-        .map_err(|e| err("XX000", &e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
 
@@ -239,7 +239,7 @@ pub fn drop_typeguard(
     let tenant_id = identity.tenant_id.as_u64();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| err("XX000", &e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
     if coll.type_guards.is_empty() {
@@ -254,7 +254,7 @@ pub fn drop_typeguard(
 
     coll.type_guards.clear();
     persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
-        .map_err(|e| err("XX000", &e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
 
@@ -276,7 +276,7 @@ pub fn show_typeguard(
     let tenant_id = identity.tenant_id.as_u64();
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| err("XX000", &e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
     let columns = vec![
@@ -317,7 +317,7 @@ pub fn show_typeguards(
     let tenant_id = identity.tenant_id.as_u64();
     let collections = catalog
         .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id)
-        .map_err(|e| err("XX000", &e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     let columns = vec!["collection".to_string(), "fields".to_string()];
 

@@ -62,6 +62,11 @@ pub(in crate::control::planner::sql_plan_convert::dml) struct WriteGates {
 /// split a balanced statement's boundary and refuse journals the constraint
 /// permits. An absent credential store or an absent collection row declares
 /// neither gate.
+///
+/// `collection` may be bare or db-qualified: the catalog keys collections by
+/// the bare name, so the lookup de-qualifies it. A qualified name looked up
+/// as-is finds no row outside the default database, and the INSERT would
+/// silently skip the CRDT and BALANCED routing.
 pub(in crate::control::planner::sql_plan_convert::dml) fn document_collection_write_gates(
     ctx: &ConvertContext,
     collection: &str,
@@ -70,8 +75,10 @@ pub(in crate::control::planner::sql_plan_convert::dml) fn document_collection_wr
         return Ok(WriteGates::default());
     };
     let catalog = credentials.catalog();
+    let bare =
+        crate::control::target_identity::naming::bare_collection_name(ctx.database_id, collection);
     Ok(catalog
-        .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), collection)?
+        .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), &bare)?
         .map(|c| WriteGates {
             crdt: c.crdt,
             balanced: c.balanced.is_some(),

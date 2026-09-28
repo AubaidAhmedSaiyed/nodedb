@@ -75,7 +75,7 @@ fn deactivate_auth_user(
     let found = state
         .auth_users
         .deactivate(user_id)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     if !found {
         return Err(err("42704", format!("auth user '{user_id}' not found")));
@@ -112,7 +112,7 @@ fn alter_auth_user_status(
     let found = state
         .auth_users
         .set_status(user_id, status_val)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     if !found {
         return Err(err("42704", format!("auth user '{user_id}' not found")));
@@ -165,7 +165,7 @@ pub fn purge_auth_users(
     let purged = state
         .auth_users
         .purge_inactive(cutoff)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

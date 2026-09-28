@@ -32,15 +32,14 @@ pub async fn handle_publish(
 ) -> Result<Vec<DdlResult>, DdlError> {
     match dispatch_sql_in_database(state, identity, database_id, sql).await {
         Ok(Some(_)) => Ok(status("PUBLISH")),
-        Err(e) => {
-            let sqlstate = match &e {
-                crate::Error::CollectionNotFound { .. } => "42704",
-                crate::Error::BadRequest { .. } => "42601",
-                crate::Error::Dispatch { .. } => "58000",
-                _ => "XX000",
-            };
-            Err(DdlError::new(sqlstate.to_string(), e.to_string()))
-        }
+        Err(e) => Err(match &e {
+            // The named topic does not exist.
+            crate::Error::CollectionNotFound { .. } => DdlError::new("42704", e.to_string()),
+            crate::Error::BadRequest { .. } => DdlError::new("42601", e.to_string()),
+            crate::Error::Dispatch { .. } => DdlError::new("58000", e.to_string()),
+            // Any other error keeps the class the SQLSTATE table gives it.
+            other => DdlError::from_error(other),
+        }),
         Ok(None) => Err(DdlError::new(
             "42601",
             "expected PUBLISH TO <topic> '<payload>'",

@@ -322,7 +322,9 @@ async fn a_vector_write_omitting_the_governed_column_is_denied() {
 /// keeps the statement single-shard, so what decides it is the write gate,
 /// which is the thing under test.
 fn node_in_collection_shard(collection: &str, prefix: &str) -> String {
-    let home = VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection).as_u32();
+    let home = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection)
+        .vshard()
+        .as_u32();
     (0..100_000u32)
         .map(|n| format!("{prefix}{n}"))
         .find(|node| VShardId::from_key(node.as_bytes()).as_u32() == home)

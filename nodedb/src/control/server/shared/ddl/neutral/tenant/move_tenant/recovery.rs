@@ -19,7 +19,7 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
 use super::super::super::super::result::{DdlError, DdlResult};
-use super::super::support::{ddl_err, status};
+use super::super::support::status;
 use super::entry::SNAPSHOT_TIMEOUT;
 use super::journal;
 use super::{cutover, drain, snapshot};
@@ -87,7 +87,7 @@ pub async fn resume_or_compensate(
             // actually completed (idempotency: tenant may already be in target).
             let already_moved =
                 tenant_already_in_target(catalog, tenant_id, source_db_id, target_db_id)
-                    .map_err(|e| ddl_err("XX000", format!("idempotency check: {e}")))?;
+                    .map_err(|e| DdlError::from_error_in_context("idempotency check", &e))?;
 
             if already_moved {
                 // Cutover succeeded but client crashed before reading the response.
@@ -116,7 +116,7 @@ pub async fn resume_or_compensate(
                 Err(ref e) => {
                     drain::release(state, tenant_id, source_db_id);
                     journal::delete_journal_entry_logged(catalog, tenant_id);
-                    return Err(DdlError::move_tenant_snapshot_failed(e.message()));
+                    return Err(DdlError::move_tenant_snapshot_failed(e.message()).with_cause_of(e));
                 }
             };
 
@@ -136,7 +136,7 @@ pub async fn resume_or_compensate(
                     let _ = snapshot::delete_temp(state, key).await;
                 }
                 journal::delete_journal_entry_logged(catalog, tenant_id);
-                return Err(DdlError::move_tenant_cutover_failed(e.message()));
+                return Err(DdlError::move_tenant_cutover_failed(e.message()).with_cause_of(e));
             }
 
             if let Some(ref key) = entry.temp_snapshot_key {

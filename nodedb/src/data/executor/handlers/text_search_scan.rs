@@ -60,14 +60,7 @@ impl CoreLoop {
             },
         ) {
             Ok(r) => r,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => return self.response_error(task, e),
         };
 
         // Read-your-own-writes for FTS phrase search: fold staged document
@@ -162,14 +155,7 @@ impl CoreLoop {
             },
         ) {
             Ok(hits) => hits.into_iter().map(|h| (h.doc_id, h.score)).collect(),
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => return self.response_error(task, e),
         };
 
         // Read-your-own-writes for FTS: fold staged document bodies into
@@ -207,14 +193,7 @@ impl CoreLoop {
         );
         let mut docs: Vec<(StorageKey, Vec<u8>)> = match scan_result {
             Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => return self.response_error(task, e),
         };
 
         // Read-your-own-writes: fold staged document bodies into the row

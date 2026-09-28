@@ -4,6 +4,7 @@
 //! tenant/collection purge. All other concerns (indexing, search,
 //! synonyms, compaction) live in sibling modules.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use redb::Database;
@@ -12,12 +13,15 @@ use nodedb_mem::MemoryGovernor;
 use nodedb_types::TenantId;
 
 use super::errors::into_result_err;
+use super::rebuild_journal::FtsJournals;
 use crate::engine::sparse::fts_redb::RedbFtsBackend;
 use crate::storage::quarantine::QuarantineRegistry;
 
 /// Full-text inverted index backed by redb via `nodedb-fts`.
 pub struct InvertedIndex {
     pub(super) inner: nodedb_fts::index::FtsIndex<RedbFtsBackend>,
+    /// Write journals of the collection rebuilds running on this index.
+    pub(super) journals: RefCell<FtsJournals>,
 }
 
 impl InvertedIndex {
@@ -27,6 +31,7 @@ impl InvertedIndex {
         let backend = RedbFtsBackend::open(db)?;
         Ok(Self {
             inner: nodedb_fts::index::FtsIndex::new(backend, governor),
+            journals: RefCell::new(FtsJournals::default()),
         })
     }
 
@@ -53,6 +58,7 @@ impl InvertedIndex {
     /// Purge all inverted index entries for a `(database, tenant)`. Structural
     /// drop via tuple ranges on every FTS table.
     pub fn purge_tenant(&self, database_id: u64, tid: TenantId) -> crate::Result<usize> {
+        self.note_purge(database_id, tid.as_u64(), None);
         self.inner
             .purge_tenant(database_id, tid.as_u64())
             .map_err(into_result_err)
@@ -67,6 +73,7 @@ impl InvertedIndex {
         tid: TenantId,
         collection: &str,
     ) -> crate::Result<usize> {
+        self.note_purge(database_id, tid.as_u64(), Some(collection));
         self.inner
             .purge_collection(database_id, tid.as_u64(), collection)
             .map_err(into_result_err)

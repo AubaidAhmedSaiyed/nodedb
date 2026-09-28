@@ -43,7 +43,7 @@ pub async fn handle_show_vector_index(
     // or:   SHOW VECTOR INDEX status ON <collection>
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
     let tenant_id = identity.tenant_id;
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     let plan = PhysicalPlan::Vector(VectorOp::QueryStats {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
@@ -59,7 +59,7 @@ pub async fn handle_show_vector_index(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     if resp.payload.is_empty() {
         return Err(ddl_err(
@@ -69,11 +69,11 @@ pub async fn handle_show_vector_index(
     }
 
     let stats: nodedb_types::VectorIndexStats = zerompk::from_msgpack(&resp.payload)
-        .map_err(|e| ddl_err("XX000", format!("decode vector stats: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("decode vector stats: {e}")))?;
 
     let columns = vec!["property".to_string(), "value".to_string()];
 
-    let pairs: Vec<(&str, String)> = vec![
+    let mut pairs: Vec<(&str, String)> = vec![
         ("dimensions", stats.dimensions.to_string()),
         ("metric", stats.metric.clone()),
         ("index_type", stats.index_type.to_string()),
@@ -94,6 +94,9 @@ pub async fn handle_show_vector_index(
             format!("{:.1}", stats.disk_bytes as f64 / (1024.0 * 1024.0)),
         ),
         ("build_in_progress", stats.build_in_progress.to_string()),
+        ("builds_queued", stats.builds_queued.to_string()),
+        ("builds_completed", stats.builds_completed.to_string()),
+        ("builds_failed", stats.builds_failed.to_string()),
         ("hnsw_m", stats.hnsw_m.to_string()),
         ("hnsw_m0", stats.hnsw_m0.to_string()),
         (
@@ -103,6 +106,17 @@ pub async fn handle_show_vector_index(
         ("seal_threshold", stats.seal_threshold.to_string()),
         ("mmap_segments", stats.mmap_segment_count.to_string()),
     ];
+    if let Some(ivf) = &stats.ivf {
+        pairs.extend([
+            ("ivf_training_threshold", ivf.training_threshold.to_string()),
+            ("ivf_trained", ivf.trained.to_string()),
+            ("ivf_trained_on", ivf.trained_on.to_string()),
+            ("ivf_trained_at_ms", ivf.trained_at_ms.to_string()),
+            ("ivf_indexed_vectors", ivf.indexed_vectors.to_string()),
+            ("ivf_cells", ivf.cells.to_string()),
+            ("ivf_nprobe", ivf.nprobe.to_string()),
+        ]);
+    }
 
     let rows: Vec<Map<String, JsonValue>> = pairs
         .into_iter()
@@ -126,7 +140,7 @@ pub async fn handle_alter_vector_index_seal(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
     let tenant_id = identity.tenant_id;
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     let plan = PhysicalPlan::Vector(VectorOp::Seal {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
@@ -142,7 +156,7 @@ pub async fn handle_alter_vector_index_seal(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     Ok(vec![DdlResult::Status {
         command: "SEAL".to_string(),
@@ -159,7 +173,7 @@ pub async fn handle_alter_vector_index_compact(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
     let tenant_id = identity.tenant_id;
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     let plan = PhysicalPlan::Vector(VectorOp::CompactIndex {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
@@ -175,7 +189,7 @@ pub async fn handle_alter_vector_index_compact(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    .map_err(|e| DdlError::from_error(&e))?;
 
     Ok(vec![DdlResult::Status {
         command: "COMPACT".to_string(),

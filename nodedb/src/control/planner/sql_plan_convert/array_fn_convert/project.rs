@@ -5,7 +5,7 @@
 use nodedb_array::types::ArrayId;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::ArrayOp;
 
 use super::super::convert::ConvertContext;
@@ -26,7 +26,7 @@ pub(crate) fn convert_project(
         });
     }
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    let vshard = ctx.collection_key(name).vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,

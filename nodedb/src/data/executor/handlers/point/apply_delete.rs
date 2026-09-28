@@ -26,6 +26,8 @@ pub(in crate::data::executor) struct PointDeleteParams<'a> {
     pub database_id: u64,
     pub tid: u64,
     pub collection: &'a str,
+    /// The row's client identity. The graph cascade removes the edges of,
+    /// and marks deleted, the node this names.
     pub document_id: &'a str,
     pub surrogate: Surrogate,
     /// Roles held by the authenticated user. Currently unused by DELETE
@@ -81,11 +83,12 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// does not reverse in-memory spatial writes).
     pub spatial_deletes: Vec<(SpatialIndexKey, u64, nodedb_types::BoundingBox, String)>,
     /// Graph edges the unconditional graph-edge cascade removed from BOTH the
-    /// in-memory CSR partition AND the persistent edge store — each captured as
-    /// `(collection, src, label, dst, old_properties)`. Populated regardless of
-    /// caller (the cascade is unconditional), so a transactional caller pushes
-    /// one `UndoEntry::DeleteEdge` per entry and a rolled-back delete restores
-    /// every cascaded edge into both stores. Autocommit callers ignore it.
+    /// in-memory CSR partition AND the persistent edge store, each with its
+    /// prior properties and the tombstone version the cascade added.
+    /// Populated regardless of caller (the cascade is unconditional), so a
+    /// transactional caller pushes one `UndoEntry::EdgeWrite` per entry and a
+    /// rolled-back delete restores every cascaded edge into both stores.
+    /// Autocommit callers ignore it.
     pub edge_deletes: Vec<crate::engine::graph::edge_store::EdgeRestore>,
     /// The node id this delete NEWLY marked deleted in the in-memory
     /// `deleted_nodes` edge referential-integrity tracker, if any. `Some(id)`
@@ -146,7 +149,17 @@ impl CoreLoop {
         let _ = user_roles;
 
         let storage_key = crate::engine::document::store::StorageKey::for_surrogate(surrogate);
-        let bitemporal = self.is_bitemporal(database_id, tid, collection);
+        // A stamp in `active_bitemporal_stamps` (a committed redo delete)
+        // forces the versioned branch at the EXACT resolve-time system time,
+        // so every replica and every restart tombstones the same version key.
+        // Absent an override, derive bitemporality from config and mint the
+        // system time here.
+        let carried_sys_from = self
+            .active_bitemporal_stamps
+            .get(&surrogate.as_u32())
+            .map(|stamp| stamp.sys_from_ms);
+        let bitemporal =
+            carried_sys_from.is_some() || self.is_bitemporal(database_id, tid, collection);
         let config_key = (
             crate::types::DatabaseId::new(database_id),
             crate::types::TenantId::new(tid),
@@ -177,7 +190,7 @@ impl CoreLoop {
                         resolved_targets,
                     )?;
                 }
-                let sys_from = self.bitemporal_now_ms();
+                let sys_from = carried_sys_from.unwrap_or_else(|| self.bitemporal_now_ms());
                 bitemporal_sys_from_ms = Some(sys_from);
                 self.sparse.versioned_tombstone_in_txn(
                     txn,
@@ -333,29 +346,20 @@ impl CoreLoop {
         // Cascade 3: Remove graph edges where this document is src or dst.
         // Captured unconditionally (the cascade runs for both autocommit and
         // transactional callers) so a transactional caller can restore every
-        // removed edge on rollback via `UndoEntry::DeleteEdge`, which re-inserts
-        // into BOTH the CSR partition and the persistent edge store — matching
-        // the two stores this cascade removes from.
-        let mut edge_deletes: Vec<crate::engine::graph::edge_store::EdgeRestore> = Vec::new();
-        let edges_removed = self
-            .csr_partition_mut(database_id, tid)
-            .remove_node_edges(document_id);
-        if edges_removed > 0 {
-            // Also tombstone in persistent edge store, capturing each removed
-            // edge (with its pre-delete properties) for rollback restore.
-            let cascade_ord = self.hlc.next_ordinal();
-            match self.edge_store.delete_edges_for_node(
-                database_id,
-                nodedb_types::TenantId::new(tid),
-                document_id,
-                cascade_ord,
-            ) {
-                Ok(removed) => edge_deletes = removed,
-                Err(e) => {
-                    warn!(core = self.core_id, %document_id, error = %e, "edge cascade failed");
-                }
+        // removed edge on rollback via `UndoEntry::EdgeWrite`, which restores
+        // BOTH the CSR partition and the persistent edge store — matching the
+        // two stores this cascade removes from.
+        // The store cascade runs first and is one transaction: its error
+        // refuses the delete with neither edge store nor CSR changed.
+        let edge_deletes = match self.cascade_node_edges(database_id, tid, document_id) {
+            Ok(removed) => removed,
+            Err(e) => {
+                warn!(core = self.core_id, %document_id, error = %e, "edge cascade failed; rejecting the delete");
+                return Err(e);
             }
-            tracing::trace!(core = self.core_id, %document_id, edges_removed, "EDGE_CASCADE_DELETE");
+        };
+        if !edge_deletes.is_empty() {
+            tracing::trace!(core = self.core_id, %document_id, edges_removed = edge_deletes.len(), "EDGE_CASCADE_DELETE");
         }
 
         // Cascade 4: Remove from spatial R-tree indexes + reverse map, and
@@ -438,7 +442,7 @@ impl CoreLoop {
 /// (`apply_point_delete`) and transactional (`tx_point_delete`) paths.
 /// These checks have no persistent side effect, so a violation here
 /// simply aborts before the write.
-fn run_delete_enforcement(
+pub(in crate::data::executor) fn run_delete_enforcement(
     sparse: &crate::engine::sparse::btree::SparseEngine,
     database_id: u64,
     tid: u64,

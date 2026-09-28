@@ -21,7 +21,7 @@
 
 use nodedb_test_support::pgwire_harness::TestServer;
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb::types::DatabaseId;
 
 /// Target and source. The names are chosen for their HASHES: they collide on
 /// one vShard, which is what makes every test below the co-resident path. See
@@ -35,8 +35,8 @@ const SOURCE: &str = "uo_entries";
 #[test]
 fn materialized_sum_source_and_target_are_co_resident() {
     assert_eq!(
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, SOURCE),
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, TARGET),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, SOURCE).vshard(),
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, TARGET).vshard(),
         "the point-shape tests in this file must exercise the CO-RESIDENT path; \
          rename the collections until the two hashes agree again"
     );

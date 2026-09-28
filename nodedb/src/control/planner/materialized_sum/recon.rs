@@ -31,7 +31,7 @@ use nodedb_types::{Surrogate, TenantId};
 
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TraceId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 
 /// What a plan-time reconnaissance read observed, and the version it observed
@@ -164,20 +164,18 @@ async fn execute_read(
             database_id,
             txn_id: None,
         };
+        // A shard verdict keeps its own typed error.
         let (payloads, _watermarks, read_version_lsn) = gateway
             .execute_internal_with_watermarks(&gw_ctx, plan)
-            .await
-            .map_err(|e| crate::Error::Storage {
-                engine: "materialized-sum-recon".into(),
-                detail: format!("reconnaissance read failed: {e}"),
-            })?;
+            .await?;
         return Ok(ReconRead {
             rows: payloads,
             read_version_lsn,
         });
     }
 
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    let vshard_id =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let response = dispatch_to_data_plane(
         state,
         tenant_id,
@@ -187,15 +185,19 @@ async fn execute_read(
         TraceId::ZERO,
     )
     .await?;
-    // A shard verdict keeps its own typed error, so a read the statement's
-    // deadline cut short reports the deadline rather than a storage fault.
-    crate::control::server::dispatch_utils::reject_data_plane_error(&response)?;
-    if response.status != crate::bridge::envelope::Status::Ok {
-        return Err(crate::Error::Storage {
-            engine: "materialized-sum-recon".into(),
-            detail: format!("reconnaissance read failed: {:?}", response.error_code),
-        });
-    }
+    read_from_response(&response)
+}
+
+/// The rows of a local read response.
+///
+/// A shard verdict keeps its own typed error, so a read the statement's
+/// deadline cut short reports the deadline rather than a storage fault.
+/// `reject_data_plane_error` passes only a `NotFound` refusal. Its payload is
+/// empty, so it reads as no rows, the answer the gateway path gives.
+fn read_from_response(
+    response: &crate::bridge::envelope::Response,
+) -> crate::Result<ReconRead<Vec<Vec<u8>>>> {
+    crate::control::local_dispatch::reject_data_plane_error(response)?;
     Ok(ReconRead {
         read_version_lsn: response.read_version_lsn,
         rows: vec![response.payload.to_vec()],
@@ -215,4 +217,48 @@ fn decode_rows(payload: &[u8]) -> Vec<serde_json::Value> {
         .into_iter()
         .filter_map(|(_, body)| nodedb_types::json_from_msgpack(&body).ok())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
+    use crate::types::RequestId;
+
+    fn refusal(code: ErrorCode) -> Response {
+        Response {
+            request_id: RequestId::new(1),
+            status: Status::Error,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: Lsn::ZERO,
+            error_code: Some(Box::new(code)),
+            read_set_valid: None,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    /// A refused read keeps its code, never a storage error.
+    #[test]
+    fn a_refused_read_keeps_its_code() {
+        let code = ErrorCode::Unsupported {
+            detail: "not on this engine".into(),
+        };
+        match read_from_response(&refusal(code.clone())) {
+            Err(crate::Error::DataPlane(kept)) => assert_eq!(kept, code),
+            Err(other) => panic!("expected the typed refusal, got {other:?}"),
+            Ok(_) => panic!("a refused read must fail"),
+        }
+    }
+
+    /// A `NotFound` refusal reads as one empty payload, which decodes to no
+    /// rows.
+    #[test]
+    fn a_not_found_read_has_no_rows() {
+        let read = read_from_response(&refusal(ErrorCode::NotFound))
+            .expect("a NotFound refusal reads as no rows");
+        assert!(read.rows.iter().all(|payload| payload.is_empty()));
+    }
 }

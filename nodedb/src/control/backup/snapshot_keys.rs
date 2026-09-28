@@ -12,13 +12,14 @@
 //!   [`extract_db_tenant_scoped_collection`].
 //! - **db-scoped (collection-last)** — `"{db}:{tid}:{collection}"` where the
 //!   collection is the remainder and may itself contain `':'` (flushed-ts
-//!   segments, columnar engines). Use [`extract_db_scoped_collection`].
-//! - **collection-name-only** — the key IS the bare collection name (kv tables).
-//!   Routed directly; no extractor needed.
+//!   segments, columnar engines, kv tables). Use [`extract_db_scoped_collection`].
 //!
-//! Both the RESTORE topology splitter and the Raft snapshot SEND builder filter
-//! sections by which vshard each entry's collection routes to, so the parsing
-//! lives here once and is shared by both — never duplicated ad-hoc.
+//! Every extracted collection is the name the Data Plane stores it under:
+//! database-qualified (`"{db}/{name}"`) outside the default database.
+//! [`vshard_of_stored`] maps such a name to its vShard.
+//!
+//! The Raft snapshot SEND builder filters sections by which vshard each
+//! entry's collection routes to, so the parsing lives here once.
 //!
 //! The backup orchestrator additionally needs to filter a fully-gathered,
 //! single-tenant [`TenantDataSnapshot`] *in place* to a set of source vshards
@@ -30,8 +31,23 @@
 
 use std::collections::HashSet;
 
+use nodedb_types::{CollectionKey, DatabaseId};
+
 use crate::engine::graph::edge_store::parse_versioned_edge_key;
 use crate::types::TenantDataSnapshot;
+
+/// The vShard of a collection named as the Data Plane stores it in
+/// `database_id`.
+///
+/// A database-qualified name routes by its bare name, exactly as the write
+/// that stored it did. A name without the qualifier routes as a bare name.
+/// Both are deterministic, so every source node that filters the same entry
+/// assigns it the same vShard.
+pub fn vshard_of_stored(database_id: DatabaseId, stored: &str) -> u32 {
+    let key = CollectionKey::from_qualified_str(database_id, stored)
+        .unwrap_or_else(|_| CollectionKey::from_bare(database_id, stored));
+    nodedb_cluster::routing::vshard_for_collection(key)
+}
 
 /// Extract the collection from a `"{db}:{tid}:{collection}[:suffix...]"` key.
 ///
@@ -80,18 +96,19 @@ pub fn extract_db_scoped_collection(key: &str, tenant_id: u64) -> Option<&str> {
 /// section shapes are unchanged, so the RESTORE merge path (`merge_sections`)
 /// consumes the output exactly as before.
 ///
-/// `vshard_of` maps a collection name to its vshard (the caller passes the
-/// canonical `vshard_for_collection(DEFAULT, _)`), matching the Raft snapshot
-/// SEND builder. Every section kind the snapshot carries is classified here so
-/// adding a section without updating this filter is impossible to miss:
+/// `vshard_of` maps a collection name to its vshard (the caller passes
+/// [`vshard_of_stored`] for the snapshot's database), matching the Raft
+/// snapshot SEND builder. Every section kind the snapshot carries is
+/// classified here so adding a section without updating this filter is
+/// impossible to miss:
 ///
-/// - db-tenant-scoped keys (`documents`, `indexes`, `vectors`, `timeseries`)
-///   via [`extract_db_tenant_scoped_collection`].
-/// - db-scoped keys (`flushed_ts_segments`, `columnar_engines`) via
-///   [`extract_db_scoped_collection`].
-/// - collection-name-only keys (`kv_tables`) routed directly.
+/// - db-tenant-scoped keys (`documents`, `indexes`, `documents_versioned`,
+///   `indexes_versioned`, `vectors`, `timeseries`) via
+///   [`extract_db_tenant_scoped_collection`].
+/// - db-scoped keys (`flushed_ts_segments`, `columnar_engines`, `kv_tables`)
+///   via [`extract_db_scoped_collection`].
 /// - graph `edges` via [`parse_versioned_edge_key`] (key embeds the collection).
-/// - `surrogate_pk` by its explicit `collection` field.
+/// - `surrogate_pk` by its explicit `collection` field (the bare name).
 /// - CRDT (`crdt_state`): per-collection, tenant-explicit. Each entry carries
 ///   its single collection, so it is kept iff that collection's vshard is in
 ///   `source_vshards` — the node owning the collection keeps it, every other
@@ -115,15 +132,18 @@ pub fn retain_tenant_data_for_vshards(
 
     snap.documents.retain(|(k, _)| in_group_db_tenant_scoped(k));
     snap.indexes.retain(|(k, _)| in_group_db_tenant_scoped(k));
+    snap.documents_versioned
+        .retain(|(k, _)| in_group_db_tenant_scoped(k));
+    snap.indexes_versioned
+        .retain(|(k, _)| in_group_db_tenant_scoped(k));
     snap.vectors.retain(|(k, _)| in_group_db_tenant_scoped(k));
     snap.timeseries
         .retain(|(k, _)| in_group_db_tenant_scoped(k));
     snap.flushed_ts_segments
         .retain(|b| in_group_db_scoped(&b.collection_key));
     snap.columnar_engines.retain(|(k, _)| in_group_db_scoped(k));
-    // kv_tables / surrogate_pk: the key / field IS the collection name.
-    snap.kv_tables
-        .retain(|(k, _)| source_vshards.contains(&vshard_of(k)));
+    snap.kv_tables.retain(|(k, _)| in_group_db_scoped(k));
+    // surrogate_pk: the field IS the collection name.
     snap.surrogate_pk
         .retain(|e| source_vshards.contains(&vshard_of(&e.collection)));
     // Graph edges: collection is the first '\0'-delimited key component. An
@@ -145,6 +165,26 @@ pub fn retain_tenant_data_for_vshards(
 #[cfg(test)]
 mod tests {
     use super::{extract_db_scoped_collection, extract_db_tenant_scoped_collection};
+
+    /// A qualified Data-Plane name in a named database routes to the vShard
+    /// of its bare catalog key, never to the vShard of the qualified string.
+    #[test]
+    fn a_stored_name_routes_by_its_bare_key() {
+        use nodedb_types::{CollectionKey, DatabaseId, QualifiedCollection};
+
+        let db = DatabaseId::new(1025);
+        let stored = QualifiedCollection::new(db, "orders");
+        let expected =
+            nodedb_cluster::routing::vshard_for_collection(CollectionKey::from_bare(db, "orders"));
+        assert_eq!(super::vshard_of_stored(db, stored.as_str()), expected);
+        assert_eq!(
+            super::vshard_of_stored(DatabaseId::DEFAULT, "orders"),
+            nodedb_cluster::routing::vshard_for_collection(CollectionKey::from_bare(
+                DatabaseId::DEFAULT,
+                "orders"
+            ))
+        );
+    }
 
     #[test]
     fn extract_db_tenant_scoped_collection_parses_key() {
@@ -228,7 +268,7 @@ mod tests {
                     partitions: vec![],
                 },
             ],
-            kv_tables: vec![("alpha".into(), b"a".to_vec())],
+            kv_tables: vec![(format!("0:{TID}:alpha"), b"a".to_vec())],
             ..Default::default()
         };
 
@@ -278,7 +318,7 @@ mod tests {
         let mut snap = TenantDataSnapshot {
             timeseries: vec![("0:1:alpha".into(), b"a".to_vec())],
             columnar_engines: vec![("0:1:beta".into(), b"b".to_vec())],
-            kv_tables: vec![("gamma".into(), b"g".to_vec())],
+            kv_tables: vec![("0:1:gamma".into(), b"g".to_vec())],
             ..Default::default()
         };
         let all: HashSet<u32> = ["alpha", "beta", "gamma"]

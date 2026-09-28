@@ -46,7 +46,7 @@ fn params() -> StoredVectorIndexParams {
 fn apply_entry(server: &TestServer, entry: &CatalogEntry) {
     apply::apply_to(entry, server.shared.credentials.catalog()).expect("apply catalog entry");
     apply_post_apply_side_effects_sync(entry, &server.shared);
-    spawn_post_apply_async_side_effects(entry.clone(), Arc::clone(&server.shared), 0);
+    spawn_post_apply_async_side_effects(entry.clone(), Arc::clone(&server.shared));
 }
 
 /// SQL for one row carrying an `embedding` array of `dim` components.

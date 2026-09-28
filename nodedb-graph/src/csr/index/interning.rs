@@ -5,6 +5,7 @@
 use std::collections::hash_map::Entry;
 
 use super::types::CsrIndex;
+use crate::csr::rebuild::journal::{CsrWriteOp, OpOutcome};
 
 impl CsrIndex {
     /// Get or create a dense ID for a node.
@@ -114,6 +115,18 @@ impl CsrIndex {
     /// is a no-op — the zero sentinel is the initial state and has no meaning.
     pub fn set_node_surrogate(&mut self, node: &str, surrogate: nodedb_types::Surrogate) {
         let raw = surrogate.as_u32();
+        self.apply_set_node_surrogate(node, raw);
+        self.journal_record(
+            || CsrWriteOp::SetNodeSurrogate {
+                node: node.to_string(),
+                surrogate: raw,
+            },
+            OpOutcome::Applied,
+        );
+    }
+
+    /// The surrogate bind itself, unjournaled. `raw == 0` is a no-op.
+    pub(crate) fn apply_set_node_surrogate(&mut self, node: &str, raw: u32) {
         if raw == 0 {
             return;
         }
@@ -215,6 +228,23 @@ impl CsrIndex {
     /// label is silently ignored). Returns `Err(GraphError::NodeOverflow)` if
     /// the node is new and the partition's node-id space is exhausted.
     pub fn add_node_label(&mut self, node: &str, label: &str) -> Result<bool, crate::GraphError> {
+        let result = self.apply_add_node_label(node, label);
+        self.journal_record(
+            || CsrWriteOp::AddNodeLabel {
+                node: node.to_string(),
+                label: label.to_string(),
+            },
+            OpOutcome::of_label(&result),
+        );
+        result
+    }
+
+    /// The label add itself, unjournaled.
+    pub(crate) fn apply_add_node_label(
+        &mut self,
+        node: &str,
+        label: &str,
+    ) -> Result<bool, crate::GraphError> {
         let node_id = self.ensure_node(node)?;
         let Some(label_id) = self.ensure_node_label(label) else {
             return Ok(false);
@@ -225,6 +255,18 @@ impl CsrIndex {
 
     /// Remove a label from a node.
     pub fn remove_node_label(&mut self, node: &str, label: &str) {
+        self.apply_remove_node_label(node, label);
+        self.journal_record(
+            || CsrWriteOp::RemoveNodeLabel {
+                node: node.to_string(),
+                label: label.to_string(),
+            },
+            OpOutcome::Applied,
+        );
+    }
+
+    /// The label removal itself, unjournaled.
+    pub(crate) fn apply_remove_node_label(&mut self, node: &str, label: &str) {
         let Some(&node_id) = self.node_to_id.get(node) else {
             return;
         };

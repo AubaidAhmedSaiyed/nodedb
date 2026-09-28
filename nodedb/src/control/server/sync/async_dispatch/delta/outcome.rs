@@ -28,10 +28,11 @@ use tracing::warn;
 use nodedb_types::sync::violation::ViolationType;
 use nodedb_types::sync::wire::{AckStatus, SyncAckResult, SyncOutcome};
 
-use super::super::super::refusal::retryable_refusal_reason;
+use super::super::super::refusal::ack_status_for_dispatch_error;
 use super::super::super::wire::{
     CompensationHint, DeltaAckMsg, DeltaPushMsg, DeltaRejectMsg, SyncFrame, SyncMessageType,
 };
+use super::compensation::compensation_hint_for_dispatch_error;
 
 /// Build the client frame for a completed dispatch.
 ///
@@ -144,11 +145,26 @@ fn reject_frame(delta_msg: &DeltaPushMsg, violation: &ViolationType) -> Option<S
 /// classified it as one, and re-wrapping it as a rejection would reintroduce
 /// exactly the loss this module exists to prevent.
 fn frame_for_dispatch_error(delta_msg: &DeltaPushMsg, error: &crate::Error) -> Option<SyncFrame> {
-    if let Some(reason) = retryable_refusal_reason(error) {
+    // The validator's terminal verdict on the frame keeps its structured
+    // violation and compensation hint.
+    if let crate::Error::DataPlane(crate::bridge::envelope::ErrorCode::SyncRejected {
+        violation,
+        ..
+    }) = error
+    {
+        return reject_frame(delta_msg, violation);
+    }
+    let hint = compensation_hint_for_dispatch_error(error);
+    // A rate refusal carries its delay in the hint, which a gap ack cannot.
+    // Every other failure that never judged the write is refused retryably,
+    // through the classifier every engine ack uses.
+    if !matches!(hint, CompensationHint::RateLimited { .. })
+        && let AckStatus::Gap { expected } = ack_status_for_dispatch_error(error, delta_msg.seq)
+    {
         warn!(
             collection = %delta_msg.collection,
             doc = %delta_msg.document_id,
-            reason,
+            error = %error,
             "sync: delta refused retryably before apply; client should re-push at this seq"
         );
         let ack = DeltaAckMsg {
@@ -156,14 +172,11 @@ fn frame_for_dispatch_error(delta_msg: &DeltaPushMsg, error: &crate::Error) -> O
             lsn: 0,
             clock_skew_warning_ms: None,
             applied_seq: delta_msg.seq.saturating_sub(1),
-            status: AckStatus::Gap {
-                expected: delta_msg.seq,
-            },
+            status: AckStatus::Gap { expected },
         };
         return SyncFrame::try_encode(SyncMessageType::DeltaAck, &ack);
     }
 
-    let hint = compensation_hint_for_dispatch_error(error);
     warn!(
         collection = %delta_msg.collection,
         doc = %delta_msg.document_id,
@@ -177,50 +190,6 @@ fn frame_for_dispatch_error(delta_msg: &DeltaPushMsg, error: &crate::Error) -> O
         compensation: Some(hint),
     };
     SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject)
-}
-
-/// Classify a dispatch failure into the hint the edge compensates against.
-pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> CompensationHint {
-    use crate::bridge::envelope::ErrorCode;
-
-    match e {
-        crate::Error::DataPlane(code) => match code {
-            ErrorCode::RejectedConstraint { constraint, detail } => CompensationHint::Custom {
-                constraint: constraint.clone(),
-                detail: detail.clone(),
-            },
-            ErrorCode::RejectedPrevalidation { reason } => CompensationHint::Custom {
-                constraint: "prevalidation".into(),
-                detail: reason.clone(),
-            },
-            ErrorCode::RejectedAuthz { .. } => CompensationHint::PermissionDenied,
-            ErrorCode::RateExceeded { retry_after_ms, .. } => CompensationHint::RateLimited {
-                retry_after_ms: *retry_after_ms,
-            },
-            other => CompensationHint::Custom {
-                constraint: "apply_failed".into(),
-                detail: format!("{other:?}"),
-            },
-        },
-        crate::Error::RejectedConstraint {
-            constraint, detail, ..
-        } => CompensationHint::Custom {
-            constraint: constraint.clone(),
-            detail: detail.clone(),
-        },
-        crate::Error::RejectedPrevalidation { constraint, reason } => CompensationHint::Custom {
-            constraint: constraint.clone(),
-            detail: reason.clone(),
-        },
-        crate::Error::RejectedAuthz { .. } => CompensationHint::PermissionDenied,
-        crate::Error::RateExceeded { retry_after_ms, .. } => CompensationHint::RateLimited {
-            retry_after_ms: *retry_after_ms,
-        },
-        other => CompensationHint::Custom {
-            constraint: "apply_failed".into(),
-            detail: other.to_string(),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -305,6 +274,35 @@ mod tests {
         ))
         .expect("encode gate result");
         let frame = frame_for_dispatch(&delta(), &provisional(), Ok(payload)).expect("frame");
+        assert_eq!(frame.msg_type, SyncMessageType::DeltaReject);
+        let reject: DeltaRejectMsg = frame.decode_body().expect("reject decodes");
+        assert_eq!(
+            reject.compensation,
+            Some(CompensationHint::UniqueViolation {
+                field: "email".into(),
+                conflicting_value: "a@b.com".into(),
+            })
+        );
+    }
+
+    /// A frame the gate refused for good arrives on the error channel, since
+    /// its record is cancelled. It keeps the validator's structured hint.
+    #[test]
+    fn a_terminal_refusal_on_the_error_channel_reaches_the_client_as_a_rejection() {
+        let error = crate::Error::DataPlane(ErrorCode::SyncRejected {
+            violation: ViolationType::UniqueViolation {
+                field: "email".into(),
+                value: "a@b.com".into(),
+            },
+            applied_seq: 5,
+            provenance: nodedb_types::sync::wire::SyncProvenance {
+                producer_id: 1,
+                epoch: 1,
+                stream_id: 1,
+                seq: 5,
+            },
+        });
+        let frame = frame_for_dispatch(&delta(), &provisional(), Err(error)).expect("frame");
         assert_eq!(frame.msg_type, SyncMessageType::DeltaReject);
         let reject: DeltaRejectMsg = frame.decode_body().expect("reject decodes");
         assert_eq!(
@@ -402,5 +400,28 @@ mod tests {
             compensation_hint_for_dispatch_error(&e),
             CompensationHint::PermissionDenied
         );
+    }
+
+    /// A dispatch that timed out never judged the delta, so the sender
+    /// re-pushes it instead of compensating.
+    #[test]
+    fn a_timed_out_dispatch_reaches_the_client_as_a_retryable_ack() {
+        let error = crate::Error::DeadlineExceeded {
+            request_id: crate::types::RequestId::new(1),
+        };
+        let frame = frame_for_dispatch(&delta(), &provisional(), Err(error)).expect("frame");
+        let ack = decode_ack(&frame);
+        assert_eq!(ack.status, AckStatus::Gap { expected: 5 });
+    }
+
+    /// A rate refusal keeps its delay: it rejects with the rate hint.
+    #[test]
+    fn a_rate_refusal_keeps_its_delay_hint() {
+        let error = crate::Error::DataPlane(ErrorCode::RateExceeded {
+            gate: "writes".into(),
+            retry_after_ms: 1500,
+        });
+        let frame = frame_for_dispatch(&delta(), &provisional(), Err(error)).expect("frame");
+        assert_eq!(frame.msg_type, SyncMessageType::DeltaReject);
     }
 }

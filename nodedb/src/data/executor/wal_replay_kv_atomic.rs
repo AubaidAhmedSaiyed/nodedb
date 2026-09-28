@@ -17,6 +17,7 @@
 //! the same pre-state, fails identically, and mutates nothing — this
 //! converges rather than diverges, so no success-gate is applied here.
 
+use nodedb_physical::physical_plan::KvCounterShape;
 use tracing::warn;
 
 use super::core_loop::CoreLoop;
@@ -105,8 +106,18 @@ impl CoreLoop {
             },
             &expected,
             &new_value,
+            // Replay re-applies a write the policy already admitted when it
+            // was first accepted.
+            &crate::engine::kv::admit_any,
         );
-        if result.success {
+        let swapped = match result {
+            Ok(result) => result.success(),
+            Err(error) => {
+                self.replay_swap_error("cas", &collection, &key, record_lsn, error);
+                false
+            }
+        };
+        if swapped {
             self.note_replay_write_lsn(
                 database_id,
                 tenant_id,
@@ -115,7 +126,7 @@ impl CoreLoop {
                 record_lsn,
             );
         }
-        Some(usize::from(result.success))
+        Some(usize::from(swapped))
     }
 
     /// Decode + tombstone-gate + replay one `kv_incr_float` WAL record.
@@ -133,8 +144,9 @@ impl CoreLoop {
         record_lsn: u64,
         tombstones: &nodedb_wal::TombstoneSet,
     ) -> Option<usize> {
-        let (disc, collection, key, delta, surrogate) =
-            zerompk::from_msgpack::<(&str, String, Vec<u8>, f64, u32)>(payload).ok()?;
+        let (disc, collection, key, delta, surrogate, shape) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, String, u32, KvCounterShape)>(payload)
+                .ok()?;
         if disc != "kv_incr_float" {
             return None;
         }
@@ -151,7 +163,8 @@ impl CoreLoop {
                 now_ms,
                 surrogate: nodedb_types::Surrogate::new(surrogate),
             },
-            delta,
+            &delta,
+            &shape,
             // Replay re-applies a write the policy already admitted when it was
             // first accepted; re-deciding it here would make recovery depend on
             // the policies of whoever happens to be connected.
@@ -177,12 +190,13 @@ impl CoreLoop {
                 );
                 Some(0)
             }
-            Err(AtomicError::Overflow) => {
+            Err(AtomicError::Counter(fault)) => {
                 warn!(
                     core = self.core_id,
                     collection = %collection,
                     key = %String::from_utf8_lossy(&key),
-                    "WAL kv_incr_float replay: overflow (NaN/Inf), skipping record"
+                    fault = fault.message(),
+                    "WAL kv_incr_float replay: no value computed, skipping record"
                 );
                 Some(0)
             }
@@ -242,7 +256,7 @@ impl CoreLoop {
         if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
-        self.kv_engine.getset(
+        let result = self.kv_engine.getset(
             AtomicKeyCtx {
                 database_id,
                 tenant_id,
@@ -252,7 +266,14 @@ impl CoreLoop {
                 surrogate: nodedb_types::Surrogate::new(surrogate),
             },
             &new_value,
+            // Replay re-applies a write the policy already admitted when it
+            // was first accepted.
+            &crate::engine::kv::admit_any,
         );
+        if let Err(error) = result {
+            self.replay_swap_error("getset", &collection, &key, record_lsn, error);
+            return Some(0);
+        }
         self.note_replay_write_lsn(
             database_id,
             tenant_id,
@@ -261,6 +282,42 @@ impl CoreLoop {
             record_lsn,
         );
         Some(1)
+    }
+
+    /// Handle a `cas` or `getset` record whose replay computed no value.
+    ///
+    /// The live apply of the same record against the same pre-state failed
+    /// the same way and wrote nothing, so replay skips it. A refusal by the
+    /// write gate cannot happen here: replay hands the engine `admit_any`.
+    /// Reaching it means a redo path re-decides writes that were already
+    /// admitted, so replay stops and files a forensic report.
+    fn replay_swap_error(
+        &self,
+        op: &'static str,
+        collection: &str,
+        key: &[u8],
+        record_lsn: u64,
+        error: AtomicError,
+    ) {
+        let detail = match error {
+            AtomicError::TypeMismatch { detail } | AtomicError::Encode { detail } => detail,
+            AtomicError::Counter(fault) => fault.message().to_string(),
+            AtomicError::Rejected(error) => abort_replay(
+                "kv",
+                "swap_admission",
+                self.core_id,
+                record_lsn,
+                &format!("the RLS write gate refused a committed {op} on '{collection}': {error}"),
+            ),
+        };
+        warn!(
+            core = self.core_id,
+            collection = %collection,
+            key = %String::from_utf8_lossy(key),
+            op,
+            %detail,
+            "WAL kv swap replay: no value computed, skipping record"
+        );
     }
 }
 
@@ -272,7 +329,7 @@ mod tests {
     use crate::control::server::wal_dispatch::wal_append_if_write;
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
-    use nodedb_physical::physical_plan::KvOp;
+    use nodedb_physical::physical_plan::{KvCounterShape, KvOp};
     use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
@@ -356,6 +413,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         let cas = PhysicalPlan::Kv(KvOp::Cas {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "state"),
@@ -388,6 +446,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         // Live dispatch would have failed this compare (expected "idle" but
         // the seeded value is "fighting"); the WAL record still exists
@@ -442,16 +501,18 @@ mod tests {
         let incr1 = PhysicalPlan::Kv(KvOp::IncrFloat {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "scores"),
             key: b"dmg".to_vec(),
-            delta: 3.0,
+            delta: "3.0".into(),
             surrogate: Surrogate::new(1),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+            shape: KvCounterShape::Raw,
         });
         let incr2 = PhysicalPlan::Kv(KvOp::IncrFloat {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "scores"),
             key: b"dmg".to_vec(),
-            delta: 1.5,
+            delta: "1.5".into(),
             surrogate: Surrogate::new(1),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+            shape: KvCounterShape::Raw,
         });
 
         let records = append_via_autocommit(&[incr1, incr2]);
@@ -459,11 +520,10 @@ mod tests {
         let mut h = make_core();
         h.core.replay_kv_wal(&records, 1, &TombstoneSet::new());
 
-        let bytes = get_value(&h.core, "scores", b"dmg").expect("dmg survives replay");
-        let value: f64 = zerompk::from_msgpack(&bytes).expect("decode f64");
-        assert!(
-            (value - 4.5).abs() < f64::EPSILON,
-            "incr_float must replay both increments against the empty-start state, got {value}"
+        assert_eq!(
+            get_value(&h.core, "scores", b"dmg"),
+            Some(b"4.5".to_vec()),
+            "incr_float must replay both increments against the empty-start state"
         );
     }
 
@@ -472,18 +532,20 @@ mod tests {
         let put_str = PhysicalPlan::Kv(KvOp::Put {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "scores"),
             key: b"str".to_vec(),
-            value: zerompk::to_msgpack_vec(&"hello").expect("encode"),
+            value: b"hello".to_vec(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         let incr = PhysicalPlan::Kv(KvOp::IncrFloat {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "scores"),
             key: b"str".to_vec(),
-            delta: 1.0,
+            delta: "1".into(),
             surrogate: Surrogate::new(1),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+            shape: KvCounterShape::Raw,
         });
 
         let records = append_via_autocommit(&[put_str, incr]);
@@ -491,10 +553,9 @@ mod tests {
         let mut h = make_core();
         h.core.replay_kv_wal(&records, 1, &TombstoneSet::new());
 
-        let bytes = get_value(&h.core, "scores", b"str").expect("str survives replay");
-        let value: String = zerompk::from_msgpack(&bytes).expect("decode string");
         assert_eq!(
-            value, "hello",
+            get_value(&h.core, "scores", b"str"),
+            Some(b"hello".to_vec()),
             "incr_float over a non-numeric value must replay to a no-op, value unchanged"
         );
     }
@@ -509,6 +570,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         let getset = PhysicalPlan::Kv(KvOp::GetSet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "session"),

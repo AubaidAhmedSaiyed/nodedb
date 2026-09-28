@@ -4,38 +4,40 @@
 //! `tenant_snapshot::execute_restore_tenant_snapshot` for the sparse/document,
 //! vector, KV, CRDT, and timeseries engines.
 
-use tracing::warn;
-
 use crate::data::executor::core_loop::CoreLoop;
 
 use super::keys::database_id_from_qualified;
 
 impl CoreLoop {
+    /// Install the snapshot's document rows, document versions and index
+    /// entries under their exported keys. Returns `(documents, indexes)`
+    /// written. The first entry that fails to install fails the restore: a
+    /// follower missing it would serve a partial collection.
     pub(super) fn restore_sparse(
         &self,
-        _tenant_id: u64,
-        documents: &[(String, Vec<u8>)],
-        indexes: &[(String, Vec<u8>)],
-    ) -> (u64, u64) {
-        let mut docs_written = 0u64;
-        for (key, value) in documents {
-            if let Err(e) = self.sparse.put_raw(key, value) {
-                warn!(key, error = %e, "failed to restore document");
-                continue;
-            }
-            docs_written += 1;
+        snap: &crate::types::TenantDataSnapshot,
+    ) -> crate::Result<(u64, u64)> {
+        for (key, value) in &snap.documents {
+            self.sparse.put_raw(key, value)?;
         }
-        let mut indexes_written = 0u64;
-        for (key, value) in indexes {
-            if let Err(e) = self.sparse.put_index_raw(key, value) {
-                warn!(key, error = %e, "failed to restore index");
-                continue;
-            }
-            indexes_written += 1;
+        for (key, value) in &snap.documents_versioned {
+            self.sparse.put_versioned_document_raw(key, value)?;
         }
-        (docs_written, indexes_written)
+        for (key, value) in &snap.indexes {
+            self.sparse.put_index_raw(key, value)?;
+        }
+        for (key, value) in &snap.indexes_versioned {
+            self.sparse.put_versioned_index_raw(key, value)?;
+        }
+        Ok((
+            (snap.documents.len() + snap.documents_versioned.len()) as u64,
+            (snap.indexes.len() + snap.indexes_versioned.len()) as u64,
+        ))
     }
 
+    /// Install the snapshot's vectors into their collection. A vector whose
+    /// width differs from the collection's fails the restore before any of
+    /// the collection's vectors lands.
     pub(super) fn restore_vector_collection(
         &mut self,
         database_id: u64,
@@ -43,9 +45,9 @@ impl CoreLoop {
         coll_key: &str,
         vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)>,
         replace_mode: bool,
-    ) {
+    ) -> crate::Result<()> {
         if vectors.is_empty() {
-            return;
+            return Ok(());
         }
         let dim = vectors[0].1.len();
         let map_key = (
@@ -53,45 +55,51 @@ impl CoreLoop {
             crate::types::TenantId::new(tenant_id),
             coll_key.to_string(),
         );
-        let params = self
-            .vector_params
-            .get(&map_key)
-            .cloned()
-            .unwrap_or_default();
         // Raft InstallSnapshot apply (`replace_mode`) must REPLACE the local
         // collection so the snapshot's vectors are not appended on top of stale
         // entries. User RESTORE (`!replace_mode`) keeps the prior insert-into-
         // existing-or-create behavior.
         if replace_mode {
-            self.vector_collections.insert(
-                map_key.clone(),
-                crate::engine::vector::collection::VectorCollection::new(dim, params.clone()),
-            );
+            self.vector_collections.remove(&map_key);
         }
-        let coll = self.vector_collections.entry(map_key).or_insert_with(|| {
-            crate::engine::vector::collection::VectorCollection::new(dim, params)
-        });
-        for (_, data, surrogate) in vectors {
-            coll.insert_with_surrogate(data, surrogate.unwrap_or(nodedb_types::Surrogate::ZERO));
-        }
+        let coll = self.ensure_vector_collection(&map_key, &map_key, dim)?;
+        let (data, surrogates): (Vec<Vec<f32>>, Vec<nodedb_types::Surrogate>) = vectors
+            .into_iter()
+            .map(|(_, data, surrogate)| (data, surrogate.unwrap_or(nodedb_types::Surrogate::ZERO)))
+            .unzip();
+        coll.insert_batch_with_surrogates(&data, &surrogates)?;
+        self.train_ivf_if_ready(&map_key);
+        Ok(())
     }
 
+    /// Install one KV table's rows. `snapshot_key` is the section key
+    /// `"{db}:{tid}:{collection}"`, where `collection` is the db-qualified name
+    /// the KV engine keys the table by (e.g. "2/orders" for database 2; the
+    /// bare name for the default database). Each table installs under the
+    /// database and tenant its key names, so a merged multi-tenant snapshot
+    /// keeps every table with its owner. A key whose database disagrees with
+    /// its qualified collection name fails the restore.
     pub(super) fn restore_kv_table(
         &mut self,
-        tenant_id: u64,
-        collection: &str,
+        snapshot_key: &str,
         entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
-    ) {
+    ) -> crate::Result<()> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        // The snapshot stores the db-qualified collection name (e.g. "2/orders"
-        // for database 2; bare name for the default database). Recover the
-        // database id from that prefix so the restored hash key matches the one
-        // live reads compute from the same (database_id, qualified collection).
-        let database_id = database_id_from_qualified(collection);
+        let (database_id, tenant_id, collection) =
+            super::keys::parse_scoped_snapshot_key(snapshot_key);
+        let collection = collection.as_str();
+        if database_id_from_qualified(collection) != database_id {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "restore: KV table key '{snapshot_key}' names database {database_id}, \
+                     but its collection is qualified for another database"
+                ),
+            });
+        }
         for (key, value, expire_at) in entries {
             let ttl_ms = if expire_at > now_ms {
                 expire_at - now_ms
@@ -111,6 +119,7 @@ impl CoreLoop {
                 surrogate: nodedb_types::Surrogate::ZERO,
             });
         }
+        Ok(())
     }
 
     pub(super) fn restore_crdt_state(
@@ -166,8 +175,8 @@ impl CoreLoop {
 
         // Parse key: "{database_id}:{tenant_id}:{collection}" (canonical).
         // Legacy 2-part key ("{tenant_id}:{collection}") and bare keys are
-        // handled by `parse_timeseries_snapshot_key`.
-        let (database_id, tenant_id, collection) = super::keys::parse_timeseries_snapshot_key(key);
+        // handled by `parse_scoped_snapshot_key`.
+        let (database_id, tenant_id, collection) = super::keys::parse_scoped_snapshot_key(key);
 
         // Restore under this core's operator tuning, not the compiled defaults:
         // a memtable keeps the limits it was built with for its whole life, so

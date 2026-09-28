@@ -6,6 +6,7 @@ mod alter;
 mod create;
 mod drop;
 mod iso8601;
+mod owner_kind;
 mod reassign_owned;
 mod tenant_purge;
 

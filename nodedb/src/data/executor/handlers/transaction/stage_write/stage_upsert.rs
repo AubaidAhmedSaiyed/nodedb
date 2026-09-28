@@ -124,7 +124,7 @@ impl CoreLoop {
         };
 
         if let Some(ref schema) = strict_schema {
-            let result = if bitemporal && schema.bitemporal {
+            if bitemporal && schema.bitemporal {
                 strict_format::value_to_binary_tuple_bitemporal(
                     &merged,
                     schema,
@@ -135,14 +135,7 @@ impl CoreLoop {
                 )
             } else {
                 strict_format::value_to_binary_tuple(&merged, schema, ctx.collection)
-            };
-            result.map_err(|e| match e {
-                crate::Error::UnknownStrictField { .. } => e,
-                other => crate::Error::Serialization {
-                    format: "binary_tuple".into(),
-                    detail: other.to_string(),
-                },
-            })
+            }
         } else {
             nodedb_types::value_to_msgpack(&merged).map_err(|e| crate::Error::Serialization {
                 format: "msgpack".into(),

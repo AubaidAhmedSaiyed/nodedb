@@ -50,7 +50,7 @@ pub async fn handle_move_tenant(
     // unauthorized caller never learns whether the tenant or target db exists.
     let source_db_id = catalog
         .get_database_id_by_name(from_db)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup", &e))?
         .ok_or_else(|| ddl_err("42P01", format!("source database '{from_db}' not found")))?;
 
     require_superuser(
@@ -64,7 +64,7 @@ pub async fn handle_move_tenant(
     // for administrative DDL operations).
     let tenant_record = catalog
         .load_all_tenants()
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup", &e))?
         .into_iter()
         .find(|t| t.name == tenant_name)
         .ok_or_else(|| ddl_err("42P01", format!("tenant '{tenant_name}' not found")))?;
@@ -72,12 +72,12 @@ pub async fn handle_move_tenant(
 
     let target_db_id = catalog
         .get_database_id_by_name(to_db)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup", &e))?
         .ok_or_else(|| ddl_err("42P01", format!("target database '{to_db}' not found")))?;
 
     // Idempotency: tenant already in target?
     if recovery::tenant_already_in_target(catalog, tenant_id, source_db_id, target_db_id)
-        .map_err(|e| ddl_err("XX000", format!("idempotency check: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("idempotency check", &e))?
     {
         return Err(DdlError::move_tenant_already_at_target(
             nodedb_types::NodeDbError::move_tenant_already_at_target(tenant_name, to_db).message(),
@@ -86,7 +86,7 @@ pub async fn handle_move_tenant(
 
     // Check for an in-progress journal entry — resume or compensate.
     if let Some(entry) = journal::load_journal_entry(catalog, tenant_id)
-        .map_err(|e| ddl_err("XX000", format!("journal read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("journal read", &e))?
     {
         return recovery::resume_or_compensate(state, catalog, entry, identity).await;
     }
@@ -108,7 +108,7 @@ pub async fn handle_move_tenant(
         temp_snapshot_key: None,
     };
     journal::save_journal_entry(catalog, &journal_entry)
-        .map_err(|e| ddl_err("XX000", format!("journal write: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("journal write", &e))?;
 
     // ── Phase 2: Drain ────────────────────────────────────────────────────────
     let drain_result = drain::run(state, tenant_id, source_db_id, DRAIN_TIMEOUT).await;
@@ -121,7 +121,7 @@ pub async fn handle_move_tenant(
     // Update journal to Snapshot phase.
     let journal_entry = journal_entry.with_phase(MovePhase::Snapshot);
     journal::save_journal_entry(catalog, &journal_entry)
-        .map_err(|e| ddl_err("XX000", format!("journal update: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("journal update", &e))?;
 
     // ── Phase 3: Snapshot ─────────────────────────────────────────────────────
     let snapshot_result = snapshot::run(state, tenant_id, source_db_id, SNAPSHOT_TIMEOUT).await;
@@ -131,7 +131,7 @@ pub async fn handle_move_tenant(
             // Compensate: release drain, remove journal.
             drain::release(state, tenant_id, source_db_id);
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            return Err(DdlError::move_tenant_snapshot_failed(e.message()));
+            return Err(DdlError::move_tenant_snapshot_failed(e.message()).with_cause_of(e));
         }
     };
 
@@ -141,7 +141,7 @@ pub async fn handle_move_tenant(
         .with_phase(MovePhase::Cutover)
         .with_temp_snapshot_key(temp_key.clone());
     journal::save_journal_entry(catalog, &journal_entry)
-        .map_err(|e| ddl_err("XX000", format!("journal update: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("journal update", &e))?;
 
     // ── Phase 4: Cutover ──────────────────────────────────────────────────────
     let cutover_result = cutover::run(
@@ -160,7 +160,7 @@ pub async fn handle_move_tenant(
         drain::release(state, tenant_id, source_db_id);
         let _ = snapshot::delete_temp(state, &temp_key).await;
         journal::delete_journal_entry_logged(catalog, tenant_id);
-        return Err(DdlError::move_tenant_cutover_failed(e.message()));
+        return Err(DdlError::move_tenant_cutover_failed(e.message()).with_cause_of(e));
     }
 
     // ── Phase 5: Resume ───────────────────────────────────────────────────────

@@ -75,7 +75,7 @@ pub async fn drop_continuous_aggregate(
         .credentials
         .catalog()
         .get_continuous_aggregate(database_id.as_u64(), tenant_id.as_u64(), &name)
-        .map_err(|e| err("XX000", format!("catalog read: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog read", &e))?
         .ok_or_else(|| {
             err(
                 "42704",
@@ -114,14 +114,13 @@ pub async fn drop_continuous_aggregate(
             sync_dispatch::SystemTask::new(
                 sync_dispatch::SystemReason::CatalogMaintenance,
                 tenant_id,
-                database_id,
-                &stored.source,
+                nodedb_types::CollectionKey::from_bare(database_id, &stored.source),
                 plan,
             ),
             Duration::from_secs(5),
         )
         .await
-        .map_err(|e| err("XX000", format!("dispatch failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("dispatch failed", &e))?;
     }
 
     tracing::info!(name, "continuous aggregate dropped");

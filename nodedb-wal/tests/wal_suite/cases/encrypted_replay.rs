@@ -9,6 +9,7 @@
 //! and the free `replay_*` drivers) rather than decrypting by hand, so they pin
 //! the behaviour where consumers actually observe it.
 
+use nodedb_types::{CollectionKey, DatabaseId};
 use nodedb_wal::crypto::{KeyRing, WalEncryptionKey};
 use nodedb_wal::mmap_reader::replay_segments_mmap;
 use nodedb_wal::record::RecordType;
@@ -110,7 +111,10 @@ fn tombstones_are_extracted_from_an_encrypted_wal() {
 
     let set = extract_tombstones(&records)
         .expect("a tombstone written to an encrypted WAL must still be extractable");
-    assert_eq!(set.purge_lsn(0, 1, "users"), Some(42));
+    assert_eq!(
+        set.purge_lsn(CollectionKey::from_bare(DatabaseId::DEFAULT, "users"), 1),
+        Some(42)
+    );
 }
 
 #[test]

@@ -34,8 +34,7 @@ impl TestClusterNode {
 
         let request_id = RequestId::new(HARNESS_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
         let vshard_id = VShardId::new(nodedb_cluster::routing::vshard_for_collection(
-            DatabaseId::DEFAULT,
-            collection,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection),
         ));
         let request = Request {
             request_id,
@@ -107,8 +106,7 @@ impl TestClusterNode {
 
         let request_id = RequestId::new(HARNESS_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
         let vshard_id = VShardId::new(nodedb_cluster::routing::vshard_for_collection(
-            DatabaseId::DEFAULT,
-            collection,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection),
         ));
         let request = Request {
             request_id,

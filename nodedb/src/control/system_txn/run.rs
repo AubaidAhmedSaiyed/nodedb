@@ -5,11 +5,14 @@
 use std::sync::Arc;
 
 use crate::control::lease::QueryLeaseScope;
+use crate::control::local_dispatch;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::identity::{Permission, required_permission};
 use crate::control::server::dispatch_utils;
 use crate::control::server::shared::session::{
-    AbortReason, CommitOutcome, StagingGateError, commit, lifecycle, route_in_tx_write,
+    AbortReason, CommitOutcome, InTxnRoute, StagingGateError, commit, lifecycle, route_in_tx_write,
 };
+use crate::control::server::shared::write_admission::plan_requires_txn_buffering;
 use crate::control::state::SharedState;
 use crate::event::EventSource;
 use crate::types::TraceId;
@@ -38,9 +41,42 @@ pub enum SystemTxnError {
         source: crate::Error,
     },
 
-    /// COMMIT itself aborted. The transaction applied nothing.
+    /// COMMIT itself aborted. The transaction applied nothing. `code` is the
+    /// Data Plane's verdict when one decided the abort.
     #[error("system transaction aborted at commit: {detail}")]
-    Commit { detail: String },
+    Commit {
+        detail: String,
+        code: Option<Box<crate::bridge::envelope::ErrorCode>>,
+    },
+
+    /// COMMIT aborted on a dispatch or DDL-propose error. The transaction
+    /// applied nothing. `source` keeps its own class.
+    #[error("system transaction aborted at commit: {source}")]
+    CommitFailed {
+        #[source]
+        source: crate::Error,
+    },
+}
+
+impl From<SystemTxnError> for crate::Error {
+    fn from(error: SystemTxnError) -> Self {
+        match error {
+            SystemTxnError::Begin { source }
+            | SystemTxnError::Statement { source, .. }
+            | SystemTxnError::CommitFailed { source } => source,
+            SystemTxnError::Commit {
+                code: Some(code), ..
+            } => crate::Error::DataPlane(*code),
+            SystemTxnError::Commit { detail, code: None } => crate::Error::Internal { detail },
+        }
+    }
+}
+
+/// One planned statement of a system transaction, with the descriptor
+/// leases its plan was built against.
+pub struct SystemTxnStatement {
+    pub tasks: Vec<PhysicalTask>,
+    pub lease_scope: Arc<QueryLeaseScope>,
 }
 
 /// Run every task as one transaction: all of them apply, or none do.
@@ -59,14 +95,65 @@ pub async fn run_tasks_atomically(
     lease_scope: Arc<QueryLeaseScope>,
     event_source: EventSource,
 ) -> Result<(), SystemTxnError> {
+    run_statements_atomically(
+        state,
+        identity,
+        vec![SystemTxnStatement { tasks, lease_scope }],
+        event_source,
+    )
+    .await
+}
+
+/// Run every statement's tasks as one transaction: all of them apply, or
+/// none do. Each statement's leases stay on the tasks it buffered, so COMMIT
+/// re-checks every version any statement was planned against.
+///
+/// A task that is neither buffered nor a read, such as a data write the
+/// transaction cannot buffer or index DDL, applies at once and survives a
+/// rollback, so a statement carrying one is refused before BEGIN with
+/// [`crate::Error::NotInTransactionBlock`]. A read runs at once against the
+/// transaction's overlay, and its error fails the transaction.
+pub async fn run_statements_atomically(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    statements: Vec<SystemTxnStatement>,
+    event_source: EventSource,
+) -> Result<(), SystemTxnError> {
+    let total: usize = statements
+        .iter()
+        .map(|statement| statement.tasks.len())
+        .sum();
+    if let Some((index, task)) = statements
+        .iter()
+        .flat_map(|statement| statement.tasks.iter())
+        .enumerate()
+        .find(|(_, task)| !runs_in_a_system_transaction(&task.plan))
+    {
+        return Err(SystemTxnError::Statement {
+            index,
+            total,
+            source: crate::Error::NotInTransactionBlock {
+                statement: match task.plan.collection() {
+                    Some(collection) => format!("a non-transactional write to '{collection}'"),
+                    None => "a non-transactional write".to_owned(),
+                },
+            },
+        });
+    }
     let scope = SystemTxnScope::begin(state).map_err(|source| SystemTxnError::Begin { source })?;
-    let total = tasks.len();
     let dp = SystemTxnDataPlane {
         state,
         event_source,
     };
+    let tasks = statements.into_iter().flat_map(|statement| {
+        let lease_scope = statement.lease_scope;
+        statement
+            .tasks
+            .into_iter()
+            .map(move |task| (task, Arc::clone(&lease_scope)))
+    });
 
-    for (index, task) in tasks.into_iter().enumerate() {
+    for (index, (task, lease_scope)) in tasks.enumerate() {
         let buffered_before = scope.sessions().buffered_task_count(scope.session_id());
         let routed = route_in_tx_write(
             state,
@@ -77,8 +164,19 @@ pub async fn run_tasks_atomically(
         )
         .await;
 
-        if let Err(error) = routed {
-            let source = staging_error(error);
+        let read = match routed {
+            Ok(InTxnRoute::Read(task)) => dispatch_read(state, *task).await.err(),
+            // Refused before BEGIN by `runs_in_a_system_transaction`: a write
+            // the transaction cannot buffer applies at once and survives a
+            // rollback.
+            Ok(InTxnRoute::Autocommit(_)) => Some(crate::Error::Internal {
+                detail: "a write a system transaction cannot buffer reached its staging gate"
+                    .into(),
+            }),
+            Ok(InTxnRoute::Buffered | InTxnRoute::Staged(_)) => None,
+            Err(error) => Some(staging_error(error)),
+        };
+        if let Some(source) = read {
             lifecycle::run_rollback(scope.sessions(), scope.session_id(), identity, state, &dp)
                 .await;
             return Err(SystemTxnError::Statement {
@@ -113,9 +211,27 @@ pub async fn run_tasks_atomically(
 
     match commit::run_commit(scope.sessions(), scope.session_id(), identity, state, &dp).await {
         CommitOutcome::Committed => Ok(()),
-        CommitOutcome::Aborted { reason } => Err(SystemTxnError::Commit {
+        CommitOutcome::Aborted { reason } => Err(commit_abort_error(reason)),
+    }
+}
+
+/// The error a commit abort answers with. A dispatch or DDL-propose error
+/// keeps its own class. Every other abort carries its Data-Plane verdict
+/// when one decided it.
+fn commit_abort_error(reason: AbortReason) -> SystemTxnError {
+    match reason {
+        AbortReason::Dispatch(source) | AbortReason::DdlPropose(source) => {
+            SystemTxnError::CommitFailed { source }
+        }
+        reason @ (AbortReason::Serialization
+        | AbortReason::NoTransaction
+        | AbortReason::BatchRejected { .. }
+        | AbortReason::CalvinCancelled
+        | AbortReason::CalvinTimeout
+        | AbortReason::SchemaChanged { .. }) => SystemTxnError::Commit {
             detail: describe(&reason),
-        }),
+            code: abort_code(&reason).map(Box::new),
+        },
     }
 }
 
@@ -137,9 +253,37 @@ async fn dispatch_staged(
             txn_id: task.txn_id,
             wal_lsn: None,
             resolved_now_ms: None,
+            minted: None,
         },
     )
     .await
+}
+
+/// Whether a task can run inside a system transaction: it is buffered for
+/// COMMIT, or it only reads.
+fn runs_in_a_system_transaction(plan: &nodedb_physical::physical_plan::PhysicalPlan) -> bool {
+    plan_requires_txn_buffering(plan)
+        || matches!(
+            required_permission(plan),
+            Permission::Read | Permission::Monitor | Permission::Execute
+        )
+}
+
+/// Run one read of the transaction against its overlay. The rows are not
+/// kept: a system transaction answers no rows. Its error fails the
+/// transaction.
+async fn dispatch_read(state: &SharedState, task: PhysicalTask) -> crate::Result<()> {
+    let response = dispatch_utils::dispatch_to_data_plane_with_txn(
+        state,
+        task.tenant_id,
+        task.database_id,
+        task.vshard_id,
+        task.plan,
+        TraceId::ZERO,
+        task.txn_id,
+    )
+    .await?;
+    local_dispatch::reject_data_plane_error(&response)
 }
 
 /// Flatten a staging-gate refusal into the crate error type.
@@ -152,6 +296,23 @@ fn staging_error(error: StagingGateError) -> crate::Error {
                 detail: "a staged write was rejected without an error code".into(),
             },
         },
+    }
+}
+
+/// The Data-Plane verdict a commit abort carries, so a caller surfaces the
+/// same class a client COMMIT would.
+fn abort_code(reason: &AbortReason) -> Option<crate::bridge::envelope::ErrorCode> {
+    match reason {
+        AbortReason::BatchRejected { code } => code.clone(),
+        AbortReason::Serialization | AbortReason::SchemaChanged { .. } => {
+            Some(crate::bridge::envelope::ErrorCode::ConflictRetry)
+        }
+        // The cross-shard coordinator ran out of time or was cancelled at
+        // its deadline: the deadline class, `57014`.
+        AbortReason::CalvinCancelled | AbortReason::CalvinTimeout => {
+            Some(crate::bridge::envelope::ErrorCode::DeadlineExceeded)
+        }
+        AbortReason::NoTransaction | AbortReason::Dispatch(_) | AbortReason::DdlPropose(_) => None,
     }
 }
 

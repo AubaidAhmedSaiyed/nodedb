@@ -46,7 +46,7 @@ use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
 
 use crate::bridge::envelope::{ErrorCode, Priority, Request, Status};
 use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
-use crate::control::server::dispatch_utils::{
+use crate::control::local_dispatch::{
     DispatchCollectError, collect_bounded_response, reject_data_plane_error,
 };
 use crate::control::state::SharedState;

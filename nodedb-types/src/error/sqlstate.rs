@@ -49,6 +49,11 @@ pub const CANNOT_DROP_DEFAULT_DATABASE: AmbiguousSqlstate = AmbiguousSqlstate("0
 
 // ── Class 22 — Data Exception ────────────────────────────────────────────────
 
+/// `22000` — `data_exception` (a function received a value it cannot compute
+/// on: a vector of the wrong dimension, an argument of the wrong shape, a
+/// malformed JSONPath)
+pub const DATA_EXCEPTION: &str = "22000";
+
 /// `22003` — `numeric_value_out_of_range`
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
@@ -60,6 +65,10 @@ pub const DIVISION_BY_ZERO: &str = "22012";
 /// negative, fractional, non-numeric, or wider than `usize`)
 pub const INVALID_LIMIT_VALUE: &str = "2201W";
 
+/// `22P02` — `invalid_text_representation` (stored text that does not
+/// parse as the number an operation reads, e.g. `INCR` on `"abc"`)
+pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+
 /// `22023` — `invalid_parameter_value` (a `SET` value the parameter's own
 /// grammar refuses, e.g. `SET statement_timeout = 'later'`)
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
@@ -68,6 +77,10 @@ pub const INVALID_PARAMETER_VALUE: &str = "22023";
 
 /// `23000` — `integrity_constraint_violation` (generic)
 pub const INTEGRITY_CONSTRAINT_VIOLATION: &str = "23000";
+
+/// `428C9` — `generated_always` (a write names a generated column; its
+/// value is computed from other columns)
+pub const GENERATED_ALWAYS: &str = "428C9";
 
 /// `23502` — `not_null_violation`
 pub const NOT_NULL_VIOLATION: &str = "23502";
@@ -111,8 +124,34 @@ pub const PERIOD_LOCK_MISCONFIGURED: &str = "23609";
 
 // ── Class 28 — Invalid Authorization Specification ───────────────────────────
 
-/// `28000` — `invalid_authorization_specification` (no valid credentials)
+/// `28000` — `invalid_authorization_specification`: no valid credentials.
+/// The default meaning, a credential failure. Its code is
+/// `AUTHENTICATION_FAILED`, the code `INVALID_PASSWORD` has too, so a client
+/// cannot tell a wrong password from an unknown user.
 pub const INVALID_AUTHORIZATION: &str = "28000";
+
+/// `28P01` — `invalid_password`: a credential failure. Same code as
+/// `INVALID_AUTHORIZATION`.
+pub const INVALID_PASSWORD: &str = "28P01";
+
+/// `28000` — the session's bearer token expired, and the client must
+/// re-authenticate. Its code is `AUTH_EXPIRED`. Ambiguous with the
+/// credential-failure meaning of `28000` — see [`AmbiguousSqlstate`].
+pub const AUTH_TOKEN_EXPIRED: AmbiguousSqlstate = AmbiguousSqlstate("28000");
+
+/// `active_sql_transaction`: the statement cannot run inside a transaction
+/// block.
+pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
+
+/// `25006` — `read_only_sql_transaction`: a write targeted a read-only
+/// database, such as an unpromoted mirror.
+pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
+
+// ── Class 2B — Dependent Privilege Descriptors Still Exist ───────────────────
+
+/// `2BP01` — `dependent_objects_still_exist`: a DROP names an object that
+/// other objects depend on.
+pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
 
 // ── Class 3D — Invalid Catalog Name ──────────────────────────────────────────
 
@@ -139,6 +178,9 @@ pub const SYNTAX_ERROR: &str = "42601";
 /// `42704` — `undefined_object` (a runtime parameter the server does not
 /// carry, e.g. `SET nonsense = 1` or `SHOW nonsense`)
 pub const UNDEFINED_OBJECT: &str = "42704";
+
+/// `42710` — `duplicate_object`: a named catalog object already exists.
+pub const DUPLICATE_OBJECT: &str = "42710";
 
 /// `42703` — `undefined_column` (a column reference that resolves against no
 /// relation in scope)
@@ -192,8 +234,10 @@ pub const LOCK_NOT_AVAILABLE: &str = "55P03";
 
 // ── Class 57 — Operator Intervention ─────────────────────────────────────────
 
-/// `57014` — `query_canceled` (deadline exceeded)
-pub const QUERY_CANCELED: &str = "57014";
+/// `57014` — `query_canceled`: a deadline passed, or a user or statement
+/// cancelled the query. No meaning is the default, so a bare `57014` never
+/// classifies as the retriable deadline code — see [`AmbiguousSqlstate`].
+pub const QUERY_CANCELED: AmbiguousSqlstate = AmbiguousSqlstate("57014");
 
 /// `57P03` — `cannot_connect_now` (collection is draining)
 pub const CANNOT_CONNECT_NOW: &str = "57P03";
@@ -285,14 +329,15 @@ pub const BACKUP_TENANT_MISMATCH: &str = "22023";
 /// `28000` — NodeDB extension: the backup envelope did not decrypt under this
 /// server's configured `backup_encryption` key. Aliased to
 /// `invalid_authorization_specification`, the same class used for any other
-/// presented-key mismatch.
-pub const BACKUP_KEY_MISMATCH: &str = "28000";
+/// presented-key mismatch. Ambiguous with the credential-failure meaning of
+/// `28000` — see [`AmbiguousSqlstate`].
+pub const BACKUP_KEY_MISMATCH: AmbiguousSqlstate = AmbiguousSqlstate("28000");
 
 // ── Move Tenant DDL (Class 55 / 57) ─────────────────────────────────────────
 
 /// `57014` — `query_canceled`: drain phase timed out; client should re-try after
 /// ensuring the tenant has no active connections on the source database.
-/// Ambiguous with `QUERY_CANCELED` (deadline exceeded) — see
+/// Ambiguous with the other meanings of `QUERY_CANCELED` — see
 /// [`AmbiguousSqlstate`].
 pub const MOVE_TENANT_DRAIN_TIMEOUT: AmbiguousSqlstate = AmbiguousSqlstate("57014");
 
@@ -322,6 +367,13 @@ pub const MOVE_TENANT_ALREADY_AT_TARGET: AmbiguousSqlstate = AmbiguousSqlstate("
 /// reach the target core (bridge closed, core panic, timeout).
 pub const CONNECTION_FAILURE: &str = "08006";
 
+/// `08004` — `sqlserver_rejected_establishment_of_sqlconnection`: the server
+/// refused to establish a sync shape subscription.
+pub const SERVER_REJECTED_ESTABLISHMENT: &str = "08004";
+
+/// `08P01` — `protocol_violation`: the protocol handshake failed.
+pub const PROTOCOL_VIOLATION: &str = "08P01";
+
 // ── Class 58 — System Error ──────────────────────────────────────────────────
 
 /// `58030` — `io_error`: a WAL append or filesystem operation failed.
@@ -343,10 +395,13 @@ mod tests {
             WARNING,
             NO_DATA,
             FEATURE_NOT_SUPPORTED,
+            DATA_EXCEPTION,
             NUMERIC_VALUE_OUT_OF_RANGE,
             DIVISION_BY_ZERO,
             INVALID_LIMIT_VALUE,
+            INVALID_TEXT_REPRESENTATION,
             INTEGRITY_CONSTRAINT_VIOLATION,
+            GENERATED_ALWAYS,
             NOT_NULL_VIOLATION,
             FOREIGN_KEY_VIOLATION,
             UNIQUE_VIOLATION,
@@ -361,6 +416,10 @@ mod tests {
             LEGAL_HOLD_ACTIVE,
             TYPE_GUARD_VIOLATION,
             INVALID_AUTHORIZATION,
+            INVALID_PASSWORD,
+            ACTIVE_SQL_TRANSACTION,
+            READ_ONLY_SQL_TRANSACTION,
+            DEPENDENT_OBJECTS_STILL_EXIST,
             SERIALIZATION_FAILURE,
             INSUFFICIENT_PRIVILEGE,
             SYNTAX_ERROR,
@@ -378,7 +437,6 @@ mod tests {
             STATEMENT_TOO_COMPLEX,
             OBJECT_NOT_IN_PREREQUISITE_STATE,
             LOCK_NOT_AVAILABLE,
-            QUERY_CANCELED,
             CANNOT_CONNECT_NOW,
             DATABASE_DROPPED,
             INTERNAL_ERROR,
@@ -389,6 +447,9 @@ mod tests {
             CLONE_PREDATES_QUERY_TIME,
             STALE_READ_NOT_LEADER,
             CONNECTION_FAILURE,
+            SERVER_REJECTED_ESTABLISHMENT,
+            PROTOCOL_VIOLATION,
+            DUPLICATE_OBJECT,
             IO_ERROR,
         ];
         for code in &codes {
@@ -400,6 +461,9 @@ mod tests {
         }
 
         let ambiguous = [
+            QUERY_CANCELED,
+            AUTH_TOKEN_EXPIRED,
+            BACKUP_KEY_MISMATCH,
             CANNOT_DROP_DEFAULT_DATABASE,
             CANNOT_CLONE_MIRROR,
             CLONE_DEPENDENCY,
@@ -426,7 +490,7 @@ mod tests {
         assert_eq!(AMBIGUOUS_COLUMN, "42702");
         assert_eq!(UNDEFINED_TABLE, "42P01");
         assert_eq!(INSUFFICIENT_PRIVILEGE, "42501");
-        assert_eq!(QUERY_CANCELED, "57014");
+        assert_eq!(QUERY_CANCELED.0, "57014");
         assert_eq!(INTERNAL_ERROR, "XX000");
         assert_eq!(FEATURE_NOT_SUPPORTED, "0A000");
     }

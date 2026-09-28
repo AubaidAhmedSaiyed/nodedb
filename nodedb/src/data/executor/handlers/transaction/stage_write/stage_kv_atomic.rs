@@ -8,7 +8,7 @@
 //! `InsertOnConflictUpdate` handler: resolve the current value under
 //! BASE ∪ OVERLAY via [`CoreLoop::resolve_kv_current`], compute the new value
 //! with the SAME pure function the autocommit engine methods call
-//! (`nodedb::engine::kv::atomic_compute`, see `engine_atomic_compute.rs`) so
+//! (`nodedb_physical::kv_atomic::compute`) so
 //! a staged value and its COMMIT-time durable replay never diverge, then
 //! stage the new bytes via [`CoreLoop::stage_put_capped`].
 //!
@@ -36,17 +36,18 @@
 //! realistic transaction, and never persisted (COMMIT replay uses the real
 //! `KvEngine` atomic path, which ignores the overlay's surrogate entirely).
 
-use nodedb_physical::physical_plan::KvOp;
+use nodedb_physical::kv_atomic::compute as atomic_compute;
+use nodedb_physical::physical_plan::{KvCounterShape, KvOp};
 use nodedb_types::Surrogate;
 
 use super::context::StageCtx;
 use super::stage_kv::kv_row_identity;
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::kv::atomic::incr_float_reply;
 use crate::data::executor::handlers::transaction::overlay::StagedTtl;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::kv::{AtomicError, atomic_compute, current_ms};
 use crate::types::TxnId;
 
 /// FNV-1a 32-bit hash, used only to derive a stable, collection-local overlay
@@ -85,10 +86,11 @@ impl CoreLoop {
                 // overlay keys its own slots (see module doc) and ignores it.
                 surrogate: _,
                 rls_write_check,
+                shape,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection.as_str(), key);
                 self.stage_kv_ttl_side_effect(&ctx, *ttl_ms);
-                self.stage_kv_incr(&ctx, key, *delta, rls_write_check)
+                self.stage_kv_incr(&ctx, key, *delta, shape, rls_write_check)
             }
             KvOp::IncrFloat {
                 collection,
@@ -96,9 +98,10 @@ impl CoreLoop {
                 delta,
                 surrogate: _,
                 rls_write_check,
+                shape,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection.as_str(), key);
-                self.stage_kv_incr_float(&ctx, key, *delta, rls_write_check)
+                self.stage_kv_incr_float(&ctx, key, delta, shape, rls_write_check)
             }
             KvOp::Cas {
                 collection,
@@ -188,10 +191,11 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         key: &[u8],
         delta: i64,
+        shape: &KvCounterShape,
         rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
-        match atomic_compute::incr(current.as_deref(), delta) {
+        match atomic_compute::incr(current.as_deref(), delta, shape) {
             Ok((new_i64, new_bytes)) => {
                 if let Err(e) = self.stage_admit_kv_image(ctx, &new_bytes, rls_write_check) {
                     return self.response_error(ctx.task, e);
@@ -201,7 +205,7 @@ impl CoreLoop {
                 }
                 self.kv_atomic_json_response(ctx.task, &serde_json::json!({ "value": new_i64 }))
             }
-            Err(e) => self.kv_atomic_error(ctx.task, ctx.collection, e),
+            Err(e) => self.response_atomic_error(ctx.task, ctx.collection, e.into()),
         }
     }
 
@@ -209,21 +213,23 @@ impl CoreLoop {
         &mut self,
         ctx: &StageCtx<'_>,
         key: &[u8],
-        delta: f64,
+        delta: &str,
+        shape: &KvCounterShape,
         rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
-        match atomic_compute::incr_float(current.as_deref(), delta) {
+        match atomic_compute::incr_float(current.as_deref(), delta, shape) {
             Ok((new_f64, new_bytes)) => {
                 if let Err(e) = self.stage_admit_kv_image(ctx, &new_bytes, rls_write_check) {
                     return self.response_error(ctx.task, e);
                 }
+                let reply = incr_float_reply(new_f64, &new_bytes);
                 if let Err(e) = self.stage_put_capped(ctx, new_bytes) {
                     return self.response_error(ctx.task, e);
                 }
-                self.kv_atomic_json_response(ctx.task, &serde_json::json!({ "value": new_f64 }))
+                self.kv_atomic_json_response(ctx.task, &reply)
             }
-            Err(e) => self.kv_atomic_error(ctx.task, ctx.collection, e),
+            Err(e) => self.response_atomic_error(ctx.task, ctx.collection, e.into()),
         }
     }
 
@@ -260,7 +266,11 @@ impl CoreLoop {
         rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
-        let (matches, write_bytes) = atomic_compute::cas(current.as_deref(), expected, new_value);
+        let (matches, write_bytes) =
+            match atomic_compute::cas(current.as_deref(), expected, new_value) {
+                Ok(outcome) => outcome,
+                Err(e) => return self.response_atomic_error(ctx.task, ctx.collection, e.into()),
+            };
 
         if matches {
             if let Err(e) = self.stage_admit_kv_image(ctx, &write_bytes, rls_write_check) {
@@ -294,7 +304,10 @@ impl CoreLoop {
         rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
-        let write_bytes = atomic_compute::getset(current.as_deref(), new_value);
+        let write_bytes = match atomic_compute::getset(current.as_deref(), new_value) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.response_atomic_error(ctx.task, ctx.collection, e.into()),
+        };
         if let Err(e) = self.stage_admit_kv_image(ctx, &write_bytes, rls_write_check) {
             return self.response_error(ctx.task, e);
         }
@@ -350,10 +363,7 @@ impl CoreLoop {
         if ttl_ms == 0 {
             return;
         }
-        let now_ms: u64 = self
-            .epoch_system_ms
-            .map(|ms| ms as u64)
-            .unwrap_or_else(current_ms);
+        let now_ms = self.kv_read_now_ms();
         self.txn_overlay_mut(ctx.txn_id).set_ttl(
             ctx.coll_key.clone(),
             ctx.surrogate.0,
@@ -368,32 +378,6 @@ impl CoreLoop {
         match response_codec::encode_json_as_msgpack(value) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, e),
-        }
-    }
-
-    fn kv_atomic_error(&self, task: &ExecutionTask, collection: &str, e: AtomicError) -> Response {
-        match e {
-            AtomicError::TypeMismatch { detail } => self.response_error(
-                task,
-                ErrorCode::TypeMismatch {
-                    collection: collection.to_string(),
-                    detail,
-                },
-            ),
-            AtomicError::Overflow => self.response_error(
-                task,
-                ErrorCode::OverflowError {
-                    collection: collection.to_string(),
-                },
-            ),
-            AtomicError::Encode { detail } => {
-                self.response_error(task, ErrorCode::Internal { detail })
-            }
-            // Staging computes its image through `atomic_compute` and decides
-            // the policy itself, so the engine's own admission gate never
-            // reaches this path — the arm exists so a new engine-side refusal
-            // cannot be silently dropped here.
-            AtomicError::Rejected(error) => self.response_error(task, *error),
         }
     }
 }

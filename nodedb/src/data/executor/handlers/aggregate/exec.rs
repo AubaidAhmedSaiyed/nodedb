@@ -286,28 +286,28 @@ impl CoreLoop {
                         }
                     };
                     if !having_predicates.is_empty() {
-                        // `Vec::retain`'s closure must return `bool`, so a
-                        // division/modulo-by-zero in a HAVING predicate is
-                        // captured via this `Cell` side-channel and checked
-                        // once the retain finishes — HAVING is WHERE-shaped,
-                        // so it gets the full error treatment.
-                        let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-                            std::cell::Cell::new(None);
+                        // `Vec::retain`'s closure must return `bool`, so an
+                        // evaluation error in a HAVING predicate is captured
+                        // via this side-channel and checked once the retain
+                        // finishes. HAVING is WHERE-shaped, so it gets the
+                        // full error treatment.
+                        let predicate_err: std::cell::RefCell<Option<nodedb_query::EvalError>> =
+                            std::cell::RefCell::new(None);
                         agg_result.rows.retain(|row| {
-                            if predicate_err.get().is_some() {
+                            if predicate_err.borrow().is_some() {
                                 return true;
                             }
                             let mp = nodedb_types::json_to_msgpack_or_empty(row);
                             match ScanFilter::all_match_binary(&having_predicates, &mp) {
                                 Ok(keep) => keep,
                                 Err(e) => {
-                                    predicate_err.set(Some(e));
+                                    predicate_err.replace(Some(e));
                                     true
                                 }
                             }
                         });
-                        if predicate_err.take().is_some() {
-                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        if let Some(e) = predicate_err.take() {
+                            return self.response_error(task, ErrorCode::from(e));
                         }
                     }
                 }

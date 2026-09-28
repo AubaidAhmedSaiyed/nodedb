@@ -158,17 +158,15 @@ pub fn read_parquet_filtered(
                 detail: format!("read batches: {e}"),
             })?;
 
-    // Check the side-channel AFTER the reader finishes: a division/modulo-
-    // by-zero row was already excluded from every batch's mask above (never
-    // surfaced as a mis-filtered result), so `reader.collect()` succeeding
-    // does not mean the read was clean — it means the predicate closure
-    // never got a chance to return an `Err` at all. This is the typed
-    // `crate::Error::DivisionByZero` the pre-fix `ArrowError` conversion
-    // above lost.
+    // Check the side-channel AFTER the reader finishes: a row whose
+    // predicate raised an evaluation error was already excluded from every
+    // batch's mask above (never surfaced as a mis-filtered result), so
+    // `reader.collect()` succeeding does not mean the read was clean. The
+    // recorded error is returned as its own typed `crate::Error`.
     if let Ok(mut slot) = predicate_err.lock()
-        && slot.take().is_some()
+        && let Some(e) = slot.take()
     {
-        return Err(crate::Error::DivisionByZero);
+        return Err(crate::Error::from(e));
     }
 
     Ok(batches)

@@ -25,3 +25,6 @@ pub fn sequencer_backpressure_drop(
     _drops: &[(u32, &'static str)],
 ) {
 }
+
+#[inline]
+pub fn sequencer_participants_underivable(_epoch: u64, _raft_index: u64, _detail: &str) {}

@@ -13,6 +13,15 @@ use crate::control::server::response_shape::types::{
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::ddl::{DdlError, DdlResult};
 
+/// The SQLSTATE, message and numeric code a native error frame carries for
+/// one Control-Plane error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeErrorFields {
+    pub(crate) sqlstate: &'static str,
+    pub(crate) message: String,
+    pub(crate) code: nodedb_types::error::ErrorCode,
+}
+
 /// Convert a Control-Plane error into a native error frame.
 ///
 /// The stable numeric NodeDB code travels alongside the SQLSTATE, taken from
@@ -24,7 +33,14 @@ use crate::control::server::shared::ddl::{DdlError, DdlResult};
 /// The SQLSTATE is chosen here because it is a protocol-level rendering, while
 /// the numeric code is the classification itself.
 pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
-    let (code, message) = match e {
+    let fields = native_error_fields(e);
+    NativeResponse::error_with_code(seq, fields.sqlstate, fields.message, fields.code.0)
+}
+
+/// The fields [`error_to_native`] puts on the frame. The one native mapping:
+/// every native rendering of an `Error` reads it.
+pub(crate) fn native_error_fields(e: &crate::Error) -> NativeErrorFields {
+    let (sqlstate, message) = match e {
         crate::Error::BadRequest { detail } => ("42601", detail.clone()),
         crate::Error::RejectedAuthz { resource, .. } => ("42501", resource.clone()),
         crate::Error::RateExceeded { .. } => (
@@ -35,11 +51,12 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
         crate::Error::CollectionNotFound { collection, .. } => {
             ("42P01", format!("collection '{collection}' not found"))
         }
-        // Same SQLSTATE as the "not authenticated" responses in
-        // `session::request`: the client's stored bearer token expired
-        // mid-connection and it must re-authenticate with a fresh Auth frame.
+        // The SQLSTATE pgwire renders, and the one the "not authenticated"
+        // responses in `session::request` carry. The client's stored bearer
+        // token expired mid-connection and it must re-authenticate with a
+        // fresh Auth frame. The message names the native Auth frame.
         crate::Error::SessionTokenExpired => (
-            "28000",
+            nodedb_types::error::sqlstate::AUTH_TOKEN_EXPIRED.0,
             "OIDC bearer token expired; re-authenticate with a fresh Auth request".into(),
         ),
         // A cross-shard Calvin OCC abort is a serialization failure (40001) —
@@ -67,10 +84,36 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
             crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(e.code()),
             e.message().to_string(),
         ),
-        other => ("XX000", format!("{other}")),
+        // Every other variant takes the protocol-neutral SQLSTATE pgwire
+        // renders for it. `XX000` is only for a variant that table leaves
+        // unclassified.
+        other => {
+            let (_severity, sqlstate, message) =
+                crate::control::server::pgwire::types::error_map::error_to_sqlstate(other);
+            (sqlstate, message)
+        }
     };
-    let ndb_code = crate::error_classify::classify(e).code().0;
-    NativeResponse::error_with_code(seq, code, message, ndb_code)
+    NativeErrorFields {
+        sqlstate,
+        message,
+        code: crate::error_classify::classify(e).code(),
+    }
+}
+
+/// Convert a Control-Plane error into a native error frame with `context`
+/// before its message. The SQLSTATE and code stay the error's own.
+pub(crate) fn error_to_native_in_context(
+    seq: u64,
+    context: &str,
+    e: &crate::Error,
+) -> NativeResponse {
+    let fields = native_error_fields(e);
+    NativeResponse::error_with_code(
+        seq,
+        fields.sqlstate,
+        format!("{context}: {}", fields.message),
+        fields.code.0,
+    )
 }
 
 /// Convert a Control-Plane error into a native error frame under a SQLSTATE
@@ -99,18 +142,26 @@ pub(crate) fn error_to_native_with_sqlstate(
 /// Convert a `NodeDbError` produced while shaping a response into a
 /// NativeResponse error frame.
 ///
-/// The numeric code travels alongside the SQLSTATE: the error is already
-/// classified here, and rendering only `XX000` would make the client rebuild
-/// it as a generic internal failure.
+/// The numeric code travels alongside the SQLSTATE its code maps to, the same
+/// SQLSTATE pgwire's `shape_error_to_pg` renders.
 pub(crate) fn shape_error_to_native(seq: u64, e: &nodedb_types::NodeDbError) -> NativeResponse {
-    NativeResponse::error_with_code(seq, "XX000", e.message().to_string(), e.code().0)
+    NativeResponse::error_with_code(
+        seq,
+        crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(e.code()),
+        e.message().to_string(),
+        e.code().0,
+    )
 }
 
 /// Render a statement-tag fold refusal as a native error frame. Two tasks of
 /// one statement disagreeing on their verb is a planner bug, so it is an
 /// internal error, the same class pgwire's `dml_fold_error_to_pg` renders.
 pub(crate) fn dml_fold_error_to_native(seq: u64, e: &DmlFoldError) -> NativeResponse {
-    sqlstate_error(seq, "XX000", e.to_string())
+    sqlstate_error(
+        seq,
+        nodedb_types::error::sqlstate::INTERNAL_ERROR,
+        e.to_string(),
+    )
 }
 
 /// Render an error [`Response`] from the Data Plane as a native error frame.
@@ -143,11 +194,16 @@ pub(crate) fn error_code_to_native(
     code: Option<&crate::bridge::envelope::ErrorCode>,
 ) -> NativeResponse {
     let Some(code) = code else {
-        return sqlstate_error(seq, "XX000", "unknown data plane error");
+        return sqlstate_error(
+            seq,
+            nodedb_types::error::sqlstate::INTERNAL_ERROR,
+            "unknown data plane error",
+        );
     };
     let (_, sqlstate, message) = error_code_to_sqlstate(code);
     let public = nodedb_types::NodeDbError::from(crate::Error::DataPlane(code.clone()));
     NativeResponse::error_with_code(seq, sqlstate, message, public.code().0)
+        .with_error_details(public.details().clone())
 }
 
 /// Encode a protocol-neutral DDL dispatch result into a single
@@ -174,7 +230,21 @@ pub(crate) fn ddl_result_to_native(
             sqlstate,
             code,
             message,
-        }) => NativeResponse::error_with_code(seq, sqlstate, message, code.0),
+            details,
+            cause,
+        }) => {
+            let frame = NativeResponse::error_with_code(seq, sqlstate, message, code.0);
+            let frame = match details {
+                Some(details) => frame.with_error_details(*details),
+                None => frame,
+            };
+            match cause {
+                Some(cause) => frame.with_error_cause(
+                    nodedb_types::protocol::ErrorCausePayload::from(cause.as_ref()),
+                ),
+                None => frame,
+            }
+        }
         // Unknown pgwire response variants are dropped during translation, so
         // the first element is the first meaningful result — the bridge
         // returns on the first known variant.
@@ -352,6 +422,42 @@ mod tests {
         assert_eq!(error.code, "28000");
     }
 
+    /// A shaping error answers the SQLSTATE its code maps to, the one pgwire
+    /// renders, never a bare internal error.
+    #[test]
+    fn a_shaping_error_keeps_its_sqlstate() {
+        let shaped = shape_error_to_native(1, &nodedb_types::NodeDbError::division_by_zero());
+        let error = shaped.error.expect("error responses carry a payload");
+        assert_eq!(error.code, "22012");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::DIVISION_BY_ZERO.0
+        );
+    }
+
+    /// A typed error behind a context prefix keeps its SQLSTATE and code.
+    #[test]
+    fn an_error_in_context_keeps_its_class() {
+        let missing = crate::Error::CollectionNotFound {
+            tenant_id: crate::types::TenantId::new(1),
+            collection: "orders".into(),
+        };
+        let response = error_to_native_in_context(1, "database catalog lookup failed", &missing);
+        let error = response.error.expect("error responses carry a payload");
+        assert_eq!(error.code, "42P01");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND.0
+        );
+        assert!(
+            error
+                .message
+                .starts_with("database catalog lookup failed: "),
+            "{}",
+            error.message
+        );
+    }
+
     /// One statement running out of time answers ONE SQLSTATE, whichever half
     /// of the race reported it: the Control-Plane timer, which raises
     /// `DeadlineExceeded` directly, or a shard refusing an already-expired
@@ -458,6 +564,32 @@ mod tests {
         );
     }
 
+    /// A phase failure keeps its own code, and the typed Data-Plane cause
+    /// rides beside it with its own code, so a client sees both.
+    #[test]
+    fn ddl_phase_failure_carries_its_typed_cause() {
+        let phase = nodedb_types::NodeDbError::move_tenant_snapshot_failed("7", "dispatch")
+            .with_cause(nodedb_types::NodeDbError::division_by_zero());
+        let response = ddl_result_to_native(
+            1,
+            Err(DdlError::move_tenant_snapshot_failed(phase.message()).with_cause_of(&phase)),
+        );
+
+        let bytes = zerompk::to_msgpack_vec(&response).expect("encode native response");
+        let decoded: NativeResponse =
+            zerompk::from_msgpack(&bytes).expect("decode native response");
+        let error = decoded.error.expect("error responses carry a payload");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::MOVE_TENANT_SNAPSHOT_FAILED.0
+        );
+        let cause = error.cause.expect("the typed cause survives the wire");
+        assert_eq!(
+            cause.to_error().code(),
+            nodedb_types::error::ErrorCode::DIVISION_BY_ZERO
+        );
+    }
+
     /// A count-bearing DDL-router status (the `{ ... }` document INSERT) is
     /// a DML answer: `(rows_affected, command)` exactly as the dispatch
     /// loop's folded tag reports, never a status row with no verb.
@@ -532,11 +664,10 @@ mod tests {
         );
     }
 
-    /// The numeric code is populated for every variant, including the ones
-    /// whose SQLSTATE falls through to `XX000` — otherwise the fix would be a
-    /// per-variant special case rather than one classification.
+    /// A variant with no native arm takes the SQLSTATE pgwire renders for it,
+    /// and keeps its numeric code.
     #[test]
-    fn errors_without_a_dedicated_sqlstate_still_carry_a_code() {
+    fn errors_without_a_native_arm_take_the_pgwire_sqlstate() {
         let response = error_to_native(
             1,
             &crate::Error::PlanError {
@@ -547,11 +678,33 @@ mod tests {
         let error = response
             .error
             .expect("error responses must carry a payload");
-        assert_eq!(error.code, "XX000");
+        assert_eq!(error.code, nodedb_types::error::sqlstate::SYNTAX_ERROR);
         assert_eq!(
             error.ndb_code,
             nodedb_types::error::ErrorCode::PLAN_ERROR.0,
-            "an unmapped SQLSTATE must not also erase the numeric classification"
+            "the numeric classification must survive the SQLSTATE rendering"
+        );
+    }
+
+    /// A constraint refusal that crossed a node boundary keeps its SQLSTATE.
+    #[test]
+    fn a_rejected_constraint_keeps_its_sqlstate() {
+        let response = error_to_native(
+            1,
+            &crate::Error::RejectedConstraint {
+                collection: "c".to_owned(),
+                constraint: "unique".to_owned(),
+                detail: "duplicate key".to_owned(),
+            },
+        );
+
+        let error = response
+            .error
+            .expect("error responses must carry a payload");
+        assert_eq!(error.code, nodedb_types::error::sqlstate::UNIQUE_VIOLATION);
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::CONSTRAINT_VIOLATION.0
         );
     }
 }

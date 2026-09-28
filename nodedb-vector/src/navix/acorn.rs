@@ -17,6 +17,7 @@ mod inner {
     use roaring::RoaringBitmap;
 
     use crate::distance::distance;
+    use crate::error::{VectorError, check_dim};
     use crate::hnsw::graph::{Candidate, HnswIndex};
     use crate::navix::traversal::SearchResult;
 
@@ -43,26 +44,34 @@ mod inner {
     /// ACORN-1 filtered search.
     ///
     /// Uses static 2-hop expansion: when a 1-hop neighbor is not in `allowed`,
-    /// expand to its 2-hop neighbors unconditionally.
+    /// expand to its 2-hop neighbors unconditionally. A query without the
+    /// index dimension fails with [`VectorError::DimensionMismatch`].
     pub fn acorn_search(
         index: &HnswIndex,
         query: &[f32],
         options: &AcornSearchOptions,
         metric: nodedb_types::vector_distance::DistanceMetric,
-    ) -> Vec<SearchResult> {
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        check_dim(index.dim(), query.len())?;
         if index.is_empty() || options.allowed.is_empty() || options.k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let total = index.len();
         let global_sel = options.allowed.len() as f64 / total as f64;
 
         if global_sel < options.brute_force_threshold {
-            return brute_force_on_allowed(index, query, options.k, &options.allowed, metric);
+            return Ok(brute_force_on_allowed(
+                index,
+                query,
+                options.k,
+                &options.allowed,
+                metric,
+            ));
         }
 
         let Some(ep) = index.entry_point() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         // Phase 1: greedy descent (unfiltered) to find best layer-0 entry.
@@ -78,14 +87,14 @@ mod inner {
         let ef = options.ef_search.max(options.k);
         let results = acorn_search_layer_0(index, query, current_ep, ef, &options.allowed, metric);
 
-        results
+        Ok(results
             .into_iter()
             .take(options.k)
             .map(|c| SearchResult {
                 id: c.id,
                 distance: c.dist,
             })
-            .collect()
+            .collect())
     }
 
     /// Minimal greedy single-layer descent used for Phase-1 layer navigation.
@@ -298,7 +307,7 @@ mod inner {
                 brute_force_threshold: 0.001,
             };
 
-            let res = acorn_search(&idx, &query, &opts, DistanceMetric::L2);
+            let res = acorn_search(&idx, &query, &opts, DistanceMetric::L2).unwrap();
             assert!(!res.is_empty());
             for r in &res {
                 assert!(
@@ -307,6 +316,24 @@ mod inner {
                     r.id
                 );
             }
+        }
+
+        #[test]
+        fn acorn_wrong_dimension_query_is_a_typed_error() {
+            let idx = build_index(20);
+            let opts = AcornSearchOptions {
+                k: 3,
+                ef_search: 64,
+                allowed: (0..20u32).collect(),
+                brute_force_threshold: 0.001,
+            };
+            assert!(matches!(
+                acorn_search(&idx, &[1.0], &opts, DistanceMetric::L2),
+                Err(VectorError::DimensionMismatch {
+                    expected: 3,
+                    got: 1
+                })
+            ));
         }
 
         /// Very low selectivity (1 ID out of 20) — result must be that single ID.
@@ -325,7 +352,7 @@ mod inner {
                 brute_force_threshold: 0.001,
             };
 
-            let res = acorn_search(&idx, &query, &opts, DistanceMetric::L2);
+            let res = acorn_search(&idx, &query, &opts, DistanceMetric::L2).unwrap();
             assert!(res.len() <= 1);
             if let Some(r) = res.first() {
                 assert_eq!(r.id, 7);

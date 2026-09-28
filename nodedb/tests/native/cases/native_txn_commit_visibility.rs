@@ -5,11 +5,11 @@
 //! read path — PK point lookups and filtered aggregates, not just full scans —
 //! on the writing connection and on fresh connections.
 //!
-//! Pre-fix, `NativeTxnDp::dispatch_no_wal` routed the commit's `MetaOp`
-//! tasks through the gateway without `task.vshard_id`; the gateway's
-//! `primary_vshard` fallback sent them to vShard 0, so the commit batch was
-//! durably applied on the wrong core. The bug needs (a) the gateway wired,
-//! as production boot does, and (b) more than one Data Plane core, so that
+//! The statement's `StageWrite` and the commit's `MetaOp` tasks name no
+//! collection. Routed through the gateway, its `primary_vshard` fallback
+//! sends them to vShard 0: the write stages in core 0's overlay, and the
+//! owning core resolves and installs nothing. The case needs the gateway
+//! wired, as production boot does, and more than one Data Plane core, so
 //! vShard 0 and the collection's owning vShard live on different cores.
 
 use std::time::Duration;
@@ -17,7 +17,6 @@ use std::time::Duration;
 use nodedb_test_support::native_harness::{do_handshake, read_frame, write_frame};
 use nodedb_test_support::pgwire_harness::TestServer;
 
-use nodedb_types::id::VShardId;
 use nodedb_types::protocol::opcodes::ResponseStatus;
 use nodedb_types::protocol::text_fields::TextFields;
 use nodedb_types::protocol::{HelloFrame, NativeRequest, NativeResponse, OpCode, RequestFields};
@@ -82,7 +81,8 @@ fn collection_on_nonzero_core() -> String {
     for i in 0..64u32 {
         let name = format!("native_txn_vis_{i}");
         let vshard =
-            VShardId::from_collection_in_database(nodedb::types::DatabaseId::DEFAULT, &name)
+            nodedb_types::CollectionKey::from_bare(nodedb::types::DatabaseId::DEFAULT, &name)
+                .vshard()
                 .as_u32();
         if !(vshard as usize).is_multiple_of(NUM_CORES) {
             return name;

@@ -5,8 +5,8 @@
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use std::sync::Arc;
 
-use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
+use crate::control::gateway::router::is_task_vshard_scoped;
 use crate::control::server::shared::clone_write::CloneCheckedOutcome;
 use crate::types::{Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 
@@ -57,7 +57,29 @@ pub(super) async fn dispatch_authorized_single_task(
         CloneCheckedOutcome::Handled(resp) => return Ok(resp),
         CloneCheckedOutcome::Proceed(checked) => checked,
     };
-    match ctx.state.gateway.get() {
+    // A write whose RLS write policy is decided per row cannot be proposed
+    // bare: a follower has no writing identity to decide it against. It
+    // resolves to a concrete row set here, while the identity is live, the
+    // way the planned native and pgwire writes resolve.
+    if checked.txn_id().is_none()
+        && ctx.state.async_raft_proposer().is_some()
+        && let Some(resolver) = crate::control::write_resolve::resolver_for_plan(checked.plan())
+    {
+        return crate::control::write_resolve::run_authorized_write_resolve(
+            ctx.state,
+            checked.into_authorized(),
+            resolver,
+        )
+        .await;
+    }
+    // A staged write and the other transaction meta-ops run on the core of
+    // the task's own vShard. The gateway would route them to vShard 0.
+    let gateway = ctx
+        .state
+        .gateway
+        .get()
+        .filter(|_| !is_task_vshard_scoped(checked.plan()));
+    match gateway {
         Some(gateway) => {
             let query = GatewayQueryContext {
                 tenant_id,
@@ -65,14 +87,9 @@ pub(super) async fn dispatch_authorized_single_task(
                 database_id: ctx.database_id(),
                 txn_id,
             };
-            gateway
-                .execute(&query, checked)
-                .await
-                .map(gateway_payloads_to_response)
-                .map_err(|error| {
-                    let (_, detail) = GatewayErrorMap::to_native(&error);
-                    crate::Error::Dispatch { detail }
-                })
+            // The typed error passes through unchanged. The native frame
+            // renders its SQLSTATE and numeric code from it.
+            gateway.execute_response(&query, checked).await
         }
         None => dispatch_without_gateway(ctx, checked).await,
     }
@@ -107,7 +124,8 @@ async fn dispatch_external_crdt_apply(
     .map_err(crate::Error::from)?;
     let task = nodedb_physical::physical_task::PhysicalTask {
         tenant_id,
-        vshard_id: VShardId::from_collection_in_database(ctx.database_id(), collection.as_str()),
+        vshard_id: nodedb_types::CollectionKey::from_qualified(ctx.database_id(), &collection)?
+            .vshard(),
         database_id: ctx.database_id(),
         plan,
         post_set_op: nodedb_physical::physical_task::PostSetOp::None,
@@ -180,8 +198,7 @@ pub(super) async fn dispatch_without_gateway(
                 if crate::control::crdt_admission::changes_crdt_frontier(op)
         );
     let write = || async move {
-        dispatch_utils::dispatch_authorized_autocommit_write(ctx.state, checked, TraceId::ZERO)
-            .await
+        dispatch_utils::dispatch_authorized_durable_write(ctx.state, checked, TraceId::ZERO).await
     };
     if frontier_mutation {
         ctx.state
@@ -190,25 +207,5 @@ pub(super) async fn dispatch_without_gateway(
             .await
     } else {
         write().await
-    }
-}
-
-fn gateway_payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
-    let payload = payloads
-        .into_iter()
-        .next()
-        .map(Payload::from_vec)
-        .unwrap_or_else(Payload::empty);
-    Response {
-        request_id: RequestId::new(0),
-        status: Status::Ok,
-        attempt: 0,
-        partial: false,
-        payload,
-        watermark_lsn: Lsn::ZERO,
-        error_code: None,
-        read_set_valid: None,
-        read_version_lsn: Lsn::ZERO,
-        write_set: Vec::new(),
     }
 }

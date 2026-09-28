@@ -36,7 +36,9 @@ fn edge_endpoints_are_co_resident() {
 #[test]
 fn the_timeseries_collection_homes_on_one_vshard() {
     assert!(
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, "g_ts_probe_metrics").as_u32()
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "g_ts_probe_metrics")
+            .vshard()
+            .as_u32()
             < VShardId::COUNT
     );
 }

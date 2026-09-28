@@ -15,7 +15,7 @@ use nodedb_cluster::calvin::types::{
     DependentReadSpec, EngineKeySet, PassiveReadKey, ReadWriteSet, SortedVec, TxClass,
     VersionedReadSet,
 };
-use nodedb_types::{TenantId, id::VShardId};
+use nodedb_types::TenantId;
 
 /// Find two collection names whose vShards differ.
 fn two_distinct_collections() -> (String, String) {
@@ -23,7 +23,8 @@ fn two_distinct_collections() -> (String, String) {
     for i in 0u32..512 {
         let name = format!("col_{i}");
         let vshard =
-            VShardId::from_collection_in_database(nodedb::types::DatabaseId::DEFAULT, &name)
+            nodedb_types::CollectionKey::from_bare(nodedb::types::DatabaseId::DEFAULT, &name)
+                .vshard()
                 .as_u32();
         if let Some((ref fname, fv)) = first {
             if fv != vshard {

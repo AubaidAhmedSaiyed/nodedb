@@ -34,7 +34,7 @@ fn params() -> HnswParams {
 fn growing_segment_tombstones_survive_checkpoint_roundtrip() {
     let mut coll = VectorCollection::new(2, params());
     for i in 0..10u32 {
-        coll.insert(vec![i as f32, 0.0]);
+        coll.insert(vec![i as f32, 0.0]).unwrap();
     }
     assert!(coll.delete(3), "delete on live growing vector must succeed");
     assert!(coll.delete(7), "delete on live growing vector must succeed");
@@ -51,7 +51,7 @@ fn growing_segment_tombstones_survive_checkpoint_roundtrip() {
         "tombstoned growing-segment vectors resurrected on restore"
     );
 
-    let results = restored.search(&[3.0, 0.0], 10, 64);
+    let results = restored.search(&[3.0, 0.0], 10, 64).unwrap();
     let ids: std::collections::HashSet<u32> = results.iter().map(|r| r.id).collect();
     assert!(
         !ids.contains(&3),
@@ -69,7 +69,7 @@ fn building_segment_tombstones_survive_checkpoint_roundtrip() {
     // snapshot time, exercising the `building_segments` encode path.
     let mut coll = VectorCollection::with_seal_threshold(2, params(), 20);
     for i in 0..20u32 {
-        coll.insert(vec![i as f32, 0.0]);
+        coll.insert(vec![i as f32, 0.0]).unwrap();
     }
     let _req = coll.seal("k").expect("seal produced request");
     // Intentionally do NOT complete the build — vectors now sit in the
@@ -89,7 +89,7 @@ fn building_segment_tombstones_survive_checkpoint_roundtrip() {
         "tombstoned building-segment vectors resurrected on restore"
     );
 
-    let results = restored.search(&[5.0, 0.0], 20, 64);
+    let results = restored.search(&[5.0, 0.0], 20, 64).unwrap();
     let ids: std::collections::HashSet<u32> = results.iter().map(|r| r.id).collect();
     assert!(
         !ids.contains(&5),

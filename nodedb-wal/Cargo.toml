@@ -17,8 +17,9 @@ default = []
 io-uring = ["dep:io-uring"]
 # File structured corruption / invariant / durability reports through the
 # `faultbox` black-box recorder. Inert until the host application calls
-# `faultbox::init`; a no-op on wasm32 regardless. Off by default so the crate
-# stays dependency-light for embedders that report failures their own way.
+# `faultbox::init`. Pulls nothing on wasm32, where the reporting modules do not
+# build. Off by default so the crate stays dependency-light for embedders that
+# report failures their own way.
 diagnostics = ["dep:faultbox"]
 # Arm the crash-injection points used by the durability tests. Without it every
 # `fail_point!` compiles to nothing, so production builds pay no cost.
@@ -35,21 +36,22 @@ hkdf = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
-faultbox = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true, optional = true }
 
+# The writer, readers, segments, and double-write buffer build only off wasm32.
+# On wasm32 the crate builds the crypto module and what it needs.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = { workspace = true }
+faultbox = { workspace = true, optional = true }
 
 # `getrandom` reaches this crate several times and no copy picks a backend on its
 # own for `wasm32-unknown-unknown`: the workspace version arrives directly, 0.3
 # via sonic-rs/rand, 0.2 via aes-gcm's `rand_core`. Naming each here with its
 # JS-backed feature lets Cargo's feature unification apply them to the
 # transitive copies, which is the same approach the WASM bindings crate already
-# uses. Without this the crate does not compile for the target at all, despite
-# carrying wasm32 code paths.
+# uses. Without this the crypto module does not compile for the target.
 #
 # The unaliased entry tracks the workspace version rather than pinning one:
 # pinning it here means a workspace bump leaves this entry naming a version the

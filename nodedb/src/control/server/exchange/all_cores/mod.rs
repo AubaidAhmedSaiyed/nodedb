@@ -30,3 +30,4 @@ mod wcc;
 
 pub use dispatch::NodeLevelResult;
 pub(crate) use dispatch::execute_plan_all_local_cores;
+pub(crate) use snapshot::snapshot_tenant_on_local_cores;

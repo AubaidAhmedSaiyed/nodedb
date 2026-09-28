@@ -16,16 +16,38 @@
 //! and thereby reconstructs the missed input deterministically. Replay is
 //! idempotent — `process_new_txn`'s in-flight guard turns an already-in-flight
 //! Txn into a no-op, and Reserve/Release re-application is a lock-manager no-op.
+//!
+//! One drain reads at most [`SchedulerConfig::catch_up_window`] log entries.
+//!
+//! [`SchedulerConfig::catch_up_window`]: super::super::config::SchedulerConfig::catch_up_window
 
 use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
+use nodedb_cluster::calvin::types::SchedulerInput;
 
 use super::scheduler::Scheduler;
+
+/// Result of one [`Scheduler::drain_catch_up`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::control::cluster::calvin::scheduler::driver::core) enum CatchUpDrain {
+    /// Nothing is left to replay now. No catch-up is armed, nothing is
+    /// committed at the armed index yet, the log read failed and the entry
+    /// stays armed for a later tick, or the armed range is fully replayed.
+    Settled,
+    /// The drain stopped before the committed index: the window filled or
+    /// the intake gate closed. Catch-up stays armed at the first unprocessed
+    /// index, and the next drain can resume at once.
+    Remaining,
+}
 
 impl Scheduler {
     /// Replay any sequencer-fan-out inputs dropped on this replica.
     ///
     /// Run on the periodic stall tick. O(1) in the common case (no pending
     /// catch-up → one map probe and return).
+    ///
+    /// Reads and replays at most `catch_up_window` log entries from the armed
+    /// index. Stops feeding at the first input after which the intake gate is
+    /// closed.
     ///
     /// # Lock discipline (deadlock-safety)
     ///
@@ -34,7 +56,9 @@ impl Scheduler {
     /// holds the SM lock while fanning out but never takes MultiRaft underneath
     /// it; this drain takes them strictly one-at-a-time (SM → release → MultiRaft
     /// → release → SM → release), so the two paths can never form a lock cycle.
-    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn drain_catch_up(&mut self) {
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn drain_catch_up(
+        &mut self,
+    ) -> CatchUpDrain {
         // 1. SM-lock scope: PEEK the earliest armed index for this vShard.
         //    `None` (the common case) means no catch-up is pending — return O(1).
         //    Otherwise pair it with the committed-index watermark as the replay
@@ -49,27 +73,30 @@ impl Scheduler {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let Some(lo) = sm.peek_catch_up_from(self.vshard_id) else {
-                return;
+                return CatchUpDrain::Settled;
             };
             let Some(hi) = sm.current_committed_index() else {
                 // Armed but nothing applied yet — leave it armed and retry once
                 // an entry is applied and `hi` is known.
-                return;
+                return CatchUpDrain::Settled;
             };
             if lo > hi {
                 // Armed ahead of the committed watermark (e.g. spawn-armed from
                 // the first available index before any entry applied on this
                 // replica). Nothing to replay yet; stay armed.
-                return;
+                return CatchUpDrain::Settled;
             }
             (lo, hi)
         };
+        // Last index this drain reads: the window end, capped at `hi`.
+        let window = self.config.catch_up_window.max(1);
+        let end = lo.saturating_add(window - 1).min(hi);
 
-        // 2. MultiRaft-lock scope: read the committed sequencer log range. No SM
-        //    lock is held here (see the lock-discipline note above).
+        // 2. MultiRaft-lock scope: read the committed sequencer log window. No
+        //    SM lock is held here (see the lock-discipline note above).
         let entries = {
             let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            match mr.read_committed_entries(SEQUENCER_GROUP_ID, lo, hi) {
+            match mr.read_committed_entries(SEQUENCER_GROUP_ID, lo, end) {
                 Ok(entries) => entries,
                 Err(nodedb_cluster::error::ClusterError::Raft(
                     nodedb_raft::RaftError::LogCompacted { .. },
@@ -93,7 +120,7 @@ impl Scheduler {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .clear_catch_up_up_to(self.vshard_id, hi);
-                    return;
+                    return CatchUpDrain::Settled;
                 }
                 Err(e) => {
                     // Transient infra fault (e.g. group transiently absent).
@@ -102,53 +129,100 @@ impl Scheduler {
                     tracing::warn!(
                         vshard = self.vshard_id,
                         lo,
-                        hi,
+                        end,
                         error = %e,
                         "calvin catch-up: failed to read committed sequencer entries"
                     );
-                    return;
+                    return CatchUpDrain::Settled;
                 }
             }
         };
 
         // 3. SM-lock scope: decode the raw log entries into this vShard's
         //    `SchedulerInput` stream (a pure `&self` read — no side effects).
-        let inputs = {
+        //    Each entry decodes on its own, so every input keeps the Raft index
+        //    it came from. Decoding holds no cross-entry state, so the stream is
+        //    identical to a whole-range decode.
+        let inputs: Vec<(u64, SchedulerInput)> = {
             let sm = self
                 .sequencer_state_machine
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            sm.replay_epochs_for_vshard(&entries, self.vshard_id, 0, u64::MAX)
+            entries
+                .iter()
+                .flat_map(|entry| {
+                    sm.replay_epochs_for_vshard(
+                        std::slice::from_ref(entry),
+                        self.vshard_id,
+                        0,
+                        u64::MAX,
+                    )
+                    .into_iter()
+                    .map(move |input| (entry.index, input))
+                })
+                .collect()
         };
 
         // 4. Feed each replayed input through the SAME live processing path — no
         //    lock held. Determinism: identical inputs through identical code.
         //    The in-flight guard makes an overlapping already-in-flight Txn a
         //    no-op; Reserve/Release re-application is idempotent.
-        let replayed = inputs.len() as u64;
-        for input in inputs {
+        //
+        //    An input after which the intake gate is closed stops the feed: a
+        //    dispatch deferred at capacity, or a full in-flight backlog. The
+        //    next drain resumes at the first input not yet processed.
+        let mut replayed: u64 = 0;
+        let mut resume_from: Option<u64> = None;
+        let mut feed = inputs.into_iter().peekable();
+        while let Some((_, input)) = feed.next() {
             self.process_scheduler_input(input);
+            replayed += 1;
+            if self.intake_closure().is_some() {
+                resume_from = feed.peek().map(|(index, _)| *index);
+                break;
+            }
         }
+        // A window that ends before `hi` resumes at the first index past it.
+        let resume_from = resume_from.or(end.checked_add(1).filter(|&next| next <= hi));
 
-        // Replay of `lo ..= hi` is complete: clear the armed catch-up, but only
-        // up to `hi` — a concurrent drop recorded at an index `> hi` while this
-        // replay ran is preserved for the next drain. This is the CONFIRM step
-        // the peek-not-take at the top defers to; a transient failure above
-        // returned early and left the entry armed.
-        self.sequencer_state_machine
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear_catch_up_up_to(self.vshard_id, hi);
+        {
+            let sm = self
+                .sequencer_state_machine
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match resume_from {
+                // Stopped early: re-arm exactly at the first unprocessed input's
+                // index. Clearing below it first lets the min-collapse arm move
+                // the entry forward. Both run under one SM lock.
+                Some(next) => {
+                    sm.clear_catch_up_up_to(self.vshard_id, next.saturating_sub(1));
+                    sm.arm_catch_up_from(self.vshard_id, next);
+                }
+                // Replay of `lo ..= hi` is complete (`end == hi` here): clear
+                // the armed catch-up, but only up to `hi` — a concurrent drop
+                // recorded at an index `> hi` while this replay ran is
+                // preserved for the next drain. This is the CONFIRM step the
+                // peek-not-take at the top defers to; a transient failure
+                // above returned early and left the entry armed.
+                None => sm.clear_catch_up_up_to(self.vshard_id, hi),
+            }
+        }
 
         if replayed > 0 {
             self.metrics.record_catch_up_replayed(replayed);
             tracing::info!(
                 vshard = self.vshard_id,
                 lo,
+                end,
                 hi,
                 replayed,
                 "calvin catch-up: replayed dropped sequencer inputs from committed log"
             );
+        }
+        if resume_from.is_some() {
+            CatchUpDrain::Remaining
+        } else {
+            CatchUpDrain::Settled
         }
     }
 }
@@ -157,111 +231,19 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use nodedb_cluster::MultiRaft;
-    use nodedb_cluster::RoutingTable;
-    use nodedb_cluster::calvin::types::{
-        EngineKeySet, EpochBatch, ReadWriteSet, SchedulerInput, SequencedTxn, SortedVec, TxClass,
-        VersionedReadSet,
-    };
-    use nodedb_cluster::calvin::{CalvinCompletionRegistry, SequencerEntry, SequencerStateMachine};
+    use nodedb_cluster::calvin::types::{EpochBatch, SchedulerInput, SequencedTxn};
+    use nodedb_cluster::calvin::{CalvinCompletionRegistry, SequencerEntry};
     use nodedb_types::TenantId;
-    use nodedb_types::id::{DatabaseId, VShardId};
+    use nodedb_types::id::DatabaseId;
 
-    use super::super::scheduler::SchedulerParams;
-    use crate::bridge::dispatch::Dispatcher;
-    use crate::control::cluster::calvin::scheduler::lock_manager::{
-        AcquireOutcome, LockManager, TxnId,
+    use crate::control::cluster::calvin::scheduler::driver::core::test_support::{
+        build_test_scheduler, build_test_scheduler_with_data_side, fill_tenant_inflight,
+        make_sequenced_txn, make_validate_only_txn, test_coll_vshard,
     };
-    use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
-    use crate::control::cluster::calvin::scheduler::{NOT_YET_APPLIED_EPOCH, SchedulerConfig};
-    use crate::control::state::SharedState;
-    use crate::wal::WalManager;
-
-    /// Build a minimally-wired `Scheduler` for driver-level unit tests. The Data
-    /// Plane is NOT started — tests exercise Control-Plane routing, guards, and
-    /// request dispatch only, so no core loop is needed. The returned `TempDir`
-    /// must be kept alive for the scheduler's lifetime (backs the WAL and
-    /// Raft storage).
-    fn build_test_scheduler(vshard_id: u32) -> (Scheduler, tempfile::TempDir) {
-        let registry = CalvinCompletionRegistry::new_detached();
-        let dir = tempfile::tempdir().unwrap();
-        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap());
-        let (dispatcher, mut data_sides) = Dispatcher::new(1, 64);
-        let _data_side = data_sides
-            .pop()
-            .expect("one configured core has one data side");
-        let shared = SharedState::new(dispatcher, wal).unwrap();
-
-        let rt = RoutingTable::uniform(1, &[1], 1);
-        let multi_raft = Arc::new(Mutex::new(MultiRaft::new(1, rt, dir.path().to_path_buf())));
-
-        let sequencer_state_machine = Arc::new(Mutex::new(SequencerStateMachine::new(
-            HashMap::new(),
-            Arc::clone(&registry),
-        )));
-
-        let (_tx, receiver) = tokio::sync::mpsc::channel(16);
-        let (_rr_tx, read_result_rx) = tokio::sync::mpsc::channel(16);
-        let (_prom_tx, promotion_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (verdict_tx, verdict_rx) = tokio::sync::mpsc::channel(16);
-        registry.register_verdict_signal_sender(vshard_id, verdict_tx);
-
-        let lock_manager = Arc::new(Mutex::new(LockManager::new()));
-
-        let scheduler = Scheduler::new(SchedulerParams {
-            vshard_id,
-            receiver,
-            shared,
-            multi_raft,
-            sequencer_state_machine,
-            // A freshly-built scheduler has applied nothing, so its watermark is the
-            // not-yet-applied sentinel (matching `read_applied_recovery` for a clean
-            // node). Hardcoding `0` here would instead claim epoch 0 is fully applied,
-            // making the exactly-once gate (`AppliedGate::is_applied`) short-circuit
-            // every epoch-0 replay before it reaches the lock table — silently
-            // defeating the end-to-end drain tests below.
-            fully_applied_epoch: NOT_YET_APPLIED_EPOCH,
-            applied_tail: BTreeSet::new(),
-            rebuild_target_epoch: 0,
-            config: SchedulerConfig::default(),
-            metrics: SchedulerMetrics::new(),
-            read_result_rx,
-            lock_manager,
-            promotion_rx,
-            registry,
-            verdict_rx,
-        });
-        (scheduler, dir)
-    }
-
-    fn make_sequenced_txn(epoch: u64, position: u32) -> SequencedTxn {
-        let write_set = ReadWriteSet::new(vec![EngineKeySet::Document {
-            collection: "test_coll".to_string(),
-            surrogates: SortedVec::new(vec![1]),
-        }]);
-        let tx_class = TxClass::new_single_vshard(
-            ReadWriteSet::new(vec![]),
-            write_set,
-            vec![],
-            TenantId::new(1),
-            None,
-            VersionedReadSet::default(),
-        )
-        .expect("valid TxClass");
-        SequencedTxn {
-            epoch,
-            position,
-            tx_class,
-            epoch_system_ms: 1_700_000_000_000,
-            epoch_vshard_txn_count: 1,
-            lock_owner: None,
-        }
-    }
+    use crate::control::cluster::calvin::scheduler::lock_manager::{AcquireOutcome, TxnId};
 
     #[tokio::test]
     async fn drain_catch_up_is_noop_when_no_drop_recorded() {
@@ -396,8 +378,9 @@ mod tests {
     async fn drain_replays_dropped_input_into_lock_table_end_to_end() {
         // Use the vShard that "test_coll" hashes to, so the batch's fan-out targets —
         // and its replay decodes for — this scheduler's vShard.
-        let vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "test_coll").as_u32();
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "test_coll")
+            .vshard()
+            .as_u32();
         let (mut scheduler, _dir) = build_test_scheduler(vshard);
         ensure_sequencer_leader(&scheduler);
 
@@ -484,8 +467,9 @@ mod tests {
     /// epoch 1 (delivered live, in-flight) must be skipped.
     #[tokio::test]
     async fn drain_skips_in_flight_overlap_no_double_dispatch_end_to_end() {
-        let vshard =
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "test_coll").as_u32();
+        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "test_coll")
+            .vshard()
+            .as_u32();
         let (mut scheduler, _dir) = build_test_scheduler(vshard);
         ensure_sequencer_leader(&scheduler);
 
@@ -550,5 +534,133 @@ mod tests {
             dispatched_before,
             "the guarded overlap must not cause a second dispatch"
         );
+    }
+
+    /// Commit two single-txn batches at epochs 0 and 1, each a validate-only
+    /// txn that stages on this scheduler, and drop both through a full
+    /// fan-out channel. Returns the two committed Raft indexes.
+    fn arm_two_dropped_stage_batches(scheduler: &Scheduler) -> (u64, u64) {
+        ensure_sequencer_leader(scheduler);
+        let txn0 = make_validate_only_txn(0, 0);
+        let txn1 = make_validate_only_txn(1, 0);
+        let (idx0, bytes0) = commit_epoch_batch(scheduler, make_batch(0, &txn0));
+        let (idx1, bytes1) = commit_epoch_batch(scheduler, make_batch(1, &txn1));
+        assert!(idx1 > idx0, "second batch commits at a later Raft index");
+        apply_with_full_channel(scheduler, scheduler.vshard_id, idx0, &bytes0, &txn0);
+        apply_with_full_channel(scheduler, scheduler.vshard_id, idx1, &bytes1, &txn1);
+        (idx0, idx1)
+    }
+
+    /// Draining a replay range against a dispatcher at tenant capacity marks
+    /// no replayed position applied.
+    #[tokio::test]
+    async fn drain_against_full_dispatcher_marks_no_replayed_position_applied() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let (mut scheduler, _dir, mut data_side) =
+            build_test_scheduler_with_data_side(test_coll_vshard(), registry);
+        arm_two_dropped_stage_batches(&scheduler);
+        let shared = std::sync::Arc::clone(&scheduler.shared);
+        fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
+
+        scheduler.drain_catch_up();
+
+        assert!(
+            !scheduler.applied.is_applied(0, 0),
+            "the refused replayed txn must stay unapplied"
+        );
+        assert!(
+            !scheduler.applied.is_applied(1, 0),
+            "a replayed txn after the refusal must stay unapplied"
+        );
+    }
+
+    /// Draining against a dispatcher at tenant capacity stops at the first
+    /// refusal and leaves catch-up armed from the first input it did not
+    /// process.
+    #[tokio::test]
+    async fn drain_against_full_dispatcher_stays_armed_from_first_unprocessed_input() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let (mut scheduler, _dir, mut data_side) =
+            build_test_scheduler_with_data_side(test_coll_vshard(), registry);
+        let (_idx0, idx1) = arm_two_dropped_stage_batches(&scheduler);
+        let shared = std::sync::Arc::clone(&scheduler.shared);
+        fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
+
+        scheduler.drain_catch_up();
+
+        let armed = scheduler
+            .sequencer_state_machine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peek_catch_up_from(scheduler.vshard_id);
+        assert_eq!(
+            armed,
+            Some(idx1),
+            "catch-up must stay armed from the input after the refused one"
+        );
+    }
+
+    /// A drain over a range longer than its window replays exactly the
+    /// window and stays armed at the first index past it. The next drain
+    /// continues from there.
+    #[tokio::test]
+    async fn drain_replays_one_window_then_resumes_past_it() {
+        let vshard = test_coll_vshard();
+        let (mut scheduler, _dir) = build_test_scheduler(vshard);
+        scheduler.config.catch_up_window = 1;
+        ensure_sequencer_leader(&scheduler);
+
+        let txn0 = make_sequenced_txn(0, 0);
+        let txn1 = make_sequenced_txn(1, 0);
+        let (idx0, bytes0) = commit_epoch_batch(&scheduler, make_batch(0, &txn0));
+        let (idx1, bytes1) = commit_epoch_batch(&scheduler, make_batch(1, &txn1));
+        assert_eq!(idx1, idx0 + 1, "the two batches commit at adjacent indexes");
+        apply_with_full_channel(&scheduler, vshard, idx0, &bytes0, &txn0);
+        apply_with_full_channel(&scheduler, vshard, idx1, &bytes1, &txn1);
+
+        // A conflicting holder on the shared key makes each replayed txn
+        // block, so nothing dispatches.
+        let keys =
+            crate::control::cluster::calvin::scheduler::driver::helpers::expand_rw_set(&txn0);
+        {
+            let mut lm = scheduler
+                .lock_manager
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                lm.acquire(TxnId::new(u64::MAX, 0), keys),
+                AcquireOutcome::Ready
+            );
+        }
+        let armed = |scheduler: &Scheduler| {
+            scheduler
+                .sequencer_state_machine
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .peek_catch_up_from(vshard)
+        };
+
+        let first = scheduler.drain_catch_up();
+
+        assert_eq!(first, CatchUpDrain::Remaining);
+        assert!(scheduler.blocked.contains_key(&TxnId::new(0, 0)));
+        assert!(
+            !scheduler.blocked.contains_key(&TxnId::new(1, 0)),
+            "the entry past the window must not be replayed"
+        );
+        assert_eq!(
+            armed(&scheduler),
+            Some(idx1),
+            "catch-up stays armed at the first index past the window"
+        );
+
+        let second = scheduler.drain_catch_up();
+
+        assert_eq!(second, CatchUpDrain::Settled);
+        assert!(
+            scheduler.blocked.contains_key(&TxnId::new(1, 0)),
+            "the next drain replays the entry past the first window"
+        );
+        assert_eq!(armed(&scheduler), None, "the armed range is fully replayed");
     }
 }

@@ -15,7 +15,7 @@ use sonic_rs;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::SessionId;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::QueryOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -37,7 +37,7 @@ pub(super) async fn execute_facet_counts_sql(
         .sessions
         .get_current_database(session_id)
         .unwrap_or(DatabaseId::DEFAULT);
-    let vshard = VShardId::from_collection_in_database(database_id, &parsed.collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &parsed.collection).vshard();
 
     // Convert filter text to ScanFilter predicates.
     let filter_bytes = if parsed.filter.is_empty() {
@@ -101,7 +101,7 @@ pub(super) async fn execute_search_with_facets_sql(
         .sessions
         .get_current_database(session_id)
         .unwrap_or(DatabaseId::DEFAULT);
-    let vshard = VShardId::from_collection_in_database(database_id, &collection);
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     let filter_bytes = if filter_text.is_empty() {
         Vec::new()
@@ -305,7 +305,7 @@ fn build_filter_bytes(filter_text: &str) -> PgWireResult<Vec<u8>> {
     zerompk::to_msgpack_vec(&filters).map_err(|e| {
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
-            "XX000".to_owned(),
+            nodedb_types::error::sqlstate::INTERNAL_ERROR.to_owned(),
             format!("filter serialization failed: {e}"),
         )))
     })

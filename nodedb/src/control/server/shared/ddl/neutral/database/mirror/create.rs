@@ -47,7 +47,7 @@ pub fn mirror_database(
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(ddl_err("XX000", format!("catalog lookup failed: {e}")));
+            return Err(DdlError::from_error_in_context("catalog lookup failed", &e));
         }
     }
 
@@ -110,12 +110,12 @@ pub fn mirror_database(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
-    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
 
     if outcome.needs_local_apply() {
         catalog
             .put_database(&descriptor)
-            .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))?;
     }
 
     // Flush allocator hwm on threshold.

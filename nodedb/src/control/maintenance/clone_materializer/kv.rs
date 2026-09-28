@@ -93,10 +93,11 @@ pub(super) async fn materialize_kv_collection(
                 continue;
             }
 
-            let surrogate =
-                state
-                    .surrogate_assigner
-                    .assign(db_id, tenant_id, &target_qualified, &key)?;
+            let surrogate = state.surrogate_assigner.assign(
+                nodedb_types::CollectionKey::from_bare(db_id, &coll.name),
+                tenant_id,
+                &key,
+            )?;
             let plan = PhysicalPlan::Kv(KvOp::Put {
                 collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
                 key: key.clone(),
@@ -105,6 +106,7 @@ pub(super) async fn materialize_kv_collection(
                 surrogate,
                 returning: None,
                 rls_filters: Vec::new(),
+                provenance: None,
             });
             let resp =
                 dispatch_local(state, tenant_id, db_id, &target_qualified, plan, None).await?;

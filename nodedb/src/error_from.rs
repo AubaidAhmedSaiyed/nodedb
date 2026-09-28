@@ -16,14 +16,19 @@ impl From<nodedb_query::expr_parse::ExprParseError> for Error {
     }
 }
 
-/// `EvalError` has exactly one variant today (`DivisionByZero`); the
-/// `match` is exhaustive rather than a `_ =>` fallback so
-/// a future evaluator error is forced to pick its own `crate::Error`
-/// mapping instead of silently inheriting this one.
+/// The `match` is exhaustive rather than a `_ =>` fallback, so a new
+/// evaluator error picks its own `crate::Error` mapping instead of silently
+/// inheriting one.
 impl From<nodedb_query::EvalError> for Error {
     fn from(e: nodedb_query::EvalError) -> Self {
         match e {
             nodedb_query::EvalError::DivisionByZero => Self::DivisionByZero,
+            nodedb_query::EvalError::UnknownFunction { name } => Self::UndefinedFunction { name },
+            e @ (nodedb_query::EvalError::VectorDimensionMismatch { .. }
+            | nodedb_query::EvalError::ArgumentType { .. }
+            | nodedb_query::EvalError::InvalidJsonPath { .. }) => Self::DataException {
+                detail: e.to_string(),
+            },
         }
     }
 }
@@ -119,11 +124,18 @@ impl From<crate::storage::quarantine::engines::FtsOrQuarantine> for Error {
 }
 
 impl From<nodedb_vector::error::VectorError> for Error {
-    /// Checkpoint failures fail-stop because replay history may be truncated.
+    /// An input vector of the wrong dimension, or index input the engine
+    /// cannot use, is the caller's data error: SQLSTATE `22000`. Checkpoint
+    /// and stored-data failures fail-stop because replay history may be
+    /// truncated.
     fn from(e: nodedb_vector::error::VectorError) -> Self {
         use nodedb_vector::error::VectorError as Ve;
         let detail = e.to_string();
         match e {
+            Ve::DimensionMismatch { .. } | Ve::InvalidInput { .. } => {
+                Self::DataException { detail }
+            }
+            Ve::InvalidFilterBitmap { .. } => Self::Internal { detail },
             Ve::BudgetExhausted(_) => Self::MemoryExhausted {
                 engine: "vector".to_string(),
             },
@@ -131,7 +143,7 @@ impl From<nodedb_vector::error::VectorError> for Error {
                 engine: "vector".to_string(),
                 detail,
             },
-            Ve::DimensionMismatch { .. }
+            Ve::StoredDimensionMismatch { .. }
             | Ve::UnsupportedVersion { .. }
             | Ve::InvalidMagic
             | Ve::DeserializationFailed(_)
@@ -139,8 +151,12 @@ impl From<nodedb_vector::error::VectorError> for Error {
             | Ve::CheckpointPlaintextKeyRequired
             | Ve::CheckpointEncryptionError { .. }
             | Ve::CheckpointSerializationError { .. }
-            | Ve::CheckpointDeserializationError { .. } => Self::SegmentCorrupted { detail },
-            // Unknown vector errors fail-stop.
+            | Ve::CheckpointDeserializationError { .. }
+            | Ve::VectorUnavailable { .. }
+            | Ve::VectorDecodeFailed { .. } => Self::SegmentCorrupted { detail },
+            // `VectorError` is `#[non_exhaustive]` and lives in another crate,
+            // so the compiler requires this arm. A variant this build cannot
+            // name fails stop.
             _ => Self::SegmentCorrupted { detail },
         }
     }
@@ -303,11 +319,114 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
                 constraint,
                 detail,
             },
-            other => {
-                // Preserve classification across multi-hop forwarding.
-                let message = other.to_string();
-                let code = u32::from(NodeDbError::from(other).code().0);
-                TypedClusterError::Internal { code, message }
+            // Every other error crosses as its public numeric code, so a
+            // multi-hop forward keeps its class.
+            other @ (Error::TxnOverlayMemoryExceeded { .. }
+            | Error::RejectedAuthz { .. }
+            | Error::OffsetRegression { .. }
+            | Error::ConflictRetry { .. }
+            | Error::CalvinSerializationConflict
+            | Error::CalvinParticipantError
+            | Error::RejectedPrevalidation { .. }
+            | Error::RetryableRefusal { .. }
+            | Error::AppendOnlyViolation { .. }
+            | Error::BalanceViolation { .. }
+            | Error::MaterializedSumTargetNotFound { .. }
+            | Error::MaterializedSumResolutionMissing { .. }
+            | Error::PeriodLocked { .. }
+            | Error::PeriodLockMisconfigured { .. }
+            | Error::RetentionViolation { .. }
+            | Error::LegalHoldActive { .. }
+            | Error::StateTransitionViolation { .. }
+            | Error::TransitionCheckViolation { .. }
+            | Error::TypeGuardViolation { .. }
+            | Error::TypeMismatch { .. }
+            | Error::InsufficientBalance { .. }
+            | Error::RateExceeded { .. }
+            | Error::CollectionNotFound { .. }
+            | Error::DocumentNotFound { .. }
+            | Error::CollectionDeactivated { .. }
+            | Error::VShardAdmissionCapacityExceeded { .. }
+            | Error::CrdtAdmissionRetriesExhausted { .. }
+            | Error::CrdtAdmissionInvalidPlan { .. }
+            | Error::CrdtAdmissionCallerFence
+            | Error::CrdtApplyRequiresAdmission
+            | Error::CrdtApplyForbiddenInTransaction
+            | Error::NotInTransactionBlock { .. }
+            | Error::CrdtAdmissionTimeout { .. }
+            | Error::NoLeader { .. }
+            | Error::FanOutExceeded { .. }
+            | Error::CrossCollectionNotColocated { .. }
+            | Error::SourceFrozen { .. }
+            | Error::CloneWriteRequiresMaterialize { .. }
+            | Error::BadRequest { .. }
+            | Error::BackupTenantMismatch { .. }
+            | Error::BackupKeyMismatch
+            | Error::QuotaOvercommit { .. }
+            | Error::PlanError { .. }
+            | Error::FeatureNotSupported { .. }
+            | Error::UndefinedFunction { .. }
+            | Error::UndefinedObject { .. }
+            | Error::ObjectNotInPrerequisiteState { .. }
+            | Error::UndefinedColumn { .. }
+            | Error::AmbiguousColumn { .. }
+            | Error::UnknownStrictField { .. }
+            | Error::DivisionByZero
+            | Error::DataException { .. }
+            | Error::InvalidLimitValue { .. }
+            | Error::RetryableSchemaChanged { .. }
+            | Error::RetryableLeaderChange { .. }
+            | Error::GroupQuorumUnavailable { .. }
+            | Error::GroupMarksUnavailable { .. }
+            | Error::MetadataLeaderUnavailable
+            | Error::AuthorizationStateBehind { .. }
+            | Error::ExecutionLimitExceeded { .. }
+            | Error::LimitExceeded { .. }
+            | Error::Wal(_)
+            | Error::Dispatch { .. }
+            | Error::DispatchCapacity { .. }
+            | Error::Storage { .. }
+            | Error::ColdStorage { .. }
+            | Error::Serialization { .. }
+            | Error::Codec { .. }
+            | Error::SegmentCorrupted { .. }
+            | Error::MemoryExhausted { .. }
+            | Error::Backpressure { .. }
+            | Error::Crdt(_)
+            | Error::Io(_)
+            | Error::Config { .. }
+            | Error::Encryption { .. }
+            | Error::Bridge { .. }
+            | Error::VersionCompat { .. }
+            | Error::Internal { .. }
+            | Error::Shaping(_)
+            | Error::Ddl(_)
+            | Error::DescriptorVersionAnomaly { .. }
+            | Error::CollectionPurgeRowMissing { .. }
+            | Error::CatalogIntegrityViolation { .. }
+            | Error::Promql(_)
+            | Error::DependentObjectsExist { .. }
+            | Error::RoleInUse { .. }
+            | Error::CascadeCycle { .. }
+            | Error::CrossShardInExplicitTransaction
+            | Error::SequencerUnavailable
+            | Error::SessionCapExceeded { .. }
+            | Error::SessionIdleTimeout
+            | Error::SessionTokenExpired
+            | Error::SessionKilledByAdmin
+            | Error::SessionUserDropped
+            | Error::OidcProviderTenantUnbound
+            | Error::OidcProviderTenantUnavailable { .. }
+            | Error::ExternalRoleUndefined { .. }
+            | Error::OidcNoDefaultDatabase { .. }
+            | Error::TenantVectorDimExceeded { .. }
+            | Error::TenantGraphDepthExceeded { .. }
+            | Error::RoleInheritanceCycle { .. }
+            | Error::RoleInheritanceDepthExceeded { .. }
+            | Error::OllpExhausted { .. }
+            | Error::MirrorReadOnly { .. }
+            | Error::StaleReadNotLeader { .. }) => {
+                crate::control::cluster::data_plane_error_wire::numeric_typed(other)
             }
         }
     }
@@ -439,5 +558,32 @@ mod tests {
             }
             other => panic!("expected Error::DataPlane, got {other:?}"),
         }
+    }
+
+    /// An input vector of the wrong width is the caller's data error; stored
+    /// data of the wrong width is corruption.
+    #[test]
+    fn vector_dimension_errors_classify_by_source() {
+        use nodedb_vector::error::VectorError;
+        let input: Error = VectorError::DimensionMismatch {
+            expected: 3,
+            got: 2,
+        }
+        .into();
+        match input {
+            Error::DataException { detail } => {
+                assert_eq!(detail, "vector dimension mismatch: expected 3, got 2");
+            }
+            other => panic!("expected Error::DataException, got {other:?}"),
+        }
+        let stored: Error = VectorError::StoredDimensionMismatch {
+            expected: 3,
+            got: 2,
+        }
+        .into();
+        assert!(
+            matches!(stored, Error::SegmentCorrupted { .. }),
+            "{stored:?}"
+        );
     }
 }

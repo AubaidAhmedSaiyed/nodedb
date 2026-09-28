@@ -25,9 +25,12 @@ pub(super) fn document_collection_is_edge_bearing(
     let Some(credentials) = ctx.credentials.as_ref() else {
         return Ok(false);
     };
+    // The catalog keys collections by the bare name.
     let catalog = credentials.catalog();
+    let bare =
+        crate::control::target_identity::naming::bare_collection_name(ctx.database_id, collection);
     Ok(catalog
-        .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), collection)?
+        .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), &bare)?
         .map(|c| c.has_implicit_edges)
         .unwrap_or(false))
 }

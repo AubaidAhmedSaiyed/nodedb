@@ -145,7 +145,7 @@ mod tests {
             .map(|i| (0..dim).map(|d| (i * dim + d) as f32 * 0.1).collect())
             .collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        Sq8Codec::calibrate(&refs, dim)
+        Sq8Codec::calibrate(&refs, dim).unwrap()
     }
 
     #[test]

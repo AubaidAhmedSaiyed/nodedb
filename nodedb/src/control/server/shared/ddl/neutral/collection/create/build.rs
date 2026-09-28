@@ -116,7 +116,7 @@ pub async fn build_and_persist(
     let catalog = state.credentials.catalog();
     if catalog
         .get_materialized_view(database_id.as_u64(), tenant_id.as_u64(), name)
-        .map_err(|error| err("XX000", error.to_string()))?
+        .map_err(|error| DdlError::from_error(&error))?
         .is_some()
     {
         return Err(err(
@@ -130,7 +130,7 @@ pub async fn build_and_persist(
     // over a soft-deleted incarnation's still-present storage.
     let existing = catalog
         .get_collection(database_id, tenant_id.as_u64(), name)
-        .map_err(|error| err("XX000", error.to_string()))?;
+        .map_err(|error| DdlError::from_error(&error))?;
     if let Some(existing) = existing {
         if existing.is_active {
             return Err(err(
@@ -176,7 +176,7 @@ pub async fn build_and_persist(
             {
                 guard.disarm();
             }
-            return Err(err("XX000", failure.error.to_string()));
+            return Err(DdlError::from_error(&failure.error));
         }
     }
 

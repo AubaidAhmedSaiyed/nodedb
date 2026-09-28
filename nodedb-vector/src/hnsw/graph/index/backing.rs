@@ -38,7 +38,7 @@ impl HnswIndex {
     /// segment is unusable — rebuild the index from the authoritative vectors,
     /// or leave the collection unloaded", never as something to ignore.
     ///
-    /// - [`VectorError::DimensionMismatch`] if the backing's `dim()` is not this
+    /// - [`VectorError::StoredDimensionMismatch`] if the backing's `dim()` is not this
     ///   index's `dim`.
     /// - [`VectorError::VectorUnavailable`] if the backing holds fewer vectors
     ///   than the index has nodes, or if a node that needs the backing has no
@@ -49,7 +49,7 @@ impl HnswIndex {
         b: Arc<dyn crate::segment_backing::VectorSegmentBacking>,
     ) -> Result<&mut Self, VectorError> {
         if b.dim() != self.dim {
-            return Err(VectorError::DimensionMismatch {
+            return Err(VectorError::StoredDimensionMismatch {
                 expected: self.dim,
                 got: b.dim(),
             });

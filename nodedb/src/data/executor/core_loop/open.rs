@@ -110,8 +110,7 @@ impl CoreLoop {
             sparse,
             crdt_engines: HashMap::new(),
             vector_collections: HashMap::new(),
-            build_tx: None,
-            build_rx: None,
+            vector_builds: super::vector_build_queue::VectorBuildQueue::spawn(core_id),
             vector_params: HashMap::new(),
             declared_dims: HashMap::new(),
             edge_store,
@@ -128,11 +127,8 @@ impl CoreLoop {
             producer_epoch_floor: HashMap::new(),
             stats_store,
             aggregate_cache: HashMap::new(),
-            last_maintenance: None,
-            compaction_interval: std::time::Duration::from_secs(600),
-            compaction_tombstone_threshold: 0.2,
+            maintenance: super::maintenance_state::MaintenanceState::new(),
             index_configs: HashMap::new(),
-            ivf_indexes: HashMap::new(),
             sparse_vector_indexes: HashMap::new(),
             doc_cache: DocCache::new(
                 nodedb_types::config::tuning::QueryTuning::default().doc_cache_entries,
@@ -142,19 +138,18 @@ impl CoreLoop {
             columnar_engines: HashMap::new(),
             columnar_flushed_segments: HashMap::new(),
             columnar_flushed_surrogates: HashMap::new(),
-            ts_max_ingested_lsn: HashMap::new(),
+            ts_replay_stamps: HashMap::new(),
+            ts_replay_cursor: None,
             last_ts_ingest: None,
             ts_last_value_caches: HashMap::new(),
             ts_series_catalogs: HashMap::new(),
             ts_registries: HashMap::new(),
             ts_truncate_backlog: Vec::new(),
-            ts_truncate_floors: HashMap::new(),
             continuous_agg_mgr:
                 crate::engine::timeseries::continuous_agg::ContinuousAggregateManager::new(),
             checkpoint_coordinator: crate::storage::checkpoint::CheckpointCoordinator::new(
                 crate::storage::checkpoint::CheckpointConfig::default(),
             ),
-            segment_compaction_config: crate::storage::compaction::CompactionConfig::default(),
             spatial_indexes: std::collections::HashMap::new(),
             spatial_doc_map: std::collections::HashMap::new(),
             vector_doc_map: std::collections::HashMap::new(),
@@ -163,6 +158,7 @@ impl CoreLoop {
             query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
             graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
             ts_tuning: nodedb_types::config::tuning::TimeseriesToning::default(),
+            vector_tuning: nodedb_types::config::tuning::VectorTuning::default(),
             kv_engine: crate::engine::kv::KvEngine::from_tuning(
                 crate::engine::kv::current_ms(),
                 &nodedb_types::config::tuning::KvTuning::default(),
@@ -182,7 +178,6 @@ impl CoreLoop {
                 ts_segment_kek: None,
             },
             governor,
-            maintenance_budget: None,
             throttle: super::pressure::SpscThrottle::new(),
             collection_arena_registry: None,
             metrics: None,
@@ -190,26 +185,18 @@ impl CoreLoop {
             event_sequence: 0,
             quiesce: None,
             quarantine_registry: None,
-            pending_reindex: Vec::new(),
             epoch_system_ms: None,
-            // Resting state is authoritative: a shard executing a bulk DML
-            // directly (single-shard / non-Calvin dispatch) has no replication
-            // followers, so it MUST run OLLP drift verification. The Calvin
-            // replicated path scopes this to actual group leadership for the
-            // duration of a batch and restores it afterward — followers in a
-            // group skip verification and apply the leader's predicted set.
-            ollp_is_group_leader: true,
             txn_overlays: HashMap::new(),
             graph_txn_overlays: HashMap::new(),
             array_txn_overlays: HashMap::new(),
             txn_created_columnar_engines: HashMap::new(),
             write_index: super::write_index::WriteVersionIndex::new(),
-            commit_pending: HashMap::new(),
-            calvin_flush_key: None,
-            calvin_flush_index_tuples: HashMap::new(),
+            calvin: super::calvin_state::CalvinCoreState::new(),
             active_bitemporal_stamps: HashMap::new(),
             active_graph_system_from: None,
-            balanced_txn_entries: None,
+            redo_apply:
+                crate::data::executor::handlers::transaction::redo_apply::RedoApplyState::new(),
+            fail_stop: super::fail_stop::CoreFailStop::default(),
         })
     }
 }

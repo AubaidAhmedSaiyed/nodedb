@@ -13,7 +13,6 @@ use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::server::shared::sql::staging_predicates::require_affected_count;
 use crate::control::state::SharedState;
-use crate::types::VShardId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -38,6 +37,10 @@ pub(super) async fn intercept_kv_clone_write(
             rls_write_check,
             returning,
             rls_filters,
+            // The tombstone path answers a count, not a sync ack. A Lite KV
+            // push that lands here moves its stream mark on its own, after
+            // this returns `Handled`.
+            provenance: _,
         }) => {
             // Delete may have multiple keys; handle each. We serialize here
             // (one tombstone per key) and return Handled with synthetic OK.
@@ -167,8 +170,11 @@ pub(super) async fn intercept_kv_clone_write(
                     // Same statement, same projection and read gate.
                     returning: returning.clone(),
                     rls_filters: rls_filters.clone(),
+                    provenance: None,
                 });
-                let vshard_id = VShardId::from_collection_in_database(db_id, collection_qualified);
+                let vshard_id =
+                    nodedb_types::CollectionKey::from_qualified_str(db_id, collection_qualified)?
+                        .vshard();
                 let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, delete_plan)
                     .await
                     .map_err(|e| write_err(format!("clone kv delete dispatch: {e}")))?;

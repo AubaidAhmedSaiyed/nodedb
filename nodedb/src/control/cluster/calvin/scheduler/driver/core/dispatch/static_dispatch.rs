@@ -11,6 +11,8 @@ use nodedb_cluster::calvin::types::SequencedTxn;
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
 
+use super::super::deferred::{DispatchOutcome, DispatchStep};
+use super::super::owed::SchedulerProposal;
 use super::super::routing::PlanRouting;
 use super::super::scheduler::Scheduler;
 use super::primary_write::{
@@ -50,21 +52,12 @@ impl Scheduler {
     /// full deadline and report a generic timeout. Mirrors the OllpMismatch
     /// broadcast in `handle_executor_response`. Shared by `dispatch_txn` and
     /// `dispatch_active_txn`.
-    pub(super) fn propose_routing_failure(
-        &self,
-        epoch: u64,
-        position: u32,
-        txn_id: TxnId,
-        err: &crate::Error,
-    ) {
+    pub(super) fn propose_routing_failure(&mut self, txn_id: TxnId, err: &crate::Error) {
         self.propose_sequencer_entry(
-            nodedb_cluster::calvin::SequencerEntry::TxnRoutingFailed {
-                epoch,
-                position,
+            txn_id,
+            SchedulerProposal::RoutingFailed {
                 detail: err.to_string(),
             },
-            txn_id,
-            "txn routing-failure signal",
         );
     }
 
@@ -148,7 +141,7 @@ impl Scheduler {
                     error = %e,
                     "calvin scheduler: plan decode failed; releasing locks and skipping txn"
                 );
-                self.on_txn_complete(txn_id);
+                self.on_unpending_txn_complete(txn_id, lock_owner);
                 return;
             }
         };
@@ -164,8 +157,8 @@ impl Scheduler {
                         error = %e,
                         "calvin scheduler: static txn routing failed; releasing locks"
                     );
-                    self.propose_routing_failure(epoch, position, txn_id, &e);
-                    self.on_txn_complete(txn_id);
+                    self.propose_routing_failure(txn_id, &e);
+                    self.on_unpending_txn_complete(txn_id, lock_owner);
                     return;
                 }
             };
@@ -199,8 +192,8 @@ impl Scheduler {
                 error = %e,
                 "calvin scheduler: static txn homes no local work; releasing locks"
             );
-            self.propose_routing_failure(epoch, position, txn_id, &e);
-            self.on_txn_complete(txn_id);
+            self.propose_routing_failure(txn_id, &e);
+            self.on_unpending_txn_complete(txn_id, lock_owner);
             return;
         }
 
@@ -219,8 +212,8 @@ impl Scheduler {
         );
     }
 
-    /// Build and dispatch a `CalvinExecuteStatic` task, then park the txn in
-    /// `pending` as `Staged`.
+    /// Park the txn in `pending` as `Staged`, then build and dispatch its
+    /// `CalvinExecuteStatic` task.
     ///
     /// Shared by the write path (`plans` = this vShard's local write slice) and
     /// the validate-only read path (`plans` empty). Both carry the txn's FULL
@@ -228,6 +221,9 @@ impl Scheduler {
     /// the read-set — whether or not `plans` is empty — and returns the commit
     /// vote on `read_set_valid`. A validate-only task has `has_primary_write ==
     /// false`, so it deposits no result sidecar entry, exactly as intended.
+    ///
+    /// The txn enters `pending` before the dispatch, so a stage refused at
+    /// capacity stays in flight with its locks until the re-send.
     fn dispatch_calvin_static(
         &mut self,
         txn: SequencedTxn,
@@ -246,6 +242,8 @@ impl Scheduler {
         let has_primary_write = plans_have_primary_write(&plans, has_non_derived_write);
         let has_returning = plans_have_returning(&plans);
         let change_sets = participant_change_sets(&plans, tenant_id, self.vshard_id);
+        let flush_scope = super::super::super::types::FlushScope::of_plans(&plans);
+        let database_id = txn.tx_class.database_id;
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteStatic {
             epoch,
             position,
@@ -262,34 +260,7 @@ impl Scheduler {
         // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
         // scheduler's response handler), so no committed LSN is known at
         // dispatch time to stamp here.
-        let request =
-            self.build_exempt_request(request_id, tenant_id, txn.tx_class.database_id, plan, None);
-
-        let resp_rx = self.shared.tracker.register(request_id);
-
-        let dispatch_result = match self.shared.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request),
-            Err(poisoned) => poisoned.into_inner().dispatch(request),
-        };
-
-        if let Err(e) = dispatch_result {
-            error!(
-                vshard_id = self.vshard_id,
-                epoch,
-                position,
-                error = %e,
-                "calvin scheduler: dispatch failed; releasing locks"
-            );
-            self.on_txn_complete(txn_id);
-            return;
-        }
-
-        self.metrics.record_dispatch();
-
-        // no-determinism: executor latency observability, off-WAL path
-        let dispatch_instant = Instant::now();
-
-        self.spawn_response_bridge(txn_id, request_id, resp_rx);
+        let request = self.build_exempt_request(request_id, tenant_id, database_id, plan, None);
 
         self.pending.insert(
             txn_id,
@@ -297,17 +268,27 @@ impl Scheduler {
                 txn,
                 lock_owner,
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
-                dispatch_time: dispatch_instant,
+                dispatch_time: Instant::now(),
                 has_primary_write,
                 has_returning,
                 change_sets,
-                // This dispatch STAGED the txn (validate + buffer, no apply);
+                // This dispatch STAGES the txn (validate + buffer, no apply);
                 // its response carries the local commit vote that drives the
                 // subsequent flush-or-drop.
                 commit_state: Some(super::super::super::types::CommitState::Staged),
                 // Set only once the txn parks in `AwaitingVerdict`.
                 verdict_deadline: None,
+                stage_error: None,
+                // Set once a committed txn appends its redo record.
+                redo_records: None,
+                flush_scope,
             },
         );
+
+        if let DispatchOutcome::Failed(error) =
+            self.dispatch_sequenced(txn_id, DispatchStep::StageStatic, request)
+        {
+            self.fail_dispatch_step(txn_id, DispatchStep::StageStatic, error);
+        }
     }
 }

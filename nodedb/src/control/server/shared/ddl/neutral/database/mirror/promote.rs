@@ -34,7 +34,7 @@ pub fn promote_database(
 
     let db_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     // Gate after db_id resolution so the audit record carries the database id.
@@ -45,10 +45,12 @@ pub fn promote_database(
         &format!("ALTER DATABASE {name} PROMOTE"),
     )?;
 
+    // A name row whose descriptor is gone is a database a concurrent DROP
+    // removed between the two reads.
     let mut descriptor = catalog
         .get_database(db_id)
-        .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?
-        .ok_or_else(|| ddl_err("XX000", format!("database '{name}' descriptor missing")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog read failed", &e))?
+        .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     // Idempotent: if already promoted (or Active without any mirror_origin),
     // return success immediately.
@@ -95,12 +97,12 @@ pub fn promote_database(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
-    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
+    .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
 
     if outcome.needs_local_apply() {
         catalog
             .put_database(&descriptor)
-            .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))?;
     }
 
     // The database is now writable. Clear the mirror-only catalog state so
@@ -113,15 +115,15 @@ pub fn promote_database(
     // lineage (origin cluster, mode, last applied LSN at promotion). DROP
     // DATABASE relies on this cleanup having happened — see drop.rs.
     if let Err(e) = catalog.delete_mirror_collection_map(db_id) {
-        return Err(ddl_err(
-            "XX000",
-            format!("PROMOTE: failed to clear mirror_collection_map: {e}"),
+        return Err(DdlError::from_error_in_context(
+            "PROMOTE: failed to clear mirror_collection_map",
+            &e,
         ));
     }
     if let Err(e) = catalog.delete_mirror_lag(db_id) {
-        return Err(ddl_err(
-            "XX000",
-            format!("PROMOTE: failed to clear mirror_lag: {e}"),
+        return Err(DdlError::from_error_in_context(
+            "PROMOTE: failed to clear mirror_lag",
+            &e,
         ));
     }
 

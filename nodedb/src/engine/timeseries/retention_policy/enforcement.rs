@@ -43,8 +43,15 @@ async fn enforcement_loop(
     registry: Arc<RetentionPolicyRegistry>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Start with a short initial delay to let the system warm up.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Start with a short initial delay to let the system warm up. Shutdown
+    // ends the delay: a server stopped within it must not wait it out.
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+        _ = shutdown.wait_for(|stopping| *stopping) => {
+            info!("retention enforcement loop shutting down");
+            return;
+        }
+    }
 
     loop {
         // Find the shortest eval interval among all enabled policies.
@@ -95,8 +102,7 @@ async fn enforcement_loop(
                             crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                                 crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
                                 tenant_id,
-                                DatabaseId::new(policy.database_id),
-                                &policy.collection,
+                                nodedb_types::CollectionKey::from_bare(DatabaseId::new(policy.database_id), &policy.collection),
                                 plan,
                             ),
                             Duration::from_secs(30),
@@ -126,8 +132,7 @@ async fn enforcement_loop(
                 crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
                     crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
                     tenant_id,
-                    DatabaseId::new(policy.database_id),
-                    &policy.collection,
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::new(policy.database_id), &policy.collection),
                     plan,
                 ),
                 Duration::from_secs(30),
@@ -186,8 +191,10 @@ async fn check_watermark_coverage(
         crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
             crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
             tenant_id,
-            DatabaseId::new(policy.database_id),
-            &policy.collection,
+            nodedb_types::CollectionKey::from_bare(
+                DatabaseId::new(policy.database_id),
+                &policy.collection,
+            ),
             plan,
         ),
         Duration::from_secs(10),

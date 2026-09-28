@@ -21,7 +21,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::insert_select::copy_rows::{assign_page_rows, resolve_copy_spec};
 use crate::control::maintenance::clone_materializer::scan_source_page;
 use crate::control::state::SharedState;
-use crate::types::{TxnId, VShardId};
+use crate::types::TxnId;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -70,8 +70,11 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
 
     // Recompute the target vShard (rather than reusing the staged task's)
     // to keep dispatch classification honest, as the MERGE expander does.
-    let vshard_id =
-        VShardId::from_collection_in_database(task.database_id, target_collection.as_str());
+    let vshard_id = nodedb_types::CollectionKey::from_qualified_str(
+        task.database_id,
+        target_collection.as_str(),
+    )?
+    .vshard();
 
     // Resolve materialized-sum targets: these ops stage directly, bypassing
     // statement-level resolution, so without this a bound target collection

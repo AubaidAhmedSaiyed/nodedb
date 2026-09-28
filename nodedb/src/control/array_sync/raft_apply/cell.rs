@@ -63,10 +63,12 @@ pub(crate) async fn apply_array_cell_write(
     target: ArrayCellTarget,
     plan: PhysicalPlan,
 ) -> bool {
+    let commit_hlc = pos.carried_commit_hlc();
     let AppliedPosition {
         group_id,
         log_index,
         applied_key,
+        ..
     } = pos;
     let ArrayCellTarget {
         tenant_id,
@@ -117,6 +119,8 @@ pub(crate) async fn apply_array_cell_write(
             // exactly as the generic committed-write branch does.
             event_source: crate::event::EventSource::User,
             resolved_now_ms,
+            apply_key: applied_key,
+            commit_hlc,
             op_label: "array cell write",
         },
     )
@@ -128,7 +132,11 @@ pub(crate) async fn apply_array_cell_write(
             "apply_array_cell_write: apply failed"
         );
     }
-    let applied_ok = result.is_ok();
+    // A final refusal is the entry's outcome: its marker carries the key.
+    let applied_ok = result.is_ok()
+        || result
+            .as_ref()
+            .is_err_and(crate::control::server::dispatch_utils::error_is_final_refusal);
     tracker.complete(group_id, log_index, applied_key, result);
     applied_ok
 }

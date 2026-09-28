@@ -103,15 +103,15 @@ impl CoreLoop {
             match ScanFilter::all_match_value(attr_filters, &doc) {
                 Ok(true) => {}
                 Ok(false) => continue,
-                Err(_e) => {
-                    return self.response_error(task, ErrorCode::DivisionByZero);
+                Err(e) => {
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             }
             match ScanFilter::all_match_value(rls_filters, &doc) {
                 Ok(true) => {}
                 Ok(false) => continue,
-                Err(_e) => {
-                    return self.response_error(task, ErrorCode::DivisionByZero);
+                Err(e) => {
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             }
 

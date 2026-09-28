@@ -50,9 +50,13 @@ pub(crate) fn resolve_database_id(
 
     match catalog.get_database_id_by_name(&db_name) {
         Ok(Some(id)) => Ok(id),
-        Ok(None) => Err(ApiError::BadRequest(format!(
-            "3D000 database '{db_name}' does not exist"
-        ))),
+        // The status of `3D000` from the one gateway status table.
+        Ok(None) => Err(ApiError::HttpStatus(
+            crate::control::gateway::GatewayErrorMap::sqlstate_to_http(
+                nodedb_types::error::sqlstate::INVALID_CATALOG_NAME,
+            ),
+            format!("3D000 database '{db_name}' does not exist"),
+        )),
         Err(e) => Err(ApiError::Internal(format!("catalog lookup failed: {e}"))),
     }
 }

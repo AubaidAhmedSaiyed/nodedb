@@ -15,6 +15,7 @@ use crate::types::{TxnId, VShardId};
 use nodedb_types::SurrogateBitmap;
 
 use super::executor::DataPlaneArrayExecutor;
+use super::refusal::refusal_error;
 use crate::data::executor::response_codec::ArraySliceResponse;
 use nodedb_physical::physical_plan::{ArrayOp, ArrayReducer, PhysicalPlan};
 
@@ -62,14 +63,7 @@ impl DataPlaneArrayExecutor {
             .await?;
 
         if resp.status == crate::bridge::envelope::Status::Error {
-            let detail = resp
-                .error_code
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "unknown Data Plane error".into());
-            return Err(ClusterError::Storage {
-                detail: format!("array slice Data Plane error: {detail}"),
-            });
+            return Err(refusal_error("array slice", &resp));
         }
 
         // Decode the structured `ArraySliceResponse` envelope, then split the
@@ -137,14 +131,7 @@ impl DataPlaneArrayExecutor {
             .await?;
 
         if resp.status == crate::bridge::envelope::Status::Error {
-            let detail = resp
-                .error_code
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "unknown Data Plane error".into());
-            return Err(ClusterError::Storage {
-                detail: format!("array agg Data Plane error: {detail}"),
-            });
+            return Err(refusal_error("array agg", &resp));
         }
 
         if resp.payload.is_empty() {
@@ -189,14 +176,7 @@ impl DataPlaneArrayExecutor {
             .await?;
 
         if resp.status == crate::bridge::envelope::Status::Error {
-            let detail = resp
-                .error_code
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "unknown Data Plane error".into());
-            return Err(ClusterError::Storage {
-                detail: format!("surrogate bitmap scan Data Plane error: {detail}"),
-            });
+            return Err(refusal_error("surrogate bitmap scan", &resp));
         }
 
         collect_surrogate_bitmap(&resp.payload)

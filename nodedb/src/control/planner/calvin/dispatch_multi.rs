@@ -162,7 +162,7 @@ pub(crate) async fn dispatch_tasks_to_calvin(
     reads: &[ReadSetEntry],
     lock_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
 ) -> crate::Result<Option<Response>> {
-    let read_vshards = read_vshards_of(reads);
+    let read_vshards = read_vshards_of(reads)?;
     match classify_dispatch(tasks, &read_vshards) {
         DispatchClass::MultiShard { .. } => {
             admit_legacy_multi_shard_dispatch(cross_shard_mode, position)?;
@@ -186,12 +186,12 @@ mod tests {
     use nodedb_cluster::calvin::types::TxnIdWire;
     use nodedb_physical::physical_plan::{DocumentOp, GraphOp, PhysicalPlan};
     use nodedb_physical::physical_task::PostSetOp;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{CollectionKey, Surrogate};
 
     fn task(collection: &str, surrogate: u32) -> PhysicalTask {
         PhysicalTask {
             tenant_id: TenantId::new(1),
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
+            vshard_id: CollectionKey::from_bare(DatabaseId::DEFAULT, collection).vshard(),
             database_id: DatabaseId::DEFAULT,
             plan: PhysicalPlan::Document(DocumentOp::PointInsert {
                 collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
@@ -225,11 +225,11 @@ mod tests {
     }
 
     fn distinct_collection(from: &str) -> String {
-        let home = VShardId::from_collection_in_database(DatabaseId::DEFAULT, from);
+        let home = CollectionKey::from_bare(DatabaseId::DEFAULT, from).vshard();
         (0..1024)
             .map(|index| format!("atomic_{index}"))
             .find(|candidate| {
-                VShardId::from_collection_in_database(DatabaseId::DEFAULT, candidate) != home
+                CollectionKey::from_bare(DatabaseId::DEFAULT, candidate).vshard() != home
             })
             .expect("test routing domain must contain more than one vShard")
     }

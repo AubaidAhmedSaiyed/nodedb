@@ -33,12 +33,16 @@ pub(crate) struct WriteDispatch {
     pub txn_id: Option<crate::types::TxnId>,
     pub wal_lsn: Option<crate::types::Lsn>,
     /// Wall-clock instant (ms since epoch) the Control Plane resolved at
-    /// WAL-append time for a TTL-bearing KV write's `expire_at_ms`. Stamped
-    /// onto the `Request` (same as `wal_lsn`) so the Data Plane installs the
-    /// SAME instant the durable WAL record carries instead of re-reading the
-    /// clock at apply time. `None` for reads, non-TTL writes, and writes whose
-    /// resolved instant is not (yet) threaded.
+    /// WAL-append time: a TTL-bearing KV write's expiry base, or a timeseries
+    /// ingest's default row timestamp. Stamped onto the `Request` (same as
+    /// `wal_lsn`) so the Data Plane installs the SAME instant the durable WAL
+    /// record carries instead of re-reading the clock at apply time. `None`
+    /// for reads and other writes.
     pub resolved_now_ms: Option<u64>,
+    /// The records the caller appended for this write, under their
+    /// outcome-floor window. The funnel closes the window from the write's
+    /// outcome. `None` when the caller appended nothing for this dispatch.
+    pub minted: Option<super::minted::MintedRecords>,
 }
 
 /// Inputs for `dispatch_to_data_plane_inner`: the Data Plane request identity

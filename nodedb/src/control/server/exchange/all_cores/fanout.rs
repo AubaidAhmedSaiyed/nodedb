@@ -14,11 +14,15 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 
+/// One core's outcome: its response, `None` for a `NotFound` refusal, or the
+/// typed error that stopped it.
+type CoreOutcome = crate::Result<Option<Response>>;
+
 /// Shared per-core fan for a BSP/WCC superstep plan: dispatch to every local
 /// core, gather bounded responses, drop `NotFound`/empty-CSR cores.
 ///
-/// Must scope `owned_vshards` to `vshard % num_cores == core_id`, or every core
-/// claims sibling-homed nodes in its local CSR, duplicating them in the merge.
+/// A core that fails is dropped while any other core answers. The call fails
+/// only when no core answers.
 pub(super) async fn gather_graph_op_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
@@ -28,6 +32,69 @@ pub(super) async fn gather_graph_op_all_cores(
     txn_id: Option<TxnId>,
     label: &'static str,
 ) -> crate::Result<Vec<Response>> {
+    let outcomes =
+        dispatch_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id, label).await?;
+    let mut out = Vec::with_capacity(outcomes.len());
+    // First error seen across cores, kept as a TYPED error: a core cut short by
+    // the statement's deadline reports the deadline, and a constraint refusal
+    // keeps its own SQLSTATE.
+    let mut first_error: Option<crate::Error> = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(Some(resp)) => out.push(resp),
+            Ok(None) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if out.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    Ok(out)
+}
+
+/// Fan `plan` to every local core and require every core to answer.
+///
+/// Each core holds only the state its own vShards home to. A merge that
+/// dropped a failed core returns that core's state as absent, so the first
+/// core error fails the whole call. A `NotFound` refusal contributes nothing.
+pub(super) async fn gather_every_core(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    label: &'static str,
+) -> crate::Result<Vec<Response>> {
+    let outcomes =
+        dispatch_all_cores(state, tenant_id, database_id, plan, trace_id, None, label).await?;
+    let mut out = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        if let Some(resp) = outcome? {
+            out.push(resp);
+        }
+    }
+    Ok(out)
+}
+
+/// Dispatch `plan` to every local core and collect each core's outcome.
+///
+/// Must scope `owned_vshards` to `vshard % num_cores == core_id`, or every core
+/// claims sibling-homed nodes in its local CSR, duplicating them in the merge.
+async fn dispatch_all_cores(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    txn_id: Option<TxnId>,
+    label: &'static str,
+) -> crate::Result<Vec<CoreOutcome>> {
     // Shared broadcast call counter (parity with gather_all_cores).
     crate::control::server::broadcast::broadcast_call_count_increment();
 
@@ -103,9 +170,9 @@ pub(super) async fn gather_graph_op_all_cores(
         .into_iter()
         .map(|(core_id, request_id, mut rx)| async move {
             let context = format!("{label} gather on core {core_id}");
-            crate::control::server::dispatch_utils::collect_under_deadline(
+            crate::control::local_dispatch::collect_under_deadline(
                 &mut rx,
-                crate::control::server::dispatch_utils::DeadlineCollect {
+                crate::control::local_dispatch::DeadlineCollect {
                     request_id,
                     deadline,
                     max_result_bytes,
@@ -117,43 +184,16 @@ pub(super) async fn gather_graph_op_all_cores(
 
     let results: Vec<crate::Result<Response>> = join_all(response_futures).await;
 
-    let mut out = Vec::with_capacity(num_cores);
-    // First error seen across cores, kept as a TYPED error: a core cut short by
-    // the statement's deadline reports the deadline, and a constraint refusal
-    // keeps its own SQLSTATE. Stringifying either one made both read as
-    // internal.
-    let mut first_error: Option<crate::Error> = None;
-
-    for result in results {
-        let resp = match result {
-            Ok(r) => r,
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                continue;
+    Ok(results
+        .into_iter()
+        .map(|result| {
+            let resp = result?;
+            if resp.status == Status::Error {
+                // `NotFound` is an empty slice on this core, not an error.
+                crate::control::local_dispatch::reject_data_plane_error(&resp)?;
+                return Ok(None);
             }
-        };
-
-        if resp.status == Status::Error {
-            // `NotFound` is an empty CSR slice on this core, not an error.
-            if let Err(error) =
-                crate::control::server::dispatch_utils::reject_data_plane_error(&resp)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-            continue;
-        }
-
-        out.push(resp);
-    }
-
-    if out.is_empty()
-        && let Some(error) = first_error
-    {
-        return Err(error);
-    }
-
-    Ok(out)
+            Ok(Some(resp))
+        })
+        .collect())
 }

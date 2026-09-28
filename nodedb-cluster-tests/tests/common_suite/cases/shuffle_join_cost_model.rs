@@ -67,8 +67,14 @@ async fn cost_model_auto_selects_shuffle_from_analyze_stats() {
     const LEFT: &str = "orders";
     const RIGHT: &str = "customers";
     assert_ne!(
-        vshard_for_collection(DatabaseId::DEFAULT, LEFT),
-        vshard_for_collection(DatabaseId::DEFAULT, RIGHT),
+        vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+            DatabaseId::DEFAULT,
+            LEFT
+        )),
+        vshard_for_collection(nodedb_types::CollectionKey::from_bare(
+            DatabaseId::DEFAULT,
+            RIGHT
+        )),
         "test collections must hash to different vShards to exercise cross-node shuffle"
     );
 

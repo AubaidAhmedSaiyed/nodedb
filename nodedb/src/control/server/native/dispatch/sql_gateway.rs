@@ -3,19 +3,19 @@
 //! Gateway-based SQL task dispatch for the native protocol.
 //!
 //! When `SharedState.gateway` is `Some`, tasks are routed through
-//! `Gateway::execute` which handles cluster-aware routing, typed `NotLeader`
+//! `Gateway::execute_response` which handles cluster-aware routing, typed `NotLeader`
 //! retry, and plan caching. The `None` fallback retains the original
 //! `dispatch_to_data_plane` path for single-node boot before the gateway is
 //! wired. This is native's SQL-TEXT opcode path — distinct from
 //! `raw_dispatch.rs`, which serves only native's direct-op opcodes.
 
-use crate::bridge::envelope::{Payload, Response, Status};
+use crate::bridge::envelope::Response;
 use std::sync::Arc;
 
-use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
+use crate::control::gateway::router::is_task_vshard_scoped;
 use crate::control::server::shared::clone_write::CloneCheckedOutcome;
-use crate::types::{Lsn, RequestId, TraceId};
+use crate::types::TraceId;
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::DispatchCtx;
@@ -48,8 +48,8 @@ pub(super) fn authorize_native_task(
 /// Dispatch a single `PhysicalTask` through the gateway when available,
 /// falling back to the local SPSC path.
 ///
-/// Returns a synthetic `Response` shaped identically to the SPSC path so that
-/// the calling code in `sql.rs` is unchanged.
+/// Both paths return the Data-Plane `Response` shape, with a `NotFound`
+/// verdict as an error status.
 pub(super) async fn dispatch_task_via_gateway(
     ctx: &DispatchCtx<'_>,
     task: PhysicalTask,
@@ -77,7 +77,14 @@ pub(super) async fn dispatch_task_via_gateway(
     let database_id = checked.database_id();
     let txn_id = checked.txn_id();
 
-    match ctx.state.gateway.get() {
+    // A staged write and the other transaction meta-ops run on the core of
+    // the task's own vShard. The gateway would route them to vShard 0.
+    let gateway = ctx
+        .state
+        .gateway
+        .get()
+        .filter(|_| !is_task_vshard_scoped(checked.plan()));
+    match gateway {
         Some(gw) => {
             let gw_ctx = GatewayQueryContext {
                 tenant_id,
@@ -87,48 +94,18 @@ pub(super) async fn dispatch_task_via_gateway(
                 // dispatch resolves the per-txn staging overlay.
                 txn_id,
             };
-            gw.execute(&gw_ctx, checked)
-                .await
-                .map_err(|e| {
-                    let (code, msg) = GatewayErrorMap::to_native(&e);
-                    crate::Error::Internal {
-                        detail: format!("gateway error {code}: {msg}"),
-                    }
-                })
-                .map(payloads_to_response)
+            // The typed error passes through unchanged. The native frame
+            // renders its SQLSTATE and numeric code from it.
+            gw.execute_response(&gw_ctx, checked).await
         }
+        // A write takes the durable route, a read the read route.
         None => {
-            crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+            crate::control::server::dispatch_utils::dispatch_authorized_task_by_class(
                 ctx.state,
                 checked,
                 TraceId::generate(),
             )
             .await
         }
-    }
-}
-
-/// Convert gateway `Vec<Vec<u8>>` payloads into a synthetic `Response`.
-///
-/// Mirrors the same conversion used in the RESP gateway_dispatch module:
-/// the first payload is used as the response body; an empty `Vec` yields an
-/// empty payload with `Status::Ok`.
-fn payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
-    let payload = payloads
-        .into_iter()
-        .next()
-        .map(Payload::from_vec)
-        .unwrap_or_else(Payload::empty);
-    Response {
-        request_id: RequestId::new(0),
-        status: Status::Ok,
-        attempt: 0,
-        partial: false,
-        payload,
-        watermark_lsn: Lsn::new(0),
-        error_code: None,
-        read_set_valid: None,
-        read_version_lsn: crate::types::Lsn::ZERO,
-        write_set: Vec::new(),
     }
 }

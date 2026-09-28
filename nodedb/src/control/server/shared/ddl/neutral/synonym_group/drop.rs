@@ -49,7 +49,7 @@ pub async fn drop_synonym_group(
         name: name.to_string(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
 
     // Single node: no applier runs, so post-apply never fires. Run the two
     // per-node effects the applier runs everywhere else — the catalog delete,
@@ -57,7 +57,7 @@ pub async fn drop_synonym_group(
     if outcome.needs_local_apply() {
         catalog
             .delete_synonym_group(database_id_u64, tenant_id_u64, name)
-            .map_err(|e| err("XX000", format!("catalog delete: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
         crate::control::catalog_entry::post_apply::remove_synonym_group(
             database_id_u64,
             tenant_id_u64,

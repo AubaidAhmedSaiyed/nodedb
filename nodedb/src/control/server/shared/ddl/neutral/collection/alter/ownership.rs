@@ -76,11 +76,11 @@ pub(super) fn alter_collection_owner(
     stored.owner = new_owner.to_string();
     let entry = CatalogEntry::PutCollection(Box::new(stored.clone()));
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         catalog
             .put_collection(database_id, &stored)
-            .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
         state.permissions.install_replicated_owner(
             &crate::control::security::catalog::StoredOwner {
                 database_id: stored.database_id.as_u64(),

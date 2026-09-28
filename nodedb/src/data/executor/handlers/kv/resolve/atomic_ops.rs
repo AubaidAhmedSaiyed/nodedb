@@ -1,43 +1,26 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Resolvers for the KV atomics: `Incr`, `IncrFloat`, `Cas`, `GetSet`. Each
-//! post-image comes from `engine_atomic_compute`, the same pure functions
+//! post-image comes from `nodedb_physical::kv_atomic::compute`, the same pure functions
 //! `KvEngine::{incr, incr_float, cas, getset}` call — recomputing here would
 //! let resolve and apply disagree.
 
-use nodedb_physical::physical_plan::KvResolveOutcome;
+use nodedb_physical::kv_atomic::compute;
+use nodedb_physical::physical_plan::{KvCounterShape, KvResolveOutcome};
 
 use super::context::{ResolveResult, ResolvedPut, expiry_from_ttl, one, put_mutation};
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::kv::atomic::KvAtomicCtx;
+use crate::data::executor::handlers::kv::atomic::{
+    KvAtomicCtx, atomic_error_code, incr_float_reply,
+};
 use crate::data::executor::handlers::kv::rls::admit_kv_row;
 use crate::data::executor::response_codec;
-use crate::engine::kv::current_ms;
-use crate::engine::kv::engine_atomic_compute as compute;
 
 /// Render a stored body for the `current_value` / `old_value` slot of an
 /// atomic's reply, exactly as the live handlers do.
 fn base64_body(body: Option<&[u8]>) -> Option<String> {
     body.map(|v| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v))
-}
-
-/// Translate an `AtomicError` into the `ErrorCode` the live handler returns
-/// for it.
-fn atomic_error_code(error: crate::engine::kv::AtomicError, collection: &str) -> ErrorCode {
-    match error {
-        crate::engine::kv::AtomicError::TypeMismatch { detail } => ErrorCode::TypeMismatch {
-            collection: collection.to_string(),
-            detail,
-        },
-        crate::engine::kv::AtomicError::Overflow => ErrorCode::OverflowError {
-            collection: collection.to_string(),
-        },
-        crate::engine::kv::AtomicError::Encode { detail } => ErrorCode::Internal { detail },
-        // The gate is consulted out here, not inside the engine, so the
-        // engine's own rejection path is unreachable from a compute call.
-        crate::engine::kv::AtomicError::Rejected(error) => (*error).into(),
-    }
 }
 
 impl CoreLoop {
@@ -48,6 +31,7 @@ impl CoreLoop {
         ctx: KvAtomicCtx<'_>,
         delta: i64,
         ttl_ms: u64,
+        shape: &KvCounterShape,
     ) -> ResolveResult {
         let KvAtomicCtx {
             task,
@@ -63,8 +47,8 @@ impl CoreLoop {
         }
         let now_ms = self.kv_ttl_now_ms(task);
         let current = self.kv_resolve_read(did, tid, collection, key, now_ms);
-        let (new_value, new_bytes) = compute::incr(current.as_deref(), delta)
-            .map_err(|e| atomic_error_code(e, collection))?;
+        let (new_value, new_bytes) = compute::incr(current.as_deref(), delta, shape)
+            .map_err(|e| atomic_error_code(e.into(), collection))?;
         admit_kv_row(rls_write_check, &new_bytes, key, tid, collection)?;
 
         let expire_at_ms = if ttl_ms > 0 {
@@ -90,7 +74,12 @@ impl CoreLoop {
 
     /// Resolve `INCR_FLOAT`. Always preserves the key's existing TTL, the
     /// same `ttl_ms = 0` call `KvEngine::incr_float` makes.
-    pub(super) fn resolve_kv_incr_float(&self, ctx: KvAtomicCtx<'_>, delta: f64) -> ResolveResult {
+    pub(super) fn resolve_kv_incr_float(
+        &self,
+        ctx: KvAtomicCtx<'_>,
+        delta: &str,
+        shape: &KvCounterShape,
+    ) -> ResolveResult {
         let KvAtomicCtx {
             did,
             tid,
@@ -103,14 +92,14 @@ impl CoreLoop {
         if self.kv_engine.is_over_budget() {
             return Err(ErrorCode::ResourcesExhausted);
         }
-        let now_ms = self.kv_atomic_now_ms();
+        let now_ms = self.kv_read_now_ms();
         let current = self.kv_resolve_read(did, tid, collection, key, now_ms);
-        let (new_value, new_bytes) = compute::incr_float(current.as_deref(), delta)
-            .map_err(|e| atomic_error_code(e, collection))?;
+        let (new_value, new_bytes) = compute::incr_float(current.as_deref(), delta, shape)
+            .map_err(|e| atomic_error_code(e.into(), collection))?;
         admit_kv_row(rls_write_check, &new_bytes, key, tid, collection)?;
 
         let response_payload =
-            response_codec::encode_json_as_msgpack(&serde_json::json!({ "value": new_value }))?;
+            response_codec::encode_json_as_msgpack(&incr_float_reply(new_value, &new_bytes))?;
         Ok(one(
             put_mutation(ResolvedPut {
                 collection,
@@ -146,13 +135,15 @@ impl CoreLoop {
         if self.kv_engine.is_over_budget() {
             return Err(ErrorCode::ResourcesExhausted);
         }
-        // Decided before the swap, same as `execute_kv_cas`: `new_value` is
-        // caller-supplied, so the post-swap row is known up front.
-        admit_kv_row(rls_write_check, new_value, key, tid, collection)?;
-
-        let now_ms = self.kv_atomic_now_ms();
+        let now_ms = self.kv_read_now_ms();
         let current = self.kv_resolve_read(did, tid, collection, key, now_ms);
-        let (matches, write_bytes) = compute::cas(current.as_deref(), expected, new_value);
+        let (matches, write_bytes) = compute::cas(current.as_deref(), expected, new_value)
+            .map_err(|e| atomic_error_code(e.into(), collection))?;
+        // Decided on the image the swap stores, same as `execute_kv_cas`: a
+        // swap into a typed row stores the row, not `new_value` itself.
+        if matches {
+            admit_kv_row(rls_write_check, &write_bytes, key, tid, collection)?;
+        }
 
         let response_payload = response_codec::encode_json_as_msgpack(&serde_json::json!({
             "success": matches,
@@ -199,11 +190,12 @@ impl CoreLoop {
         if self.kv_engine.is_over_budget() {
             return Err(ErrorCode::ResourcesExhausted);
         }
-        admit_kv_row(rls_write_check, new_value, key, tid, collection)?;
-
-        let now_ms = self.kv_atomic_now_ms();
+        let now_ms = self.kv_read_now_ms();
         let old = self.kv_resolve_read(did, tid, collection, key, now_ms);
-        let write_bytes = compute::getset(old.as_deref(), new_value);
+        let write_bytes = compute::getset(old.as_deref(), new_value)
+            .map_err(|e| atomic_error_code(e.into(), collection))?;
+        // Decided on the image the write stores, same as `execute_kv_getset`.
+        admit_kv_row(rls_write_check, &write_bytes, key, tid, collection)?;
 
         let disclosable_old = match &old {
             Some(bytes) => match self.row_passes_rls(bytes, rls_filters) {
@@ -233,14 +225,6 @@ impl CoreLoop {
             }),
             response_payload,
         ))
-    }
-
-    /// The instant `execute_kv_incr_float` / `execute_kv_cas` /
-    /// `execute_kv_getset` read for expiry evaluation.
-    fn kv_atomic_now_ms(&self) -> u64 {
-        self.epoch_system_ms
-            .map(|ms| ms as u64)
-            .unwrap_or_else(current_ms)
     }
 }
 
@@ -327,8 +311,9 @@ mod tests {
             .get(did(), TID, collection, key, crate::engine::kv::current_ms())
     }
 
+    /// A raw counter body: the decimal text of `v`.
     fn i64_bytes(v: i64) -> Vec<u8> {
-        zerompk::to_msgpack_vec(&v).expect("encode i64")
+        v.to_string().into_bytes()
     }
 
     /// Run the resolve handler and decode its outcome.
@@ -368,6 +353,7 @@ mod tests {
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+            shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         }
     }
 

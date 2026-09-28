@@ -115,10 +115,13 @@ pub(super) fn load_wal_tombstones_in(
     {
         let (key, value) = entry.map_err(|e| catalog_err("read wal_tombstone", e))?;
         let (database_id, tenant_id, collection) = key.value();
+        // Rows name the collection by its bare catalog name.
         set.insert(
-            database_id,
+            nodedb_types::CollectionKey::from_bare(
+                nodedb_types::DatabaseId::new(database_id),
+                collection,
+            ),
             tenant_id,
-            collection.to_string(),
             value.value(),
         );
     }
@@ -127,8 +130,14 @@ pub(super) fn load_wal_tombstones_in(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use nodedb_types::{CollectionKey, DatabaseId};
     use tempfile::TempDir;
+
+    use super::*;
+
+    fn key(database: u64, name: &str) -> CollectionKey<'_> {
+        CollectionKey::from_bare(DatabaseId::new(database), name)
+    }
 
     fn catalog() -> (SystemCatalog, TempDir) {
         let tmp = TempDir::new().unwrap();
@@ -146,9 +155,9 @@ mod tests {
 
         let set = cat.load_wal_tombstones().unwrap();
         assert_eq!(set.len(), 3);
-        assert_eq!(set.purge_lsn(7, 1, "users"), Some(100));
-        assert_eq!(set.purge_lsn(7, 1, "orders"), Some(150));
-        assert_eq!(set.purge_lsn(8, 1, "users"), Some(200));
+        assert_eq!(set.purge_lsn(key(7, "users"), 1), Some(100));
+        assert_eq!(set.purge_lsn(key(7, "orders"), 1), Some(150));
+        assert_eq!(set.purge_lsn(key(8, "users"), 1), Some(200));
     }
 
     #[test]
@@ -157,12 +166,16 @@ mod tests {
         cat.record_wal_tombstone(7, 1, "users", 100).unwrap();
         cat.record_wal_tombstone(7, 1, "users", 50).unwrap();
         assert_eq!(
-            cat.load_wal_tombstones().unwrap().purge_lsn(7, 1, "users"),
+            cat.load_wal_tombstones()
+                .unwrap()
+                .purge_lsn(key(7, "users"), 1),
             Some(100)
         );
         cat.record_wal_tombstone(7, 1, "users", 200).unwrap();
         assert_eq!(
-            cat.load_wal_tombstones().unwrap().purge_lsn(7, 1, "users"),
+            cat.load_wal_tombstones()
+                .unwrap()
+                .purge_lsn(key(7, "users"), 1),
             Some(200)
         );
     }
@@ -179,7 +192,7 @@ mod tests {
 
         let set = cat.load_wal_tombstones().unwrap();
         assert_eq!(set.len(), 1);
-        assert_eq!(set.purge_lsn(7, 1, "c"), Some(1000));
+        assert_eq!(set.purge_lsn(key(7, "c"), 1), Some(1000));
     }
 
     #[test]
@@ -189,5 +202,16 @@ mod tests {
         // Threshold == purge_lsn: entry stays (not strictly less than).
         assert_eq!(cat.delete_wal_tombstones_before_lsn(100).unwrap(), 0);
         assert_eq!(cat.load_wal_tombstones().unwrap().len(), 1);
+    }
+
+    /// A persisted row holds the bare name. Loaded, it must shadow the
+    /// qualified storage name a named database's data records carry.
+    #[test]
+    fn loaded_tombstone_shadows_qualified_records() {
+        let (cat, _tmp) = catalog();
+        cat.record_wal_tombstone(1024, 1, "orders", 100).unwrap();
+        let set = cat.load_wal_tombstones().unwrap();
+        assert!(set.is_tombstoned(1024, 1, "1024/orders", 99));
+        assert!(!set.is_tombstoned(1024, 1, "1024/orders", 100));
     }
 }

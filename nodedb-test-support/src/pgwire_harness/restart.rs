@@ -200,6 +200,9 @@ impl TestServer {
             s.governor = init_test_memory_governor();
         }
         let shared = shared;
+        // The same gateway install production boot runs, after every
+        // `Arc::get_mut` above.
+        nodedb::bootstrap::state_wiring::install_gateway(&shared);
         nodedb::bootstrap::credentials::replay_surrogate_wal(
             &shared,
             &wal_records,
@@ -234,6 +237,8 @@ impl TestServer {
             let core_handle =
                 crate::core_loop_runner::spawn_core_loop(crate::core_loop_runner::CoreLoopSpawn {
                     idx,
+                    // Single-core harness (`Dispatcher::new(1, ..)`).
+                    num_cores: 1,
                     data_side,
                     core_dir: dir_path.to_path_buf(),
                     core_array_catalog: shared.array_catalog.clone(),
@@ -316,6 +321,12 @@ impl TestServer {
             shutdown: Arc::clone(&shared.shutdown),
             shutdown_bus: shutdown_bus.clone(),
         });
+
+        // Load grants and hierarchy edges before the listener opens, as the
+        // production boot does once the data groups replayed.
+        nodedb::bootstrap::permission_tree_load::load_permission_trees(&shared)
+            .await
+            .expect("permission tree load on restart");
 
         let pg_listener = PgListener::bind("127.0.0.1:0".parse().unwrap())
             .await

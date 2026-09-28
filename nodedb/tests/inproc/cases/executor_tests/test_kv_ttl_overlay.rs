@@ -37,7 +37,7 @@ fn send_txn(
         ..make_request(plan)
     };
     req_tx
-        .try_push(nodedb::bridge::dispatch::BridgeRequest { inner: request })
+        .try_push(nodedb::bridge::dispatch::BridgeRequest::unfloored(request))
         .unwrap();
     core.tick();
     resp_rx.try_pop().unwrap().inner
@@ -96,6 +96,7 @@ fn staged_expire_is_observed_by_in_tx_get_ttl_then_reverts_on_rollback() {
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         }),
     );
 
@@ -181,6 +182,7 @@ fn staged_persist_hides_base_ttl_then_reverts_on_rollback() {
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         }),
     );
 
@@ -277,6 +279,7 @@ fn staged_expire_with_zero_ttl_makes_key_appear_absent_to_in_tx_get() {
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         }),
     );
 
@@ -374,6 +377,7 @@ fn staged_incr_with_ttl_is_observed_by_in_tx_get_ttl() {
             ttl_ms: 30_000,
             surrogate: nodedb_types::Surrogate::ZERO,
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         })),
     });
     let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, stage_incr);

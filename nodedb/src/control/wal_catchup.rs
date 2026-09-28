@@ -79,6 +79,32 @@ enum CatchupResult {
     Idle,
 }
 
+/// What catch-up does with one timeseries record.
+enum Resend {
+    /// Send the record again under this window.
+    Send(crate::control::server::dispatch_utils::MintedRecords),
+    /// The record's outcome is final: step past it.
+    Skip,
+    /// A live or held window owns the record and carries it to its outcome.
+    /// The cursor must not pass it, or the record is never reached again.
+    Wait,
+}
+
+/// Decide whether the record at `lsn` is sent again.
+///
+/// A record at or below the outcome floor, or one whose last owner closed,
+/// has a final outcome: sending it again would apply it twice or below a
+/// published watermark. A record a window still owns is left for that
+/// window.
+fn plan_resend(floor: &Arc<crate::bridge::dispatch::OutcomeFloor>, lsn: Lsn) -> Resend {
+    use crate::bridge::dispatch::ResendRefusal;
+    match crate::control::server::dispatch_utils::MintedRecords::resend(floor, lsn) {
+        Ok(minted) => Resend::Send(minted),
+        Err(ResendRefusal::BelowFloor | ResendRefusal::Closed) => Resend::Skip,
+        Err(ResendRefusal::Owned) => Resend::Wait,
+    }
+}
+
 /// Run one catch-up cycle: read new WAL records, dispatch timeseries batches.
 ///
 /// Uses paginated mmap replay to bound memory. Passes WAL LSNs to the
@@ -161,37 +187,44 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
             continue;
         }
 
-        // Deserialize WAL payload. Try the new 4-element shape (with kind
-        // discriminator, collection, payload, and trailing provenance) first,
-        // then fall back to the legacy 2-element (collection, payload) shape
-        // written by pre-3a records. Provenance is decoded and discarded here.
-        let (collection, payload) = if let Ok((disc, coll, p, _provenance)) =
-            zerompk::from_msgpack::<(
-                String,
-                String,
-                Vec<u8>,
-                Option<nodedb_types::sync::wire::SyncProvenance>,
-            )>(&record.payload)
-        {
-            let _ = disc;
-            (coll, p)
-        } else if let Ok((coll, p)) = zerompk::from_msgpack::<(String, Vec<u8>)>(&record.payload) {
-            (coll, p)
-        } else {
+        // A columnar record shares this record type and is not a timeseries
+        // ingest; catch-up re-dispatches timeseries ingests only.
+        let Ok(decoded) = crate::wal::decode_batch_record(&record.payload) else {
             max_lsn = max_lsn.max(record.header.lsn);
             continue;
         };
+        if decoded
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != "timeseries")
+        {
+            max_lsn = max_lsn.max(record.header.lsn);
+            continue;
+        }
+
+        let minted = match plan_resend(&shared.outcome_floor, Lsn::new(record.header.lsn)) {
+            Resend::Send(minted) => minted,
+            Resend::Skip => {
+                max_lsn = max_lsn.max(record.header.lsn);
+                continue;
+            }
+            // The cursor stays below this record, so a later cycle reaches
+            // it again once its window settles.
+            Resend::Wait => break,
+        };
 
         let tenant_id = TenantId::new(record.header.tenant_id);
+        let database_id = DatabaseId::new(record.header.database_id);
         let vshard_id = VShardId::new(record.header.vshard_id);
+        let format = decoded.format.unwrap_or_else(|| "ilp".to_string());
 
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: nodedb_types::QualifiedCollection::from_stored(collection),
-            payload,
-            format: "ilp".to_string(),
+            collection: nodedb_types::QualifiedCollection::from_stored(decoded.collection),
+            payload: decoded.payload,
+            format,
             wal_lsn: Some(record.header.lsn),
             // Re-derived on the engine side during apply (record carries
-            // raw ILP — row identities are reconstructed from the wire).
+            // raw rows — row identities are reconstructed from the wire).
             surrogates: Vec::new(),
             provenance: None,
             // No predicate here: catch-up replays an already-committed WAL
@@ -202,13 +235,23 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
         });
 
         // Dispatch to Data Plane — do NOT re-append to WAL (already there).
-        match crate::control::server::dispatch_utils::dispatch_to_data_plane(
+        // Untimed rows take the instant the record carries.
+        match crate::control::server::dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
             shared,
-            tenant_id,
-            DatabaseId::DEFAULT,
-            vshard_id,
-            plan,
-            TraceId::ZERO,
+            crate::control::server::dispatch_utils::WriteDispatch {
+                tenant_id,
+                database_id,
+                vshard_id,
+                plan,
+                trace_id: TraceId::ZERO,
+                event_source: crate::event::EventSource::User,
+                txn_id: None,
+                wal_lsn: None,
+                resolved_now_ms: decoded
+                    .default_timestamp_ms
+                    .and_then(|ms| u64::try_from(ms).ok()),
+                minted: Some(minted),
+            },
         )
         .await
         {
@@ -239,5 +282,27 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
         CatchupResult::Dispatched
     } else {
         CatchupResult::Idle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::dispatch::OutcomeFloor;
+
+    /// Catch-up never steps past a record a live or held window owns, skips
+    /// one whose outcome is final, and sends a free one.
+    #[test]
+    fn catchup_waits_on_an_owned_record_and_skips_a_closed_one() {
+        let floor = OutcomeFloor::new();
+        floor.open_dispatched(Lsn::new(5)).hold();
+        floor.open_dispatched(Lsn::new(6)).settle();
+
+        assert!(matches!(plan_resend(&floor, Lsn::new(5)), Resend::Wait));
+        assert!(matches!(plan_resend(&floor, Lsn::new(6)), Resend::Skip));
+        match plan_resend(&floor, Lsn::new(7)) {
+            Resend::Send(minted) => minted.settle(),
+            Resend::Skip | Resend::Wait => panic!("a free record above the floor is sent"),
+        }
     }
 }

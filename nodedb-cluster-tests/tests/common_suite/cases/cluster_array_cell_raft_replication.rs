@@ -71,7 +71,11 @@ fn array_surrogate(
     shared
         .credentials
         .catalog()
-        .get_surrogate_for_pk(DatabaseId::DEFAULT, tenant, ARRAY, coord_bytes)
+        .get_surrogate_for_pk(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, ARRAY),
+            tenant,
+            coord_bytes,
+        )
         .ok()
         .flatten()
         .map(|s| s.as_u32())

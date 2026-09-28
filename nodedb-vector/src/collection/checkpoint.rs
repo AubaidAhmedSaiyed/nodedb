@@ -24,12 +24,13 @@ use nodedb_types::{Surrogate, VectorQuantization};
 use serde::{Deserialize, Serialize};
 
 use crate::collection::payload_index::PayloadIndexSetSnapshot;
-use crate::collection::segment::{DEFAULT_SEAL_THRESHOLD, SealedSegment};
+use crate::collection::segment::{BuildingSegment, DEFAULT_SEAL_THRESHOLD, SealedSegment};
 use crate::collection::tier::StorageTier;
 use crate::distance::DistanceMetric;
 use crate::error::VectorError;
 use crate::flat::FlatIndex;
 use crate::hnsw::{HnswIndex, HnswParams};
+use crate::ivf::IvfPqIndex;
 use crate::quantize::pq::PqCodec;
 use crate::quantize::sq8::Sq8Codec;
 
@@ -98,6 +99,12 @@ pub(crate) struct CollectionSnapshot {
     /// nothing and replay everything, exactly as before.
     #[serde(default)]
     pub checkpoint_wal_lsn: u64,
+    /// Index type and PQ/IVF parameters. Its HNSW parameters are the
+    /// `params_*` fields above.
+    pub index_config: crate::index_config::IndexConfig,
+    /// Encoded trained IVF-PQ index. `None` for a non-IVF collection or one
+    /// still buffering toward its training threshold.
+    pub ivf_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack)]
@@ -225,6 +232,8 @@ impl VectorCollection {
                 }
             },
             checkpoint_wal_lsn: self.checkpoint_wal_lsn.max(self.applied_wal_lsn),
+            index_config: self.index_config.clone(),
+            ivf_bytes: self.ivf.as_ref().map(IvfPqIndex::to_bytes).transpose()?,
         };
         let msgpack = match zerompk::to_msgpack_vec(&snapshot) {
             Ok(bytes) => bytes,
@@ -309,11 +318,14 @@ impl VectorCollection {
         let mut growing = FlatIndex::new(snap.dim, metric);
         for (i, v) in snap.growing_vectors.iter().enumerate() {
             let deleted = snap.growing_deleted.get(i).copied().unwrap_or(false);
-            if deleted {
-                growing.insert_tombstoned(v.clone());
+            let inserted = if deleted {
+                growing.insert_tombstoned(v.clone())
             } else {
-                growing.insert(v.clone());
-            }
+                growing.insert(v.clone())
+            };
+            inserted.map_err(|e| VectorError::CheckpointDeserializationError {
+                detail: format!("growing-segment replay insert: {e}"),
+            })?;
         }
 
         let mut sealed = Vec::with_capacity(snap.sealed_segments.len());
@@ -366,43 +378,44 @@ impl VectorCollection {
             });
         }
 
+        // A segment sealed but not yet built comes back as a building
+        // segment, searched by brute force; the owning core queues its build.
+        let mut next_segment_id = (sealed.len() + 1) as u32;
+        let mut building = Vec::with_capacity(snap.building_segments.len());
         for bs in &snap.building_segments {
-            let mut index = HnswIndex::new(snap.dim, params.clone());
-            for v in &bs.vectors {
-                index.insert(v.clone()).map_err(|e| {
-                    VectorError::CheckpointDeserializationError {
-                        detail: format!("building-segment replay insert: {e}"),
-                    }
+            let mut flat = FlatIndex::new(snap.dim, metric);
+            for (i, v) in bs.vectors.iter().enumerate() {
+                let inserted = if bs.deleted.get(i).copied().unwrap_or(false) {
+                    flat.insert_tombstoned(v.clone())
+                } else {
+                    flat.insert(v.clone())
+                };
+                inserted.map_err(|e| VectorError::CheckpointDeserializationError {
+                    detail: format!("building-segment replay insert: {e}"),
                 })?;
             }
-            // Replay building-segment tombstones onto the HNSW index.
-            for (i, &dead) in bs.deleted.iter().enumerate() {
-                if dead {
-                    index.delete(i as u32);
-                }
-            }
-            let sq8 = VectorCollection::build_sq8_for_index(&index);
-            sealed.push(SealedSegment {
-                index,
+            building.push(BuildingSegment {
+                flat,
                 base_id: bs.base_id,
-                sq8,
-                pq: None,
-                tier: StorageTier::L0Ram,
-                mmap_vectors: None,
+                segment_id: next_segment_id,
             });
+            next_segment_id += 1;
         }
-
-        let next_segment_id = (sealed.len() + 1) as u32;
 
         let index_config = crate::index_config::IndexConfig {
             hnsw: params.clone(),
-            ..crate::index_config::IndexConfig::default()
+            ..snap.index_config
         };
+        let ivf = snap
+            .ivf_bytes
+            .as_deref()
+            .map(|bytes| IvfPqIndex::from_bytes(bytes, memory.clone()))
+            .transpose()?;
         Ok(Self {
             growing,
             growing_base_id: snap.growing_base_id,
             sealed,
-            building: Vec::new(),
+            building,
             params,
             next_id: snap.next_id,
             next_segment_id,
@@ -429,6 +442,7 @@ impl VectorCollection {
             seal_threshold: DEFAULT_SEAL_THRESHOLD,
             index_config,
             codec_dispatch: None,
+            ivf,
             quantization: quantization_from_tag(snap.quantization_tag),
             payload: if snap.payload_index_bytes.is_empty() {
                 super::payload_index::PayloadIndexSet::default()
@@ -440,6 +454,8 @@ impl VectorCollection {
             arena_index: None,
             checkpoint_wal_lsn: snap.checkpoint_wal_lsn,
             applied_wal_lsn: snap.checkpoint_wal_lsn,
+            builds_completed: 0,
+            builds_failed: 0,
         })
     }
 }
@@ -503,7 +519,7 @@ mod tests {
             for (d, slot) in v.iter_mut().enumerate() {
                 *slot = ((i as f32) * 0.01 + (d as f32) * 0.1).sin();
             }
-            coll.insert(v);
+            coll.insert(v).unwrap();
         }
         let req = coll.seal("sq8_test").expect("seal produced request");
         let mut idx = HnswIndex::new(req.dim, req.params.clone());
@@ -551,14 +567,14 @@ mod tests {
             },
         );
         for i in 0..50u32 {
-            coll.insert(vec![i as f32, 0.0, 0.0]);
+            coll.insert(vec![i as f32, 0.0, 0.0]).unwrap();
         }
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
         let restored = VectorCollection::from_checkpoint(&bytes, None, test_memory()).unwrap();
         assert_eq!(restored.len(), 50);
         assert_eq!(restored.dim(), 3);
 
-        let results = restored.search(&[25.0, 0.0, 0.0], 1, 64);
+        let results = restored.search(&[25.0, 0.0, 0.0], 1, 64).unwrap();
         assert_eq!(results[0].id, 25);
     }
 
@@ -579,7 +595,7 @@ mod tests {
                 ..HnswParams::default()
             },
         );
-        coll.insert(vec![1.0, 0.0, 0.0]);
+        coll.insert(vec![1.0, 0.0, 0.0]).unwrap();
         coll.note_checkpoint_lsn(42);
         assert_eq!(coll.applied_wal_lsn(), 42);
         assert_eq!(
@@ -634,7 +650,7 @@ mod tests {
         coll.payload
             .add_index("category".to_string(), PayloadIndexKind::Equality);
         for i in 0u32..10 {
-            let node_id = coll.insert(vec![i as f32, 0.0, 0.0]);
+            let node_id = coll.insert(vec![i as f32, 0.0, 0.0]).unwrap();
             let mut fields = HashMap::new();
             let cat = if i % 2 == 0 { "A" } else { "B" };
             fields.insert("category".to_string(), Value::String(cat.to_string()));

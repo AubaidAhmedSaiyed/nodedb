@@ -11,10 +11,7 @@ use crate::error::Result;
 use crate::record::WalRecord;
 
 use super::buffer::DoubleWriteBuffer;
-use super::layout::SlotPrefix;
-
-#[cfg(not(target_arch = "wasm32"))]
-use super::layout::{DWB_CAPACITY, DWB_SLOT_STRIDE, SLOT_PREFIX_SIZE, slot_offset};
+use super::layout::{DWB_CAPACITY, DWB_SLOT_STRIDE, SLOT_PREFIX_SIZE, SlotPrefix, slot_offset};
 
 impl DoubleWriteBuffer {
     /// Try to recover a WAL record by LSN from the double-write buffer.
@@ -25,31 +22,19 @@ impl DoubleWriteBuffer {
     /// highest slot sequence number wins. Returning the older one would
     /// resurrect a payload that was never acknowledged to any client.
     pub fn recover_record(&mut self, target_lsn: u64) -> Result<Option<WalRecord>> {
-        // Tail expressions, not early returns: exactly one arm compiles per
-        // target, so a `return` here is redundant and `-D warnings` rejects it
-        // on the wasm build.
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = target_lsn;
-            Ok(None)
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut best: Option<(u64, WalRecord)> = None;
-            for_each_slot(self, |prefix, record_bytes| {
-                let Some(record) = decode_record(record_bytes) else {
-                    return;
-                };
-                if record.header.lsn != target_lsn || record.verify_checksum().is_err() {
-                    return;
-                }
-                if best.as_ref().is_none_or(|(seq, _)| prefix.seq > *seq) {
-                    best = Some((prefix.seq, record));
-                }
-            })?;
-            Ok(best.map(|(_, record)| record))
-        }
+        let mut best: Option<(u64, WalRecord)> = None;
+        for_each_slot(self, |prefix, record_bytes| {
+            let Some(record) = decode_record(record_bytes) else {
+                return;
+            };
+            if record.header.lsn != target_lsn || record.verify_checksum().is_err() {
+                return;
+            }
+            if best.as_ref().is_none_or(|(seq, _)| prefix.seq > *seq) {
+                best = Some((prefix.seq, record));
+            }
+        })?;
+        Ok(best.map(|(_, record)| record))
     }
 }
 
@@ -58,45 +43,13 @@ impl DoubleWriteBuffer {
 /// The write path resumes above this so a reused sequence number can never let
 /// a stale copy tie with the record that replaced it.
 pub(super) fn scan_max_seq(dwb: &mut DoubleWriteBuffer) -> Result<u64> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let mut max = 0u64;
-        for_each_slot(dwb, |prefix, _| max = max.max(prefix.seq))?;
-        Ok(max)
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        use std::io::{Read as _, Seek as _, SeekFrom};
-
-        use super::layout::{DWB_CAPACITY, SLOT_PREFIX_SIZE, slot_offset};
-        use crate::error::WalError;
-
-        let mut max = 0u64;
-        let mut prefix = [0u8; SLOT_PREFIX_SIZE];
-        for i in 0..DWB_CAPACITY as u32 {
-            if dwb
-                .file
-                .seek(SeekFrom::Start(slot_offset(i)))
-                .map_err(WalError::Io)
-                .is_err()
-            {
-                continue;
-            }
-            if dwb.file.read_exact(&mut prefix).is_err() {
-                continue;
-            }
-            if let Some(decoded) = SlotPrefix::decode(&prefix) {
-                max = max.max(decoded.seq);
-            }
-        }
-        Ok(max)
-    }
+    let mut max = 0u64;
+    for_each_slot(dwb, |prefix, _| max = max.max(prefix.seq))?;
+    Ok(max)
 }
 
 /// Visit every slot that carries a well-formed prefix, handing the callback
 /// the prefix and the record bytes (WAL header + payload) it frames.
-#[cfg(not(target_arch = "wasm32"))]
 fn for_each_slot<F>(dwb: &DoubleWriteBuffer, mut visit: F) -> Result<()>
 where
     F: FnMut(&SlotPrefix, &[u8]),
@@ -141,7 +94,6 @@ where
 
 /// Rebuild a record from the bytes a slot frames. `None` when the header is
 /// not a WAL header at all.
-#[cfg(not(target_arch = "wasm32"))]
 fn decode_record(bytes: &[u8]) -> Option<WalRecord> {
     use crate::record::{HEADER_SIZE, RecordHeader, WAL_MAGIC};
 

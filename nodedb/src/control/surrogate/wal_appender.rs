@@ -15,9 +15,10 @@
 
 use std::sync::Arc;
 
-use nodedb_types::{DatabaseId, TenantId};
+use nodedb_types::{CollectionKey, TenantId};
 
 use crate::wal::WalManager;
+use crate::wal::manager::NO_APPLY_KEY;
 
 /// Pluggable WAL appender. Tests substitute `NoopWalAppender`;
 /// production wires [`WalSurrogateAppender`] (a thin wrapper over
@@ -32,20 +33,20 @@ pub trait SurrogateWalAppender: Send + Sync {
     /// `(surrogate, collection, pk_bytes)` triple. Called by
     /// `SurrogateAssigner::assign` after the catalog two-table txn so
     /// the binding is durable before the write-lock is released. The
-    /// `(database_id, tenant_id)` scope is stamped into the record header
-    /// so replay re-keys the binding under the same scope.
+    /// record carries the key's bare name. The `(database_id, tenant_id)`
+    /// scope is stamped into the record header so replay re-keys the
+    /// binding under the same canonical key.
     fn record_bind_to_wal(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
         surrogate: u32,
-        collection: &str,
         pk_bytes: &[u8],
     ) -> crate::Result<()>;
 }
 
 /// Production appender — wraps `Arc<WalManager>` and forwards to
-/// `WalManager::append_surrogate_alloc`.
+/// `WalAppender::append_surrogate_alloc`.
 pub struct WalSurrogateAppender {
     wal: Arc<WalManager>,
 }
@@ -58,19 +59,26 @@ impl WalSurrogateAppender {
 
 impl SurrogateWalAppender for WalSurrogateAppender {
     fn record_alloc_to_wal(&self, hi: u32) -> crate::Result<()> {
-        self.wal.append_surrogate_alloc(hi).map(|_| ())
+        self.wal
+            .appender(NO_APPLY_KEY)
+            .append_surrogate_alloc(hi)
+            .map(|_| ())
     }
 
     fn record_bind_to_wal(
         &self,
-        database_id: DatabaseId,
+        key: CollectionKey<'_>,
         tenant_id: TenantId,
         surrogate: u32,
-        collection: &str,
         pk_bytes: &[u8],
     ) -> crate::Result<()> {
-        self.wal
-            .append_surrogate_bind(database_id, tenant_id, surrogate, collection, pk_bytes)?;
+        self.wal.appender(NO_APPLY_KEY).append_surrogate_bind(
+            key.database_id(),
+            tenant_id,
+            surrogate,
+            key.name(),
+            pk_bytes,
+        )?;
         // Force the record to disk before the assigner releases its
         // write-lock. A crash after `assign` returns must always see
         // the binding on replay; group-commit batching alone does not
@@ -90,10 +98,9 @@ impl SurrogateWalAppender for NoopWalAppender {
 
     fn record_bind_to_wal(
         &self,
-        _database_id: DatabaseId,
+        _key: CollectionKey<'_>,
         _tenant_id: TenantId,
         _surrogate: u32,
-        _collection: &str,
         _pk_bytes: &[u8],
     ) -> crate::Result<()> {
         Ok(())

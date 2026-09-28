@@ -50,8 +50,10 @@ pub async fn register_persisted_continuous_aggregates(state: &SharedState) {
             sync_dispatch::SystemTask::new(
                 sync_dispatch::SystemReason::CatalogMaintenance,
                 tenant_id,
-                crate::types::DatabaseId::new(def.database_id),
-                &def.source,
+                nodedb_types::CollectionKey::from_bare(
+                    crate::types::DatabaseId::new(def.database_id),
+                    &def.source,
+                ),
                 plan,
             ),
             Duration::from_secs(5),

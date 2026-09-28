@@ -19,10 +19,6 @@ use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 
-fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError::new(sqlstate, message)
-}
-
 pub fn show_materialized_views(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -49,7 +45,7 @@ pub fn show_materialized_views(
         .credentials
         .catalog()
         .list_materialized_views(database_id.as_u64(), tenant_id.as_u64())
-        .map_err(|e| err("XX000", format!("catalog read failed: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("catalog read failed", &e))?;
 
     let mut rows = Vec::new();
     for view in &views {

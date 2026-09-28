@@ -92,13 +92,15 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
-        wal.append_put(
-            TenantId::new(TID),
-            VShardId::new(0),
-            DatabaseId::DEFAULT,
-            &entry,
-        )
-        .expect("append raw kv_put record");
+        wal.appender(crate::wal::manager::NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
+            .append_put(
+                TenantId::new(TID),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                &entry,
+            )
+            .expect("append raw kv_put record");
         wal.sync().expect("wal sync");
         let records = wal.replay().expect("wal replay read");
 
@@ -130,13 +132,15 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
-        wal.append_put(
-            TenantId::new(TID),
-            VShardId::new(0),
-            DatabaseId::DEFAULT,
-            &entry,
-        )
-        .expect("append raw kv_batch_put record");
+        wal.appender(crate::wal::manager::NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
+            .append_put(
+                TenantId::new(TID),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                &entry,
+            )
+            .expect("append raw kv_batch_put record");
         wal.sync().expect("wal sync");
         let records = wal.replay().expect("wal replay read");
 
@@ -170,6 +174,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -221,6 +226,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -285,6 +291,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         // 1_000 is vastly less than the real wall clock, so a live-apply path
         // that ignores `resolved_now_ms` and reads the wall clock instead

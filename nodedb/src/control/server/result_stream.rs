@@ -3,7 +3,7 @@
 //! Durable streaming result abstraction.
 //!
 //! A dispatched scan returns its rows as a sequence of `Response` frames over a
-//! `tokio::sync::mpsc::Receiver<Response>` (see `RequestTracker::register`):
+//! `ResponseReceiver` (see `RequestTracker::register`):
 //! several `partial: true` frames followed by one terminal (`partial: false`)
 //! frame, each carrying a standalone msgpack-array payload of rows
 //! (`encode_raw_document_rows`).
@@ -15,8 +15,8 @@
 //! merged msgpack array for byte-demanding consumers that still need the
 //! fully-collected result.
 
-use crate::bridge::envelope::{Response, Status};
-use crate::control::server::dispatch_utils::reject_data_plane_error;
+use crate::bridge::envelope::Status;
+use crate::control::local_dispatch::reject_data_plane_error;
 use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::types::Lsn;
 
@@ -51,7 +51,7 @@ pub type ResultStream =
 /// ends after the terminal (`!partial`) frame is yielded, or when the channel
 /// closes.
 pub(crate) fn stream_response_channel(
-    mut rx: tokio::sync::mpsc::Receiver<Response>,
+    mut rx: crate::control::ResponseReceiver,
     max_result_bytes: usize,
     tolerate_not_found: bool,
 ) -> ResultStream {
@@ -78,10 +78,11 @@ pub(crate) fn stream_response_channel(
                     Err(error) => error,
                     // `NotFound` is the one code that conversion reads as an
                     // empty observation rather than an error. This stream
-                    // declined to tolerate it, so it stops here.
-                    Ok(()) => crate::Error::Dispatch {
-                        detail: "data plane error: NotFound".to_string(),
-                    },
+                    // declined to tolerate it, so it stops here with the
+                    // code's own class.
+                    Ok(()) => crate::Error::DataPlane(
+                        crate::bridge::envelope::ErrorCode::NotFound,
+                    ),
                 };
                 Err(error)?;
                 return;
@@ -134,7 +135,7 @@ pub(crate) async fn materialize(mut stream: ResultStream) -> crate::Result<(Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::envelope::{ErrorCode, Payload};
+    use crate::bridge::envelope::{ErrorCode, Payload, Response};
     use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
     use crate::types::RequestId;
     use tokio::sync::mpsc;
@@ -213,7 +214,11 @@ mod tests {
         tx.send(partial(1000)).await.unwrap();
         tx.send(final_frame(500)).await.unwrap();
         drop(tx);
-        let stream = stream_response_channel(rx, 1 << 20, false);
+        let stream = stream_response_channel(
+            crate::control::ResponseReceiver::from_channel(rx),
+            1 << 20,
+            false,
+        );
         let (merged, _lsn) = materialize(stream).await.unwrap();
         assert_eq!(
             extract_msgpack_elements(&merged).len(),
@@ -228,7 +233,11 @@ mod tests {
         tx.send(raw_partial(600)).await.unwrap();
         tx.send(raw_partial(600)).await.unwrap();
         drop(tx);
-        let stream = stream_response_channel(rx, 1000, false);
+        let stream = stream_response_channel(
+            crate::control::ResponseReceiver::from_channel(rx),
+            1000,
+            false,
+        );
         let err = materialize(stream).await.unwrap_err();
         assert!(matches!(err, crate::Error::ExecutionLimitExceeded { .. }));
     }
@@ -244,7 +253,11 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        let stream = stream_response_channel(rx, 1 << 20, false);
+        let stream = stream_response_channel(
+            crate::control::ResponseReceiver::from_channel(rx),
+            1 << 20,
+            false,
+        );
         match materialize(stream).await {
             Err(crate::Error::DataPlane(ErrorCode::ResourcesExhausted)) => {}
             other => panic!("expected the shard's own code, got {other:?}"),
@@ -262,7 +275,11 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        let stream = stream_response_channel(rx, 1 << 20, false);
+        let stream = stream_response_channel(
+            crate::control::ResponseReceiver::from_channel(rx),
+            1 << 20,
+            false,
+        );
         match materialize(stream).await {
             Err(crate::Error::DeadlineExceeded { request_id }) => {
                 assert_eq!(request_id, RequestId::new(1));
@@ -272,14 +289,21 @@ mod tests {
     }
 
     /// An untolerated `NotFound` still stops the stream rather than reading as
-    /// an empty success.
+    /// an empty success, and keeps its typed code.
     #[tokio::test]
     async fn untolerated_not_found_errors() {
         let (tx, rx) = mpsc::channel(8);
         tx.send(error_frame(ErrorCode::NotFound)).await.unwrap();
         drop(tx);
-        let stream = stream_response_channel(rx, 1 << 20, false);
-        assert!(materialize(stream).await.is_err());
+        let stream = stream_response_channel(
+            crate::control::ResponseReceiver::from_channel(rx),
+            1 << 20,
+            false,
+        );
+        match materialize(stream).await {
+            Err(crate::Error::DataPlane(ErrorCode::NotFound)) => {}
+            other => panic!("expected the typed NotFound refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -287,7 +311,11 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         tx.send(error_frame(ErrorCode::NotFound)).await.unwrap();
         drop(tx);
-        let stream = stream_response_channel(rx, 1 << 20, true);
+        let stream = stream_response_channel(
+            crate::control::ResponseReceiver::from_channel(rx),
+            1 << 20,
+            true,
+        );
         let (merged, _lsn) = materialize(stream).await.unwrap();
         assert_eq!(
             extract_msgpack_elements(&merged).len(),

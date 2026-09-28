@@ -12,6 +12,7 @@
 //! 4. [`TombstoneSet::is_tombstoned`] against realistic `(tenant,
 //!    collection, lsn)` tuples.
 
+use nodedb_types::{CollectionKey, DatabaseId};
 use nodedb_wal::reader::WalReader;
 use nodedb_wal::record::RecordType;
 use nodedb_wal::writer::WalWriter;
@@ -98,7 +99,10 @@ fn extract_and_shadow_writes_before_purge_lsn() {
     let set: TombstoneSet = extract_tombstones(&records).unwrap();
 
     assert_eq!(set.len(), 1);
-    assert_eq!(set.purge_lsn(0, 1, "users"), Some(purge_lsn));
+    assert_eq!(
+        set.purge_lsn(CollectionKey::from_bare(DatabaseId::DEFAULT, "users"), 1),
+        Some(purge_lsn)
+    );
 
     for lsn in &put_lsns {
         assert!(
@@ -160,7 +164,10 @@ fn multiple_tombstones_keep_highest_purge_lsn() {
 
     let records = read_all(&path);
     let set = extract_tombstones(&records).unwrap();
-    assert_eq!(set.purge_lsn(0, 1, "users"), Some(500));
+    assert_eq!(
+        set.purge_lsn(CollectionKey::from_bare(DatabaseId::DEFAULT, "users"), 1),
+        Some(500)
+    );
     assert!(set.is_tombstoned(0, 1, "users", 499));
     assert!(!set.is_tombstoned(0, 1, "users", 500));
 }

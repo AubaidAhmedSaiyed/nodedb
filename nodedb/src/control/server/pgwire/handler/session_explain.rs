@@ -48,15 +48,18 @@ impl NodeDbPgHandler {
                 ))]);
             }
             Some(Err(error)) => {
-                let sqlstate = match error {
-                    nodedb_sql::SqlError::UnsupportedConstraint { .. }
-                    | nodedb_sql::SqlError::ConflictingEngineClause { .. } => "0A000",
-                    _ => "42601",
-                };
+                // The SQLSTATE the planner path renders for the same error.
+                let message = error.to_string();
+                let (_, sqlstate, _) = crate::control::server::pgwire::types::error_to_sqlstate(
+                    &crate::control::planner::plan_error_map::map_plan_error(
+                        error,
+                        identity.tenant_id,
+                    ),
+                );
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
                     sqlstate.to_owned(),
-                    error.to_string(),
+                    message,
                 ))));
             }
             None => {}
@@ -75,7 +78,10 @@ impl NodeDbPgHandler {
             self.state.auth_stores(),
             database_id,
         );
-        let perm_cache = self.state.permission_cache.read().await;
+        let perm_cache =
+            crate::control::security::auth_fence::permission_view(&self.state, tenant_id)
+                .await
+                .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;
         let sec = crate::control::planner::context::PlanSecurityContext {
             identity,
             auth: scope.auth(),

@@ -15,16 +15,169 @@
 
 use nodedb_types::sync::wire::AckStatus;
 
+use crate::bridge::envelope::ErrorCode;
+
 /// The reason text when `error` means "nothing applied, re-send the same frame".
 ///
 /// Matched on the typed error only — never by substring-matching the human
 /// message, which is how a rewording silently turns a retry into a loss.
 pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
-    use crate::bridge::envelope::ErrorCode;
     match error {
         crate::Error::RetryableRefusal { reason } => Some(reason),
-        crate::Error::DataPlane(ErrorCode::RetryableRefusal { reason }) => Some(reason),
-        _ => None,
+        crate::Error::DataPlane(code) => match code {
+            ErrorCode::RetryableRefusal { reason } => Some(reason),
+            ErrorCode::DeadlineExceeded
+            | ErrorCode::RejectedConstraint { .. }
+            | ErrorCode::RejectedPrevalidation { .. }
+            | ErrorCode::SyncRejected { .. }
+            | ErrorCode::SyncNotApplied { .. }
+            | ErrorCode::NotFound
+            | ErrorCode::RejectedAuthz { .. }
+            | ErrorCode::ConflictRetry
+            | ErrorCode::CrdtFrontierMismatch { .. }
+            | ErrorCode::FanOutExceeded
+            | ErrorCode::ResourcesExhausted
+            | ErrorCode::RejectedDanglingEdge { .. }
+            | ErrorCode::DuplicateWrite
+            | ErrorCode::AppendOnlyViolation { .. }
+            | ErrorCode::BalanceViolation { .. }
+            | ErrorCode::PeriodLocked { .. }
+            | ErrorCode::PeriodLockMisconfigured { .. }
+            | ErrorCode::RetentionViolation { .. }
+            | ErrorCode::LegalHoldActive { .. }
+            | ErrorCode::StateTransitionViolation { .. }
+            | ErrorCode::TransitionCheckViolation { .. }
+            | ErrorCode::TypeGuardViolation { .. }
+            | ErrorCode::TypeMismatch { .. }
+            | ErrorCode::CounterFault { .. }
+            | ErrorCode::InsufficientBalance { .. }
+            | ErrorCode::RateExceeded { .. }
+            | ErrorCode::CollectionDraining { .. }
+            | ErrorCode::RecursionDepthExceeded { .. }
+            | ErrorCode::UndefinedColumn { .. }
+            | ErrorCode::Internal { .. }
+            | ErrorCode::Unsupported { .. }
+            | ErrorCode::RollbackFailed { .. }
+            | ErrorCode::OllpRetryRequired
+            | ErrorCode::TxnOverlayMemoryExceeded { .. }
+            | ErrorCode::DivisionByZero
+            | ErrorCode::UndefinedFunction { .. }
+            | ErrorCode::DataException { .. }
+            | ErrorCode::DispatchCapacity { .. }
+            | ErrorCode::ExpiredBeforeExecution
+            | ErrorCode::BadRequest { .. }
+            | ErrorCode::TransactionRollback { .. }
+            | ErrorCode::ActiveSqlTransaction { .. }
+            | ErrorCode::DependentObjectsExist { .. } => None,
+        },
+        crate::Error::RejectedConstraint { .. }
+        | crate::Error::TxnOverlayMemoryExceeded { .. }
+        | crate::Error::RejectedAuthz { .. }
+        | crate::Error::OffsetRegression { .. }
+        | crate::Error::DeadlineExceeded { .. }
+        | crate::Error::ConflictRetry { .. }
+        | crate::Error::CalvinSerializationConflict
+        | crate::Error::CalvinParticipantError
+        | crate::Error::RejectedPrevalidation { .. }
+        | crate::Error::AppendOnlyViolation { .. }
+        | crate::Error::BalanceViolation { .. }
+        | crate::Error::MaterializedSumTargetNotFound { .. }
+        | crate::Error::MaterializedSumResolutionMissing { .. }
+        | crate::Error::PeriodLocked { .. }
+        | crate::Error::PeriodLockMisconfigured { .. }
+        | crate::Error::RetentionViolation { .. }
+        | crate::Error::LegalHoldActive { .. }
+        | crate::Error::StateTransitionViolation { .. }
+        | crate::Error::TransitionCheckViolation { .. }
+        | crate::Error::TypeGuardViolation { .. }
+        | crate::Error::TypeMismatch { .. }
+        | crate::Error::InsufficientBalance { .. }
+        | crate::Error::RateExceeded { .. }
+        | crate::Error::CollectionNotFound { .. }
+        | crate::Error::DocumentNotFound { .. }
+        | crate::Error::CollectionDeactivated { .. }
+        | crate::Error::VShardAdmissionCapacityExceeded { .. }
+        | crate::Error::CrdtAdmissionRetriesExhausted { .. }
+        | crate::Error::CrdtAdmissionInvalidPlan { .. }
+        | crate::Error::CrdtAdmissionCallerFence
+        | crate::Error::CrdtApplyRequiresAdmission
+        | crate::Error::CrdtApplyForbiddenInTransaction
+        | crate::Error::NotInTransactionBlock { .. }
+        | crate::Error::CrdtAdmissionTimeout { .. }
+        | crate::Error::NoLeader { .. }
+        | crate::Error::NotLeader { .. }
+        | crate::Error::FanOutExceeded { .. }
+        | crate::Error::CrossCollectionNotColocated { .. }
+        | crate::Error::SourceFrozen { .. }
+        | crate::Error::CloneWriteRequiresMaterialize { .. }
+        | crate::Error::BadRequest { .. }
+        | crate::Error::BackupTenantMismatch { .. }
+        | crate::Error::BackupKeyMismatch
+        | crate::Error::QuotaOvercommit { .. }
+        | crate::Error::PlanError { .. }
+        | crate::Error::FeatureNotSupported { .. }
+        | crate::Error::UndefinedFunction { .. }
+        | crate::Error::UndefinedObject { .. }
+        | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::UndefinedColumn { .. }
+        | crate::Error::AmbiguousColumn { .. }
+        | crate::Error::UnknownStrictField { .. }
+        | crate::Error::DivisionByZero
+        | crate::Error::DataException { .. }
+        | crate::Error::InvalidLimitValue { .. }
+        | crate::Error::RetryableSchemaChanged { .. }
+        | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::GroupQuorumUnavailable { .. }
+        | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::ExecutionLimitExceeded { .. }
+        | crate::Error::LimitExceeded { .. }
+        | crate::Error::Wal(_)
+        | crate::Error::Dispatch { .. }
+        | crate::Error::DispatchCapacity { .. }
+        | crate::Error::Storage { .. }
+        | crate::Error::ColdStorage { .. }
+        | crate::Error::Serialization { .. }
+        | crate::Error::Codec { .. }
+        | crate::Error::SegmentCorrupted { .. }
+        | crate::Error::MemoryExhausted { .. }
+        | crate::Error::Backpressure { .. }
+        | crate::Error::Crdt(_)
+        | crate::Error::Io(_)
+        | crate::Error::Config { .. }
+        | crate::Error::Encryption { .. }
+        | crate::Error::Bridge { .. }
+        | crate::Error::VersionCompat { .. }
+        | crate::Error::Internal { .. }
+        | crate::Error::Shaping(_)
+        | crate::Error::RemoteTyped { .. }
+        | crate::Error::Ddl(_)
+        | crate::Error::DescriptorVersionAnomaly { .. }
+        | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CatalogIntegrityViolation { .. }
+        | crate::Error::Promql(_)
+        | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
+        | crate::Error::CascadeCycle { .. }
+        | crate::Error::CrossShardInExplicitTransaction
+        | crate::Error::SequencerUnavailable
+        | crate::Error::SessionCapExceeded { .. }
+        | crate::Error::SessionIdleTimeout
+        | crate::Error::SessionTokenExpired
+        | crate::Error::SessionKilledByAdmin
+        | crate::Error::SessionUserDropped
+        | crate::Error::OidcProviderTenantUnbound
+        | crate::Error::OidcProviderTenantUnavailable { .. }
+        | crate::Error::ExternalRoleUndefined { .. }
+        | crate::Error::OidcNoDefaultDatabase { .. }
+        | crate::Error::TenantVectorDimExceeded { .. }
+        | crate::Error::TenantGraphDepthExceeded { .. }
+        | crate::Error::RoleInheritanceCycle { .. }
+        | crate::Error::RoleInheritanceDepthExceeded { .. }
+        | crate::Error::OllpExhausted { .. }
+        | crate::Error::MirrorReadOnly { .. }
+        | crate::Error::StaleReadNotLeader { .. } => None,
     }
 }
 
@@ -32,27 +185,185 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
 /// refused on its merits.
 ///
 /// These are the failures where the cluster never judged the write at all — it
-/// timed out, the leader moved, the sequencer was absent, or memory pressure
-/// shed it. Nothing about the write itself is wrong, so the same bytes are
-/// expected to land once the condition clears.
+/// timed out, the leader moved, a quorum or the sequencer was absent, memory or
+/// rate pressure shed it, the dispatcher refused it at capacity, or a
+/// concurrent change aborted it before it applied. Nothing about the write
+/// itself is wrong, so the same bytes are expected to land once the condition
+/// clears.
 fn is_indeterminate(error: &crate::Error) -> bool {
-    use crate::bridge::envelope::ErrorCode;
-    matches!(
-        error,
+    match error {
         crate::Error::DeadlineExceeded { .. }
-            | crate::Error::CrdtAdmissionTimeout { .. }
-            | crate::Error::NoLeader { .. }
-            | crate::Error::NotLeader { .. }
-            | crate::Error::StaleReadNotLeader { .. }
-            | crate::Error::SequencerUnavailable
-            | crate::Error::Backpressure { .. }
-            | crate::Error::ConflictRetry { .. }
-            | crate::Error::DataPlane(
-                ErrorCode::DeadlineExceeded
-                    | ErrorCode::ResourcesExhausted
-                    | ErrorCode::ConflictRetry
-            )
-    )
+        | crate::Error::CrdtAdmissionTimeout { .. }
+        | crate::Error::NoLeader { .. }
+        | crate::Error::NotLeader { .. }
+        | crate::Error::StaleReadNotLeader { .. }
+        | crate::Error::SequencerUnavailable
+        | crate::Error::Backpressure { .. }
+        | crate::Error::DispatchCapacity { .. }
+        | crate::Error::ConflictRetry { .. }
+        | crate::Error::RetryableRefusal { .. }
+        // A concurrent change aborted the write before it applied: the
+        // retryable class `40`.
+        | crate::Error::RetryableSchemaChanged { .. }
+        | crate::Error::CrdtAdmissionRetriesExhausted { .. }
+        | crate::Error::CalvinSerializationConflict
+        | crate::Error::CalvinParticipantError
+        | crate::Error::SourceFrozen { .. }
+        // No leader or no quorum took the write: the retryable leader class.
+        | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::GroupQuorumUnavailable { .. }
+        | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::AuthorizationStateBehind { .. }
+        // Shed by a resource or rate gate: the class `53`.
+        | crate::Error::VShardAdmissionCapacityExceeded { .. }
+        | crate::Error::MemoryExhausted { .. }
+        | crate::Error::RateExceeded { .. } => true,
+        crate::Error::DataPlane(code) => is_indeterminate_code(code),
+        crate::Error::OllpExhausted { cause, .. } => match cause {
+            crate::OllpExhaustedCause::PredicateDrift
+            | crate::OllpExhaustedCause::AdmissionRefused { .. } => true,
+            crate::OllpExhaustedCause::PreAdmission(inner) => is_indeterminate(inner),
+        },
+        // Refused on its merits, or a fault the same bytes reproduce.
+        crate::Error::RejectedConstraint { .. }
+        | crate::Error::TxnOverlayMemoryExceeded { .. }
+        | crate::Error::RejectedAuthz { .. }
+        | crate::Error::OffsetRegression { .. }
+        | crate::Error::RejectedPrevalidation { .. }
+        | crate::Error::AppendOnlyViolation { .. }
+        | crate::Error::BalanceViolation { .. }
+        | crate::Error::MaterializedSumTargetNotFound { .. }
+        | crate::Error::MaterializedSumResolutionMissing { .. }
+        | crate::Error::PeriodLocked { .. }
+        | crate::Error::PeriodLockMisconfigured { .. }
+        | crate::Error::RetentionViolation { .. }
+        | crate::Error::LegalHoldActive { .. }
+        | crate::Error::StateTransitionViolation { .. }
+        | crate::Error::TransitionCheckViolation { .. }
+        | crate::Error::TypeGuardViolation { .. }
+        | crate::Error::TypeMismatch { .. }
+        | crate::Error::InsufficientBalance { .. }
+        | crate::Error::CollectionNotFound { .. }
+        | crate::Error::DocumentNotFound { .. }
+        | crate::Error::CollectionDeactivated { .. }
+        | crate::Error::CrdtAdmissionInvalidPlan { .. }
+        | crate::Error::CrdtAdmissionCallerFence
+        | crate::Error::CrdtApplyRequiresAdmission
+        | crate::Error::CrdtApplyForbiddenInTransaction
+        | crate::Error::NotInTransactionBlock { .. }
+        | crate::Error::FanOutExceeded { .. }
+        | crate::Error::CrossCollectionNotColocated { .. }
+        | crate::Error::CloneWriteRequiresMaterialize { .. }
+        | crate::Error::BadRequest { .. }
+        | crate::Error::BackupTenantMismatch { .. }
+        | crate::Error::BackupKeyMismatch
+        | crate::Error::QuotaOvercommit { .. }
+        | crate::Error::PlanError { .. }
+        | crate::Error::FeatureNotSupported { .. }
+        | crate::Error::UndefinedFunction { .. }
+        | crate::Error::UndefinedObject { .. }
+        | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::UndefinedColumn { .. }
+        | crate::Error::AmbiguousColumn { .. }
+        | crate::Error::UnknownStrictField { .. }
+        | crate::Error::DivisionByZero
+        | crate::Error::DataException { .. }
+        | crate::Error::InvalidLimitValue { .. }
+        | crate::Error::ExecutionLimitExceeded { .. }
+        | crate::Error::LimitExceeded { .. }
+        | crate::Error::Wal(_)
+        | crate::Error::Dispatch { .. }
+        | crate::Error::Storage { .. }
+        | crate::Error::ColdStorage { .. }
+        | crate::Error::Serialization { .. }
+        | crate::Error::Codec { .. }
+        | crate::Error::SegmentCorrupted { .. }
+        | crate::Error::Crdt(_)
+        | crate::Error::Io(_)
+        | crate::Error::Config { .. }
+        | crate::Error::Encryption { .. }
+        | crate::Error::Bridge { .. }
+        | crate::Error::VersionCompat { .. }
+        | crate::Error::Internal { .. }
+        | crate::Error::Shaping(_)
+        | crate::Error::RemoteTyped { .. }
+        | crate::Error::Ddl(_)
+        | crate::Error::DescriptorVersionAnomaly { .. }
+        | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CatalogIntegrityViolation { .. }
+        | crate::Error::Promql(_)
+        | crate::Error::DependentObjectsExist { .. }
+        | crate::Error::RoleInUse { .. }
+        | crate::Error::CascadeCycle { .. }
+        | crate::Error::CrossShardInExplicitTransaction
+        | crate::Error::SessionCapExceeded { .. }
+        | crate::Error::SessionIdleTimeout
+        | crate::Error::SessionTokenExpired
+        | crate::Error::SessionKilledByAdmin
+        | crate::Error::SessionUserDropped
+        | crate::Error::OidcProviderTenantUnbound
+        | crate::Error::OidcProviderTenantUnavailable { .. }
+        | crate::Error::ExternalRoleUndefined { .. }
+        | crate::Error::OidcNoDefaultDatabase { .. }
+        | crate::Error::TenantVectorDimExceeded { .. }
+        | crate::Error::TenantGraphDepthExceeded { .. }
+        | crate::Error::RoleInheritanceCycle { .. }
+        | crate::Error::RoleInheritanceDepthExceeded { .. }
+        | crate::Error::MirrorReadOnly { .. } => false,
+    }
+}
+
+/// [`is_indeterminate`] for a Data-Plane verdict.
+fn is_indeterminate_code(code: &ErrorCode) -> bool {
+    match code {
+        ErrorCode::DeadlineExceeded
+        | ErrorCode::ExpiredBeforeExecution
+        | ErrorCode::ResourcesExhausted
+        | ErrorCode::DispatchCapacity { .. }
+        | ErrorCode::ConflictRetry
+        | ErrorCode::RetryableRefusal { .. }
+        | ErrorCode::OllpRetryRequired
+        | ErrorCode::CrdtFrontierMismatch { .. }
+        | ErrorCode::CollectionDraining { .. }
+        | ErrorCode::RateExceeded { .. }
+        | ErrorCode::TransactionRollback { .. } => true,
+        // A sync hold is decided by the session that owns the stream before
+        // it reaches this classifier. Every other code is a verdict.
+        ErrorCode::RejectedConstraint { .. }
+        | ErrorCode::RejectedPrevalidation { .. }
+        | ErrorCode::SyncRejected { .. }
+        | ErrorCode::SyncNotApplied { .. }
+        | ErrorCode::NotFound
+        | ErrorCode::RejectedAuthz { .. }
+        | ErrorCode::FanOutExceeded
+        | ErrorCode::RejectedDanglingEdge { .. }
+        | ErrorCode::DuplicateWrite
+        | ErrorCode::AppendOnlyViolation { .. }
+        | ErrorCode::BalanceViolation { .. }
+        | ErrorCode::PeriodLocked { .. }
+        | ErrorCode::PeriodLockMisconfigured { .. }
+        | ErrorCode::RetentionViolation { .. }
+        | ErrorCode::LegalHoldActive { .. }
+        | ErrorCode::StateTransitionViolation { .. }
+        | ErrorCode::TransitionCheckViolation { .. }
+        | ErrorCode::TypeGuardViolation { .. }
+        | ErrorCode::TypeMismatch { .. }
+        | ErrorCode::CounterFault { .. }
+        | ErrorCode::InsufficientBalance { .. }
+        | ErrorCode::RecursionDepthExceeded { .. }
+        | ErrorCode::UndefinedColumn { .. }
+        | ErrorCode::Internal { .. }
+        | ErrorCode::Unsupported { .. }
+        | ErrorCode::RollbackFailed { .. }
+        | ErrorCode::TxnOverlayMemoryExceeded { .. }
+        | ErrorCode::DivisionByZero
+        | ErrorCode::UndefinedFunction { .. }
+        | ErrorCode::DataException { .. }
+        | ErrorCode::BadRequest { .. }
+        | ErrorCode::ActiveSqlTransaction { .. }
+        | ErrorCode::DependentObjectsExist { .. } => false,
+    }
 }
 
 /// The [`AckStatus`] an engine ack must carry when its dispatch failed.
@@ -169,6 +480,21 @@ mod tests {
     }
 
     #[test]
+    fn a_dispatch_refused_at_capacity_is_retryable_not_a_refusal_of_the_write() {
+        let error = crate::Error::DispatchCapacity {
+            scope: crate::DispatchCapacityScope::TenantInflight {
+                tenant_id: crate::types::TenantId::new(1),
+                inflight: 64,
+                cap: 64,
+            },
+        };
+        assert_eq!(
+            ack_status_for_dispatch_error(&error, 4),
+            AckStatus::Gap { expected: 4 }
+        );
+    }
+
+    #[test]
     fn a_retryable_status_carries_no_reject_reason() {
         // A reason beside a retryable status reads as "give up" to a receiver
         // that checks the field before the status.
@@ -194,5 +520,51 @@ mod tests {
             AckStatus::Applied,
             "a failed dispatch must never be reported as applied"
         );
+    }
+
+    /// A write aborted by a concurrent change, or not taken for want of a
+    /// quorum or under a rate gate, never got a verdict, so it is retried.
+    #[test]
+    fn retry_class_failures_are_retryable() {
+        let errors = [
+            crate::Error::CalvinSerializationConflict,
+            crate::Error::GroupQuorumUnavailable {
+                group_id: 1,
+                voters: vec![1, 2, 3],
+                unreachable: vec![2, 3],
+            },
+            crate::Error::RateExceeded {
+                gate: "sync".into(),
+                detail: "over budget".into(),
+                retry_after_ms: 10,
+            },
+            crate::Error::DataPlane(ErrorCode::OllpRetryRequired),
+            crate::Error::OllpExhausted {
+                retries: 3,
+                cause: crate::OllpExhaustedCause::PredicateDrift,
+            },
+        ];
+        for error in errors {
+            assert_eq!(
+                ack_status_for_dispatch_error(&error, 5),
+                AckStatus::Gap { expected: 5 },
+                "{error:?}"
+            );
+        }
+    }
+
+    /// Retry exhaustion before admission takes the verdict of its cause.
+    #[test]
+    fn pre_admission_exhaustion_follows_its_cause() {
+        let error = crate::Error::OllpExhausted {
+            retries: 3,
+            cause: crate::OllpExhaustedCause::PreAdmission(Box::new(crate::Error::BadRequest {
+                detail: "bad key".into(),
+            })),
+        };
+        assert!(matches!(
+            ack_status_for_dispatch_error(&error, 5),
+            AckStatus::Rejected { .. }
+        ));
     }
 }

@@ -88,6 +88,10 @@ pub(super) fn try_eval(name: &str, args: &[Value]) -> Option<Value> {
             reversed.reverse();
             Value::Array(reversed)
         }
+        // `ARRAY[a, b, ...]` with a non-literal element lowers to this call,
+        // so the array is built per row from the evaluated elements. A NULL
+        // element stays a NULL element.
+        "make_array" => Value::Array(args.to_vec()),
         _ => return None,
     };
     Some(v)

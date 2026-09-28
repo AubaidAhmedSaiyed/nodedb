@@ -16,6 +16,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::wal_dispatch::VectorResolvedDirectWriteRecord;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::vector_direct_resolve::VectorResolvedIndexSpec;
+use crate::data::executor::wal_replay_vector_redo::RedoVectorWrite;
 use crate::types::DatabaseId;
 
 impl CoreLoop {
@@ -32,21 +33,52 @@ impl CoreLoop {
         let Ok((collection, field, quantization, storage_dtype, payload_indexes, mutations)) =
             zerompk::from_msgpack::<VectorResolvedDirectWriteRecord>(payload)
         else {
+            self.replay_record_unapplied(
+                "vector",
+                "resolved_direct_write_decode",
+                record_lsn,
+                "VectorResolvedDirectWrite payload does not decode",
+            );
             return false;
         };
         if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
             return false;
         }
         let index_key = CoreLoop::vector_index_key(database_id, tenant_id, &collection, &field);
-        if let Some(existing) = self.vector_collections.get(&index_key)
-            && record_lsn <= existing.checkpoint_wal_lsn()
-        {
+        if self.vector_replay_skips(record_lsn) {
             return false;
         }
-        let vshard = crate::types::VShardId::from_collection_in_database(
+        let surrogates: Vec<nodedb_types::Surrogate> = mutations
+            .iter()
+            .map(|mutation| mutation.surrogate())
+            .collect();
+        let dim = mutations
+            .iter()
+            .find_map(|mutation| mutation.stored_vector())
+            .map_or(0, <[f32]>::len);
+        if !self.redo_vector_prelude(
+            RedoVectorWrite {
+                index_key: &index_key,
+                tid: tenant_id,
+                collection: &collection,
+                dim,
+                surrogates: &surrogates,
+                ids: &[],
+                sidecars: true,
+            },
+            None,
+            record_lsn,
+        ) {
+            return false;
+        }
+        let Some(vshard) = self.replay_vshard(
+            "vector",
+            record_lsn,
             DatabaseId::new(database_id),
             &collection,
-        );
+        ) else {
+            return false;
+        };
         let rls_write_check = nodedb_types::RlsWriteCheck::already_decided_elsewhere();
         let task = Self::replay_vector_task(
             nodedb_types::TenantId::new(tenant_id),
@@ -79,21 +111,17 @@ impl CoreLoop {
         ) {
             Ok(touched) => touched,
             Err(e) => {
-                tracing::warn!(
-                    core = self.core_id,
-                    %collection,
-                    lsn = record_lsn,
-                    error = ?e,
-                    "WAL replay: resolved direct write apply returned error; skipping"
+                self.replay_record_rejected(
+                    "vector",
+                    record_lsn,
+                    Some(Box::new(e)),
+                    &format!("vector resolved direct write on '{collection}' failed"),
                 );
                 return false;
             }
         };
         if !touched.is_empty() {
             self.finish_vector_direct_write(&task, &index_key, tenant_id, &collection, &touched);
-        }
-        if let Some(coll) = self.vector_collections.get_mut(&index_key) {
-            coll.note_checkpoint_lsn(record_lsn);
         }
         true
     }

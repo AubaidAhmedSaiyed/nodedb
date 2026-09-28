@@ -56,7 +56,7 @@ mod tests {
     use crate::control::security::identity::{
         AuthMethod, AuthenticatedIdentity, DatabaseSet, Role,
     };
-    use crate::types::{DatabaseId, TenantId, VShardId};
+    use crate::types::{DatabaseId, TenantId};
     use crate::wal::WalManager;
 
     use super::*;
@@ -93,7 +93,8 @@ mod tests {
     fn buffered_task(plan: PhysicalPlan) -> PhysicalTask {
         PhysicalTask {
             tenant_id: TenantId::new(1),
-            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, "widgets"),
+            vshard_id: nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "widgets")
+                .vshard(),
             database_id: DatabaseId::DEFAULT,
             plan,
             post_set_op: PostSetOp::None,
@@ -114,6 +115,7 @@ mod tests {
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         }))
     }
 

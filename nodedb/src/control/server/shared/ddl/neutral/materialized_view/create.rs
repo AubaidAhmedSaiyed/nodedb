@@ -81,7 +81,7 @@ pub async fn create_materialized_view(
         // failed.
         if catalog
             .get_materialized_view(database_id.as_u64(), tenant_id.as_u64(), &name)
-            .map_err(|error| err("XX000", error.to_string()))?
+            .map_err(|error| DdlError::from_error(&error))?
             .is_some()
         {
             return Err(err(
@@ -91,7 +91,7 @@ pub async fn create_materialized_view(
         }
         if catalog
             .get_collection(database_id, tenant_id.as_u64(), &name)
-            .map_err(|error| err("XX000", error.to_string()))?
+            .map_err(|error| DdlError::from_error(&error))?
             .is_some()
         {
             return Err(err("42P07", format!("collection '{name}' already exists")));
@@ -178,7 +178,7 @@ pub async fn create_materialized_view(
     propose_and_apply(state, &coll_entry)?;
     super::super::collection::dispatch_register_from_stored(state, &target)
         .await
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|e| DdlError::from_error(&e))?;
 
     tracing::info!(
         view = name,
@@ -277,7 +277,7 @@ async fn create_streaming_mv(
         Box::new(def.clone()),
     );
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|error| err("XX000", format!("metadata propose: {error}")))?;
+        .map_err(|error| DdlError::from_error_in_context("metadata propose", &error))?;
     crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, outcome);
     if outcome.needs_local_apply() {
         state.permissions.install_replicated_owner(

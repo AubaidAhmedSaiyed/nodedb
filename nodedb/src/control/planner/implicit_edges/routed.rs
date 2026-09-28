@@ -54,26 +54,12 @@ pub(super) async fn push_edge_delete(
     let vsrc = VShardId::from_key(src.as_bytes());
     let vdst = VShardId::from_key(dst.as_bytes());
 
-    let src_surrogate = assign_surrogate_routed(
-        state,
-        vsrc,
-        database_id,
-        tenant_id,
-        collection,
-        src.as_bytes(),
-        trace_id,
-    )
-    .await?;
-    let dst_surrogate = assign_surrogate_routed(
-        state,
-        vdst,
-        database_id,
-        tenant_id,
-        collection,
-        dst.as_bytes(),
-        trace_id,
-    )
-    .await?;
+    // `collection` is the plan's database-qualified name.
+    let key = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?;
+    let src_surrogate =
+        assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), trace_id).await?;
+    let dst_surrogate =
+        assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), trace_id).await?;
 
     out.push(PhysicalTask {
         tenant_id,
@@ -131,26 +117,12 @@ pub(super) async fn push_edge_put(
     let vsrc = VShardId::from_key(src.as_bytes());
     let vdst = VShardId::from_key(dst.as_bytes());
 
-    let src_surrogate = assign_surrogate_routed(
-        state,
-        vsrc,
-        database_id,
-        tenant_id,
-        collection,
-        src.as_bytes(),
-        trace_id,
-    )
-    .await?;
-    let dst_surrogate = assign_surrogate_routed(
-        state,
-        vdst,
-        database_id,
-        tenant_id,
-        collection,
-        dst.as_bytes(),
-        trace_id,
-    )
-    .await?;
+    // `collection` is the plan's database-qualified name.
+    let key = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?;
+    let src_surrogate =
+        assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), trace_id).await?;
+    let dst_surrogate =
+        assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), trace_id).await?;
 
     out.push(PhysicalTask {
         tenant_id,

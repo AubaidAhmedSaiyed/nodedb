@@ -39,7 +39,9 @@ impl<'a> SieveRouter<'a> {
     ///
     /// # Returns
     ///
-    /// Up to `k` nearest-neighbour results, sorted by ascending distance.
+    /// Up to `k` nearest-neighbour results, sorted by ascending distance, or
+    /// [`VectorError::DimensionMismatch`](crate::error::VectorError::DimensionMismatch)
+    /// when `query` does not have the index dimension.
     pub fn route(
         &self,
         query: &[f32],
@@ -48,7 +50,7 @@ impl<'a> SieveRouter<'a> {
         k: usize,
         ef_search: usize,
         metric: DistanceMetric,
-    ) -> Vec<SearchResult> {
+    ) -> Result<Vec<SearchResult>, crate::error::VectorError> {
         // Fast path: subindex hit.
         if let Some(sig) = predicate_signature
             && let Some(subindex) = self.collection.get(sig)
@@ -63,13 +65,13 @@ impl<'a> SieveRouter<'a> {
             allowed,
             brute_force_threshold: 0.001,
         };
-        navix_search(self.fallback, query, &opts, metric)
+        Ok(navix_search(self.fallback, query, &opts, metric)?
             .into_iter()
             .map(|r| SearchResult {
                 id: r.id,
                 distance: r.distance,
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -124,14 +126,16 @@ mod tests {
             fallback: &fallback,
         };
 
-        let results = router.route(
-            &[2.0, 0.0, 0.0],
-            Some(&"T".to_string()),
-            all_allowed(20), // bitmap irrelevant on subindex path
-            3,
-            32,
-            DistanceMetric::L2,
-        );
+        let results = router
+            .route(
+                &[2.0, 0.0, 0.0],
+                Some(&"T".to_string()),
+                all_allowed(20), // bitmap irrelevant on subindex path
+                3,
+                32,
+                DistanceMetric::L2,
+            )
+            .unwrap();
 
         assert!(!results.is_empty());
         // All result IDs must be within the subindex range [0..5).
@@ -152,14 +156,16 @@ mod tests {
         };
 
         let allowed = all_allowed(20);
-        let results = router.route(
-            &[10.0, 0.0, 0.0],
-            Some(&"unknown_sig".to_string()),
-            allowed,
-            3,
-            64,
-            DistanceMetric::L2,
-        );
+        let results = router
+            .route(
+                &[10.0, 0.0, 0.0],
+                Some(&"unknown_sig".to_string()),
+                allowed,
+                3,
+                64,
+                DistanceMetric::L2,
+            )
+            .unwrap();
 
         assert!(!results.is_empty());
         // The nearest vector to [10,0,0] in [0..20] is id=10.
@@ -182,7 +188,9 @@ mod tests {
         };
 
         let allowed = all_allowed(20);
-        let results = router.route(&[5.0, 0.0, 0.0], None, allowed, 3, 64, DistanceMetric::L2);
+        let results = router
+            .route(&[5.0, 0.0, 0.0], None, allowed, 3, 64, DistanceMetric::L2)
+            .unwrap();
 
         assert!(!results.is_empty());
         // Must include id=5 since fallback has all 20 vectors.

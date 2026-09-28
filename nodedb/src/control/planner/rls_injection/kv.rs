@@ -63,6 +63,14 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
              and the plan names only the index",
         ),
 
+        // Refuse: the reply is ranked keys, a rank, or a count, with no row
+        // body to filter. The plan names the owning collection.
+        KvOp::SortedIndexTxnRead { collection, .. } => ctx.refuse_if_policy(
+            collection,
+            "a sorted-index read returns ranked keys, a rank, or a count taken from stored rows, \
+             so the row filter cannot be evaluated",
+        ),
+
         // Admit now: a single-scalar `value` write has no field to name,
         // so it fails the same evaluation rather than a carve-out.
         KvOp::Put {
@@ -273,6 +281,7 @@ mod tests {
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         })
     }
 
@@ -286,6 +295,7 @@ mod tests {
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         })
     }
 
@@ -345,6 +355,7 @@ mod tests {
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
             rls_filters: Vec::new(),
+            provenance: None,
         });
         assert!(matches!(
             inject(&mut plan, &store),
@@ -458,6 +469,7 @@ mod tests {
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: None,
                 rls_filters: Vec::new(),
+                provenance: None,
             },
             KvOp::FieldSet {
                 collection: collection(),
@@ -518,6 +530,7 @@ mod tests {
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         });
         assert!(inject(&mut plan, &store).is_ok());
         assert!(write_check(&plan).has_predicate());

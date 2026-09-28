@@ -6,7 +6,8 @@
 //! and messages the pgwire handlers produced), the single-row `ALTER`-status
 //! result builder, and the neutral `propose_and_apply` mirror of the pgwire
 //! `ddl::catalog_propose::propose_and_apply` (same propose + local-apply
-//! ordering, same `XX000` / `"metadata propose: {e}"` error).
+//! ordering). A propose error keeps its own SQLSTATE under a
+//! `"metadata propose"` prefix.
 
 use nodedb_types::DatabaseId;
 
@@ -52,7 +53,7 @@ pub(super) fn load_active_collection(
         .credentials
         .catalog()
         .get_collection(database_id, tenant_id, name)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .filter(|c| c.is_active)
         .ok_or_else(|| err("42P01", format!("collection '{name}' does not exist")))
 }
@@ -67,7 +68,7 @@ pub(super) fn propose_and_apply(
     entry: &CatalogEntry,
 ) -> Result<ProposeOutcome, DdlError> {
     let outcome = propose_catalog_entry(state, entry)
-        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     apply_locally_if_needed(state, entry, outcome);
     Ok(outcome)
 }
@@ -91,7 +92,7 @@ pub(super) async fn propose_and_apply_async(
     entry: CatalogEntry,
 ) -> Result<ProposeOutcome, DdlError> {
     let outcome = propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     if outcome.needs_local_apply() {
         // Clone only the cheap `Arc<Database>` handle (not `SharedState`) so
         // the blocking closure owns exactly what the apply needs.
@@ -100,8 +101,8 @@ pub(super) async fn propose_and_apply_async(
             crate::control::catalog_entry::apply::apply_to(&entry, &catalog)
         })
         .await
-        .map_err(|e| err("XX000", format!("catalog apply join: {e}")))?
-        .map_err(|e| err("XX000", format!("catalog apply: {e}")))?;
+        .map_err(|e| DdlError::internal(format!("catalog apply join: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("catalog apply", &e))?;
     }
     Ok(outcome)
 }

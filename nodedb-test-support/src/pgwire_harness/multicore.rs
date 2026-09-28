@@ -51,6 +51,9 @@ impl TestServer {
             s.governor = init_test_memory_governor();
         }
         let shared = shared;
+        // The same gateway install production boot runs, after every
+        // `Arc::get_mut` above.
+        nodedb::bootstrap::state_wiring::install_gateway(&shared);
 
         let mut core_stop_txs = Vec::new();
         let mut core_handles = Vec::new();
@@ -61,6 +64,7 @@ impl TestServer {
             let core_handle =
                 crate::core_loop_runner::spawn_core_loop(crate::core_loop_runner::CoreLoopSpawn {
                     idx,
+                    num_cores,
                     data_side,
                     core_dir: dir.path().to_path_buf(),
                     core_array_catalog: shared.array_catalog.clone(),

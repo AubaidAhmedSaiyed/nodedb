@@ -36,15 +36,15 @@ pub enum MetaOp {
         target_request_id: nodedb_types::id::RequestId,
     },
 
-    /// Atomic transaction batch: execute all sub-plans atomically.
+    /// A transaction's plans as one batch. An embedded (Lite) engine executes
+    /// the sub-plans atomically. An Origin core refuses it: a committed
+    /// transaction installs there only through its redo record
+    /// (`ApplyTransactionRedo`, `CalvinFlush`).
     ///
     /// `txn_id` identifies the committing session transaction whose staging
-    /// overlay holds the resolve-time bitemporal stamps this install must reuse
-    /// (so a `bitemporal=true` document put lands on the same version key the
-    /// redo carries, not a fresh one). `None` for install paths with no session
-    /// overlay to consult — Calvin (which threads its stamps in directly) and
-    /// procedural/test callers. Wire-additive: defaults to `None` on decode of
-    /// older entries.
+    /// overlay holds the resolve-time bitemporal stamps an install must reuse.
+    /// `None` for callers with no session overlay to consult. Wire-additive:
+    /// defaults to `None` on decode of older entries.
     TransactionBatch {
         plans: Vec<super::PhysicalPlan>,
         #[serde(default)]
@@ -93,7 +93,16 @@ pub enum MetaOp {
 
     /// Snapshot a tenant's data from the sparse engine.
     /// Returns serialized `(documents, indexes)` as JSON payload.
-    CreateTenantSnapshot { tenant_id: u64 },
+    CreateTenantSnapshot {
+        tenant_id: u64,
+        /// `Some(W)` asks the node that receives the plan to take a backup's
+        /// consistent cut at watermark `W` before it snapshots: every write
+        /// committed below `W` has its final outcome there first. The
+        /// receiving Control Plane takes the cut and clears the field. The
+        /// Data Plane never reads it.
+        #[serde(default)]
+        cut_watermark: Option<u64>,
+    },
 
     /// Restore a tenant's data across all engines from a snapshot.
     /// `snapshot` is a MessagePack-serialized `TenantDataSnapshot`.
@@ -111,10 +120,13 @@ pub enum MetaOp {
         /// for a lagging follower). Empty = legacy install-over-present behavior.
         #[serde(default)]
         clear_vshards: Vec<u32>,
-        /// (tenant_id, collection) pairs to clear before install — pre-resolved by the
-        /// applier from the local catalog for the cleared vShards. Empty = no clear.
+        /// `(database_id, tenant_id, collection)` triples to clear before
+        /// install — pre-resolved by the applier from the local catalog for the
+        /// cleared vShards. `collection` is the name the Data Plane stores the
+        /// collection under: database-qualified outside the default database.
+        /// Empty = no clear.
         #[serde(default)]
-        collections_to_clear: Vec<(u64, String)>,
+        collections_to_clear: Vec<(u64, u64, String)>,
     },
 
     /// Purge ALL data for a tenant across every engine and cache.
@@ -292,9 +304,10 @@ pub enum MetaOp {
     ///
     /// The Calvin scheduler dispatches this variant after lock acquisition for
     /// transactions whose read/write set is fully known at submission time (the
-    /// common case). The Data Plane handler executes `plans` atomically (same
-    /// semantics as `TransactionBatch`) and the scheduler writes a
-    /// `WalRecord::CalvinApplied` after a successful response.
+    /// common case). The Data Plane handler validates the read-set and stages
+    /// `plans` without mutating base. Once the global verdict is commit, the
+    /// scheduler resolves the staged plans into a redo record, appends it, and
+    /// flushes it (`CalvinResolve`, `CalvinFlush`).
     ///
     /// NOTE: This variant occupies the same msgpack positional tag as the
     /// original `CalvinExecute` variant it replaces, preserving wire
@@ -386,22 +399,23 @@ pub enum MetaOp {
         is_group_leader: bool,
     },
 
-    /// Rebuild all indexes (HNSW, FTS LSM, graph CSR) for a collection
-    /// on this core in a shadow-build + atomic-swap manner.
+    /// Rebuild a collection's indexes (HNSW, full-text, graph CSR) on
+    /// this core.
     ///
-    /// When `concurrent = true`, the build proceeds without blocking query
-    /// handling: a background OS thread performs the rebuild and the Data
-    /// Plane polls for completion on subsequent ticks, only swapping the
-    /// live index in at cutover.  When `concurrent = false` the rebuild
-    /// runs inline (same semantics as the legacy Checkpoint path).
+    /// `index_name` narrows the rebuild to one kind: `hnsw`, `fts` or
+    /// `csr`. `None` rebuilds every kind the collection has.
     ///
-    /// `index_name` narrows the rebuild to a single named index when set;
-    /// `None` rebuilds all index types for the collection.
+    /// Each rebuild runs off the core while the core keeps serving reads
+    /// and writes. Writes made during the build are replayed onto the
+    /// rebuilt index at cutover, and the core swaps it in on a later tick.
+    /// With `concurrent = true` the core answers once the rebuilds have
+    /// started. With `concurrent = false` it answers once they have cut
+    /// over, or `DeadlineExceeded` at the request deadline; the rebuilds
+    /// still complete.
     ///
-    /// Returns `Response::Ok` on successful cutover, or a typed error if:
-    /// - another rebuild is already in progress for this collection
-    ///   (`ErrorCode::Conflict`), or
-    /// - the shadow build fails (`ErrorCode::Internal`).
+    /// Errors when a rebuild of the collection already runs
+    /// (`ObjectNotInPrerequisiteState`), when a rebuild cannot start, or,
+    /// with `concurrent = false`, when a rebuild is discarded.
     RebuildIndex {
         collection: QualifiedCollection,
         index_name: Option<String>,
@@ -450,9 +464,9 @@ pub enum MetaOp {
     /// (unique / primary-key) immediately, computes the real affected-row
     /// count, and records the resulting body (or tombstone) in the overlay so
     /// a subsequent same-transaction read-modify-write observes it. It does
-    /// NOT make the write durable — the buffered plan is still replayed
-    /// through the real apply path inside the COMMIT `TransactionBatch`, which
-    /// remains the sole durable apply. Keyed by the request's `txn_id`.
+    /// NOT make the write durable — COMMIT resolves the overlay into the
+    /// transaction's redo record, and the redo install remains the sole
+    /// durable apply. Keyed by the request's `txn_id`.
     StageWrite { plan: Box<super::PhysicalPlan> },
 
     /// Drop the per-transaction staging overlay for a completed (committed
@@ -493,40 +507,42 @@ pub enum MetaOp {
         array_marker: u64,
     },
 
-    /// Record the per-key / per-collection write versions of a committed
-    /// Calvin transaction's locally-applied write plans.
+    /// Record the per-key write versions of a committed Calvin transaction's
+    /// locally-applied write plans.
     ///
-    /// A Calvin apply's committed WAL LSN is known only after the apply
-    /// succeeds, so the apply itself cannot advance the version index. The
-    /// scheduler stamps that LSN onto this op's `wal_lsn` and dispatches it back
-    /// to the same core, which funnels `plans` through the shared write-version
-    /// recorder at that LSN — landing in the same shard-local WAL-LSN space the
+    /// The scheduler stamps the transaction's committed LSN onto this op's
+    /// `wal_lsn` and dispatches it back to the same core once the flush
+    /// completes. The core funnels `plans` through the shared write-version
+    /// recorder at that LSN — the same shard-local WAL-LSN space the
     /// single-shard fast path and read watermarks use. Records only: no base
-    /// mutation, no WAL append, no event emission. Wire-additive (appended last)
-    /// so older log entries decode unchanged.
+    /// mutation, no WAL append, no event emission.
     RecordCalvinWriteVersions {
         /// Tenant scope for all plans.
         tenant_id: TenantId,
         /// The locally-applied write plans whose keys' versions are recorded.
         plans: Vec<super::PhysicalPlan>,
-        /// Calvin epoch of the applied transaction. With `position` and the
-        /// request's vShard, keys the index-value tuples the flush staged so the
-        /// core drains and records them at this op's applied LSN.
-        epoch: u64,
-        /// Calvin position within the epoch (see `epoch`).
-        position: u32,
     },
 
-    /// Flush the staged writes of a Calvin transaction to base storage.
+    /// Install a committed Calvin transaction's redo record on base storage.
     ///
-    /// `CalvinExecuteStatic` validates and STAGES the transaction's plans into
-    /// the per-core commit-pending buffer without mutating base. Once the local
-    /// commit vote resolves to commit, the scheduler dispatches this op back to
-    /// the same core, which pops the staged plans keyed by `(epoch, position)`
-    /// and replays them through the durable apply funnel (base + side effects +
-    /// version recording). Absent key (already flushed/dropped) is an idempotent
-    /// no-op, not an error.
-    CalvinFlush { epoch: u64, position: u32 },
+    /// `CalvinExecuteStatic` STAGES the transaction's plans without mutating
+    /// base, and `CalvinResolve` resolves them into one redo record, which the
+    /// scheduler appends to the WAL as a `TransactionRedo` record. This op
+    /// carries that record's bytes, and the request carries its LSN. The core
+    /// installs it through the same passes restart replay drives: validate,
+    /// install with undo, then settle and cover. It then drops the staged
+    /// state keyed by `(epoch, position)`.
+    ///
+    /// `redo` is empty when the transaction wrote nothing. `collections` names
+    /// every collection the transaction wrote. `sum_targets` is the
+    /// materialized-sum resolution its document writes fold into.
+    CalvinFlush {
+        epoch: u64,
+        position: u32,
+        redo: Vec<u8>,
+        collections: Vec<String>,
+        sum_targets: Vec<super::RedoSumTargets>,
+    },
 
     /// Discard the staged writes of a Calvin transaction.
     ///
@@ -567,10 +583,27 @@ pub enum MetaOp {
     /// `commit_pending` under `(epoch, position, vshard)` and the per-core
     /// staging overlay written under the corresponding synthetic `TxnId`
     /// (see `calvin_synthetic_txn_id`). Dispatched by the scheduler once the
-    /// local commit vote resolves to commit, in place of (or ahead of)
-    /// `CalvinFlush` — the flush path mutates base directly, while resolve
-    /// produces a durable redo record for a later install phase instead. No
-    /// base engine is touched during resolve. Wire-additive: appended last
-    /// so older log entries decode unchanged.
+    /// global verdict is commit, ahead of `CalvinFlush`, which installs the
+    /// record this op returns. No base engine is touched during resolve.
     CalvinResolve { epoch: u64, position: u32 },
+
+    /// Apply one committed transaction's resolved redo record on the core that
+    /// owns its vShard.
+    ///
+    /// Every replica runs this from the vShard's data-group Raft log, in log
+    /// order, and installs the same post-images. The write funnel appends
+    /// `redo` to this node's WAL as one `TransactionRedo` record before the
+    /// dispatch, so restart replay reproduces the apply.
+    ///
+    /// `redo` is the zerompk-encoded redo record. `collections` names every
+    /// collection the transaction wrote; each gets a collection-floor write
+    /// version at the record's LSN. `sum_targets` is the materialized-sum
+    /// resolution the transaction's document writes fold into their targets.
+    /// `origin` decides which commit-boundary checks the apply runs.
+    ApplyTransactionRedo {
+        redo: Vec<u8>,
+        collections: Vec<String>,
+        sum_targets: Vec<super::RedoSumTargets>,
+        origin: super::RedoOrigin,
+    },
 }

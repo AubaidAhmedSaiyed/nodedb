@@ -31,20 +31,21 @@
 //! and never assume co-residence.
 
 use nodedb_physical::physical_plan::PhysicalPlan;
-use nodedb_types::DatabaseId;
+use nodedb_types::{CollectionKey, DatabaseId};
 
 use crate::control::router::vshard::VShardRouter;
 use crate::control::state::SharedState;
-use crate::types::VShardId;
 
 /// Resolve the Data-Plane core that owns `collection`'s vShard on THIS node,
 /// using the same `VShardRouter` the dispatch path uses so the guard can never
 /// drift from the real vShard→core mapping.
+///
+/// `collection` is the plan's database-qualified name, de-qualified into the
+/// canonical key. A name that does not de-qualify resolves to no core, so the
+/// guard refuses the write.
 fn owning_core(router: &VShardRouter, database_id: DatabaseId, collection: &str) -> Option<usize> {
-    router.resolve(VShardId::from_collection_in_database(
-        database_id,
-        collection,
-    ))
+    let key = CollectionKey::from_qualified_str(database_id, collection).ok()?;
+    router.resolve(key.vshard())
 }
 
 /// True when `coll_a` and `coll_b` resolve to DIFFERENT cores on `router`.

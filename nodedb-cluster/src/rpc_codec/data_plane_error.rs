@@ -72,8 +72,9 @@ pub enum DataPlaneErrorCode {
         collection: String,
         detail: String,
     },
-    OverflowError {
+    CounterFault {
         collection: String,
+        fault: DataPlaneCounterFault,
     },
     InsufficientBalance {
         collection: String,
@@ -112,6 +113,15 @@ pub enum DataPlaneErrorCode {
         limit: u64,
     },
     DivisionByZero,
+    /// Expression evaluation called a function no evaluator implements.
+    UndefinedFunction {
+        name: String,
+    },
+    /// A function received an argument it cannot compute on (SQLSTATE
+    /// `22000`). `detail` names the function and the value.
+    DataException {
+        detail: String,
+    },
     /// A period-lock reference row exists but does not carry the
     /// configured `status_column` — a misconfigured column name, not a
     /// locked period.
@@ -121,4 +131,66 @@ pub enum DataPlaneErrorCode {
         status_column: String,
         row_identity: String,
     },
+    /// The bridge dispatcher refused the request at a capacity limit; nothing
+    /// was enqueued. `reason` names the limit and its counts.
+    DispatchCapacity {
+        reason: String,
+    },
+    /// The request's deadline passed before the core started it; nothing
+    /// ran.
+    ExpiredBeforeExecution,
+    /// A sync frame the validator refused for good. Nothing applied. The
+    /// four provenance fields name the stream position the high-water mark
+    /// advanced to.
+    SyncRejected {
+        violation: nodedb_types::sync::violation::ViolationType,
+        applied_seq: u64,
+        producer_id: u64,
+        epoch: u64,
+        stream_id: u64,
+        seq: u64,
+    },
+    /// A sync frame the idempotency gate held back. Nothing applied, and
+    /// the stream's mark did not move.
+    SyncNotApplied {
+        hold: DataPlaneSyncHold,
+        applied_seq: u64,
+    },
+    /// The request itself is malformed (SQLSTATE `42601`).
+    BadRequest {
+        detail: String,
+    },
+    /// The whole transaction aborted before any read-set was validated
+    /// (SQLSTATE `40000`).
+    TransactionRollback {
+        detail: String,
+    },
+    /// The statement cannot run in the current transaction state (SQLSTATE
+    /// `25001`).
+    ActiveSqlTransaction {
+        detail: String,
+    },
+    /// A DROP refused because other objects depend on `object` (SQLSTATE
+    /// `2BP01`).
+    DependentObjectsExist {
+        object: String,
+        detail: String,
+    },
+}
+
+/// Wire mirror of `nodedb::bridge::envelope::SyncHold`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum DataPlaneSyncHold {
+    Duplicate,
+    Fenced,
+    Gap { expected: u64 },
+}
+
+/// Wire mirror of `nodedb_physical::kv_atomic::CounterFault`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum DataPlaneCounterFault {
+    NotAnInteger,
+    NotAFloat,
+    IntegerOverflow,
+    NonFinite,
 }

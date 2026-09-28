@@ -83,38 +83,6 @@ fn db_detail(e: &tokio_postgres::Error) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn three_node_backup_gathers_one_section_per_node() {
-    let cluster = TestCluster::spawn_three().await.expect("cluster");
-
-    let bytes = drain_backup(0, &cluster, TENANT).await;
-    let env = parse_envelope(&bytes, DEFAULT_MAX_TOTAL_BYTES, &TEST_KEK).expect("parse envelope");
-    assert_eq!(
-        env.meta.tenant_id, TENANT,
-        "envelope tenant id should match request"
-    );
-    assert!(
-        env.meta.source_vshard_count >= 1,
-        "envelope must record source vshard count, got {}",
-        env.meta.source_vshard_count
-    );
-    // One section per unique cluster node — three nodes, three sections.
-    // The orchestrator dedupes by node id (leader + replicas of every group).
-    assert!(
-        !env.sections.is_empty() && env.sections.len() <= 3,
-        "expected 1..=3 sections, got {}",
-        env.sections.len()
-    );
-    let origins: std::collections::BTreeSet<u64> =
-        env.sections.iter().map(|s| s.origin_node_id).collect();
-    assert!(
-        !origins.contains(&0),
-        "origin_node_id 0 must not appear in cluster sections: {origins:?}"
-    );
-
-    cluster.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_roundtrip_preserves_data() {
     let cluster = TestCluster::spawn_three().await.expect("cluster");
 
@@ -313,21 +281,23 @@ async fn backup_watermark_advances_after_writes() {
 // 3-node spawn cost is acceptable.
 
 // ────────────────────────────────────────────────────────────────────
-// Mid-flight node failure during restore fan-out.
+// Restore into a group that lost its quorum.
 //
-// The restore orchestrator iterates per-node sub-snapshots via
-// `sync_dispatch` (local) or `RaftRpc::ExecuteRequest` (remote) and
-// surfaces the first per-node error. Two contracts must hold:
+// A restore commits every write through Raft: catalog rows through the
+// metadata group, rows through each collection's data group. One dead node
+// of three leaves every group a majority, and the restore succeeds. Two dead
+// nodes leave no group a majority, and nothing can commit. Two contracts
+// must hold:
 //
-//   1. Loud failure — the client receives a structured error that
-//      names the failing node, never silent partial success.
-//   2. Idempotent retry — the engine-level PointPut writes are
-//      idempotent, so a subsequent retry after the failed node is
-//      restored converges to the expected state.
+//   1. Loud, prompt failure — the client receives a typed error that names
+//      the group and the nodes it cannot reach, well within the statement
+//      deadline, never a hang and never a silent success.
+//   2. Nothing applied — no group on the surviving node applied an entry of
+//      the refused restore.
 // ────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restore_surfaces_failing_node_id_on_midflight_failure() {
+async fn restore_refuses_a_group_without_quorum_and_applies_nothing() {
     let mut cluster = TestCluster::spawn_three().await.expect("cluster");
 
     cluster
@@ -347,64 +317,55 @@ async fn restore_surfaces_failing_node_id_on_midflight_failure() {
             .await
             .unwrap_or_else(|e| panic!("insert f{i}: {}", db_detail(&e)));
     }
+    let bytes = drain_backup(0, &cluster, TENANT).await;
 
-    // Fault-inject: take down node 2, then pin node 0's routing table
-    // so it still believes node 2 is the leader for every raft group.
-    // Without the stale-route pin, quorum-replicated failover hides the
-    // fault entirely — restore transparently re-routes to a surviving
-    // replica and succeeds. Pinning forces the restore fan-out to
-    // attempt dispatch against the dead peer so the structured
-    // error-naming contract is actually exercised.
-    let downed_node_id = cluster.nodes[2].node_id;
-    let downed = cluster.nodes.remove(2);
-    downed.shutdown().await;
-    // Wait for the surviving nodes' SWIM/topology subsystem to observe
-    // the peer death before pinning the stale routes. If we pin before
-    // SWIM converges, an in-flight SWIM update can land *after* the pin
-    // and overwrite it with a fresh leader hint, defeating the
-    // fault-injection. The pin must be the last write to the routing
-    // table for `downed_node_id`'s groups.
+    // Take down two of the three nodes: no group keeps a majority.
+    let mut downed_ids = Vec::new();
+    for _ in 0..2 {
+        let downed = cluster.nodes.remove(1);
+        downed_ids.push(downed.node_id);
+        downed.shutdown().await;
+    }
+    downed_ids.sort_unstable();
     wait_for(
-        "node 0 marks downed peer as inactive in its topology view",
-        Duration::from_secs(10),
+        "the surviving node marks both downed peers inactive",
+        Duration::from_secs(20),
         Duration::from_millis(20),
-        || cluster.nodes[0].active_topology_size() < 3,
+        || cluster.nodes[0].active_topology_size() == 1,
     )
     .await;
 
-    // Back up only once the topology has settled, and before the routes
-    // are pinned.
-    //
-    // The restore path refuses an envelope whose watermark predates the
-    // destination's last observed write-HLC, and that high-water advances on
-    // every successful dispatch for the tenant — not only on writes the test
-    // issues itself. Taking the backup first leaves the node teardown and the
-    // SWIM convergence window sitting between the envelope and the restore,
-    // and anything dispatched in there carries the high-water past the
-    // envelope. The restore then fails the staleness check instead of
-    // reaching the fan-out, and the assertion below sees the wrong loud
-    // failure. Capturing after the teardown keeps the envelope dominant;
-    // pinning afterwards adds nothing, since it only rewrites a local routing
-    // table.
-    //
-    // The backup itself still succeeds with the peer down: routing has failed
-    // over to the surviving replicas at this point, which is exactly the
-    // transparent recovery the pin below goes on to defeat.
-    let bytes = drain_backup(0, &cluster, TENANT).await;
-
-    for group_id in 0..8u64 {
-        cluster.nodes[0].force_stale_route_for_test(group_id, downed_node_id);
-    }
-
-    let err = push_restore(0, &cluster, TENANT, bytes)
-        .await
-        .expect_err("restore must fail loudly when fan-out targets a dead node");
+    let applied_before = cluster.nodes[0].shared.group_watchers().snapshot();
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        push_restore(0, &cluster, TENANT, bytes),
+    )
+    .await
+    .expect("a restore into a group without quorum must fail promptly, not hang")
+    .expect_err("a restore into a group without quorum must fail loudly");
 
     assert!(
-        err.contains(&format!("node {downed_node_id}"))
-            || err.contains(&downed_node_id.to_string()),
-        "restore error must name the failing node id {downed_node_id} so the \
-         operator can act; got: {err}"
+        err.contains("has no reachable quorum"),
+        "expected the typed quorum refusal, got: {err}"
+    );
+    assert!(
+        err.contains(&format!("unreachable {downed_ids:?}")),
+        "the refusal must name the unreachable nodes {downed_ids:?}, got: {err}"
+    );
+    assert!(
+        err.contains("raft group "),
+        "the refusal must name the group, got: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the refusal took {:?}; it must not wait out a commit deadline",
+        started.elapsed()
+    );
+    assert_eq!(
+        cluster.nodes[0].shared.group_watchers().snapshot(),
+        applied_before,
+        "the refused restore applied an entry on the surviving node"
     );
 
     cluster.shutdown().await;

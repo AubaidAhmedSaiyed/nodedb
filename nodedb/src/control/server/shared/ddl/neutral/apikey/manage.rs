@@ -54,13 +54,13 @@ pub fn revoke_api_key(
         key_id: key_id.to_string(),
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     let revoked = if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         state
             .api_keys
             .revoke_key(key_id, Some(catalog))
-            .map_err(|e| err("XX000", e.to_string()))?
+            .map_err(|e| DdlError::from_error(&e))?
     } else {
         // Cluster mode: trust the committed log index — the
         // in-memory cache update runs in a spawned tokio task and

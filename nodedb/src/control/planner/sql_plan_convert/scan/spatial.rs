@@ -3,7 +3,6 @@
 //! Spatial scan converter.
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::VShardId;
 use nodedb_physical::physical_plan::*;
 
 use super::super::aggregate::extract_projection_names;
@@ -26,10 +25,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_spatial_scan(
         tenant_id,
         database_id,
     } = p;
-    let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let collection_key = nodedb_types::CollectionKey::from_bare(database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
+    let vshard = collection_key.vshard();
     let attr_bytes = serialize_filters(attribute_filters)?;
     let proj_names = extract_projection_names(projection, &[]);
     let sp = match predicate {

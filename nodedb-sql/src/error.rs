@@ -37,6 +37,19 @@ pub enum SqlError {
     )]
     SequencePerRowUnsupported { name: String },
 
+    /// An index-owned search function (`bm25_score`, `text_match`,
+    /// `rrf_score`, `sparse_score`, ...) sits in a position the row evaluator
+    /// runs: the planner could not lower it into its search plan. The
+    /// function reads a search index and has no per-row value.
+    ///
+    /// Rendered as SQLSTATE `0A000` (feature_not_supported).
+    #[error(
+        "{name}(...) reads a search index and has no per-row value here; \
+         call it in ORDER BY, in WHERE as the search predicate, or in the \
+         SELECT list of a search, with a literal query"
+    )]
+    SearchFunctionOutsideSearch { name: String },
+
     /// A statement names a database object that does not exist — a sequence,
     /// most commonly. Distinct from [`SqlError::UndefinedFunction`]: the
     /// function exists, the object it names does not. PostgreSQL rejects the
@@ -70,6 +83,13 @@ pub enum SqlError {
     /// it failed, so the statement must raise rather than yield NULL.
     #[error("division by zero")]
     DivisionByZero,
+
+    /// A constant function call received an argument it cannot compute on:
+    /// vectors of different dimensions, an argument of the wrong type, a
+    /// malformed JSONPath. Same distinction as [`SqlError::DivisionByZero`].
+    /// Rendered as SQLSTATE `22000` (`data_exception`).
+    #[error("{detail}")]
+    DataException { detail: String },
 
     /// A LIMIT, OFFSET, or FETCH FIRST clause resolved to a value outside
     /// `[0, usize::MAX]`, or to an expression the planner cannot read as a

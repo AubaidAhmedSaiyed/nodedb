@@ -6,44 +6,98 @@
 //! hash slot). No cross-core coordination is needed because each key maps
 //! to exactly one core.
 
+use nodedb_physical::kv_atomic::{AtomicComputeError, compute};
+use nodedb_physical::physical_plan::KvCounterShape;
+
 use super::engine::KvEngine;
-use super::engine_atomic_compute as compute;
 use super::engine_helpers::{expiry_key, table_key};
 use super::entry::NO_EXPIRY;
 use super::hash_table::KvHashTable;
 
 /// Result of a compare-and-swap operation.
 pub struct CasResult {
-    /// Whether the swap succeeded (current == expected).
-    pub success: bool,
+    /// The bytes the swap stored. `None` when the compare failed and nothing
+    /// was written.
+    pub written: Option<Vec<u8>>,
     /// The value that was present at the time of the CAS.
     /// `None` if the key did not exist.
     pub current_value: Option<Vec<u8>>,
 }
 
+impl CasResult {
+    /// Whether the swap succeeded (current == expected).
+    pub fn success(&self) -> bool {
+        self.written.is_some()
+    }
+}
+
+/// Result of a get-and-set operation.
+pub struct GetSetResult {
+    /// The value that was present before the write. `None` if the key did
+    /// not exist.
+    pub old: Option<Vec<u8>>,
+    /// The bytes the write stored.
+    pub written: Vec<u8>,
+}
+
+/// The value a counter atomic computed, and the bytes it stored.
+///
+/// `written` is the whole stored body: the re-encoded row for a typed row,
+/// the decimal text for a raw body. A write event carries these bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Incremented<T> {
+    /// The new counter value.
+    pub value: T,
+    /// The bytes the increment stored.
+    pub written: Vec<u8>,
+}
+
+/// One `INCR` step: the delta, the TTL request, and the row an absent key
+/// becomes.
+#[derive(Clone, Copy)]
+pub struct IncrStep<'a> {
+    /// The signed increment.
+    pub delta: i64,
+    /// TTL in milliseconds. `0` preserves the existing TTL.
+    pub ttl_ms: u64,
+    /// The row an absent key becomes.
+    pub shape: &'a KvCounterShape,
+}
+
 /// Errors specific to atomic KV operations.
 #[derive(Debug)]
 pub enum AtomicError {
-    /// Value is not the expected numeric type for INCR/DECR.
+    /// A typed row has no column of the type the atomic reads.
     TypeMismatch { detail: String },
-    /// Integer overflow on INCR/DECR.
-    Overflow,
+    /// A counter atomic read a stored value it cannot parse as a number, or
+    /// computed a result out of range.
+    Counter(crate::bridge::envelope::CounterFault),
     /// The computed new value failed to re-encode as MessagePack.
     Encode { detail: String },
-    /// The [`IncrAdmission`] gate refused the computed post-image, so nothing
+    /// The [`AtomicAdmission`] gate refused the computed post-image, so nothing
     /// was written. Boxed to keep the error small on the success path.
     Rejected(Box<crate::Error>),
 }
 
-/// A gate consulted with the computed post-image before an increment commits.
+impl From<AtomicComputeError> for AtomicError {
+    fn from(error: AtomicComputeError) -> Self {
+        match error {
+            AtomicComputeError::TypeMismatch { detail } => Self::TypeMismatch { detail },
+            AtomicComputeError::Counter(fault) => Self::Counter(fault),
+            AtomicComputeError::Encode { detail } => Self::Encode { detail },
+        }
+    }
+}
+
+/// A gate consulted with the computed post-image before an atomic commits.
 ///
-/// INCR computes the value it stores from the stored one, so the row a
-/// row-level-security write policy has to decide does not exist until the
-/// arithmetic has run — and the arithmetic runs here, inside the engine, in the
-/// same pass that persists the result. Passing the decision in is what keeps
-/// that arithmetic in one place: pre-computing the increment at the call site
-/// just to check it would leave two copies of it to drift apart.
-pub type IncrAdmission<'a> = &'a dyn Fn(&[u8]) -> crate::Result<()>;
+/// Every atomic computes the value it stores from the stored one: INCR runs
+/// arithmetic, and CAS and GETSET swap one column of a typed row. The row a
+/// row-level-security write policy has to decide does not exist until that
+/// computation has run, and it runs here, inside the engine, in the same pass
+/// that persists the result. Passing the decision in keeps the computation in
+/// one place.
+pub type AtomicAdmission<'a> = &'a dyn Fn(&[u8]) -> crate::Result<()>;
 
 /// An admission that accepts every image.
 ///
@@ -74,11 +128,17 @@ pub struct AtomicKeyCtx<'a> {
 }
 
 impl KvEngine {
-    /// Atomically increment an i64 value by `delta`. Returns the new value.
+    /// Atomically increment an i64 value by `delta`. Returns the new value
+    /// and the bytes stored.
     ///
-    /// - If key doesn't exist: initializes to 0, adds delta, returns delta.
-    /// - If value is not a MessagePack integer: returns `TypeMismatch`.
-    /// - On i64 overflow: returns `Overflow` (never wraps silently).
+    /// - If key doesn't exist: initializes to 0, adds delta, and stores the
+    ///   row `shape` names: decimal text, or a typed row.
+    /// - A raw body is read as decimal text and written back as decimal
+    ///   text. A typed row moves its first integer column in key order.
+    /// - A raw body that is not a decimal i64: returns
+    ///   `Counter(NotAnInteger)`. A typed row without an integer column:
+    ///   returns `TypeMismatch`.
+    /// - On i64 overflow: returns `Counter(IntegerOverflow)`. It never wraps.
     /// - TTL behavior: if `ttl_ms > 0` and key is new, sets TTL.
     ///   If key exists and `ttl_ms > 0`, resets TTL. If `ttl_ms == 0`, preserves.
     /// - If `admit` refuses the computed value: returns `Rejected` and writes
@@ -88,9 +148,19 @@ impl KvEngine {
         ctx: AtomicKeyCtx<'_>,
         delta: i64,
         ttl_ms: u64,
-        admit: IncrAdmission<'_>,
-    ) -> Result<i64, AtomicError> {
-        self.incr_resolved(ctx, delta, ttl_ms, None, admit)
+        shape: &KvCounterShape,
+        admit: AtomicAdmission<'_>,
+    ) -> Result<Incremented<i64>, AtomicError> {
+        self.incr_resolved(
+            ctx,
+            IncrStep {
+                delta,
+                ttl_ms,
+                shape,
+            },
+            None,
+            admit,
+        )
     }
 
     /// Atomically increment an i64 value by `delta`, installing an
@@ -108,12 +178,11 @@ impl KvEngine {
     pub fn incr_with_absolute_expiry(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
-        delta: i64,
-        ttl_ms: u64,
+        step: IncrStep<'_>,
         expire_at_ms: u64,
-        admit: IncrAdmission<'_>,
-    ) -> Result<i64, AtomicError> {
-        self.incr_resolved(ctx, delta, ttl_ms, Some(expire_at_ms), admit)
+        admit: AtomicAdmission<'_>,
+    ) -> Result<Incremented<i64>, AtomicError> {
+        self.incr_resolved(ctx, step, Some(expire_at_ms), admit)
     }
 
     /// Shared INCR body: computes the new value, then installs it via
@@ -122,56 +191,67 @@ impl KvEngine {
     fn incr_resolved(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
-        delta: i64,
-        ttl_ms: u64,
+        step: IncrStep<'_>,
         expire_override: Option<u64>,
-        admit: IncrAdmission<'_>,
-    ) -> Result<i64, AtomicError> {
+        admit: AtomicAdmission<'_>,
+    ) -> Result<Incremented<i64>, AtomicError> {
+        let IncrStep {
+            delta,
+            ttl_ms,
+            shape,
+        } = step;
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
-        let (new_i64, new_bytes) = compute::incr(current.as_deref(), delta)?;
+        let (value, written) = compute::incr(current.as_deref(), delta, shape)?;
         // Decided before `atomic_put`, so a refused image is never durable and
         // never reaches the expiry wheel or the secondary indexes.
-        admit(&new_bytes).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
+        admit(&written).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
         self.atomic_put(
             ctx,
             tkey,
-            &new_bytes,
+            &written,
             ttl_ms,
             current.is_none(),
             expire_override,
         );
 
-        Ok(new_i64)
+        Ok(Incremented { value, written })
     }
 
-    /// Atomically increment an f64 value by `delta`. Returns the new value.
+    /// Atomically increment an f64 value by `delta`. Returns the new value
+    /// and the bytes stored.
     ///
-    /// - If key doesn't exist: initializes to 0.0, adds delta, returns delta.
-    /// - If value is not a MessagePack float or integer: returns `TypeMismatch`.
-    /// - f64 does not overflow in the traditional sense (it goes to infinity),
-    ///   but NaN/Infinity results are rejected as `Overflow`.
+    /// - `delta` is the client's decimal text.
+    /// - If key doesn't exist: initializes to 0, adds delta, and stores the
+    ///   row `shape` names: decimal text, or a typed row.
+    /// - A raw body is read as decimal text and written back as decimal
+    ///   text. A typed row moves its first numeric column in key order.
+    /// - A raw body that is not a decimal float: returns
+    ///   `Counter(NotAFloat)`. A typed row without a numeric column: returns
+    ///   `TypeMismatch`.
+    /// - A NaN or infinite result: returns `Counter(NonFinite)`.
     /// - If `admit` refuses the computed value: returns `Rejected` and writes
     ///   nothing.
     pub fn incr_float(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
-        delta: f64,
-        admit: IncrAdmission<'_>,
-    ) -> Result<f64, AtomicError> {
+        delta: &str,
+        shape: &KvCounterShape,
+        admit: AtomicAdmission<'_>,
+    ) -> Result<Incremented<f64>, AtomicError> {
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
-        let (new_f64, new_bytes) = compute::incr_float(current.as_deref(), delta)?;
+        let (value, written) = compute::incr_float(current.as_deref(), delta, shape)?;
         // Decided before the value is installed — see `incr_resolved`.
-        admit(&new_bytes).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
+        admit(&written).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
         // incr_float always preserves existing TTL (ttl_ms = 0).
-        self.atomic_put(ctx, tkey, &new_bytes, 0, current.is_none(), None);
+        self.atomic_put(ctx, tkey, &written, 0, current.is_none(), None);
 
-        Ok(new_f64)
+        Ok(Incremented { value, written })
     }
 
     /// Atomic compare-and-swap.
@@ -179,41 +259,61 @@ impl KvEngine {
     /// If current value equals `expected`, sets to `new_value` and returns success.
     /// If current value differs, returns the actual current value.
     /// If key doesn't exist and `expected` is empty, creates the key (create-if-not-exists).
-    pub fn cas(&mut self, ctx: AtomicKeyCtx<'_>, expected: &[u8], new_value: &[u8]) -> CasResult {
+    /// If `admit` refuses the bytes the swap would store: returns `Rejected`
+    /// and writes nothing.
+    pub fn cas(
+        &mut self,
+        ctx: AtomicKeyCtx<'_>,
+        expected: &[u8],
+        new_value: &[u8],
+        admit: AtomicAdmission<'_>,
+    ) -> Result<CasResult, AtomicError> {
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
 
-        let (matches, write_bytes) = compute::cas(current.as_deref(), expected, new_value);
-
-        if matches {
-            self.atomic_put(ctx, tkey, &write_bytes, 0, current.is_none(), None);
-            CasResult {
-                success: true,
+        let (matches, write_bytes) = compute::cas(current.as_deref(), expected, new_value)?;
+        if !matches {
+            return Ok(CasResult {
+                written: None,
                 current_value: current,
-            }
-        } else {
-            CasResult {
-                success: false,
-                current_value: current,
-            }
+            });
         }
+        // Decided before the value is installed — see `incr_resolved`.
+        admit(&write_bytes).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
+        self.atomic_put(ctx, tkey, &write_bytes, 0, current.is_none(), None);
+        Ok(CasResult {
+            written: Some(write_bytes),
+            current_value: current,
+        })
     }
 
     /// Atomic get-and-set: sets new value, returns old value.
     ///
-    /// If key didn't exist, returns `None`.
+    /// If key didn't exist, `old` is `None`.
     /// Preserves existing TTL.
-    pub fn getset(&mut self, ctx: AtomicKeyCtx<'_>, new_value: &[u8]) -> Option<Vec<u8>> {
+    /// If `admit` refuses the bytes the write would store: returns `Rejected`
+    /// and writes nothing.
+    pub fn getset(
+        &mut self,
+        ctx: AtomicKeyCtx<'_>,
+        new_value: &[u8],
+        admit: AtomicAdmission<'_>,
+    ) -> Result<GetSetResult, AtomicError> {
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
         let old = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
-        let write_bytes = compute::getset(old.as_deref(), new_value);
+        let write_bytes = compute::getset(old.as_deref(), new_value)?;
+        // Decided before the value is installed — see `incr_resolved`.
+        admit(&write_bytes).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
 
         // GetSet preserves existing TTL (ttl_ms = 0).
         self.atomic_put(ctx, tkey, &write_bytes, 0, old.is_none(), None);
-        old
+        Ok(GetSetResult {
+            old,
+            written: write_bytes,
+        })
     }
 
     /// Ensure a hash table exists for (tenant, collection), creating if needed.
@@ -360,6 +460,18 @@ mod tests {
 
     use super::super::engine_write::KvPutParams;
     use super::*;
+    use crate::bridge::envelope::CounterFault;
+
+    static RAW: KvCounterShape = KvCounterShape::Raw;
+
+    /// A raw-shaped `INCR` step.
+    fn step(delta: i64, ttl_ms: u64) -> IncrStep<'static> {
+        IncrStep {
+            delta,
+            ttl_ms,
+            shape: &RAW,
+        }
+    }
 
     fn make_engine() -> KvEngine {
         KvEngine::new(1000, 16, 0.75, 4, 64, 1000, 1024)
@@ -380,28 +492,36 @@ mod tests {
     #[test]
     fn incr_new_key() {
         let mut engine = make_engine();
-        let result = engine.incr(ctx("counters", b"hits"), 10, 0, &admit_any);
-        assert_eq!(result.unwrap(), 10);
+        let result = engine
+            .incr(ctx("counters", b"hits"), 10, 0, &RAW, &admit_any)
+            .expect("incr");
+        assert_eq!(result.value, 10);
+        assert_eq!(result.written, b"10".to_vec());
+        assert_eq!(
+            engine.get(0, 1, "counters", b"hits", 1000).as_deref(),
+            Some(b"10".as_slice()),
+            "the engine stores exactly the bytes it returns"
+        );
     }
 
     #[test]
     fn incr_existing_key() {
         let mut engine = make_engine();
         engine
-            .incr(ctx("counters", b"hits"), 10, 0, &admit_any)
+            .incr(ctx("counters", b"hits"), 10, 0, &RAW, &admit_any)
             .unwrap();
-        let result = engine.incr(ctx("counters", b"hits"), 5, 0, &admit_any);
-        assert_eq!(result.unwrap(), 15);
+        let result = engine.incr(ctx("counters", b"hits"), 5, 0, &RAW, &admit_any);
+        assert_eq!(result.expect("incr").value, 15);
     }
 
     #[test]
     fn incr_negative_delta() {
         let mut engine = make_engine();
         engine
-            .incr(ctx("counters", b"gold"), 100, 0, &admit_any)
+            .incr(ctx("counters", b"gold"), 100, 0, &RAW, &admit_any)
             .unwrap();
-        let result = engine.incr(ctx("counters", b"gold"), -30, 0, &admit_any);
-        assert_eq!(result.unwrap(), 70);
+        let result = engine.incr(ctx("counters", b"gold"), -30, 0, &RAW, &admit_any);
+        assert_eq!(result.expect("incr").value, 70);
     }
 
     /// The increment is computed inside the engine, so the gate is the only
@@ -411,7 +531,7 @@ mod tests {
     fn a_refused_increment_writes_nothing() {
         let mut engine = make_engine();
         engine
-            .incr(ctx("counters", b"hits"), 7, 0, &admit_any)
+            .incr(ctx("counters", b"hits"), 7, 0, &RAW, &admit_any)
             .unwrap();
 
         let deny = |_: &[u8]| {
@@ -420,21 +540,24 @@ mod tests {
                 resource: "test".into(),
             })
         };
-        let result = engine.incr(ctx("counters", b"hits"), 5, 0, &deny);
+        let result = engine.incr(ctx("counters", b"hits"), 5, 0, &RAW, &deny);
         assert!(matches!(result, Err(AtomicError::Rejected(_))));
 
         let stored = engine
             .get(0, 1, "counters", b"hits", 1000)
             .expect("the refused increment must leave the prior row in place");
-        let value: i64 = zerompk::from_msgpack(&stored).unwrap();
-        assert_eq!(value, 7, "a refused increment must not be applied");
+        assert_eq!(
+            stored,
+            b"7".to_vec(),
+            "a refused increment must not be applied"
+        );
     }
 
     #[test]
     fn incr_overflow() {
         let mut engine = make_engine();
         // Set to MAX.
-        let bytes = zerompk::to_msgpack_vec(&i64::MAX).unwrap();
+        let bytes = i64::MAX.to_string().into_bytes();
         engine.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -445,14 +568,17 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let result = engine.incr(ctx("counters", b"max"), 1, 0, &admit_any);
-        assert!(matches!(result, Err(AtomicError::Overflow)));
+        let result = engine.incr(ctx("counters", b"max"), 1, 0, &RAW, &admit_any);
+        assert!(matches!(
+            result,
+            Err(AtomicError::Counter(CounterFault::IntegerOverflow))
+        ));
     }
 
     #[test]
-    fn incr_type_mismatch() {
+    fn incr_on_raw_text_that_is_not_an_integer_is_refused() {
         let mut engine = make_engine();
-        let bytes = zerompk::to_msgpack_vec(&"hello").unwrap();
+        let bytes = b"hello".to_vec();
         engine.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -463,15 +589,18 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let result = engine.incr(ctx("counters", b"str"), 1, 0, &admit_any);
-        assert!(matches!(result, Err(AtomicError::TypeMismatch { .. })));
+        let result = engine.incr(ctx("counters", b"str"), 1, 0, &RAW, &admit_any);
+        assert!(matches!(
+            result,
+            Err(AtomicError::Counter(CounterFault::NotAnInteger))
+        ));
     }
 
     #[test]
     fn incr_with_ttl_new_key() {
         let mut engine = make_engine();
         engine
-            .incr(ctx("counters", b"daily"), 1, 86_400_000, &admit_any)
+            .incr(ctx("counters", b"daily"), 1, 86_400_000, &RAW, &admit_any)
             .unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"daily", 1000);
         assert!(ttl.is_some());
@@ -482,7 +611,7 @@ mod tests {
     fn incr_preserves_ttl_when_zero() {
         let mut engine = make_engine();
         // Set key with TTL.
-        let bytes = zerompk::to_msgpack_vec(&50i64).unwrap();
+        let bytes = b"50".to_vec();
         engine.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -495,7 +624,7 @@ mod tests {
         });
         // Incr with ttl_ms=0 should preserve existing TTL.
         engine
-            .incr(ctx("counters", b"temp"), 10, 0, &admit_any)
+            .incr(ctx("counters", b"temp"), 10, 0, &RAW, &admit_any)
             .unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
         assert!(ttl.is_some());
@@ -509,7 +638,12 @@ mod tests {
         // 1000 + 5000 = 6000. Passing an explicit absolute instant must
         // override that derivation entirely.
         engine
-            .incr_with_absolute_expiry(ctx("counters", b"daily"), 1, 5_000, 1_000_000, &admit_any)
+            .incr_with_absolute_expiry(
+                ctx("counters", b"daily"),
+                step(1, 5_000),
+                1_000_000,
+                &admit_any,
+            )
             .unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"daily", 1000);
         assert_eq!(
@@ -522,7 +656,7 @@ mod tests {
     #[test]
     fn incr_with_absolute_expiry_and_zero_ttl_still_preserves_existing_expiry() {
         let mut engine = make_engine();
-        let bytes = zerompk::to_msgpack_vec(&50i64).unwrap();
+        let bytes = b"50".to_vec();
         engine.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -538,7 +672,12 @@ mod tests {
         // ttl_ms == 0 must ignore the supplied absolute instant and preserve
         // the existing expiry exactly as `incr` does.
         engine
-            .incr_with_absolute_expiry(ctx("counters", b"temp"), 10, 0, 999_999_999, &admit_any)
+            .incr_with_absolute_expiry(
+                ctx("counters", b"temp"),
+                step(10, 0),
+                999_999_999,
+                &admit_any,
+            )
             .unwrap();
         let ttl_after = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
         assert_eq!(
@@ -550,24 +689,31 @@ mod tests {
     #[test]
     fn incr_float_new_key() {
         let mut engine = make_engine();
-        let result = engine.incr_float(ctx("scores", b"dmg"), 3.125, &admit_any);
-        assert!((result.unwrap() - 3.125).abs() < f64::EPSILON);
+        let result = engine
+            .incr_float(ctx("scores", b"dmg"), "3.125", &RAW, &admit_any)
+            .expect("incr_float");
+        assert!((result.value - 3.125).abs() < f64::EPSILON);
+        assert_eq!(result.written, b"3.125".to_vec());
     }
 
     #[test]
     fn incr_float_existing() {
         let mut engine = make_engine();
         engine
-            .incr_float(ctx("scores", b"dmg"), 3.0, &admit_any)
+            .incr_float(ctx("scores", b"dmg"), "3.0", &RAW, &admit_any)
             .unwrap();
-        let result = engine.incr_float(ctx("scores", b"dmg"), 1.5, &admit_any);
-        assert!((result.unwrap() - 4.5).abs() < f64::EPSILON);
+        let result = engine
+            .incr_float(ctx("scores", b"dmg"), "1.5", &RAW, &admit_any)
+            .expect("incr_float");
+        assert!((result.value - 4.5).abs() < f64::EPSILON);
+        assert_eq!(result.written, b"4.5".to_vec());
     }
 
     #[test]
     fn incr_float_infinity_rejected() {
         let mut engine = make_engine();
-        let bytes = zerompk::to_msgpack_vec(&f64::MAX).unwrap();
+        let bytes_text = f64::MAX.to_string();
+        let bytes = bytes_text.clone().into_bytes();
         engine.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -578,15 +724,20 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let result = engine.incr_float(ctx("scores", b"big"), f64::MAX, &admit_any);
-        assert!(matches!(result, Err(AtomicError::Overflow)));
+        let result = engine.incr_float(ctx("scores", b"big"), &bytes_text, &RAW, &admit_any);
+        assert!(matches!(
+            result,
+            Err(AtomicError::Counter(CounterFault::NonFinite))
+        ));
     }
 
     #[test]
     fn cas_create_if_not_exists() {
         let mut engine = make_engine();
-        let result = engine.cas(ctx("state", b"player1"), b"", b"idle");
-        assert!(result.success);
+        let result = engine
+            .cas(ctx("state", b"player1"), b"", b"idle", &admit_any)
+            .expect("cas");
+        assert!(result.success());
         assert!(result.current_value.is_none());
         // Verify key was created.
         let val = engine.get(0, 1, "state", b"player1", 1000);
@@ -606,8 +757,10 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let result = engine.cas(ctx("state", b"p1"), b"idle", b"in_match");
-        assert!(result.success);
+        let result = engine
+            .cas(ctx("state", b"p1"), b"idle", b"in_match", &admit_any)
+            .expect("cas");
+        assert!(result.success());
         assert_eq!(result.current_value.as_deref(), Some(b"idle".as_slice()));
         let val = engine.get(0, 1, "state", b"p1", 1000);
         assert_eq!(val.as_deref(), Some(b"in_match".as_slice()));
@@ -626,8 +779,10 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let result = engine.cas(ctx("state", b"p1"), b"idle", b"in_match");
-        assert!(!result.success);
+        let result = engine
+            .cas(ctx("state", b"p1"), b"idle", b"in_match", &admit_any)
+            .expect("cas");
+        assert!(!result.success());
         assert_eq!(
             result.current_value.as_deref(),
             Some(b"fighting".as_slice())
@@ -640,7 +795,10 @@ mod tests {
     #[test]
     fn getset_new_key() {
         let mut engine = make_engine();
-        let old = engine.getset(ctx("session", b"tok"), b"new-token");
+        let old = engine
+            .getset(ctx("session", b"tok"), b"new-token", &admit_any)
+            .expect("getset")
+            .old;
         assert!(old.is_none());
         let val = engine.get(0, 1, "session", b"tok", 1000);
         assert_eq!(val.as_deref(), Some(b"new-token".as_slice()));
@@ -659,7 +817,10 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let old = engine.getset(ctx("session", b"tok"), b"new-token");
+        let old = engine
+            .getset(ctx("session", b"tok"), b"new-token", &admit_any)
+            .expect("getset")
+            .old;
         assert_eq!(old.as_deref(), Some(b"old-token".as_slice()));
         let val = engine.get(0, 1, "session", b"tok", 1000);
         assert_eq!(val.as_deref(), Some(b"new-token".as_slice()));

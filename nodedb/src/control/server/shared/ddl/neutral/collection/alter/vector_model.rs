@@ -18,7 +18,6 @@ use crate::control::server::shared::ddl::result::DdlError;
 use crate::control::state::SharedState;
 
 use super::super::super::vector_replicate::{propose_delete_model, propose_put_model};
-use super::support::err;
 
 /// Drop `column`'s embedding-model row on every node.
 pub(super) fn drop_vector_model_row(
@@ -52,7 +51,7 @@ pub(super) fn move_vector_model_row(
         .credentials
         .catalog()
         .get_vector_model(db, tenant_id, collection, old_column)
-        .map_err(|e| err("XX000", format!("read vector model: {e}")))?
+        .map_err(|e| DdlError::from_error_in_context("read vector model", &e))?
     else {
         return Ok(());
     };
@@ -74,7 +73,7 @@ fn model_row_exists(
         .catalog()
         .get_vector_model(database_id, tenant_id, collection, column)
         .map(|row| row.is_some())
-        .map_err(|e| err("XX000", format!("read vector model: {e}")))
+        .map_err(|e| DdlError::from_error_in_context("read vector model", &e))
 }
 
 #[cfg(test)]

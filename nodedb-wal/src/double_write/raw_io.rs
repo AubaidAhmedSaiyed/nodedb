@@ -31,37 +31,27 @@ pub(crate) fn full_capacity_slice(buf: &AlignedBuf) -> &[u8] {
 
 /// `pwrite`-retry helper that handles short writes.
 pub(crate) fn pwrite_all(file: &File, data: &[u8], offset: u64) -> Result<()> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::os::unix::io::AsRawFd as _;
-        let fd = file.as_raw_fd();
-        let mut remaining = data;
-        let mut write_offset = offset;
-        while !remaining.is_empty() {
-            // SAFETY: `remaining` is a live slice of `remaining.len()` bytes
-            // and `fd` is owned by the borrowed `file`.
-            let n = unsafe {
-                libc::pwrite(
-                    fd,
-                    remaining.as_ptr() as *const libc::c_void,
-                    remaining.len(),
-                    write_offset as libc::off_t,
-                )
-            };
-            if n < 0 {
-                return Err(WalError::Io(std::io::Error::last_os_error()));
-            }
-            let n = n as usize;
-            remaining = &remaining[n..];
-            write_offset += n as u64;
+    use std::os::unix::io::AsRawFd as _;
+    let fd = file.as_raw_fd();
+    let mut remaining = data;
+    let mut write_offset = offset;
+    while !remaining.is_empty() {
+        // SAFETY: `remaining` is a live slice of `remaining.len()` bytes
+        // and `fd` is owned by the borrowed `file`.
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                remaining.as_ptr() as *const libc::c_void,
+                remaining.len(),
+                write_offset as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(WalError::Io(std::io::Error::last_os_error()));
         }
-        Ok(())
+        let n = n as usize;
+        remaining = &remaining[n..];
+        write_offset += n as u64;
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (file, data, offset);
-        Err(WalError::Unsupported {
-            detail: "O_DIRECT pwrite not available on wasm32",
-        })
-    }
+    Ok(())
 }

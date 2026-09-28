@@ -6,20 +6,34 @@ use nodedb_types::error::sqlstate;
 
 use crate::bridge::envelope::ErrorCode;
 
+/// The SQLSTATE for a rejected constraint of kind `constraint`.
+///
+/// `not_null` and `unique` keep their specific codes; `generated_always`
+/// (a write to a generated column) is `428C9`. A CRDT delta refusal carries
+/// its violation kind: `fk_missing` is `23503`, and `rls_policy` /
+/// `permission_denied` are `42501`. Every other kind is the generic
+/// integrity class `23000`, never `unique_violation`.
+pub fn constraint_sqlstate(constraint: &str) -> &'static str {
+    match constraint {
+        "not_null" => sqlstate::NOT_NULL_VIOLATION,
+        "unique" => sqlstate::UNIQUE_VIOLATION,
+        "generated_always" => sqlstate::GENERATED_ALWAYS,
+        "fk_missing" => sqlstate::FOREIGN_KEY_VIOLATION,
+        "rls_policy" | "permission_denied" => sqlstate::INSUFFICIENT_PRIVILEGE,
+        _ => sqlstate::INTEGRITY_CONSTRAINT_VIOLATION,
+    }
+}
+
 /// Map a Data Plane `ErrorCode` to SQLSTATE.
 pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, String) {
     match code {
-        ErrorCode::DeadlineExceeded => (
+        ErrorCode::DeadlineExceeded | ErrorCode::ExpiredBeforeExecution => (
             "ERROR",
-            sqlstate::QUERY_CANCELED,
+            sqlstate::QUERY_CANCELED.0,
             "query cancelled due to deadline".into(),
         ),
         ErrorCode::RejectedConstraint { constraint, detail } => {
-            let code = if constraint == "not_null" {
-                sqlstate::NOT_NULL_VIOLATION
-            } else {
-                sqlstate::UNIQUE_VIOLATION
-            };
+            let code = constraint_sqlstate(constraint);
             (
                 "ERROR",
                 code,
@@ -34,6 +48,18 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             "ERROR",
             sqlstate::CHECK_VIOLATION,
             format!("pre-validation rejected: {reason}"),
+        ),
+        ErrorCode::SyncRejected { violation, .. } => (
+            "ERROR",
+            sqlstate::CHECK_VIOLATION,
+            format!("sync frame rejected: {violation}"),
+        ),
+        // Nothing applied, and the sender re-sends or retires the frame by
+        // the hold, so it takes the class drivers already retry on.
+        ErrorCode::SyncNotApplied { hold, .. } => (
+            "ERROR",
+            sqlstate::SERIALIZATION_FAILURE,
+            format!("sync frame not applied: {hold}"),
         ),
         // Nothing applied and the identical statement is expected to succeed
         // later, so drivers get the same class they already retry on rather
@@ -139,22 +165,24 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             sqlstate::CANNOT_COERCE,
             format!("type mismatch on {collection}: {detail}"),
         ),
-        ErrorCode::OverflowError { collection } => (
+        ErrorCode::CounterFault { collection, fault } => (
             "ERROR",
-            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
-            format!("arithmetic overflow on {collection}"),
+            fault.sqlstate(),
+            format!("{} on {collection}", fault.message()),
         ),
         ErrorCode::InsufficientBalance { collection, detail } => (
             "ERROR",
             sqlstate::CHECK_VIOLATION,
             format!("insufficient balance on {collection}: {detail}"),
         ),
+        // The transient, retryable class, the same SQLSTATE the Control
+        // Plane gives `crate::Error::RateExceeded`.
         ErrorCode::RateExceeded {
             gate,
             retry_after_ms,
         } => (
             "ERROR",
-            sqlstate::STATEMENT_TOO_COMPLEX,
+            sqlstate::TOO_MANY_CONNECTIONS,
             format!("rate limit exceeded for {gate}, retry after {retry_after_ms}ms"),
         ),
         ErrorCode::CollectionDraining { collection } => (
@@ -187,6 +215,29 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             sqlstate::DIVISION_BY_ZERO,
             "division by zero".into(),
         ),
+        ErrorCode::UndefinedFunction { name } => (
+            "ERROR",
+            sqlstate::UNDEFINED_FUNCTION,
+            format!("function {name}() does not exist"),
+        ),
+        ErrorCode::DataException { detail } => ("ERROR", sqlstate::DATA_EXCEPTION, detail.clone()),
+        // The same SQLSTATE the Control Plane gives `crate::Error::BadRequest`.
+        ErrorCode::BadRequest { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
+        ErrorCode::TransactionRollback { detail } => {
+            ("ERROR", sqlstate::TRANSACTION_ROLLBACK, detail.clone())
+        }
+        ErrorCode::ActiveSqlTransaction { detail } => {
+            ("ERROR", sqlstate::ACTIVE_SQL_TRANSACTION, detail.clone())
+        }
+        ErrorCode::DependentObjectsExist { detail, .. } => (
+            "ERROR",
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            detail.clone(),
+        ),
+        // Transient: the client retries after a backoff.
+        ErrorCode::DispatchCapacity { reason } => {
+            ("ERROR", sqlstate::SERVER_OVERLOAD, reason.clone())
+        }
         ErrorCode::Unsupported { detail } => {
             ("ERROR", sqlstate::FEATURE_NOT_SUPPORTED, detail.clone())
         }
@@ -222,5 +273,63 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
                  split the transaction into smaller batches"
             ),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a unique-key refusal is `23505`; every other constraint kind
+    /// keeps its own class.
+    #[test]
+    fn constraint_kinds_map_to_their_own_sqlstate() {
+        assert_eq!(constraint_sqlstate("unique"), sqlstate::UNIQUE_VIOLATION);
+        assert_eq!(
+            constraint_sqlstate("not_null"),
+            sqlstate::NOT_NULL_VIOLATION
+        );
+        assert_eq!(
+            constraint_sqlstate("generated_always"),
+            sqlstate::GENERATED_ALWAYS
+        );
+        assert_eq!(
+            constraint_sqlstate("fk_missing"),
+            sqlstate::FOREIGN_KEY_VIOLATION
+        );
+        assert_eq!(
+            constraint_sqlstate("rls_policy"),
+            sqlstate::INSUFFICIENT_PRIVILEGE
+        );
+        assert_eq!(
+            constraint_sqlstate("crdt_single_document_delta"),
+            sqlstate::INTEGRITY_CONSTRAINT_VIOLATION
+        );
+    }
+
+    /// A vector of the wrong width is a data exception, not a constraint.
+    #[test]
+    fn vector_dimension_mismatch_is_a_data_exception() {
+        let code = ErrorCode::DataException {
+            detail: nodedb_vector::error::VectorError::DimensionMismatch {
+                expected: 3,
+                got: 2,
+            }
+            .to_string(),
+        };
+        let (_, state, message) = error_code_to_sqlstate(&code);
+        assert_eq!(state, sqlstate::DATA_EXCEPTION);
+        assert_eq!(message, "vector dimension mismatch: expected 3, got 2");
+    }
+
+    /// A request the Data Plane rejects as malformed is a syntax error, the
+    /// same SQLSTATE the Control Plane returns for it.
+    #[test]
+    fn a_bad_request_from_the_data_plane_is_a_syntax_error() {
+        let code = ErrorCode::from(crate::Error::BadRequest {
+            detail: "bad text query".into(),
+        });
+        let (_, state, _) = error_code_to_sqlstate(&code);
+        assert_eq!(state, sqlstate::SYNTAX_ERROR);
     }
 }

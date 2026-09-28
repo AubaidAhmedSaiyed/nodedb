@@ -9,7 +9,6 @@
 //! on single-node — the same branch a normal write takes.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use nodedb_columnar::{ColumnarEngineSnapshot, MutationEngine, materialize_segment_live_rows};
 use nodedb_types::RlsWriteCheck;
@@ -18,10 +17,6 @@ use nodedb_types::value::Value;
 
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::shared::ddl::sync_dispatch;
-use crate::control::server::wal_dispatch::wal_append_if_write;
-use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
 
 /// Live rows of a decoded snapshot, ready to re-issue.
@@ -160,58 +155,6 @@ pub fn build_columnar_insert_plan(
         rls_filters: Vec::new(),
     }))
 }
-
-/// Re-issue a restored columnar collection's rows durably.
-///
-/// Branches identically to a normal write:
-/// - Cluster: `to_replicated_entry` + `propose_replicated_entry`.
-/// - Single-node: `wal_append_if_write` then `sync_dispatch::dispatch_system`.
-pub async fn reissue_columnar_durably(
-    state: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    collection: &str,
-    plan: PhysicalPlan,
-) -> crate::Result<()> {
-    let vshard = VShardId::from_collection_in_database(database_id, collection);
-
-    if let Some(proposer) = state.async_raft_proposer() {
-        let entry = crate::control::wal_replication::to_replicated_entry(
-            tenant_id,
-            database_id,
-            vshard,
-            &crate::control::wal_replication::ReplicableWrite::decide_for_replication(&plan)?,
-        )?
-        .ok_or_else(|| Error::Internal {
-            detail: format!(
-                "restore reissue: columnar plan for '{collection}' did not map to a \
-                     replicated write"
-            ),
-        })?;
-        crate::control::wal_replication::propose_replicated_entry(state, proposer, entry).await?;
-        return Ok(());
-    }
-
-    // Single-node: WAL first (durable for restart replay), then install live.
-    wal_append_if_write(&state.wal, tenant_id, vshard, database_id, &plan)?;
-    sync_dispatch::dispatch_system(
-        state,
-        sync_dispatch::SystemTask::new(
-            sync_dispatch::SystemReason::BackupRestore,
-            tenant_id,
-            database_id,
-            collection,
-            plan,
-        ),
-        REISSUE_TIMEOUT,
-    )
-    .await?;
-    Ok(())
-}
-
-/// Per-collection re-issue dispatch timeout. Generous: a restored collection may
-/// carry many flushed segments' worth of rows in one insert.
-const REISSUE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Convert a row's positional `Value`s (schema column order) into a field-keyed
 /// `Value::Object`. Errors if the arity does not match the schema.

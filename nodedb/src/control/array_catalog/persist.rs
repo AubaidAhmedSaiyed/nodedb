@@ -140,9 +140,8 @@ mod tests {
         let array = entry("cells");
         persist(&cat, &array).unwrap();
         cat.put_surrogate(
-            array.array_id.database_id,
+            nodedb_types::CollectionKey::from_bare(array.array_id.database_id, &array.name),
             array.array_id.tenant_id,
-            &array.name,
             b"coord:1",
             nodedb_types::Surrogate::new(42),
         )
@@ -162,9 +161,8 @@ mod tests {
         );
         assert_eq!(
             cat.get_surrogate_for_pk(
-                array.array_id.database_id,
+                nodedb_types::CollectionKey::from_bare(array.array_id.database_id, &array.name),
                 array.array_id.tenant_id,
-                &array.name,
                 b"coord:1"
             )
             .unwrap(),
@@ -183,9 +181,8 @@ mod tests {
         );
         assert!(
             cat.get_surrogate_for_pk(
-                array.array_id.database_id,
+                nodedb_types::CollectionKey::from_bare(array.array_id.database_id, &array.name),
                 array.array_id.tenant_id,
-                &array.name,
                 b"coord:1"
             )
             .unwrap()

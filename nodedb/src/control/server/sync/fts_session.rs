@@ -12,7 +12,7 @@ use nodedb_types::sync::wire::AckStatus;
 use super::fts_handler::FtsDispatcher;
 use super::session::SyncSession;
 use super::wire::*;
-use crate::types::{TenantId, VShardId};
+use crate::types::TenantId;
 
 impl SyncSession {
     /// Process a `FtsIndexMsg`: allocate surrogate, WAL-append on CP, dispatch
@@ -85,7 +85,8 @@ impl SyncSession {
         };
 
         let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(self.database_id(), &msg.collection);
+        let vshard =
+            nodedb_types::CollectionKey::from_bare(self.database_id(), &msg.collection).vshard();
 
         debug!(
             session = %self.session_id,
@@ -216,7 +217,8 @@ impl SyncSession {
         };
 
         let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(self.database_id(), &msg.collection);
+        let vshard =
+            nodedb_types::CollectionKey::from_bare(self.database_id(), &msg.collection).vshard();
 
         debug!(
             session = %self.session_id,

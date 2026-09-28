@@ -34,7 +34,7 @@ pub fn propose_and_apply(
     entry: &CatalogEntry,
 ) -> Result<ProposeOutcome, DdlError> {
     let outcome = propose_catalog_entry(state, entry)
-        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     apply_locally_if_needed(state, entry, outcome);
     Ok(outcome)
 }

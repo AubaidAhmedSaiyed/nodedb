@@ -203,6 +203,41 @@ impl NodeDbError {
         }
     }
 
+    /// A KV counter atomic (`INCR`, `INCRBYFLOAT`) refused on `collection`.
+    ///
+    /// `fault` is the client text, e.g. `value is not an integer or out of
+    /// range`. The message is `"{fault} on {collection}"`, the text the SQL
+    /// surfaces send. `out_of_range` picks the class, and both classes are
+    /// the data-exception class (`22`) the SQL surfaces send:
+    ///
+    /// - `OVERFLOW` for a result out of range (SQLSTATE `22003`).
+    /// - `DATA_EXCEPTION` for a stored value that does not parse (SQLSTATE
+    ///   `22P02`). `TYPE_MISMATCH` is the class for a key that holds the
+    ///   wrong kind of value (SQLSTATE `42846`), a different condition.
+    pub fn kv_counter_fault(
+        collection: impl Into<String>,
+        fault: impl fmt::Display,
+        out_of_range: bool,
+    ) -> Self {
+        let collection = collection.into();
+        let message = format!("{fault} on {collection}");
+        if out_of_range {
+            Self {
+                code: ErrorCode::OVERFLOW,
+                message,
+                details: ErrorDetails::Overflow { collection },
+                cause: None,
+            }
+        } else {
+            Self {
+                code: ErrorCode::DATA_EXCEPTION,
+                message: message.clone(),
+                details: ErrorDetails::DataException { detail: message },
+                cause: None,
+            }
+        }
+    }
+
     pub fn insufficient_balance(collection: impl Into<String>, detail: impl fmt::Display) -> Self {
         let collection = collection.into();
         Self {
@@ -219,6 +254,32 @@ impl NodeDbError {
             code: ErrorCode::RATE_EXCEEDED,
             message: format!("rate limit exceeded for {gate}: {detail}"),
             details: ErrorDetails::RateExceeded { gate },
+            cause: None,
+        }
+    }
+
+    /// A transaction rolled back for a reason other than a serialization
+    /// conflict. SQLSTATE `40000` (`transaction_rollback`). The client
+    /// retries it. `detail` is the full message.
+    pub fn transaction_rollback(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            code: ErrorCode::TRANSACTION_ROLLBACK,
+            message: detail.clone(),
+            details: ErrorDetails::TransactionRollback { detail },
+            cause: None,
+        }
+    }
+
+    /// The statement cannot run inside an explicit transaction block.
+    /// SQLSTATE `25001` (`active_sql_transaction`). `detail` is the full
+    /// message.
+    pub fn active_sql_transaction(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            code: ErrorCode::ACTIVE_SQL_TRANSACTION,
+            message: detail.clone(),
+            details: ErrorDetails::ActiveSqlTransaction { detail },
             cause: None,
         }
     }

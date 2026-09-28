@@ -32,48 +32,27 @@ fn prefetch_t0(ptr: *const u8) {
 use roaring::RoaringBitmap;
 
 use crate::dtype::cast_from_f32;
+use crate::error::{VectorError, check_dim};
 use crate::hnsw::graph::{Candidate, HnswIndex, SearchResult};
+
+/// Maximum beam width to prevent runaway search cost.
+const MAX_EF: usize = 8192;
 
 impl HnswIndex {
     /// K-NN search: find the `k` closest vectors to `query`.
     ///
     /// `ef` controls the search beam width (higher = better recall, slower).
     /// Must be >= k. Typical values: ef = 2*k to 10*k.
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult> {
-        assert_eq!(query.len(), self.dim, "query dimension mismatch");
-        if self.is_empty() {
-            return Vec::new();
-        }
-
-        /// Maximum beam width to prevent runaway search cost.
-        const MAX_EF: usize = 8192;
-        let ef = ef.max(k).min(MAX_EF);
-        let Some(ep) = self.entry_point else {
-            return Vec::new();
-        };
-
-        let query_bytes = cast_from_f32(query, self.params.dtype);
-
-        // Phase 1: Greedy descent from top layer to layer 1.
-        let mut current_ep = ep;
-        for layer in (1..=self.max_layer).rev() {
-            let results = search_layer(self, &query_bytes, current_ep, 1, layer, None, 0);
-            if let Some(nearest) = results.first() {
-                current_ep = nearest.id;
-            }
-        }
-
-        // Phase 2: Beam search at layer 0.
-        let results = search_layer(self, &query_bytes, current_ep, ef, 0, None, 0);
-
-        results
-            .into_iter()
-            .take(k)
-            .map(|c| SearchResult {
-                id: c.id,
-                distance: c.dist,
-            })
-            .collect()
+    ///
+    /// Returns [`VectorError::DimensionMismatch`] when `query` does not have
+    /// the index dimension.
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        self.search_inner(query, k, ef.max(k).min(MAX_EF), None, 0)
     }
 
     /// Filtered K-NN search with Roaring bitmap pre-filtering.
@@ -83,7 +62,7 @@ impl HnswIndex {
         k: usize,
         ef: usize,
         filter: &RoaringBitmap,
-    ) -> Vec<SearchResult> {
+    ) -> Result<Vec<SearchResult>, VectorError> {
         self.search_filtered_offset(query, k, ef, filter, 0)
     }
 
@@ -99,45 +78,8 @@ impl HnswIndex {
         ef: usize,
         filter: &RoaringBitmap,
         id_offset: u32,
-    ) -> Vec<SearchResult> {
-        assert_eq!(query.len(), self.dim, "query dimension mismatch");
-        if self.is_empty() {
-            return Vec::new();
-        }
-
-        let ef = ef.max(k);
-        let Some(ep) = self.entry_point else {
-            return Vec::new();
-        };
-
-        let query_bytes = cast_from_f32(query, self.params.dtype);
-
-        let mut current_ep = ep;
-        for layer in (1..=self.max_layer).rev() {
-            let results = search_layer(self, &query_bytes, current_ep, 1, layer, None, 0);
-            if let Some(nearest) = results.first() {
-                current_ep = nearest.id;
-            }
-        }
-
-        let results = search_layer(
-            self,
-            &query_bytes,
-            current_ep,
-            ef,
-            0,
-            Some(filter),
-            id_offset,
-        );
-
-        results
-            .into_iter()
-            .take(k)
-            .map(|c| SearchResult {
-                id: c.id,
-                distance: c.dist,
-            })
-            .collect()
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        self.search_inner(query, k, ef.max(k), Some(filter), id_offset)
     }
 
     /// Deserialize a Roaring bitmap from bytes and perform filtered search.
@@ -147,12 +89,16 @@ impl HnswIndex {
         k: usize,
         ef: usize,
         bitmap_bytes: &[u8],
-    ) -> Vec<SearchResult> {
+    ) -> Result<Vec<SearchResult>, VectorError> {
         self.search_with_bitmap_bytes_offset(query, k, ef, bitmap_bytes, 0)
     }
 
     /// Deserialize a Roaring bitmap and search with an ID offset applied
     /// before testing membership. See `search_filtered_offset` for rationale.
+    ///
+    /// Bytes that do not decode fail with
+    /// [`VectorError::InvalidFilterBitmap`]: an unfiltered search would
+    /// return rows the filter excludes.
     pub fn search_with_bitmap_bytes_offset(
         &self,
         query: &[f32],
@@ -160,12 +106,59 @@ impl HnswIndex {
         ef: usize,
         bitmap_bytes: &[u8],
         id_offset: u32,
-    ) -> Vec<SearchResult> {
-        match RoaringBitmap::deserialize_from(bitmap_bytes) {
-            Ok(bitmap) => self.search_filtered_offset(query, k, ef, &bitmap, id_offset),
-            Err(_) => self.search(query, k, ef),
-        }
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        let bitmap = decode_filter_bitmap(bitmap_bytes)?;
+        self.search_filtered_offset(query, k, ef, &bitmap, id_offset)
     }
+
+    /// Greedy descent to layer 1, then a beam search of width `ef` at layer
+    /// 0, restricted to `filter` when one is given.
+    fn search_inner(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: Option<&RoaringBitmap>,
+        id_offset: u32,
+    ) -> Result<Vec<SearchResult>, VectorError> {
+        check_dim(self.dim, query.len())?;
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(ep) = self.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        let query_bytes = cast_from_f32(query, self.params.dtype);
+
+        // Phase 1: Greedy descent from top layer to layer 1.
+        let mut current_ep = ep;
+        for layer in (1..=self.max_layer).rev() {
+            let results = search_layer(self, &query_bytes, current_ep, 1, layer, None, 0);
+            if let Some(nearest) = results.first() {
+                current_ep = nearest.id;
+            }
+        }
+
+        // Phase 2: Beam search at layer 0.
+        let results = search_layer(self, &query_bytes, current_ep, ef, 0, filter, id_offset);
+
+        Ok(results
+            .into_iter()
+            .take(k)
+            .map(|c| SearchResult {
+                id: c.id,
+                distance: c.dist,
+            })
+            .collect())
+    }
+}
+
+/// Decode a serialized Roaring pre-filter bitmap.
+pub fn decode_filter_bitmap(bytes: &[u8]) -> Result<RoaringBitmap, VectorError> {
+    RoaringBitmap::deserialize_from(bytes).map_err(|e| VectorError::InvalidFilterBitmap {
+        detail: e.to_string(),
+    })
 }
 
 /// Unified HNSW beam search on a single layer with optional pre-filter.
@@ -313,7 +306,7 @@ mod tests {
     #[test]
     fn search_empty_index() {
         let idx = HnswIndex::new(3, HnswParams::default());
-        let results = idx.search(&[1.0, 2.0, 3.0], 5, 50);
+        let results = idx.search(&[1.0, 2.0, 3.0], 5, 50).unwrap();
         assert!(results.is_empty());
     }
 
@@ -331,7 +324,7 @@ mod tests {
             1,
         );
         idx.insert(vec![1.0, 0.0]).unwrap();
-        let results = idx.search(&[1.0, 0.0], 1, 10);
+        let results = idx.search(&[1.0, 0.0], 1, 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 0);
         assert!(results[0].distance < 1e-6);
@@ -341,7 +334,7 @@ mod tests {
     fn search_finds_exact_match() {
         let idx = build_index(50, 3);
         let query = idx.get_vector(25).unwrap().to_vec();
-        let results = idx.search(&query, 1, 50);
+        let results = idx.search(&query, 1, 50).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 25);
         assert!(results[0].distance < 1e-6);
@@ -351,7 +344,7 @@ mod tests {
     fn search_returns_sorted_by_distance() {
         let idx = build_index(100, 4);
         let query = vec![50.0, 50.0, 50.0, 50.0];
-        let results = idx.search(&query, 10, 64);
+        let results = idx.search(&query, 10, 64).unwrap();
         assert_eq!(results.len(), 10);
         for w in results.windows(2) {
             assert!(w[0].distance <= w[1].distance);
@@ -361,7 +354,7 @@ mod tests {
     #[test]
     fn search_k_larger_than_index() {
         let idx = build_index(5, 2);
-        let results = idx.search(&[0.0, 0.0], 20, 50);
+        let results = idx.search(&[0.0, 0.0], 20, 50).unwrap();
         assert_eq!(results.len(), 5);
     }
 
@@ -369,7 +362,7 @@ mod tests {
     fn search_recall_at_10() {
         let idx = build_index(500, 3);
         let query = vec![100.0, 100.0, 100.0];
-        let results = idx.search(&query, 10, 128);
+        let results = idx.search(&query, 10, 128).unwrap();
 
         let mut truth: Vec<(u32, f32)> = (0..500)
             .map(|i| {
@@ -390,7 +383,7 @@ mod tests {
     fn search_excludes_tombstoned() {
         let mut idx = build_index(20, 3);
         idx.delete(0);
-        let results = idx.search(&[0.0, 0.0, 0.0], 5, 32);
+        let results = idx.search(&[0.0, 0.0, 0.0], 5, 32).unwrap();
         for r in &results {
             assert_ne!(r.id, 0, "tombstoned node appeared in results");
         }
@@ -403,7 +396,9 @@ mod tests {
         for i in (0..50u32).step_by(2) {
             filter.insert(i);
         }
-        let results = idx.search_filtered(&[0.0, 0.0, 0.0], 5, 64, &filter);
+        let results = idx
+            .search_filtered(&[0.0, 0.0, 0.0], 5, 64, &filter)
+            .unwrap();
         assert_eq!(results.len(), 5);
         for r in &results {
             assert!(r.id % 2 == 0, "got odd id {}", r.id);
@@ -414,7 +409,9 @@ mod tests {
     fn search_filtered_empty_returns_empty() {
         let idx = build_index(20, 3);
         let filter = RoaringBitmap::new();
-        let results = idx.search_filtered(&[0.0, 0.0, 0.0], 5, 64, &filter);
+        let results = idx
+            .search_filtered(&[0.0, 0.0, 0.0], 5, 64, &filter)
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -427,9 +424,56 @@ mod tests {
         }
         let mut bytes = Vec::new();
         filter.serialize_into(&mut bytes).unwrap();
-        let results = idx.search_with_bitmap_bytes(&[0.0, 0.0, 0.0], 5, 32, &bytes);
+        let results = idx
+            .search_with_bitmap_bytes(&[0.0, 0.0, 0.0], 5, 32, &bytes)
+            .unwrap();
         for r in &results {
             assert!(r.id < 25, "got filtered-out node {}", r.id);
         }
+    }
+
+    /// A query of the wrong dimension is a typed error on every entry point,
+    /// on an empty index and a populated one alike.
+    #[test]
+    fn wrong_dimension_query_is_a_typed_error() {
+        use crate::error::VectorError;
+        let empty = HnswIndex::new(3, HnswParams::default());
+        let idx = build_index(20, 3);
+        let filter: RoaringBitmap = (0..20u32).collect();
+        let mut bytes = Vec::new();
+        filter.serialize_into(&mut bytes).unwrap();
+        let short = [0.0_f32, 0.0];
+        for result in [
+            empty.search(&short, 5, 32),
+            idx.search(&short, 5, 32),
+            idx.search_filtered(&short, 5, 32, &filter),
+            idx.search_filtered_offset(&short, 5, 32, &filter, 0),
+            idx.search_with_bitmap_bytes(&short, 5, 32, &bytes),
+            idx.search_with_bitmap_bytes_offset(&short, 5, 32, &bytes, 0),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(VectorError::DimensionMismatch {
+                        expected: 3,
+                        got: 2
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// Filter bytes that do not decode fail the search: an unfiltered
+    /// search would return rows the filter excludes.
+    #[test]
+    fn undecodable_filter_bitmap_is_a_typed_error() {
+        use crate::error::VectorError;
+        let idx = build_index(20, 3);
+        let result = idx.search_with_bitmap_bytes(&[0.0, 0.0, 0.0], 5, 32, &[0xff, 0x01]);
+        assert!(
+            matches!(result, Err(VectorError::InvalidFilterBitmap { .. })),
+            "{result:?}"
+        );
     }
 }

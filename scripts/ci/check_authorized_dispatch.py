@@ -94,7 +94,8 @@ ALLOWED_REFERENCES = {
         "control/server/sync/raft_dispatch/mod.rs",
         "dispatch_trusted_internal_sync_response",
     ),
-    ("control/server/pgwire/handler/dispatch.rs", "into_physical_task"),
+    ("control/server/pgwire/handler/dispatch/replicated.rs", "into_physical_task"),
+    ("control/server/pgwire/handler/dispatch/routing.rs", "into_physical_task"),
     ("control/server/pgwire/handler/submit.rs", "into_physical_task"),
     ("control/server/shared/cluster_array_dispatch.rs", "into_physical_task"),
     ("control/array_sync/inbound.rs", "into_scope"),
@@ -104,7 +105,7 @@ ALLOWED_REFERENCES = {
     ("control/server/sync/raft_dispatch/response.rs", "propose_sync_write"),
     ("control/server/sync/raft_dispatch/write.rs", "propose_sync_write"),
     (
-        "control/server/pgwire/handler/dispatch.rs",
+        "control/server/pgwire/handler/dispatch/replicated.rs",
         "propose_replicated_entry",
     ),
 }

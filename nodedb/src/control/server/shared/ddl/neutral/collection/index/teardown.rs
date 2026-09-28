@@ -7,7 +7,7 @@
 //!
 //! | kind      | durable state created                              |
 //! |-----------|----------------------------------------------------|
-//! | secondary | `StoredCollection.indexes` entry + sparse-engine index entries |
+//! | secondary | `StoredCollection.indexes` entry + sparse-engine index entries, or the KV engine's field index on a key-value collection |
 //! | vector    | `_system.vector_index_params` row + Data Plane index + checkpoint |
 //! | fulltext  | the collection's analyzer / fuzzy binding (per collection) |
 //! | spatial   | none beyond the registry + ownership rows           |
@@ -23,11 +23,15 @@
 //! cannot propagate and files a `Capture` instead.
 
 use crate::control::security::catalog::{IndexKind, StoredIndexRecord};
+use crate::control::server::dispatch_utils::{MintedRecords, RecordOwner};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
 
 use super::super::super::super::result::DdlError;
-use super::commit::{commit_collection_mutation, err};
+use crate::control::server::shared::session::ddl_buffer;
+use crate::control::server::shared::session::ddl_effect::DeferredDdlEffect;
+
+use super::commit::commit_collection_mutation;
 
 /// Remove every piece of engine and catalog state belonging to `record`,
 /// except the registry and ownership rows the caller removes afterwards.
@@ -53,6 +57,15 @@ pub(super) async fn teardown(
         // write — so its removal goes through the same route
         // `DROP SORTED INDEX` uses.
         IndexKind::Sorted => {
+            let deferred = ddl_buffer::defer_effect(DeferredDdlEffect::SortedIndexDrop {
+                tenant_id,
+                database_id,
+                collection: record.collection.clone(),
+                index_name: record.name.clone(),
+            });
+            if deferred {
+                return Ok(());
+            }
             super::super::super::kv_sorted_index::drop_in_engine(
                 state,
                 &super::super::super::kv_sorted_index::SortedIndexTarget {
@@ -68,7 +81,8 @@ pub(super) async fn teardown(
 }
 
 /// Drop the `StoredIndex` entry from the owning collection and purge the
-/// sparse engine's entries for the indexed path.
+/// indexed path's entries: from the sparse engine, or from the KV engine on
+/// a key-value collection.
 async fn secondary(
     state: &SharedState,
     record: &StoredIndexRecord,
@@ -78,7 +92,7 @@ async fn secondary(
     let catalog = state.credentials.catalog();
     let Some(mut coll) = catalog
         .get_collection(database_id, tenant_id.as_u64(), &record.collection)
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
     else {
         // The registry outlived its collection — the collection teardown
         // path already reclaimed every engine surface, so there is nothing
@@ -99,13 +113,34 @@ async fn secondary(
     let Some(field) = dropped_field.or_else(|| record.fields.first().cloned()) else {
         return Ok(());
     };
+    // A key-value collection's index lives in the KV engine.
+    if coll.collection_type.is_kv() {
+        let field = field.strip_prefix("$.").unwrap_or(&field).to_string();
+        let deferred = ddl_buffer::defer_effect(DeferredDdlEffect::KvIndexDrop {
+            tenant_id,
+            database_id,
+            collection: record.collection.clone(),
+            field: field.clone(),
+        });
+        if deferred {
+            return Ok(());
+        }
+        return super::kv_index::drop_kv_index(
+            state,
+            tenant_id,
+            database_id,
+            &record.collection,
+            &field,
+        )
+        .await;
+    }
     let plan = crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::DropIndex {
             collection: nodedb_types::QualifiedCollection::new(database_id, &record.collection),
             field,
         },
     );
-    dispatch(state, tenant_id, database_id, &record.collection, plan).await
+    teardown_now_or_at_commit(state, tenant_id, database_id, &record.collection, plan).await
 }
 
 /// Remove the vector index's durable build parameters and its Data Plane
@@ -144,30 +179,61 @@ async fn vector(
     // WAL first: the `VectorParams` record that created this index is still
     // in the log, so without a durable drop record a restart rebuilds the
     // index the user just dropped.
-    let vshard =
-        crate::types::VShardId::from_collection_in_database(database_id, &record.collection);
-    let appended = crate::control::server::wal_dispatch::wal_append_if_write(
-        &state.wal,
+    //
+    // The record's outcome-floor window opens before the append and closes
+    // from the drop's outcome.
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &record.collection).vshard();
+    let owner = RecordOwner {
         tenant_id,
-        vshard,
         database_id,
+        vshard_id: vshard,
+    };
+    let minted = MintedRecords::open(&state.outcome_floor);
+    let appended = match minted.append_plan(
+        &state.wal,
+        owner,
         &plan,
-    )
-    .map_err(|e| err("XX000", format!("persist vector index drop to WAL: {e}")))?;
+        // The drop is dispatched as a client statement.
+        crate::event::EventSource::User,
+    ) {
+        Ok(appended) => appended,
+        Err(e) => {
+            // Any record appended before the error never reaches a core.
+            minted.cancel(&state.wal, owner, 0).await.map_err(|c| {
+                DdlError::from_error_in_context("cancel vector index drop record", &c)
+            })?;
+            return Err(DdlError::from_error_in_context(
+                "persist vector index drop to WAL",
+                &e,
+            ));
+        }
+    };
 
     // An append only buffers. The records this drop cancels were already
     // fsynced by the writes that acked them, so a buffered-only drop is lost on
     // restart while replay still rebuilds the index from those records.
-    let lsn = appended
-        .lsn
-        .ok_or_else(|| err("XX000", "vector index drop minted no WAL record"))?;
-    state
-        .wal
-        .wait_durable(lsn)
-        .await
-        .map_err(|e| err("XX000", format!("fsync vector index drop: {e}")))?;
+    let Some(lsn) = appended.lsn else {
+        minted.settle();
+        return Err(DdlError::internal("vector index drop minted no WAL record"));
+    };
+    if let Err(e) = state.wal.wait_durable(lsn).await {
+        // The record can still be on disk, so restart replay can reach it.
+        minted.hold();
+        return Err(DdlError::from_error_in_context(
+            "fsync vector index drop",
+            &e,
+        ));
+    }
 
-    dispatch(state, tenant_id, database_id, &record.collection, plan).await
+    dispatch(
+        state,
+        tenant_id,
+        database_id,
+        &record.collection,
+        plan,
+        Some(minted),
+    )
+    .await
 }
 
 /// Reset the collection's FTS binding once its last full-text index is gone.
@@ -191,7 +257,7 @@ async fn fulltext(
             tenant_id.as_u64(),
             &record.collection,
         )
-        .map_err(|e| err("XX000", e.to_string()))?
+        .map_err(|e| DdlError::from_error(&e))?
         .into_iter()
         .filter(|r| r.kind == IndexKind::FullText && r.name != record.name)
         .count();
@@ -206,37 +272,73 @@ async fn fulltext(
             fuzzy_default: Some(false),
         },
     );
-    dispatch(state, tenant_id, database_id, &record.collection, plan).await
+    teardown_now_or_at_commit(state, tenant_id, database_id, &record.collection, plan).await
 }
 
-/// Dispatch one teardown plan to the Data Plane, surfacing both transport and
-/// handler-side failures.
-async fn dispatch(
+/// Run one teardown plan now, or at COMMIT inside an explicit transaction:
+/// the catalog entry that drops the index is buffered, so its engine state
+/// must survive a ROLLBACK.
+async fn teardown_now_or_at_commit(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     collection: &str,
     plan: crate::bridge::envelope::PhysicalPlan,
 ) -> Result<(), DdlError> {
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, collection);
-    let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
-        state,
+    let deferred = ddl_buffer::defer_effect(DeferredDdlEffect::IndexTeardown {
         tenant_id,
         database_id,
-        vshard,
-        plan,
-        TraceId::ZERO,
-    )
-    .await
-    .map_err(|e| err("XX000", format!("index teardown dispatch failed: {e}")))?;
+        collection: collection.to_string(),
+        plan: plan.clone(),
+    });
+    if deferred {
+        return Ok(());
+    }
+    dispatch(state, tenant_id, database_id, collection, plan, None).await
+}
+
+/// Dispatch one teardown plan to the Data Plane, surfacing both transport and
+/// handler-side failures. `minted` holds the record appended for the plan;
+/// the funnel closes its outcome-floor window from the plan's outcome.
+pub(crate) async fn dispatch(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    collection: &str,
+    plan: crate::bridge::envelope::PhysicalPlan,
+    minted: Option<MintedRecords>,
+) -> Result<(), DdlError> {
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, collection).vshard();
+    let response =
+        crate::control::server::dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
+            state,
+            crate::control::server::dispatch_utils::WriteDispatch {
+                tenant_id,
+                database_id,
+                vshard_id: vshard,
+                plan,
+                trace_id: TraceId::ZERO,
+                event_source: crate::event::EventSource::User,
+                txn_id: None,
+                wal_lsn: None,
+                resolved_now_ms: None,
+                minted,
+            },
+        )
+        .await
+        .map_err(|e| DdlError::from_error_in_context("index teardown dispatch failed", &e))?;
 
     if response.status == crate::bridge::envelope::Status::Error {
-        let detail = match response.error_code.as_deref() {
-            Some(crate::bridge::envelope::ErrorCode::Internal { detail, .. }) => detail.clone(),
-            Some(other) => format!("{other:?}"),
-            None => String::from_utf8_lossy(&response.payload).into_owned(),
-        };
-        return Err(err("XX000", format!("index teardown failed: {detail}")));
+        return Err(match response.error_code.as_deref() {
+            Some(code) => DdlError::from_error_in_context(
+                "index teardown failed",
+                &crate::Error::DataPlane(code.clone()),
+            ),
+            None => DdlError::internal(format!(
+                "index teardown failed: {}",
+                String::from_utf8_lossy(&response.payload)
+            )),
+        });
     }
     Ok(())
 }

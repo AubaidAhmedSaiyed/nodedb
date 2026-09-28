@@ -21,7 +21,8 @@ use super::phase::StartupPhase;
 pub enum HealthState {
     /// Still advancing through startup phases.
     Starting { phase: StartupPhase },
-    /// Node has reached [`StartupPhase::GatewayEnable`] and is serving.
+    /// Node has reached [`StartupPhase::Serving`], the final phase: its
+    /// client protocols listen.
     Ok,
     /// Startup failed; includes the original error.
     Failed { error: Arc<StartupError> },
@@ -33,7 +34,7 @@ pub fn observe(gate: &StartupGate) -> HealthState {
         return HealthState::Failed { error: err };
     }
     let phase = gate.current_phase();
-    if phase >= StartupPhase::GatewayEnable {
+    if phase >= StartupPhase::Serving {
         HealthState::Ok
     } else {
         HealthState::Starting { phase }
@@ -55,7 +56,7 @@ pub fn to_http_response(state: &HealthState) -> (axum::http::StatusCode, serde_j
             StatusCode::OK,
             serde_json::json!({
                 "status": "ok",
-                "phase": StartupPhase::GatewayEnable.name(),
+                "phase": StartupPhase::Serving.name(),
             }),
         ),
         HealthState::Starting { phase } => (
@@ -112,7 +113,7 @@ mod tests {
     use crate::control::startup::StartupSequencer;
 
     #[test]
-    fn observe_starting_before_gateway_enable() {
+    fn observe_starting_before_serving() {
         // A pre-fired gate (used by test helpers) reports Ok immediately.
         let gate = StartupGate::pre_fired();
         let state = observe(&gate);
@@ -160,5 +161,26 @@ mod tests {
         assert_eq!(NativeStatus::Ok.to_string(), "OK");
         assert_eq!(NativeStatus::Starting.to_string(), "Starting");
         assert_eq!(NativeStatus::Failed.to_string(), "Failed");
+    }
+
+    /// Boot reaches `GatewayEnable` before it listens on the client
+    /// protocols. The node reports starting until the final phase.
+    #[test]
+    fn observe_starting_until_serving() {
+        let (seq, gate) = StartupSequencer::new();
+        let gateway = seq.register_gate(StartupPhase::GatewayEnable, "gateway");
+        let serving = seq.register_gate(StartupPhase::Serving, "serving");
+        gateway.fire();
+        assert_eq!(gate.current_phase(), StartupPhase::GatewayEnable);
+        assert!(matches!(
+            observe(&gate),
+            HealthState::Starting {
+                phase: StartupPhase::GatewayEnable
+            }
+        ));
+
+        serving.fire();
+        assert_eq!(gate.current_phase(), StartupPhase::Serving);
+        assert!(matches!(observe(&gate), HealthState::Ok));
     }
 }

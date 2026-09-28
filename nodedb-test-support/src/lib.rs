@@ -15,6 +15,7 @@ pub mod pgwire_harness;
 pub mod sync_client;
 pub mod test_tracing;
 pub mod tx_batch_helpers;
+pub mod tx_commit;
 
 use nodedb::event::cdc::event::CdcEvent;
 use nodedb_types::DatabaseId;
@@ -53,5 +54,6 @@ pub fn make_cdc_event(
         field_diffs: None,
         system_time_ms: None,
         valid_time_ms: None,
+        source: nodedb::event::EventSource::User,
     }
 }

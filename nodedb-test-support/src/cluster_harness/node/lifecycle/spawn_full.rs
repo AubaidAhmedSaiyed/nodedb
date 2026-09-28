@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nodedb::bridge::dispatch::Dispatcher;
+use nodedb::bridge::dispatch::{DATA_PLANE_QUEUE_CAPACITY, Dispatcher};
 use nodedb::config::auth::AuthMode;
 use nodedb::config::server::ClusterSettings;
 use nodedb::control::server::pgwire::listener::PgListener;
@@ -33,7 +33,7 @@ impl TestClusterNode {
         seed_nodes: Vec<SocketAddr>,
         config: &ClusterSpawnConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::spawn_with_full_config_at(node_id, seed_nodes, config, None).await
+        Self::spawn_with_full_config_at(node_id, seed_nodes, config, None, None).await
     }
 
     /// Lowest-level cluster-node spawn. In addition to the tuning knobs of
@@ -67,11 +67,16 @@ impl TestClusterNode {
     /// before this parameter existed); on a reopened directory it rebuilds
     /// in-memory-only structures (e.g. the vector HNSW index) from the
     /// persisted `TransactionRedo` / `Put` / etc. records.
+    ///
+    /// `listen_override`: `None` binds the QUIC transport on an ephemeral
+    /// port. `Some(addr)` binds it on `addr`, the address a restarted node's
+    /// peers already hold for it.
     pub(crate) async fn spawn_with_full_config_at(
         node_id: u64,
         seed_nodes: Vec<SocketAddr>,
         config: &ClusterSpawnConfig,
         data_dir_path_override: Option<PathBuf>,
+        listen_override: Option<SocketAddr>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Every cluster node funnels through here, so installing tracing at
         // this one point means no test has to opt in to see server-side logs.
@@ -101,7 +106,7 @@ impl TestClusterNode {
         )?);
         let wal_records: Arc<[nodedb_wal::WalRecord]> = Arc::from(wal.replay()?.into_boxed_slice());
         let replay_tombstones = nodedb_wal::extract_tombstones(&wal_records).unwrap();
-        let (dispatcher, data_sides) = Dispatcher::new(num_cores, 1024);
+        let (dispatcher, data_sides) = Dispatcher::new(num_cores, DATA_PLANE_QUEUE_CAPACITY);
         let (event_producers, event_consumers) = create_event_bus(num_cores);
 
         // Credential store backed by the system catalog — required for
@@ -143,9 +148,13 @@ impl TestClusterNode {
         } else {
             // Pre-bind the QUIC transport on a random port so we know the
             // listen address before wiring seeds / cluster settings.
+            let bind_addr = match listen_override {
+                Some(addr) => addr,
+                None => "127.0.0.1:0".parse()?,
+            };
             let transport = Arc::new(nodedb_cluster::NexarTransport::new(
                 node_id,
-                "127.0.0.1:0".parse()?,
+                bind_addr,
                 nodedb_cluster::TransportCredentials::Insecure,
             )?);
             let listen_addr = transport.local_addr();
@@ -253,6 +262,7 @@ impl TestClusterNode {
             let core_handle =
                 crate::core_loop_runner::spawn_core_loop(crate::core_loop_runner::CoreLoopSpawn {
                     idx,
+                    num_cores,
                     data_side,
                     core_dir: data_dir_path.clone(),
                     core_array_catalog: shared.array_catalog.clone(),
@@ -439,6 +449,19 @@ impl TestClusterNode {
         let conn_handle = tokio::spawn(async move {
             let _ = connection.await;
         });
+
+        // The node plans permission-checked statements only under an
+        // authorization lease, as a production node opens its gateway only
+        // once it holds one.
+        if let Some(timing) = shared.authorization_fence.timing() {
+            nodedb::control::security::auth_lease::await_planning_admitted(
+                &shared,
+                Duration::from_secs(15),
+                timing.renew_every,
+            )
+            .await
+            .map_err(|e| format!("node {node_id}: {e}"))?;
+        }
 
         Ok(Self {
             node_id,

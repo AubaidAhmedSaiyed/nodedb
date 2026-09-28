@@ -130,9 +130,11 @@ pub(super) async fn handle_hset(
     // Content-addressed cross-engine identity so the merged row keeps the
     // surrogate its original insert assigned.
     let surrogate = match state.surrogate_assigner.assign(
-        nodedb_types::DatabaseId::DEFAULT,
+        nodedb_types::CollectionKey::from_bare(
+            nodedb_types::DatabaseId::DEFAULT,
+            &session.collection,
+        ),
         session.tenant_id,
-        &session.collection,
         &key,
     ) {
         Ok(s) => s,
