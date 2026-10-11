@@ -3,8 +3,8 @@
 //! Read-path coordinator for distributed array operations.
 //!
 //! [`ArrayCoordinator`] drives fan-out reads (`coord_slice`, `coord_agg`,
-//! `coord_surrogate_bitmap_scan`) to the set of vShards whose Hilbert range
-//! overlaps the slice predicate.
+//! `coord_surrogate_bitmap_scan`) to the vShards that own a tile the slice
+//! predicate covers.
 
 use std::sync::Arc;
 
@@ -15,8 +15,11 @@ use super::super::merge::{
     ArrayAggPartial, any_truncated_before_horizon_agg, merge_read_versions, merge_slice_rows,
     merge_slice_rows_sorted, reduce_agg_partials,
 };
+use super::super::routing::shard_bucket_for_vshard;
 use super::super::rpc::ShardRpcDispatch;
-use super::super::scatter::{FanOutParams, FanOutPartitionedParams, fan_out, fan_out_partitioned};
+use super::super::scatter::{
+    ArrayCoordError, FanOutParams, FanOutPartitionedParams, fan_out, fan_out_partitioned,
+};
 use super::super::wire::{
     ArrayShardAggReq, ArrayShardAggResp, ArrayShardDeleteReq, ArrayShardDeleteResp,
     ArrayShardSliceReq, ArrayShardSliceResp, ArrayShardSurrogateBitmapReq,
@@ -30,14 +33,13 @@ pub struct ArrayCoordParams {
     pub shard_ids: Vec<u32>,
     /// Per-shard RPC timeout in milliseconds.
     pub timeout_ms: u64,
-    /// Hilbert routing granularity (1–16). 0 means no shard-side routing
-    /// validation (e.g. when the coordinator was constructed without slice
-    /// range information, as in tests or unbounded scans).
+    /// Routing granularity (1–16). 0 skips shard-side routing validation
+    /// and the per-shard bucket filter.
     pub prefix_bits: u8,
-    /// Inclusive Hilbert-prefix ranges `(lo, hi)` that this read covers.
-    /// Forwarded to each shard so it can verify it still owns the range.
-    /// Empty means unbounded — the shard skips routing validation.
-    pub slice_hilbert_ranges: Vec<(u64, u64)>,
+    /// Tile keys this read covers, at least one per bucket. Forwarded to
+    /// each shard so it checks that it still owns one. Empty means
+    /// unbounded, and the shard skips routing validation.
+    pub slice_tile_keys: Vec<u64>,
 }
 
 /// Result of a coordinated slice fan-out.
@@ -69,24 +71,13 @@ pub struct CoordAggResult {
     pub read_versions: Vec<nodedb_types::ShardVersion>,
 }
 
-/// Compute the inclusive Hilbert-prefix range `[lo, hi]` that vShard `shard_id`
-/// owns given the array's routing granularity `prefix_bits`.
-///
-/// Each bucket `b = shard_id / stride` covers the Hilbert range
-/// `[b << (64 - prefix_bits), ((b + 1) << (64 - prefix_bits)) - 1]`.
-/// The stride is `VSHARD_COUNT >> prefix_bits` (floored at 1).
-pub(super) fn shard_hilbert_range_for_vshard(shard_id: u32, prefix_bits: u8) -> (u64, u64) {
-    use crate::routing::VSHARD_COUNT;
-    let stride = (VSHARD_COUNT >> (prefix_bits as u32)).max(1);
-    let bucket = shard_id / stride;
-    let shift = 64u8.saturating_sub(prefix_bits);
-    let lo = (bucket as u64) << shift;
-    let hi = if shift == 0 {
-        u64::MAX
-    } else {
-        lo.saturating_add((1u64 << shift).saturating_sub(1))
-    };
-    (lo, hi)
+/// The bucket filter for a read sent to vShard `shard_id`. `None` when
+/// `prefix_bits` is 0, which reads every tile.
+fn shard_bucket(shard_id: u32, prefix_bits: u8) -> Result<Option<nodedb_types::ShardBucket>> {
+    if prefix_bits == 0 {
+        return Ok(None);
+    }
+    shard_bucket_for_vshard(shard_id, prefix_bits).map(Some)
 }
 
 /// Coordinator for distributed array read operations.
@@ -109,24 +100,24 @@ impl ArrayCoordinator {
         }
     }
 
-    /// Construct an `ArrayCoordinator` whose target shards are computed from
-    /// the Hilbert-prefix ranges that overlap a slice predicate.
+    /// Construct an `ArrayCoordinator` whose target shards own the tiles a
+    /// slice predicate covers.
     ///
-    /// `slice_hilbert_ranges` — `(lo, hi)` pairs computed by the planner from
-    /// the `Slice` predicate. Pass an empty slice for an unbounded scan.
+    /// `slice_tile_keys` — tile keys computed by the planner from the
+    /// `Slice` predicate. Pass an empty slice for an unbounded scan.
     /// `prefix_bits` — the array's routing granularity from the catalog entry.
     /// `total_shards` — the number of active vShards in the cluster.
     pub fn for_slice(
         source_node: u64,
         timeout_ms: u64,
-        slice_hilbert_ranges: &[(u64, u64)],
+        slice_tile_keys: &[u64],
         prefix_bits: u8,
         total_shards: u32,
         dispatch: Arc<dyn ShardRpcDispatch>,
         circuit_breaker: Arc<CircuitBreaker>,
     ) -> crate::error::Result<Self> {
         let shard_ids = super::super::routing::array_vshards_for_slice(
-            slice_hilbert_ranges,
+            slice_tile_keys,
             prefix_bits,
             total_shards,
         )?;
@@ -136,7 +127,7 @@ impl ArrayCoordinator {
                 shard_ids,
                 timeout_ms,
                 prefix_bits,
-                slice_hilbert_ranges: slice_hilbert_ranges.to_vec(),
+                slice_tile_keys: slice_tile_keys.to_vec(),
             },
             dispatch,
             circuit_breaker,
@@ -147,10 +138,9 @@ impl ArrayCoordinator {
     ///
     /// Each shard receives the full slice request with the caller-supplied
     /// `limit` pushed down so shards can stop scanning early. The coordinator
-    /// stamps a per-shard `shard_hilbert_range` so each shard only returns
-    /// cells whose Hilbert prefix falls within its owned range, preventing
-    /// duplicate rows in single-node harnesses where all vShards share one
-    /// Data Plane. The coordinator applies the same `limit` as a final
+    /// stamps a per-shard `shard_bucket`, so each shard returns only cells
+    /// whose tile key routes to it. vShards that share one Data Plane then
+    /// return no duplicate rows. The coordinator applies the same `limit` as a final
     /// cut-off on the merged result.
     ///
     /// When `system_time` is `AllVersions`, the coordinator merge-sorts rows
@@ -167,22 +157,17 @@ impl ArrayCoordinator {
         req: ArrayShardSliceReq,
         coordinator_limit: u32,
         system_time: nodedb_types::SystemTimeScope,
-    ) -> Result<CoordSliceResult> {
+    ) -> std::result::Result<CoordSliceResult, ArrayCoordError> {
         let prefix_bits = self.params.prefix_bits;
         let per_shard: Vec<(u32, Vec<u8>)> = self
             .params
             .shard_ids
             .iter()
             .map(|&shard_id| {
-                let shard_hilbert_range = if prefix_bits > 0 {
-                    Some(shard_hilbert_range_for_vshard(shard_id, prefix_bits))
-                } else {
-                    None
-                };
                 let per_shard_req = ArrayShardSliceReq {
                     prefix_bits,
-                    slice_hilbert_ranges: self.params.slice_hilbert_ranges.clone(),
-                    shard_hilbert_range,
+                    slice_tile_keys: self.params.slice_tile_keys.clone(),
+                    shard_bucket: shard_bucket(shard_id, prefix_bits)?,
                     ..req.clone()
                 };
                 let bytes =
@@ -224,24 +209,21 @@ impl ArrayCoordinator {
 
     /// Fan out an aggregate request and reduce partial aggregates from all shards.
     ///
-    /// Each shard receives its own `shard_hilbert_range` so it can apply a
-    /// Hilbert-prefix pre-filter and only count cells in its partition. This
-    /// prevents double-counting in configurations where multiple vShards share
-    /// a single Data Plane executor (e.g. single-node harnesses).
-    pub async fn coord_agg(&self, req: ArrayShardAggReq) -> Result<CoordAggResult> {
+    /// Each shard receives its own `shard_bucket` and counts only cells whose
+    /// tile key routes to it. vShards that share one Data Plane executor then
+    /// count no cell twice.
+    pub async fn coord_agg(
+        &self,
+        req: ArrayShardAggReq,
+    ) -> std::result::Result<CoordAggResult, ArrayCoordError> {
         let prefix_bits = self.params.prefix_bits;
         let per_shard: Vec<(u32, Vec<u8>)> = self
             .params
             .shard_ids
             .iter()
             .map(|&shard_id| {
-                let hilbert_range = if prefix_bits > 0 {
-                    Some(shard_hilbert_range_for_vshard(shard_id, prefix_bits))
-                } else {
-                    None
-                };
                 let per_shard_req = ArrayShardAggReq {
-                    shard_hilbert_range: hilbert_range,
+                    shard_bucket: shard_bucket(shard_id, prefix_bits)?,
                     ..req.clone()
                 };
                 let bytes =
@@ -276,7 +258,7 @@ impl ArrayCoordinator {
     pub async fn coord_delete(
         &self,
         req: ArrayShardDeleteReq,
-    ) -> Result<Vec<ArrayShardDeleteResp>> {
+    ) -> std::result::Result<Vec<ArrayShardDeleteResp>, ArrayCoordError> {
         let req_bytes = zerompk::to_msgpack_vec(&req).map_err(|e| ClusterError::Codec {
             detail: format!("ArrayShardDeleteReq serialise: {e}"),
         })?;
@@ -288,7 +270,7 @@ impl ArrayCoordinator {
             &self.circuit_breaker,
         )
         .await?;
-        decode_resps::<ArrayShardDeleteResp>(&raw)
+        Ok(decode_resps::<ArrayShardDeleteResp>(&raw)?)
     }
 
     /// Fan out a surrogate bitmap scan, collect per-shard bitmap bytes, and
@@ -298,7 +280,7 @@ impl ArrayCoordinator {
     pub async fn coord_surrogate_bitmap_scan(
         &self,
         req: ArrayShardSurrogateBitmapReq,
-    ) -> Result<Vec<ArrayShardSurrogateBitmapResp>> {
+    ) -> std::result::Result<Vec<ArrayShardSurrogateBitmapResp>, ArrayCoordError> {
         let req_bytes = zerompk::to_msgpack_vec(&req).map_err(|e| ClusterError::Codec {
             detail: format!("ArrayShardSurrogateBitmapReq serialise: {e}"),
         })?;
@@ -310,7 +292,7 @@ impl ArrayCoordinator {
             &self.circuit_breaker,
         )
         .await?;
-        decode_resps::<ArrayShardSurrogateBitmapResp>(&raw)
+        Ok(decode_resps::<ArrayShardSurrogateBitmapResp>(&raw)?)
     }
 
     pub(super) fn fan_out_params(&self) -> FanOutParams {
@@ -414,11 +396,10 @@ mod tests {
                 source_node: 1,
                 shard_ids,
                 timeout_ms: 1000,
-                // Tests use prefix_bits=0 so shard-side routing validation
-                // is skipped — mock executors don't need to match Hilbert
-                // ownership.
+                // prefix_bits=0 skips shard-side routing validation and the
+                // bucket filter, so mock executors ignore ownership.
                 prefix_bits: 0,
-                slice_hilbert_ranges: vec![],
+                slice_tile_keys: vec![],
             },
             dispatch,
             Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
@@ -440,8 +421,8 @@ mod tests {
             limit: 100,
             cell_filter_msgpack: vec![],
             prefix_bits: 0,
-            slice_hilbert_ranges: vec![],
-            shard_hilbert_range: None,
+            slice_tile_keys: vec![],
+            shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             txn_id: None,
@@ -481,8 +462,8 @@ mod tests {
             limit: 3,
             cell_filter_msgpack: vec![],
             prefix_bits: 0,
-            slice_hilbert_ranges: vec![],
-            shard_hilbert_range: None,
+            slice_tile_keys: vec![],
+            shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             txn_id: None,
@@ -503,7 +484,7 @@ mod tests {
             reducer_msgpack: vec![0x00],
             group_by_dim: -1,
             cell_filter_msgpack: vec![],
-            shard_hilbert_range: None,
+            shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
             txn_id: None,
@@ -662,8 +643,8 @@ mod tests {
             limit: 0,
             cell_filter_msgpack: vec![],
             prefix_bits: 0,
-            slice_hilbert_ranges: vec![],
-            shard_hilbert_range: None,
+            slice_tile_keys: vec![],
+            shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             txn_id: None,
@@ -675,5 +656,86 @@ mod tests {
             .await
             .expect("coord_slice unlimited should succeed");
         assert_eq!(result.rows.len(), 20);
+    }
+
+    /// Serves a fixed set of tile keys, each as one row, keeping only the
+    /// keys the request's `shard_bucket` admits.
+    struct BucketFilterDispatch {
+        tile_keys: Vec<u64>,
+    }
+
+    #[async_trait]
+    impl ShardRpcDispatch for BucketFilterDispatch {
+        async fn call(&self, req: VShardEnvelope, _timeout_ms: u64) -> Result<VShardEnvelope> {
+            let slice: ArrayShardSliceReq = zerompk::from_msgpack(&req.payload).unwrap();
+            let rows = self
+                .tile_keys
+                .iter()
+                .filter(|&&k| nodedb_types::array_route::shard_bucket_admits(slice.shard_bucket, k))
+                .map(|k| zerompk::to_msgpack_vec(k).unwrap())
+                .collect();
+            let resp = ArrayShardSliceResp {
+                shard_id: req.vshard_id,
+                rows_msgpack: rows,
+                truncated: false,
+                truncated_before_horizon: false,
+                read_versions: Vec::new(),
+            };
+            let payload = zerompk::to_msgpack_vec(&resp).unwrap();
+            Ok(VShardEnvelope::new(
+                VShardMessageType::ArrayShardSliceResp,
+                req.target_node,
+                req.source_node,
+                req.vshard_id,
+                payload,
+            ))
+        }
+    }
+
+    /// Over every primary vShard, the bucket filters return each tile once.
+    #[tokio::test]
+    async fn bucket_filters_partition_every_tile_across_shards() {
+        let tile_keys: Vec<u64> = (0u64..4096).chain([1 << 40, u64::MAX]).collect();
+        for prefix_bits in [1u8, 8, 10, 16] {
+            let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(BucketFilterDispatch {
+                tile_keys: tile_keys.clone(),
+            });
+            let coord = ArrayCoordinator::for_slice(
+                1,
+                1000,
+                &[],
+                prefix_bits,
+                crate::routing::VSHARD_COUNT,
+                dispatch,
+                Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
+            )
+            .expect("for_slice");
+            let req = ArrayShardSliceReq {
+                array_id_msgpack: vec![],
+                slice_msgpack: vec![],
+                attr_projection: vec![],
+                limit: 0,
+                cell_filter_msgpack: vec![],
+                prefix_bits: 0,
+                slice_tile_keys: vec![],
+                shard_bucket: None,
+                system_time: nodedb_types::SystemTimeScope::Current,
+                valid_at_ms: None,
+                txn_id: None,
+            };
+            let result = coord
+                .coord_slice(req, 0, nodedb_types::SystemTimeScope::Current)
+                .await
+                .expect("coord_slice");
+            let mut got: Vec<u64> = result
+                .rows
+                .iter()
+                .map(|r| zerompk::from_msgpack::<u64>(r).unwrap())
+                .collect();
+            got.sort_unstable();
+            let mut want = tile_keys.clone();
+            want.sort_unstable();
+            assert_eq!(got, want, "prefix_bits={prefix_bits}");
+        }
     }
 }

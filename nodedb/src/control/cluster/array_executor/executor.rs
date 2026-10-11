@@ -12,7 +12,7 @@ use nodedb_cluster::rpc_codec::DataPlaneErrorCode;
 use super::refusal::execution_error;
 use crate::bridge::envelope::{Priority, Request, Response};
 use crate::control::cluster::linearizable_read::{
-    confirm_linearizable_read, groups_of_vshards, statement_read_deadline,
+    StatementDeadline, confirm_linearizable_read, groups_of_vshards,
 };
 use crate::control::server::shared::write_admission::plan_is_write;
 use crate::control::state::SharedState;
@@ -59,9 +59,13 @@ impl DataPlaneArrayExecutor {
         if !plan_is_write(&plan) {
             let groups = groups_of_vshards(&self.state, [local_vshard_id.as_u32()])
                 .map_err(|e| execution_error("array read confirmation", e))?;
-            confirm_linearizable_read(&self.state, &groups, statement_read_deadline(&self.state))
-                .await
-                .map_err(|e| execution_error("array read confirmation", e))?;
+            confirm_linearizable_read(
+                &self.state,
+                &groups,
+                StatementDeadline::of_statement(&self.state),
+            )
+            .await
+            .map_err(|e| execution_error("array read confirmation", e))?;
         }
         let request_id = self.state.next_request_id();
         let request = local_request(request_id, array_id, local_vshard_id, plan, txn_id);

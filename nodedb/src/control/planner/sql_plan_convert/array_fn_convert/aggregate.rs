@@ -69,7 +69,7 @@ pub(crate) fn convert_agg(
             attr_idx,
             reducer_msgpack,
             group_by_dim: group_by_dim_idx,
-            slice_hilbert_ranges: vec![],
+            slice_tile_keys: vec![],
             prefix_bits: entry.prefix_bits,
             system_as_of,
             valid_at_ms,
@@ -82,7 +82,7 @@ pub(crate) fn convert_agg(
             group_by_dim: group_by_dim_idx,
             cell_filter: None,
             return_partial: false,
-            hilbert_range: None,
+            shard_bucket: None,
             system_as_of,
             valid_at_ms,
         })

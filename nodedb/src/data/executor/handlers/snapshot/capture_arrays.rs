@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use nodedb_array::schema::ArraySchema;
 use nodedb_array::tile::cell_tile_prefix;
-use nodedb_cluster::distributed_array::array_vshard_for_tile;
+use nodedb_types::array_route::array_vshard_for_tile;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::array::export::ArrayCellVersion;
@@ -81,18 +81,18 @@ fn by_vshard(
 ) -> crate::Result<BTreeMap<u32, Vec<ArrayCellVersion>>> {
     let mut grouped: BTreeMap<u32, Vec<ArrayCellVersion>> = BTreeMap::new();
     for version in versions {
-        let prefix = match cell_tile_prefix(schema, &version.coord) {
-            Ok(prefix) => prefix,
+        let tile_key = match cell_tile_prefix(schema, &version.coord) {
+            Ok(tile_key) => tile_key,
             Err(_) if version.payload.is_none() => continue,
             Err(e) => {
                 return Err(capture_error(
                     array,
-                    format!("Hilbert prefix of a live cell: {e}"),
+                    format!("tile key of a live cell: {e}"),
                 ));
             }
         };
-        let vshard = array_vshard_for_tile(prefix, prefix_bits)
-            .map_err(|e| capture_error(array, format!("vShard of Hilbert prefix {prefix}: {e}")))?;
+        let vshard = array_vshard_for_tile(tile_key, prefix_bits)
+            .map_err(|e| capture_error(array, format!("vShard of tile key {tile_key}: {e}")))?;
         grouped.entry(vshard).or_default().push(version);
     }
     Ok(grouped)
@@ -152,9 +152,68 @@ mod tests {
         );
         for (vshard, cells) in &grouped {
             for cell in cells {
-                let prefix = cell_tile_prefix(&s, &cell.coord).expect("prefix");
-                assert_eq!(array_vshard_for_tile(prefix, 8).expect("route"), *vshard);
+                let tile_key = cell_tile_prefix(&s, &cell.coord).expect("tile key");
+                assert_eq!(array_vshard_for_tile(tile_key, 8).expect("route"), *vshard);
             }
+        }
+    }
+
+    fn full_range_2d() -> ArraySchema {
+        let full = || Domain::new(DomainBound::Int64(i64::MIN), DomainBound::Int64(i64::MAX));
+        ArraySchemaBuilder::new("open")
+            .dim(DimSpec::new("x", DimType::Int64, full()))
+            .dim(DimSpec::new("y", DimType::Int64, full()))
+            .attr(AttrSpec::new("v", AttrType::Int64, true))
+            .tile_extents(vec![1, 1])
+            .build()
+            .expect("schema")
+    }
+
+    fn live_2d(x: i64, y: i64) -> ArrayCellVersion {
+        ArrayCellVersion {
+            coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
+            ..live(x)
+        }
+    }
+
+    /// Cells near the origin of a full-range 2-D array spread over vShards,
+    /// and a snapshot captured for a group of vShards installs into exactly
+    /// the cells that group's install replaces.
+    #[test]
+    fn a_full_range_array_captures_and_installs_by_the_same_route() {
+        let s = full_range_2d();
+        let versions: Vec<ArrayCellVersion> = (0..16)
+            .flat_map(|x| (0..16).map(move |y| live_2d(x, y)))
+            .collect();
+        let grouped = by_vshard("open", &s, 8, versions.clone()).expect("group");
+        assert!(
+            grouped.len() >= 64,
+            "256 tiles near the origin reach only {} vShards",
+            grouped.len()
+        );
+        assert_eq!(
+            grouped.values().map(Vec::len).sum::<usize>(),
+            versions.len(),
+            "every version is captured once"
+        );
+
+        // A Raft group owning every other captured vShard.
+        let group: std::collections::HashSet<u32> = grouped.keys().copied().step_by(2).collect();
+        let captured: Vec<&ArrayCellVersion> = grouped
+            .iter()
+            .filter(|(vshard, _)| group.contains(vshard))
+            .flat_map(|(_, cells)| cells.iter())
+            .collect();
+        assert!(!captured.is_empty());
+        for version in &versions {
+            let in_snapshot = captured.iter().any(|c| c.coord == version.coord);
+            let replaced =
+                super::super::install_arrays::routes_into_group(&s, 8, &group, &version.coord);
+            assert_eq!(
+                replaced, in_snapshot,
+                "coord {:?}: install replaces it iff the snapshot carries it",
+                version.coord
+            );
         }
     }
 

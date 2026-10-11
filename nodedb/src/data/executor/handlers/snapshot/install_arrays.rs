@@ -13,7 +13,7 @@ use std::sync::Arc;
 use nodedb_array::schema::ArraySchema;
 use nodedb_array::tile::cell_tile_prefix;
 use nodedb_array::types::coord::value::CoordValue;
-use nodedb_cluster::distributed_array::array_vshard_for_tile;
+use nodedb_types::array_route::array_vshard_for_tile;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::array::export::ArrayCellVersion;
@@ -27,6 +27,21 @@ fn install_error(detail: String) -> crate::Error {
 
 /// `(database, tenant, array)`.
 type ArrayKey = (u64, u64, String);
+
+/// Whether a cell write at `coord` routes to a vShard in `group`. The install
+/// replaces exactly the cells this admits. A coordinate outside the schema's
+/// domain has no route and is never replaced.
+pub(super) fn routes_into_group(
+    schema: &ArraySchema,
+    prefix_bits: u8,
+    group: &HashSet<u32>,
+    coord: &[CoordValue],
+) -> bool {
+    cell_tile_prefix(schema, coord)
+        .ok()
+        .and_then(|tile_key| array_vshard_for_tile(tile_key, prefix_bits).ok())
+        .is_some_and(|vshard| group.contains(&vshard))
+}
 
 impl CoreLoop {
     /// Replace the array cells of `vshards` on this core with `blobs`.
@@ -92,12 +107,8 @@ impl CoreLoop {
             let schema = Arc::new(schema);
             let routes = Arc::clone(&schema);
             let prefix_bits = entry.prefix_bits;
-            let replaced = |coord: &[CoordValue]| {
-                cell_tile_prefix(&routes, coord)
-                    .ok()
-                    .and_then(|prefix| array_vshard_for_tile(prefix, prefix_bits).ok())
-                    .is_some_and(|vshard| group.contains(&vshard))
-            };
+            let replaced =
+                |coord: &[CoordValue]| routes_into_group(&routes, prefix_bits, &group, coord);
             self.array_engine
                 .replace_cells(
                     &entry.array_id,

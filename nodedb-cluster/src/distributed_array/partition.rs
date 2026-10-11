@@ -3,12 +3,11 @@
 //! Cell-to-tile partitioning for distributed array writes.
 //!
 //! Both `coord_put` and `coord_delete` receive a flat list of cells (or
-//! coord tuples) paired with their pre-computed Hilbert prefixes. This
-//! module groups them by tile bucket (the top `prefix_bits` of the Hilbert
-//! prefix) and maps each bucket to its owning vShard via
-//! `array_vshard_for_tile`.
+//! coord tuples) paired with their pre-computed tile keys. This module
+//! groups them by owning vShard, the vShard of the key's routing bucket
+//! from `array_vshard_for_tile`.
 //!
-//! Callers pre-attach Hilbert prefixes because the query planner already
+//! Callers pre-attach tile keys because the query planner already
 //! holds the schema and can compute them at planning time; doing the same
 //! computation again inside the coordinator would require an additional
 //! schema lookup that `nodedb-cluster` intentionally avoids (it carries no
@@ -16,13 +15,14 @@
 //!
 //! ## Output shape
 //!
-//! `partition_put_cells` returns a `Vec<(vshard_id, representative_hilbert_prefix,
-//! cells_msgpack)>` where `cells_msgpack` is a zerompk-encoded
+//! `partition_put_cells` returns one `PutBucket` per vShard: its
+//! `representative_tile_key` and `cells_msgpack`, a zerompk-encoded
 //! `Vec<raw-cell-bytes>` (the same bytes the shard handler passes to
 //! `exec_put`).
 //!
-//! `partition_delete_coords` returns a `Vec<(vshard_id, coords_msgpack)>` where
-//! `coords_msgpack` is a zerompk-encoded `Vec<raw-coord-bytes>`.
+//! `partition_delete_coords` returns one `DeleteBucket` per vShard: its
+//! `representative_tile_key` and `coords_msgpack`, a zerompk-encoded
+//! `Vec<raw-coord-bytes>`.
 
 use std::collections::HashMap;
 
@@ -33,9 +33,9 @@ use super::routing::array_vshard_for_tile;
 /// One bucket produced by `partition_put_cells`.
 pub struct PutBucket {
     pub vshard_id: u32,
-    /// Hilbert prefix of the first cell added to this bucket. Used by the
-    /// shard handler for routing validation (`validate_put_routing`).
-    pub representative_hilbert_prefix: u64,
+    /// Tile key of the first cell added to this bucket. The shard handler
+    /// routes it to check ownership (`validate_put_routing`).
+    pub representative_tile_key: u64,
     /// zerompk-encoded `Vec<raw-cell-bytes>` for all cells in this bucket.
     pub cells_msgpack: Vec<u8>,
 }
@@ -43,16 +43,16 @@ pub struct PutBucket {
 /// One bucket produced by `partition_delete_coords`.
 pub struct DeleteBucket {
     pub vshard_id: u32,
-    /// Hilbert prefix of the first coord added to this bucket. Used by the
-    /// shard handler for routing validation (`validate_delete_routing`).
-    pub representative_hilbert_prefix: u64,
+    /// Tile key of the first coord added to this bucket. The shard handler
+    /// routes it to check ownership (`validate_delete_routing`).
+    pub representative_tile_key: u64,
     /// zerompk-encoded `Vec<raw-coord-bytes>` for all coords in this bucket.
     pub coords_msgpack: Vec<u8>,
 }
 
-/// Group `(hilbert_prefix, cell_msgpack)` pairs by tile bucket.
+/// Group `(tile_key, cell_msgpack)` pairs by owning vShard.
 ///
-/// `cells` — each element is `(hilbert_prefix, zerompk-encoded single cell)`.
+/// `cells` — each element is `(tile_key, zerompk-encoded single cell)`.
 /// `prefix_bits` — routing granularity (1–16).
 ///
 /// Returns one `PutBucket` per unique owning vShard. The order of buckets
@@ -62,14 +62,12 @@ pub fn partition_put_cells(cells: &[(u64, Vec<u8>)], prefix_bits: u8) -> Result<
         return Ok(Vec::new());
     }
 
-    // vshard_id → (representative_hilbert_prefix, per-cell byte blobs)
+    // vshard_id → (representative tile key, per-cell byte blobs)
     let mut buckets: HashMap<u32, (u64, Vec<Vec<u8>>)> = HashMap::new();
 
-    for (hilbert_prefix, cell_bytes) in cells {
-        let vshard_id = array_vshard_for_tile(*hilbert_prefix, prefix_bits)?;
-        let entry = buckets
-            .entry(vshard_id)
-            .or_insert((*hilbert_prefix, Vec::new()));
+    for (tile_key, cell_bytes) in cells {
+        let vshard_id = array_vshard_for_tile(*tile_key, prefix_bits)?;
+        let entry = buckets.entry(vshard_id).or_insert((*tile_key, Vec::new()));
         entry.1.push(cell_bytes.clone());
     }
 
@@ -79,16 +77,16 @@ pub fn partition_put_cells(cells: &[(u64, Vec<u8>)], prefix_bits: u8) -> Result<
             let cells_msgpack = encode_blob_vec(&cell_blobs)?;
             Ok(PutBucket {
                 vshard_id,
-                representative_hilbert_prefix: representative,
+                representative_tile_key: representative,
                 cells_msgpack,
             })
         })
         .collect()
 }
 
-/// Group `(hilbert_prefix, coord_msgpack)` pairs by tile bucket.
+/// Group `(tile_key, coord_msgpack)` pairs by owning vShard.
 ///
-/// `coords` — each element is `(hilbert_prefix, zerompk-encoded single coord)`.
+/// `coords` — each element is `(tile_key, zerompk-encoded single coord)`.
 /// `prefix_bits` — routing granularity (1–16).
 ///
 /// Returns one `DeleteBucket` per unique owning vShard.
@@ -100,14 +98,12 @@ pub fn partition_delete_coords(
         return Ok(Vec::new());
     }
 
-    // vshard_id → (representative_hilbert_prefix, coord byte blobs)
+    // vshard_id → (representative tile key, coord byte blobs)
     let mut buckets: HashMap<u32, (u64, Vec<Vec<u8>>)> = HashMap::new();
 
-    for (hilbert_prefix, coord_bytes) in coords {
-        let vshard_id = array_vshard_for_tile(*hilbert_prefix, prefix_bits)?;
-        let entry = buckets
-            .entry(vshard_id)
-            .or_insert((*hilbert_prefix, Vec::new()));
+    for (tile_key, coord_bytes) in coords {
+        let vshard_id = array_vshard_for_tile(*tile_key, prefix_bits)?;
+        let entry = buckets.entry(vshard_id).or_insert((*tile_key, Vec::new()));
         entry.1.push(coord_bytes.clone());
     }
 
@@ -117,7 +113,7 @@ pub fn partition_delete_coords(
             let coords_msgpack = encode_blob_vec(&coord_blobs)?;
             Ok(DeleteBucket {
                 vshard_id,
-                representative_hilbert_prefix: representative,
+                representative_tile_key: representative,
                 coords_msgpack,
             })
         })
@@ -142,7 +138,7 @@ fn encode_blob_vec(blobs: &[Vec<u8>]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    // Build a fake (hilbert_prefix, cell_bytes) pair. The cell_bytes are
+    // Build a fake (tile_key, cell_bytes) pair. The cell_bytes are
     // opaque for the partitioner — any non-empty Vec<u8> works.
     fn cell(prefix: u64, tag: u8) -> (u64, Vec<u8>) {
         (prefix, vec![tag])
@@ -153,7 +149,7 @@ mod tests {
         (prefix, vec![tag])
     }
 
-    // Helper: compute expected vshard for a given hilbert prefix and prefix_bits.
+    // Helper: compute expected vshard for a given tile key and prefix_bits.
     fn expected_vshard(prefix: u64, prefix_bits: u8) -> u32 {
         array_vshard_for_tile(prefix, prefix_bits).unwrap()
     }
@@ -172,23 +168,18 @@ mod tests {
 
     #[test]
     fn partition_put_single_cell_one_bucket() {
-        // prefix_bits=10, stride=1 → vshard == bucket == top 10 bits.
-        // All-zero hilbert prefix → bucket 0 → vshard 0.
+        // Key 0 mixes to 0 → bucket 0 → vShard 0.
         let cells = vec![cell(0, 0xAA)];
         let buckets = partition_put_cells(&cells, 10).unwrap();
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].vshard_id, 0);
-        assert_eq!(buckets[0].representative_hilbert_prefix, 0);
+        assert_eq!(buckets[0].representative_tile_key, 0);
     }
 
     #[test]
     fn partition_put_cells_by_tile_three_buckets() {
-        // With prefix_bits=10 (stride=1), every distinct top-10-bit value
-        // is its own vshard. Use three well-separated prefixes.
-        //
-        //  prefix 0x0000_0000_0000_0000 → bucket 0  → vshard 0
-        //  prefix 0x0040_0000_0000_0000 → top 10 bits = 1 → vshard 1
-        //  prefix 0x0080_0000_0000_0000 → top 10 bits = 2 → vshard 2
+        // With prefix_bits=10 (stride=1), each mixed bucket is its own
+        // vShard. The three keys mix to three distinct buckets.
         let p0 = 0x0000_0000_0000_0000u64;
         let p1 = 0x0040_0000_0000_0000u64;
         let p2 = 0x0080_0000_0000_0000u64;
@@ -201,22 +192,19 @@ mod tests {
             cell(p1, 0x05), // same bucket as second
         ];
 
-        let mut buckets = partition_put_cells(&cells, 10).unwrap();
-        // Sort by vshard_id for deterministic assertion.
-        buckets.sort_by_key(|b| b.vshard_id);
+        let buckets = partition_put_cells(&cells, 10).unwrap();
         assert_eq!(buckets.len(), 3);
 
-        assert_eq!(buckets[0].vshard_id, expected_vshard(p0, 10));
-        assert_eq!(buckets[1].vshard_id, expected_vshard(p1, 10));
-        assert_eq!(buckets[2].vshard_id, expected_vshard(p2, 10));
-
-        // Bucket 0 and 1 each have 2 cells, bucket 2 has 1.
-        let blobs0: Vec<Vec<u8>> = zerompk::from_msgpack(&buckets[0].cells_msgpack).unwrap();
-        let blobs1: Vec<Vec<u8>> = zerompk::from_msgpack(&buckets[1].cells_msgpack).unwrap();
-        let blobs2: Vec<Vec<u8>> = zerompk::from_msgpack(&buckets[2].cells_msgpack).unwrap();
-        assert_eq!(blobs0.len(), 2);
-        assert_eq!(blobs1.len(), 2);
-        assert_eq!(blobs2.len(), 1);
+        // p0 and p1 each own 2 cells, p2 owns 1.
+        for (key, want) in [(p0, 2), (p1, 2), (p2, 1)] {
+            let vshard = expected_vshard(key, 10);
+            let bucket = buckets
+                .iter()
+                .find(|b| b.vshard_id == vshard)
+                .expect("bucket for key");
+            let blobs: Vec<Vec<u8>> = zerompk::from_msgpack(&bucket.cells_msgpack).unwrap();
+            assert_eq!(blobs.len(), want, "key={key:#x}");
+        }
     }
 
     #[test]
@@ -226,16 +214,17 @@ mod tests {
 
         let coords = vec![coord(p0, 0xAA), coord(p1, 0xBB), coord(p0, 0xCC)];
 
-        let mut buckets = partition_delete_coords(&coords, 10).unwrap();
-        buckets.sort_by_key(|b| b.vshard_id);
+        let buckets = partition_delete_coords(&coords, 10).unwrap();
         assert_eq!(buckets.len(), 2);
-        assert_eq!(buckets[0].vshard_id, expected_vshard(p0, 10));
-        assert_eq!(buckets[1].vshard_id, expected_vshard(p1, 10));
-
-        let blobs0: Vec<Vec<u8>> = zerompk::from_msgpack(&buckets[0].coords_msgpack).unwrap();
-        let blobs1: Vec<Vec<u8>> = zerompk::from_msgpack(&buckets[1].coords_msgpack).unwrap();
-        assert_eq!(blobs0.len(), 2);
-        assert_eq!(blobs1.len(), 1);
+        for (key, want) in [(p0, 2), (p1, 1)] {
+            let vshard = expected_vshard(key, 10);
+            let bucket = buckets
+                .iter()
+                .find(|b| b.vshard_id == vshard)
+                .expect("bucket for key");
+            let blobs: Vec<Vec<u8>> = zerompk::from_msgpack(&bucket.coords_msgpack).unwrap();
+            assert_eq!(blobs.len(), want, "key={key:#x}");
+        }
     }
 
     #[test]

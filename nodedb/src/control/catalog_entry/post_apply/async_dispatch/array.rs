@@ -11,7 +11,7 @@
 //!   done: the tombstone fences a same-name open until the next `PutArray`
 //!   purges it.
 //! - A `DeleteArray` with `moved_to` rekeys the store on every core instead.
-//!   Cells route by Hilbert prefix alone, so the vShard of every cell stays
+//!   Cells route by tile key alone, so the vShard of every cell stays
 //!   the same, and only the store directory carries the database.
 //! - Every `DeleteArray` changes the mirror last, under the array
 //!   incarnation's exclusive gate (see `control::write_gate`).

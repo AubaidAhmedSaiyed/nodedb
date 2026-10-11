@@ -5,6 +5,7 @@
 //! fast path.
 
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
+use nodedb_cluster::distributed_array::scatter::{ArrayCoordError, ShardFailure};
 use nodedb_cluster::error::ClusterError;
 use nodedb_cluster::wire::VShardMessageType;
 
@@ -95,17 +96,33 @@ pub(super) fn finalize_agg_partials(
     rows
 }
 
+/// Map an array coordinator error to an [`Error`].
+///
+/// A request that never reached its shard ran nothing. It answers the
+/// definite, retryable `NoLeader` for that vShard. `NoLeader` never moves
+/// the gateway's routing hint. Every other error maps as [`cluster_err`].
+pub(super) fn coord_err(e: ArrayCoordError) -> Error {
+    match e {
+        ArrayCoordError::Shard(ShardFailure { vshard_id, error }) if error.is_unsent() => {
+            tracing::debug!(vshard_id, %error, "array shard request never reached its shard");
+            Error::NoLeader {
+                vshard_id: crate::types::VShardId::new(vshard_id),
+            }
+        }
+        ArrayCoordError::Shard(ShardFailure { error, .. })
+        | ArrayCoordError::Coordinator(error) => cluster_err(error),
+    }
+}
+
 pub(super) fn cluster_err(e: ClusterError) -> Error {
     match e {
         // A shard did not answer within its timeout: surface as a deterministic
         // deadline rather than an opaque internal error, matching the
         // `TypedClusterError::DeadlineExceeded` mapping used elsewhere. A
         // sent request with no answer can have run, so it takes the same class.
-        ClusterError::ShardTimeout { .. } | ClusterError::Unanswered { .. } => {
-            Error::DeadlineExceeded {
-                request_id: crate::types::RequestId::new(0),
-            }
-        }
+        lost if lost.is_lost_answer() => Error::DeadlineExceeded {
+            request_id: crate::types::RequestId::new(0),
+        },
         // A shard's Data-Plane verdict keeps its code, so the statement
         // renders the SQLSTATE a single-node execution renders.
         ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
@@ -168,6 +185,9 @@ pub(super) fn cluster_err(e: ClusterError) -> Error {
         | ClusterError::SpatialGather(_)
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
+        // The guards above take these. They stay named for exhaustiveness.
+        | ClusterError::ShardTimeout { .. }
+        | ClusterError::Unanswered { .. }
         | ClusterError::ShufflePush(_)
         | ClusterError::RemoteUntyped { .. }) => Error::Internal {
             detail: format!("array cluster: {other}"),
@@ -201,6 +221,45 @@ pub(super) fn array_resp_msg_type(opcode: u32) -> Option<VShardMessageType> {
 mod tests {
     use super::*;
     use crate::bridge::envelope::ErrorCode;
+
+    /// A shard request that never went out answers `NoLeader` for that
+    /// shard: nothing ran, so the refusal is definite.
+    #[test]
+    fn an_unsent_shard_request_is_no_leader_for_its_vshard() {
+        let unsent = ArrayCoordError::Shard(ShardFailure {
+            vshard_id: 41,
+            error: ClusterError::Transport {
+                detail: "connect refused".into(),
+            },
+        });
+        match coord_err(unsent) {
+            Error::NoLeader { vshard_id } => assert_eq!(vshard_id.as_u32(), 41),
+            other => panic!("expected NoLeader for vshard 41, got {other:?}"),
+        }
+    }
+
+    /// Every other shard failure maps as `cluster_err` does.
+    #[test]
+    fn a_lost_shard_answer_stays_an_unknown_outcome() {
+        let lost = ArrayCoordError::Shard(ShardFailure {
+            vshard_id: 41,
+            error: ClusterError::Unanswered {
+                node_id: 2,
+                detail: "stream reset".into(),
+            },
+        });
+        assert!(matches!(coord_err(lost), Error::DeadlineExceeded { .. }));
+    }
+
+    /// A coordinator-side transport error names no shard, so it keeps its
+    /// `cluster_err` mapping.
+    #[test]
+    fn a_coordinator_error_maps_as_cluster_err() {
+        let local = ArrayCoordError::Coordinator(ClusterError::Codec {
+            detail: "encode".into(),
+        });
+        assert!(matches!(coord_err(local), Error::Internal { .. }));
+    }
 
     /// A shard verdict that crossed the cluster keeps its code at the
     /// coordinator, never `Internal`.

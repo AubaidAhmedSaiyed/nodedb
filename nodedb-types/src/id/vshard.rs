@@ -26,9 +26,14 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct VShardId(pub(super) u32);
 
+const _: () = assert!(VShardId::COUNT.is_power_of_two());
+
 impl VShardId {
     /// Total number of virtual shards in the system.
     pub const COUNT: u32 = 1024;
+
+    /// Bits that address every vShard once: `COUNT == 1 << BITS`.
+    pub const BITS: u8 = Self::COUNT.trailing_zeros() as u8;
 
     pub const fn new(id: u32) -> Self {
         assert!(id < Self::COUNT, "vShard ID must be < 1024");

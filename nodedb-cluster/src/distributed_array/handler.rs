@@ -174,15 +174,15 @@ async fn handle_surrogate_bitmap(
 
 /// Validate that a PUT request is routed to the correct shard.
 ///
-/// Returns `Ok(())` when routing is correct or when `prefix_bits == 0`
-/// (which means the request predates Hilbert routing and skips validation).
-/// Returns `Err(ClusterError::WrongOwner)` when the coordinator used a stale
-/// routing table; the coordinator should refresh and retry.
+/// Returns `Ok(())` when routing is correct or when `prefix_bits == 0`,
+/// which skips validation. Returns `Err(ClusterError::WrongOwner)` when the
+/// coordinator used a stale routing table. The coordinator then refreshes
+/// and retries.
 fn validate_put_routing(req: &ArrayShardPutReq, local_vshard_id: u32) -> Result<()> {
     if req.prefix_bits == 0 {
         return Ok(());
     }
-    let expected = array_vshard_for_tile(req.representative_hilbert_prefix, req.prefix_bits)?;
+    let expected = array_vshard_for_tile(req.representative_tile_key, req.prefix_bits)?;
     if expected != local_vshard_id {
         return Err(ClusterError::WrongOwner {
             vshard_id: local_vshard_id,
@@ -194,18 +194,16 @@ fn validate_put_routing(req: &ArrayShardPutReq, local_vshard_id: u32) -> Result<
 
 /// Validate that a SLICE request is routed to the correct shard.
 ///
-/// Returns `Ok(())` when `prefix_bits == 0` (no validation) or when
-/// `local_vshard_id` falls within the Hilbert ranges carried by the request.
-/// Returns `Err(ClusterError::WrongOwner)` when this shard no longer covers
-/// any of the requested ranges, indicating a stale routing table.
+/// Returns `Ok(())` when `prefix_bits == 0` or `slice_tile_keys` is empty,
+/// which skips validation, or when some tile key routes to
+/// `local_vshard_id`. Returns `Err(ClusterError::WrongOwner)` when no key
+/// routes here, which means the coordinator used a stale routing table.
 fn validate_slice_routing(req: &ArrayShardSliceReq, local_vshard_id: u32) -> Result<()> {
-    if req.prefix_bits == 0 || req.slice_hilbert_ranges.is_empty() {
+    if req.prefix_bits == 0 || req.slice_tile_keys.is_empty() {
         return Ok(());
     }
-    // Compute which vShards overlap the slice ranges. If local_vshard_id is not
-    // among them, this node no longer owns the required Hilbert range.
     let covered = array_vshards_for_slice(
-        &req.slice_hilbert_ranges,
+        &req.slice_tile_keys,
         req.prefix_bits,
         crate::routing::VSHARD_COUNT,
     )?;
@@ -226,7 +224,7 @@ fn validate_delete_routing(req: &ArrayShardDeleteReq, local_vshard_id: u32) -> R
     if req.prefix_bits == 0 {
         return Ok(());
     }
-    let expected = array_vshard_for_tile(req.representative_hilbert_prefix, req.prefix_bits)?;
+    let expected = array_vshard_for_tile(req.representative_tile_key, req.prefix_bits)?;
     if expected != local_vshard_id {
         return Err(ClusterError::WrongOwner {
             vshard_id: local_vshard_id,
@@ -351,8 +349,8 @@ mod tests {
             cell_filter_msgpack: vec![],
             // prefix_bits=0 skips routing validation in the handler.
             prefix_bits: 0,
-            slice_hilbert_ranges: vec![],
-            shard_hilbert_range: None,
+            slice_tile_keys: vec![],
+            shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             txn_id: None,
@@ -372,7 +370,7 @@ mod tests {
             reducer_msgpack: reducer_bytes,
             group_by_dim: -1,
             cell_filter_msgpack: vec![],
-            shard_hilbert_range: None,
+            shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
             txn_id: None,
@@ -528,7 +526,7 @@ mod tests {
         assert!((resp.partials[0].sum - 42.0).abs() < f64::EPSILON);
     }
 
-    fn make_put_req_bytes(vshard_id: u32, prefix_bits: u8) -> Vec<u8> {
+    fn make_put_req_bytes(prefix_bits: u8) -> Vec<u8> {
         // Build a minimal ArrayShardPutReq with routing metadata set so
         // validate_put_routing can confirm the request is destined for
         // the right shard. Use prefix_bits=0 to skip routing validation
@@ -537,17 +535,10 @@ mod tests {
             array_id_msgpack: vec![],
             cells_msgpack: vec![],
             wal_lsn: 77,
-            representative_hilbert_prefix: if prefix_bits == 0 {
-                0
-            } else {
-                // Route to bucket 0 (top bits all zero) → vshard 0 with any prefix_bits.
-                0u64
-            },
+            // Key 0 mixes to 0, so it routes to vShard 0 at any prefix_bits.
+            representative_tile_key: 0,
             prefix_bits,
         };
-        // Adjust routing so the request would target vshard_id: set bits so
-        // bucket = vshard_id when stride = 1 (prefix_bits=10, VSHARD_COUNT=1024).
-        let _ = vshard_id; // routing byte chosen above; test uses prefix_bits=0.
         zerompk::to_msgpack_vec(&req).unwrap()
     }
 
@@ -557,7 +548,7 @@ mod tests {
             coords_msgpack: vec![],
             wal_lsn: 88,
             // prefix_bits=0 skips routing validation in the handler.
-            representative_hilbert_prefix: 0,
+            representative_tile_key: 0,
             prefix_bits: 0,
         };
         zerompk::to_msgpack_vec(&req).unwrap()
@@ -573,7 +564,7 @@ mod tests {
             affected: 3,
         });
         // prefix_bits=0 disables routing validation.
-        let payload = make_put_req_bytes(0, 0);
+        let payload = make_put_req_bytes(0);
         let resp_bytes = handle_array_shard_rpc(ARRAY_SHARD_PUT_REQ, 0, &payload, &executor)
             .await
             .expect("put handler should succeed");
@@ -623,14 +614,13 @@ mod tests {
             truncated_before_horizon: false,
             affected: 0,
         });
-        // prefix_bits=10, stride=1 → bucket = top 10 bits of hilbert_prefix.
-        // hilbert_prefix = 0 → bucket 0 → expected vshard 0.
-        // We tell the handler we're vshard 7 → mismatch → error.
+        // Key 0 mixes to 0 → bucket 0 → expected vShard 0.
+        // The handler runs as vShard 7 → mismatch → error.
         let req = super::super::wire::ArrayShardPutReq {
             array_id_msgpack: vec![],
             cells_msgpack: vec![],
             wal_lsn: 1,
-            representative_hilbert_prefix: 0,
+            representative_tile_key: 0,
             prefix_bits: 10,
         };
         let payload = zerompk::to_msgpack_vec(&req).unwrap();
@@ -646,53 +636,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_slice_routing_rejects_disjoint_range() {
-        // prefix_bits=10, stride=1 → vshard == bucket == top 10 bits.
-        // Hilbert range [0x0040_0000_0000_0000, 0x0040_0000_0000_0000]
-        // covers bucket 1 → vshard 1.
-        // Local shard is vshard 5 → disjoint → WrongOwner.
-        let req = super::super::wire::ArrayShardSliceReq {
+    fn slice_req_with_keys(slice_tile_keys: Vec<u64>) -> super::super::wire::ArrayShardSliceReq {
+        super::super::wire::ArrayShardSliceReq {
             array_id_msgpack: vec![],
             slice_msgpack: vec![],
             attr_projection: vec![],
             limit: 10,
             cell_filter_msgpack: vec![],
             prefix_bits: 10,
-            slice_hilbert_ranges: vec![(0x0040_0000_0000_0000, 0x0040_0000_0000_0000)],
-            shard_hilbert_range: None,
+            slice_tile_keys,
+            shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             txn_id: None,
-        };
-        let err = super::validate_slice_routing(&req, 5)
-            .expect_err("disjoint Hilbert range should reject");
+        }
+    }
+
+    #[test]
+    fn validate_slice_routing_rejects_a_shard_no_key_routes_to() {
+        let key = 0x0040_0000_0000_0000u64;
+        let owner = crate::distributed_array::array_vshard_for_tile(key, 10).unwrap();
+        let other = (owner + 1) % crate::routing::VSHARD_COUNT;
+        let err = super::validate_slice_routing(&slice_req_with_keys(vec![key]), other)
+            .expect_err("a shard no key routes to should reject");
         assert!(
             matches!(
                 err,
-                crate::error::ClusterError::WrongOwner { vshard_id: 5, .. }
+                crate::error::ClusterError::WrongOwner { vshard_id, .. } if vshard_id == other
             ),
-            "expected WrongOwner for vshard 5, got {err:?}"
+            "expected WrongOwner for vshard {other}, got {err:?}"
         );
     }
 
     #[test]
-    fn validate_slice_routing_accepts_overlapping_range() {
-        // Same range as above → vshard 1. Local shard IS vshard 1 → accept.
-        let req = super::super::wire::ArrayShardSliceReq {
-            array_id_msgpack: vec![],
-            slice_msgpack: vec![],
-            attr_projection: vec![],
-            limit: 10,
-            cell_filter_msgpack: vec![],
-            prefix_bits: 10,
-            slice_hilbert_ranges: vec![(0x0040_0000_0000_0000, 0x0040_0000_0000_0000)],
-            shard_hilbert_range: None,
-            system_time: nodedb_types::SystemTimeScope::Current,
-            valid_at_ms: None,
-            txn_id: None,
-        };
-        super::validate_slice_routing(&req, 1).expect("overlapping range should accept");
+    fn validate_slice_routing_accepts_the_owner_of_a_key() {
+        let key = 0x0040_0000_0000_0000u64;
+        let owner = crate::distributed_array::array_vshard_for_tile(key, 10).unwrap();
+        super::validate_slice_routing(&slice_req_with_keys(vec![key]), owner)
+            .expect("the owning shard should accept");
     }
 
     #[tokio::test]

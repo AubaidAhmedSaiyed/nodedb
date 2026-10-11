@@ -15,6 +15,7 @@ pub mod quota;
 
 pub mod approx;
 pub mod array_cell;
+pub mod array_route;
 pub mod ascii;
 pub mod backup_envelope;
 pub mod bbox;
@@ -78,6 +79,7 @@ pub mod write_version;
 
 pub use approx::{CountMinSketch, HyperLogLog, SpaceSaving, TDigest};
 pub use array_cell::ArrayCell;
+pub use array_route::ShardBucket;
 pub use ascii::{
     find_ascii_case_insensitive, find_ascii_case_insensitive_from, rfind_ascii_case_insensitive,
     starts_with_ascii_case_insensitive, strip_prefix_ascii_case_insensitive,

@@ -16,10 +16,8 @@
 //!
 //! # Returned type
 //!
-//! Functions here return a raw `u16` vShard ID (0..1023). Callers in the
-//! `nodedb` crate wrap this in `VShardId::new(…)`. `VShardId` lives in
-//! `nodedb::types` which `nodedb-cluster` cannot depend on without creating
-//! a circular dependency.
+//! Functions here return a raw `u32` vShard ID below `VShardId::COUNT`.
+//! Callers wrap it in `VShardId::new(…)`.
 //!
 //! # Fallbacks
 //!
@@ -27,8 +25,8 @@
 //! - Zero tile extent in any dimension: same fallback (no division by zero).
 //! - `coord.len() != tile_extents.len()`: fallback.
 
-/// Number of virtual shards — must match `VShardId::COUNT` in `nodedb::types`.
-pub const VSHARD_COUNT: u32 = 1024;
+/// Number of virtual shards.
+pub const VSHARD_COUNT: u32 = nodedb_types::id::VShardId::COUNT;
 
 // ─── Collection-level fallback hash ──────────────────────────────────────────
 
@@ -120,7 +118,7 @@ pub fn tile_id_of_coord(coord: &[u64], tile_extents: &[u64]) -> Option<u64> {
 /// - `coord` / `tile_extents` are empty or mismatched.
 /// - Any `tile_extents[i]` is zero.
 ///
-/// Returns a raw `u16` in `0..1023`. Callers wrap it in `VShardId::new(…)`.
+/// Returns a raw `u32` below `VSHARD_COUNT`. Callers wrap it in `VShardId::new(…)`.
 pub fn vshard_for_array_coord(array_name: &str, coord: &[u64], tile_extents: &[u64]) -> u32 {
     match tile_id_of_coord(coord, tile_extents) {
         Some(tile_id) => vshard_for_array_tile(array_name, tile_id),
@@ -133,7 +131,7 @@ pub fn vshard_for_array_coord(array_name: &str, coord: &[u64], tile_extents: &[u
 /// Use this when the tile_id is already known (e.g. from the op-log key or
 /// snapshot metadata) and coord re-derivation is unnecessary.
 ///
-/// Returns a raw `u16` in `0..1023`. Callers wrap it in `VShardId::new(…)`.
+/// Returns a raw `u32` below `VSHARD_COUNT`. Callers wrap it in `VShardId::new(…)`.
 pub fn vshard_for_array_tile(array_name: &str, tile_id: u64) -> u32 {
     let mut buf = Vec::with_capacity(array_name.len() + 8);
     buf.extend_from_slice(array_name.as_bytes());

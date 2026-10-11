@@ -23,9 +23,11 @@ use futures::future::join_all;
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
+use crate::control::gateway::retry::Attempt;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_staged_write};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::server::shared::sql::staging_predicates::require_affected_count;
 use crate::control::state::SharedState;
 use crate::types::VShardId;
@@ -122,7 +124,9 @@ where
                 // the INNER write, so the un-wrapped plan rides alongside.
                 remote => {
                     let version_plan = inner.clone();
-                    forward_to_leader(state, remote, wrap(inner), &version_plan).await
+                    let attempt =
+                        Attempt::sole(StatementDeadline::of_statement(state).tokio_instant());
+                    forward_to_leader(state, remote, wrap(inner), &version_plan, attempt).await
                 }
             }
         }

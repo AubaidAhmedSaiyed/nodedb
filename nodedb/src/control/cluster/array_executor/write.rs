@@ -129,7 +129,10 @@ impl DataPlaneArrayExecutor {
                 &self.state,
                 proposer,
                 entry,
-                crate::control::wal_replication::statement_propose_deadline(&self.state),
+                crate::control::server::shared::session::StatementDeadline::of_statement(
+                    &self.state,
+                )
+                .tokio_instant(),
             )
             .await
             .map_err(|e| execution_error(&format!("{op_label} raft propose"), e))?;

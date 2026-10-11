@@ -3,7 +3,7 @@
 //! Write-path coordinator for distributed array operations.
 //!
 //! Provides [`coord_put`], [`coord_put_partitioned`], and [`coord_delete`]
-//! — functions that partition a flat cell/coord list by Hilbert tile and
+//! — functions that partition a flat cell/coord list by routing bucket and
 //! fan writes to the owning vShards.
 
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::error::{ClusterError, Result};
 
 use super::super::partition::{partition_delete_coords, partition_put_cells};
 use super::super::rpc::ShardRpcDispatch;
-use super::super::scatter::{FanOutPartitionedParams, fan_out_partitioned};
+use super::super::scatter::{ArrayCoordError, FanOutPartitionedParams, fan_out_partitioned};
 use super::super::wire::{
     ArrayShardDeleteReq, ArrayShardDeleteResp, ArrayShardPutReq, ArrayShardPutResp,
 };
@@ -27,7 +27,7 @@ pub struct ArrayWriteCoordParams {
 
 /// Forward pre-partitioned cell writes to the owning shards.
 ///
-/// The caller groups cells by Hilbert prefix bucket using
+/// The caller groups cells by routing bucket using
 /// `array_vshard_for_tile` and produces one `ArrayShardPutReq` per
 /// target shard. This function dispatches each batch to its shard via
 /// `fan_out_partitioned` and collects acknowledgements.
@@ -39,7 +39,7 @@ pub async fn coord_put_partitioned(
     per_shard: Vec<(u32, ArrayShardPutReq)>,
     dispatch: &Arc<dyn ShardRpcDispatch>,
     circuit_breaker: &Arc<CircuitBreaker>,
-) -> Result<Vec<ArrayShardPutResp>> {
+) -> std::result::Result<Vec<ArrayShardPutResp>, ArrayCoordError> {
     if per_shard.is_empty() {
         return Ok(Vec::new());
     }
@@ -69,15 +69,15 @@ pub async fn coord_put_partitioned(
     )
     .await?;
 
-    decode_resps::<ArrayShardPutResp>(&raw)
+    Ok(decode_resps::<ArrayShardPutResp>(&raw)?)
 }
 
-/// Partition a flat cell list by Hilbert tile and fan out to owning shards.
+/// Partition a flat cell list by routing bucket and fan out to owning shards.
 ///
-/// `cells` — each element is `(hilbert_prefix, zerompk-encoded single-cell bytes)`.
-/// The Hilbert prefix is computed by the caller (the Control Plane planner) from
-/// the cell's coord tuple and the array schema; this function does not decode
-/// cell bytes.
+/// `cells` — each element is `(tile_key, zerompk-encoded single-cell bytes)`.
+/// The caller (the Control Plane planner) computes the tile key from the
+/// cell's coord tuple and the array schema. This function decodes no cell
+/// bytes.
 ///
 /// `prefix_bits` — routing granularity (1–16) from the array catalog entry.
 /// `wal_lsn` — WAL sequence number allocated by the Control Plane for this batch.
@@ -93,7 +93,7 @@ pub async fn coord_put(
     cells: &[(u64, Vec<u8>)],
     dispatch: &Arc<dyn ShardRpcDispatch>,
     circuit_breaker: &Arc<CircuitBreaker>,
-) -> Result<Vec<ArrayShardPutResp>> {
+) -> std::result::Result<Vec<ArrayShardPutResp>, ArrayCoordError> {
     if cells.is_empty() {
         return Ok(Vec::new());
     }
@@ -107,7 +107,7 @@ pub async fn coord_put(
                 array_id_msgpack: array_id_msgpack.clone(),
                 cells_msgpack: b.cells_msgpack,
                 wal_lsn,
-                representative_hilbert_prefix: b.representative_hilbert_prefix,
+                representative_tile_key: b.representative_tile_key,
                 prefix_bits,
             };
             (b.vshard_id, req)
@@ -117,9 +117,9 @@ pub async fn coord_put(
     coord_put_partitioned(params, per_shard, dispatch, circuit_breaker).await
 }
 
-/// Partition a flat coord list by Hilbert tile and fan delete requests to owning shards.
+/// Partition a flat coord list by routing bucket and fan delete requests to owning shards.
 ///
-/// `coords` — each element is `(hilbert_prefix, zerompk-encoded single-coord bytes)`.
+/// `coords` — each element is `(tile_key, zerompk-encoded single-coord bytes)`.
 /// `prefix_bits` — routing granularity (1–16).
 /// `wal_lsn` — WAL sequence number allocated by the Control Plane.
 ///
@@ -132,7 +132,7 @@ pub async fn coord_delete(
     coords: &[(u64, Vec<u8>)],
     dispatch: &Arc<dyn ShardRpcDispatch>,
     circuit_breaker: &Arc<CircuitBreaker>,
-) -> Result<Vec<ArrayShardDeleteResp>> {
+) -> std::result::Result<Vec<ArrayShardDeleteResp>, ArrayCoordError> {
     if coords.is_empty() {
         return Ok(Vec::new());
     }
@@ -151,7 +151,7 @@ pub async fn coord_delete(
                 array_id_msgpack: array_id_msgpack.clone(),
                 coords_msgpack: b.coords_msgpack,
                 wal_lsn,
-                representative_hilbert_prefix: b.representative_hilbert_prefix,
+                representative_tile_key: b.representative_tile_key,
                 prefix_bits,
             };
             zerompk::to_msgpack_vec(&req)
@@ -171,7 +171,7 @@ pub async fn coord_delete(
     )
     .await?;
 
-    decode_resps::<ArrayShardDeleteResp>(&raw)
+    Ok(decode_resps::<ArrayShardDeleteResp>(&raw)?)
 }
 
 #[cfg(test)]
@@ -179,6 +179,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use crate::distributed_array::scatter::ShardFailure;
     use crate::wire::{VShardEnvelope, VShardMessageType};
 
     use super::*;
@@ -263,10 +264,8 @@ mod tests {
 
     #[tokio::test]
     async fn coord_put_partitions_cells_by_tile() {
-        // prefix_bits=10, stride=1 → vshard == top-10-bit bucket.
-        // p0 → bucket 0 → vshard 0
-        // p1 → bucket 1 → vshard 1
-        // p2 → bucket 2 → vshard 2
+        // prefix_bits=10, stride=1 → vShard == mixed bucket.
+        // The three keys mix to three distinct buckets.
         let p0 = 0x0000_0000_0000_0000u64;
         let p1 = 0x0040_0000_0000_0000u64;
         let p2 = 0x0080_0000_0000_0000u64;
@@ -285,10 +284,16 @@ mod tests {
             .expect("coord_put should succeed");
 
         resps.sort_by_key(|r| r.shard_id);
+        let mut expected: Vec<u32> = [p0, p1, p2]
+            .iter()
+            .map(|&k| crate::distributed_array::array_vshard_for_tile(k, 10).unwrap())
+            .collect();
+        expected.sort_unstable();
         assert_eq!(resps.len(), 3, "should fan-out to 3 shards");
-        assert_eq!(resps[0].shard_id, 0);
-        assert_eq!(resps[1].shard_id, 1);
-        assert_eq!(resps[2].shard_id, 2);
+        assert_eq!(
+            resps.iter().map(|r| r.shard_id).collect::<Vec<_>>(),
+            expected
+        );
         // Each shard echoes back wal_lsn=42.
         for r in &resps {
             assert_eq!(r.applied_lsn, 42);
@@ -325,8 +330,14 @@ mod tests {
             .await
             .expect_err("coord_put with failing shard should return error");
         assert!(
-            matches!(err, ClusterError::Codec { .. }),
-            "expected Codec error, got {err:?}"
+            matches!(
+                err,
+                ArrayCoordError::Shard(ShardFailure {
+                    error: ClusterError::Codec { .. },
+                    ..
+                })
+            ),
+            "expected a shard's Codec error, got {err:?}"
         );
     }
 
@@ -343,9 +354,16 @@ mod tests {
             .expect("coord_delete should succeed");
 
         resps.sort_by_key(|r| r.shard_id);
+        let mut expected: Vec<u32> = [p0, p1]
+            .iter()
+            .map(|&k| crate::distributed_array::array_vshard_for_tile(k, 10).unwrap())
+            .collect();
+        expected.sort_unstable();
         assert_eq!(resps.len(), 2, "should fan-out to 2 shards");
-        assert_eq!(resps[0].shard_id, 0);
-        assert_eq!(resps[1].shard_id, 1);
+        assert_eq!(
+            resps.iter().map(|r| r.shard_id).collect::<Vec<_>>(),
+            expected
+        );
         for r in &resps {
             assert_eq!(r.applied_lsn, 55);
         }
