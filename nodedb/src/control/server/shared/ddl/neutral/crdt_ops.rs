@@ -8,8 +8,6 @@
 //! Handlers build [`DdlResult`](super::super::result::DdlResult) directly and
 //! carry no pgwire types.
 
-use std::time::Duration;
-
 use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -20,6 +18,7 @@ use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::authorization::{authorize_collection, authorize_task_set};
 use crate::control::server::shared::ddl::sql_parse::hex_decode;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -87,7 +86,7 @@ pub async fn crdt_state(
             database_id,
             collection,
             plan,
-            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            deadline: StatementDeadline::of_statement(state),
             // This handler receives no session or peer information; the
             // request was admitted at its own transport entry, and
             // `AlreadyAdmitted` carries no address precisely so there is
@@ -228,7 +227,7 @@ pub async fn crdt_apply(
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
             authorized,
             collection: &qualified_collection,
-            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            deadline: StatementDeadline::of_statement(state),
             event_source: crate::event::EventSource::User,
             policy: &policy,
         },

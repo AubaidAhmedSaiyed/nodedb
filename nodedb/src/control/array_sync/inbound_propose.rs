@@ -96,8 +96,9 @@ impl OriginArrayInbound {
                 ))
             })?
             .as_ref();
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(self.shared().tuning.network.default_deadline_secs);
+        let deadline =
+            crate::control::server::shared::session::StatementDeadline::of_statement(self.shared())
+                .tokio_instant();
         match async_proposer(vshard_id, idempotency_key, data, deadline).await {
             Ok((_payload, _committed_version)) => Ok(()),
             Err(e) => {

@@ -53,42 +53,6 @@ pub fn reply_wait(deadline_remaining_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(deadline_remaining_ms).saturating_add(REPLY_MARGIN)
 }
 
-/// The budget one send attempt gets out of the `remaining_ms` a statement has
-/// left. `attempts_left` counts this attempt.
-///
-/// A request that is not resend-safe gets all of `remaining_ms`: a lost
-/// answer is an unknown outcome, so no later attempt follows.
-///
-/// A resend-safe request reserves `rpc_timeout + REPLY_MARGIN` for each later
-/// attempt: that attempt's floor plus its reply margin. It still gets at
-/// least `rpc_timeout`, capped at `remaining_ms`. The last attempt gets all
-/// that is left.
-///
-/// Bound: each attempt waits [`reply_wait`] of its budget. A caller that
-/// starts no attempt once the deadline passed waits at most the statement
-/// budget plus one `REPLY_MARGIN` across every attempt. Each attempt's
-/// budget is at most what is left, so only the attempt that reaches the
-/// deadline runs past it, by its margin.
-pub fn attempt_budget(
-    remaining_ms: u64,
-    resend_safe: bool,
-    attempts_left: usize,
-    rpc_timeout: std::time::Duration,
-) -> u64 {
-    if !resend_safe || attempts_left <= 1 {
-        return remaining_ms;
-    }
-    let rpc_timeout_ms = u64::try_from(rpc_timeout.as_millis()).unwrap_or(u64::MAX);
-    let margin_ms = u64::try_from(REPLY_MARGIN.as_millis()).unwrap_or(u64::MAX);
-    let later_attempts = u64::try_from(attempts_left - 1).unwrap_or(u64::MAX);
-    let reserve = rpc_timeout_ms
-        .saturating_add(margin_ms)
-        .saturating_mul(later_attempts);
-    remaining_ms
-        .saturating_sub(reserve)
-        .max(remaining_ms.min(rpc_timeout_ms))
-}
-
 /// The leader's deadline for a forward that carries `deadline_remaining_ms`.
 /// `None` when the budget is spent.
 ///
@@ -328,81 +292,6 @@ mod tests {
         );
     }
 
-    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// A write can have run on a node that never answered, so it never
-    /// retries and keeps the whole remainder on every attempt.
-    #[test]
-    fn a_write_attempt_gets_the_full_remainder() {
-        assert_eq!(attempt_budget(30_000, false, 3, RPC_TIMEOUT), 30_000);
-        assert_eq!(attempt_budget(30_000, false, 2, RPC_TIMEOUT), 30_000);
-        assert_eq!(attempt_budget(1_000, false, 3, RPC_TIMEOUT), 1_000);
-    }
-
-    /// A read leaves one RPC timeout plus one reply margin for each later
-    /// attempt.
-    #[test]
-    fn a_read_attempt_reserves_an_rpc_timeout_and_margin_per_later_attempt() {
-        // 30 s - 2 × (5 s + 2 s) = 16 s; 30 s - (5 s + 2 s) = 23 s.
-        assert_eq!(attempt_budget(30_000, true, 3, RPC_TIMEOUT), 16_000);
-        assert_eq!(attempt_budget(30_000, true, 2, RPC_TIMEOUT), 23_000);
-    }
-
-    /// A read with little left still gets one RPC timeout, never more than
-    /// what is left.
-    #[test]
-    fn a_read_attempt_keeps_at_least_one_rpc_timeout() {
-        assert_eq!(attempt_budget(15_000, true, 3, RPC_TIMEOUT), 5_000);
-        assert_eq!(attempt_budget(3_000, true, 3, RPC_TIMEOUT), 3_000);
-        assert_eq!(attempt_budget(0, true, 3, RPC_TIMEOUT), 0);
-    }
-
-    /// Every attempt of a read sent to a node that never answers waits out
-    /// its reply. The waits together stay within the budget plus one margin,
-    /// for an RPC timeout above and below the margin.
-    #[test]
-    fn hung_read_attempts_fit_the_budget_plus_one_margin() {
-        let margin_ms = u64::try_from(REPLY_MARGIN.as_millis()).unwrap_or(u64::MAX);
-        for rpc_timeout_ms in [500, 1_000, 5_000] {
-            let rpc_timeout = std::time::Duration::from_millis(rpc_timeout_ms);
-            for budget_ms in [1_000, 4_000, 12_000, 30_000] {
-                let mut remaining = budget_ms;
-                let mut waited = 0;
-                for attempts_left in (1..=3).rev() {
-                    if remaining == 0 {
-                        break;
-                    }
-                    let attempt = attempt_budget(remaining, true, attempts_left, rpc_timeout);
-                    assert!(attempt <= remaining);
-                    let wait = attempt + margin_ms;
-                    waited += wait;
-                    remaining = remaining.saturating_sub(wait);
-                }
-                assert!(
-                    waited <= budget_ms + margin_ms,
-                    "rpc timeout {rpc_timeout_ms} ms, budget {budget_ms} ms: waited {waited} ms"
-                );
-            }
-        }
-    }
-
-    /// An RPC timeout below the reply margin still leaves each later
-    /// attempt its whole floor and margin.
-    #[test]
-    fn a_short_rpc_timeout_reserves_its_margin_too() {
-        let rpc_timeout = std::time::Duration::from_millis(500);
-        // 12 s - 2 × (0.5 s + 2 s) = 7 s.
-        assert_eq!(attempt_budget(12_000, true, 3, rpc_timeout), 7_000);
-        // 12 s - (0.5 s + 2 s) = 9.5 s.
-        assert_eq!(attempt_budget(12_000, true, 2, rpc_timeout), 9_500);
-    }
-
-    /// The last attempt of a read gets all that is left.
-    #[test]
-    fn the_last_read_attempt_gets_all_that_is_left() {
-        assert_eq!(attempt_budget(30_000, true, 1, RPC_TIMEOUT), 30_000);
-        assert_eq!(attempt_budget(30_000, true, 0, RPC_TIMEOUT), 30_000);
-    }
     use crate::rpc_codec::{decode, encode};
 
     fn roundtrip(target: ProposeTarget) -> DataProposeRequest {

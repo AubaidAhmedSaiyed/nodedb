@@ -48,12 +48,11 @@
 //!
 //! [`ReplicatedWrite::CutBarrier`]: crate::control::wal_replication::ReplicatedWrite::CutBarrier
 
-use std::time::Duration;
-
 use nodedb_physical::physical_plan::CutCaptureRequest;
 use nodedb_types::Hlc;
 
 use crate::Error;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 
 use super::cut_order::OrderedCut;
@@ -118,8 +117,9 @@ async fn cut_barriers(state: &SharedState, cut: OrderedCut) -> Result<(), Error>
     state
         .hlc_clock
         .update(Hlc::new(cut.hlc.saturating_add(1), 0));
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
+    let statement = StatementDeadline::of_statement(state);
+    let budget_ms = statement.remaining().as_millis();
+    let deadline = statement.tokio_instant();
     // Read after the watermark: a record minted after this read stamps its
     // write above the watermark.
     let target = state.outcome_floor.max_noted();
@@ -145,11 +145,11 @@ async fn cut_barriers(state: &SharedState, cut: OrderedCut) -> Result<(), Error>
         return Err(Error::Internal {
             detail: format!(
                 "backup: writes minted at or below WAL LSN {} had no final outcome within \
-                 {}s, so the backup cannot take a consistent cut (outcome floor at {}). \
-                 Retry the backup. A write window held until restart keeps the floor \
-                 below it: restart the node if the floor does not move",
+                 the statement deadline ({} ms), so the backup cannot take a consistent cut \
+                 (outcome floor at {}). Retry the backup. A write window held until restart \
+                 keeps the floor below it: restart the node if the floor does not move",
                 target.as_u64(),
-                timeout.as_secs(),
+                budget_ms,
                 state.outcome_floor.floor().as_u64(),
             ),
         });

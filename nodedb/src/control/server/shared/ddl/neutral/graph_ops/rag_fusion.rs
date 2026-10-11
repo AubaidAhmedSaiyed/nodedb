@@ -7,8 +7,6 @@
 //! this single function, so caps and defaults cannot drift between the
 //! two surfaces.
 
-use std::time::Duration;
-
 use serde_json::{Map, Value as JsonValue};
 
 use nodedb_sql::ddl_ast::FusionParams;
@@ -18,6 +16,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::ddl::user_dispatch;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::engine::graph::edge_store::Direction;
@@ -127,7 +126,7 @@ pub async fn rag_fusion(
         database_id,
         collection: &collection,
         plan,
-        timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+        deadline: StatementDeadline::of_statement(state),
         // Admitted at this request's own transport entry; this handler has no
         // session or peer information of its own.
         admission: user_dispatch::RequestAdmission::AlreadyAdmitted,

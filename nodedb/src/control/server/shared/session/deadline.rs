@@ -152,6 +152,11 @@ impl StatementDeadline {
     pub fn hop_budget_ms(self) -> u64 {
         hop_budget_ms(self.0)
     }
+
+    /// Time left until the deadline, zero once it passed.
+    pub fn remaining(self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
 }
 
 /// Install a fresh node-default deadline for cleanup work, such as an overlay

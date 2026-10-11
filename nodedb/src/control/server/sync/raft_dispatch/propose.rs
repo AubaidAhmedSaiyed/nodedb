@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::dispatch_utils::RecordOwner;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{
     AsyncRaftProposer, ReplicableWrite, ReplicatedEntry, to_replicated_entry,
@@ -34,6 +35,7 @@ pub(crate) async fn propose_sync_plan(
     owner: RecordOwner,
     plan: &PhysicalPlan,
     event_source: EventSource,
+    deadline: StatementDeadline,
 ) -> crate::Result<Vec<u8>> {
     let RecordOwner {
         tenant_id,
@@ -63,7 +65,13 @@ pub(crate) async fn propose_sync_plan(
             ),
         },
     )?;
-    propose_sync_write(state, entry.with_event_source(event_source), proposer).await
+    propose_sync_write(
+        state,
+        entry.with_event_source(event_source),
+        proposer,
+        deadline,
+    )
+    .await
 }
 
 /// Propose a `ReplicatedEntry` through Raft and block until the entry is
@@ -84,6 +92,7 @@ pub(crate) async fn propose_sync_write(
     state: &SharedState,
     mut entry: ReplicatedEntry,
     proposer: &Arc<AsyncRaftProposer>,
+    deadline: StatementDeadline,
 ) -> crate::Result<Vec<u8>> {
     if let Some(response) =
         crate::control::planner::calvin::sequence_replicated_edge_write(state, &entry).await?
@@ -100,8 +109,7 @@ pub(crate) async fn propose_sync_write(
     let idempotency_key = entry.idempotency_key;
     let data = entry.encode()?;
     let vshard_id = entry.vshard_id;
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(state.tuning.network.default_deadline_secs);
+    let deadline = deadline.tokio_instant();
 
     const BACKOFF_MS: [u64; 5] = [10, 25, 50, 100, 200];
     let mut payload: Option<Vec<u8>> = None;

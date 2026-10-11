@@ -15,6 +15,7 @@ use crate::error::{ClusterError, Result};
 use crate::transport::auth_context::AuthContext;
 use crate::transport::config;
 use crate::transport::credentials::{self, TransportCredentials};
+use crate::transport::endpoint::RaftListener;
 use crate::transport::peer_identity_store::{NoopIdentityStore, PeerIdentityStore};
 use crate::transport::topology_identity_store::TopologyIdentityStore;
 
@@ -33,7 +34,7 @@ use crate::transport::topology_identity_store::TopologyIdentityStore;
 /// [`serve`]: Self::serve
 pub struct NexarTransport {
     pub(super) node_id: u64,
-    pub(super) listener: nexar::TransportListener,
+    pub(super) listener: RaftListener,
     pub(super) client_config: quinn::ClientConfig,
     /// Cached connections to peers. Stale connections are replaced on next use.
     pub(super) peers: RwLock<HashMap<u64, quinn::Connection>>,
@@ -114,8 +115,8 @@ impl NexarTransport {
 
     /// Create a new transport using values from `ClusterTransportTuning`.
     ///
-    /// All QUIC parameters (streams, windows, keep-alive, idle timeout) and
-    /// the RPC timeout are read from `tuning`. `creds` selects channel-level
+    /// All QUIC parameters (streams, windows) and the RPC timeout are read
+    /// from `tuning`. The idle timeout and keep-alive follow the RPC timeout. `creds` selects channel-level
     /// authentication. Use this in production so that operators can override
     /// defaults via the `[tuning.cluster_transport]` section of `config.toml`.
     ///
@@ -185,14 +186,24 @@ impl NexarTransport {
 
         let (server_config, client_config) = match &creds {
             TransportCredentials::Mtls(tls) => (
-                config::make_raft_server_config_mtls(tls, tuning, Arc::clone(&identity_store))?,
-                config::make_raft_client_config_mtls(tls, tuning, Arc::clone(&identity_store))?,
+                config::make_raft_server_config_mtls(
+                    tls,
+                    tuning,
+                    rpc_timeout,
+                    Arc::clone(&identity_store),
+                )?,
+                config::make_raft_client_config_mtls(
+                    tls,
+                    tuning,
+                    rpc_timeout,
+                    Arc::clone(&identity_store),
+                )?,
             ),
             TransportCredentials::Insecure => {
                 credentials::announce_insecure_transport(node_id);
                 (
-                    config::make_raft_server_config(tuning)?,
-                    config::make_raft_client_config(tuning)?,
+                    config::make_raft_server_config(tuning, rpc_timeout)?,
+                    config::make_raft_client_config(tuning, rpc_timeout)?,
                 )
             }
         };
@@ -204,10 +215,7 @@ impl NexarTransport {
 
         let auth = Arc::new(AuthContext::from_credentials(node_id, &creds));
 
-        let listener = nexar::TransportListener::bind_with_config(listen_addr, server_config)
-            .map_err(|e| ClusterError::Transport {
-                detail: format!("bind {listen_addr}: {e}"),
-            })?;
+        let listener = RaftListener::bind(node_id, listen_addr, server_config)?;
 
         info!(
             node_id,
@@ -455,6 +463,12 @@ pub(super) mod tests {
     /// How long `EchoHandler` holds a vote request of [`STALLED_GROUP`].
     pub(crate) const STALL: Duration = Duration::from_secs(2);
 
+    /// The group whose vote requests `EchoHandler` answers after [`SLOW`].
+    pub(crate) const SLOW_GROUP: u64 = 504;
+
+    /// How long `EchoHandler` holds a vote request of [`SLOW_GROUP`].
+    pub(crate) const SLOW: Duration = Duration::from_secs(1);
+
     /// AppendEntries requests `EchoHandler` refused for `UNHOSTED_GROUP`.
     static UNHOSTED_APPENDS: AtomicU32 = AtomicU32::new(0);
 
@@ -478,6 +492,13 @@ pub(super) mod tests {
                         last_log_index: req.prev_log_index + req.entries.len() as u64,
                         round: req.round,
                         replica: nodedb_raft::ReplicaState::Whole,
+                    }))
+                }
+                RaftRpc::RequestVoteRequest(req) if req.group_id == SLOW_GROUP => {
+                    tokio::time::sleep(SLOW).await;
+                    Ok(RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                        term: req.term,
+                        vote_granted: true,
                     }))
                 }
                 RaftRpc::RequestVoteRequest(req) if req.group_id == STALLED_GROUP => {
@@ -965,6 +986,36 @@ pub(super) mod tests {
     ) {
         let server = Arc::new(make_transport(1));
         let client = Arc::new(make_transport(2));
+        client.register_peer(1, server.local_addr());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let srv = server.clone();
+        tokio::spawn(async move {
+            srv.serve(Arc::new(EchoHandler), shutdown_rx).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (server, client, shutdown_tx)
+    }
+
+    /// [`serve_echo`] with `rpc_timeout` on both nodes, so the QUIC idle
+    /// timeout is `rpc_timeout` too.
+    pub(crate) async fn serve_echo_with_rpc_timeout(
+        rpc_timeout: Duration,
+    ) -> (
+        Arc<NexarTransport>,
+        Arc<NexarTransport>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let bind = |node_id| {
+            NexarTransport::with_timeout(
+                node_id,
+                "127.0.0.1:0".parse().unwrap(),
+                rpc_timeout,
+                TransportCredentials::Insecure,
+            )
+            .unwrap()
+        };
+        let server = Arc::new(bind(1));
+        let client = Arc::new(bind(2));
         client.register_peer(1, server.local_addr());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let srv = server.clone();

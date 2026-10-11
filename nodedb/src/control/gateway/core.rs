@@ -8,7 +8,7 @@
 //!    version mapping).
 //! 2. Routes the plan via [`route_plan`] to `Local` or `Remote` task routes.
 //! 3. Dispatches each route (local SPSC or `ExecuteRequest` RPC) with typed
-//!    `NotLeader` retry (up to 3 attempts).
+//!    `NotLeader` retry until the statement deadline.
 //! 4. Handles `RetryableSchemaChanged` (descriptor cache miss) by fetching a
 //!    fresh lease and re-planning once.
 //! 5. Fuses multiple vShard payloads for broadcast scans.
@@ -37,7 +37,7 @@ use super::key_extractor::UnwiredKeyExtractor;
 use super::live_leaders::resolve_live_decision;
 use super::outcome::GatewayOutcome;
 use super::plan_cache::PlanCache;
-use super::retry::retry_not_leader;
+use super::retry::{RetryPacing, retry_not_leader};
 use super::route::TaskRoute;
 use super::router::route_plan;
 use super::version_set::GatewayVersionSet;
@@ -251,6 +251,7 @@ impl Gateway {
 
         // One deadline for every route and attempt of the statement.
         let deadline = StatementDeadline::of_statement(&shared).tokio_instant();
+        let pacing = RetryPacing::from_tuning(&shared.tuning.cluster_transport);
         // Gateway-level byte ceiling: per-route `dispatch_to_data_plane`
         // already caps each shard's payload; this additionally caps the
         // scatter-gather *sum* so an N-shard fan-out can't accumulate
@@ -273,7 +274,7 @@ impl Gateway {
             let retry_counter = Arc::clone(&self.not_leader_retry_count);
             let version_set_for_route = version_set.clone();
             let shared_for_route = Arc::clone(&shared);
-            let outcome = retry_not_leader(routing_ref, deadline, move |attempt| {
+            let outcome = retry_not_leader(routing_ref, deadline, pacing, move |attempt| {
                 if attempt.index > 0 {
                     retry_counter.fetch_add(1, Ordering::Relaxed);
                 }
@@ -299,7 +300,6 @@ impl Gateway {
                         database_id,
                         trace_id,
                         deadline_ms: attempt.remaining_ms(),
-                        attempts_left: attempt.attempts_left(),
                         version_set: &version_set,
                         txn_id,
                         linearizable,

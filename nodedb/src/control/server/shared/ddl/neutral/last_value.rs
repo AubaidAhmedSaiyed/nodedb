@@ -18,6 +18,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::MetaOp;
@@ -44,7 +45,7 @@ pub async fn query_last_values(
             database_id,
             collection,
             plan,
-            timeout: Duration::from_secs(5),
+            deadline: StatementDeadline::after(Duration::from_secs(5)),
             // Admitted at this request's own transport entry; this handler
             // has no session or peer information of its own.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
@@ -116,7 +117,7 @@ pub async fn query_last_value(
             database_id,
             collection,
             plan,
-            timeout: Duration::from_secs(5),
+            deadline: StatementDeadline::after(Duration::from_secs(5)),
             // Admitted at this request's own transport entry; this handler
             // has no session or peer information of its own.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,

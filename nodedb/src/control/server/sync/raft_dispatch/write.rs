@@ -2,11 +2,10 @@
 
 //! Sync dispatch that returns raw payload bytes, used by the CRDT delta path.
 
-use std::time::Duration;
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::dispatch_utils::RecordOwner;
 use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::event::EventSource;
 
@@ -21,7 +20,7 @@ pub async fn dispatch_sync_bytes(
     state: &SharedState,
     collection: &str,
     authorized: AuthorizedTask,
-    timeout: Duration,
+    deadline: StatementDeadline,
     event_source: EventSource,
     policy: &dyn crate::control::crdt_admission::CrdtPostImagePolicy,
 ) -> crate::Result<SyncDispatchOutcome> {
@@ -39,7 +38,7 @@ pub async fn dispatch_sync_bytes(
                 crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
                     authorized,
                     collection,
-                    timeout,
+                    deadline,
                     event_source,
                     policy,
                 },
@@ -51,7 +50,7 @@ pub async fn dispatch_sync_bytes(
         });
     }
     // The Raft entry's apply owns durability.
-    dispatch_write_replicated(state, collection, authorized, event_source)
+    dispatch_write_replicated(state, collection, authorized, deadline, event_source)
         .await
         .map(SyncDispatchOutcome::untrimmed)
 }
@@ -63,6 +62,7 @@ pub(crate) async fn dispatch_write_replicated(
     state: &SharedState,
     collection: &str,
     authorized: AuthorizedTask,
+    deadline: StatementDeadline,
     event_source: EventSource,
 ) -> crate::Result<Vec<u8>> {
     let task = authorized.into_physical_task();
@@ -91,7 +91,7 @@ pub(crate) async fn dispatch_write_replicated(
     )
     .await?;
     // The apply's write funnel records the write's mark on every replica.
-    propose_sync_plan(state, owner, &plan, event_source).await
+    propose_sync_plan(state, owner, &plan, event_source, deadline).await
 }
 
 #[cfg(test)]
@@ -100,6 +100,7 @@ mod tests {
         COLLECTION, applying_proposer, authorized_write, fixture,
     };
     use super::dispatch_write_replicated;
+    use crate::control::server::shared::session::StatementDeadline;
     use crate::event::EventSource;
 
     /// A proposed write answers with the applied entry's payload.
@@ -113,10 +114,15 @@ mod tests {
         .expect("install proposer");
         let authorized = authorized_write(&state);
 
-        let payload =
-            dispatch_write_replicated(&state, COLLECTION, authorized, EventSource::CrdtSync)
-                .await
-                .expect("the proposal applies");
+        let payload = dispatch_write_replicated(
+            &state,
+            COLLECTION,
+            authorized,
+            StatementDeadline::of_statement(&state),
+            EventSource::CrdtSync,
+        )
+        .await
+        .expect("the proposal applies");
 
         assert_eq!(payload, b"applied".to_vec());
     }
@@ -128,8 +134,14 @@ mod tests {
         let (state, _side, _directory) = fixture();
         let authorized = authorized_write(&state);
 
-        let result =
-            dispatch_write_replicated(&state, COLLECTION, authorized, EventSource::CrdtSync).await;
+        let result = dispatch_write_replicated(
+            &state,
+            COLLECTION,
+            authorized,
+            StatementDeadline::of_statement(&state),
+            EventSource::CrdtSync,
+        )
+        .await;
 
         assert!(
             matches!(result, Err(crate::Error::Internal { .. })),

@@ -110,7 +110,6 @@ pub async fn read_on_vshard(
                 deadline_ms:
                     crate::control::server::shared::session::StatementDeadline::of_statement(state)
                         .hop_budget_ms(),
-                attempts_left: 1,
                 version_set: &version_set,
                 txn_id,
                 linearizable,

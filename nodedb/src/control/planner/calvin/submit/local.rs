@@ -198,7 +198,12 @@ pub(crate) async fn submit_prepared_and_await(
         AttemptOutcome::Aborted { reason } => return Err(calvin_abort_error(reason)),
     }
     if binds_authorization {
-        crate::control::security::auth_lease::calvin_write_barrier(state).await?;
+        crate::control::security::auth_lease::calvin_write_barrier(
+            state,
+            crate::control::server::shared::session::StatementDeadline::of_statement(state)
+                .instant(),
+        )
+        .await?;
     }
 
     // Completion fired: the scheduler deposited the applied Response (with any

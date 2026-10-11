@@ -7,8 +7,6 @@
 //! DROP CHECKPOINT 'launch-ready' ON documents WHERE id = 'doc-123';
 //! ```
 
-use std::time::Duration;
-
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -16,8 +14,9 @@ use crate::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::server::shared::ddl::sync_dispatch::{
-    SystemReason, SystemTask, dispatch_system,
+    SystemReason, SystemTask, dispatch_system_by,
 };
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -42,8 +41,7 @@ pub async fn create_checkpoint(
     let plan = PhysicalPlan::Crdt(CrdtOp::GetVersionVector {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
     });
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let vv_bytes = dispatch_system(
+    let vv_bytes = dispatch_system_by(
         state,
         SystemTask::new(
             SystemReason::CatalogMaintenance,
@@ -51,7 +49,7 @@ pub async fn create_checkpoint(
             nodedb_types::CollectionKey::from_bare(database_id, &collection),
             plan,
         ),
-        timeout,
+        StatementDeadline::of_statement(state),
     )
     .await
     .map_err(|e| DdlError::from_error_in_context("dispatch", &e))?;

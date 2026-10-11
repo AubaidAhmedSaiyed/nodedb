@@ -175,8 +175,8 @@ pub async fn crdt_apply(
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
             authorized,
             collection: &collection,
-            timeout: std::time::Duration::from_secs(
-                state.shared.tuning.network.default_deadline_secs,
+            deadline: crate::control::server::shared::session::StatementDeadline::of_statement(
+                &state.shared,
             ),
             event_source: crate::event::EventSource::User,
             policy: &policy,

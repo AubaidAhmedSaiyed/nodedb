@@ -8,8 +8,6 @@
 //! this instead of the system door, which exists only for work no user asked
 //! for.
 
-use std::time::Duration;
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -21,6 +19,7 @@ use crate::control::server::shared::metering::{
     PlanMeteringInfo, meter_dispatch, operation_for_plan,
 };
 use crate::control::server::shared::response_payload::payload_or_typed_error;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -62,7 +61,7 @@ pub(crate) enum RequestAdmission<'a> {
 /// Parameters for [`dispatch_for_identity`].
 ///
 /// Grouped into a struct rather than passed positionally because the
-/// argument count (state, identity, database, collection, plan, timeout,
+/// argument count (state, identity, database, collection, plan, deadline,
 /// admission) exceeds what a positional call stays readable at.
 pub(crate) struct DispatchRequest<'a> {
     pub state: &'a SharedState,
@@ -70,7 +69,8 @@ pub(crate) struct DispatchRequest<'a> {
     pub database_id: DatabaseId,
     pub collection: &'a str,
     pub plan: PhysicalPlan,
-    pub timeout: Duration,
+    /// The bound of the dispatch, never past the running statement.
+    pub deadline: StatementDeadline,
     /// Whether this request still has to pass the admission gate, and — when
     /// it does — the real remote address it is admitted against.
     pub admission: RequestAdmission<'a>,
@@ -90,7 +90,7 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         database_id,
         collection,
         plan,
-        timeout,
+        deadline,
         admission,
         linearizable,
     } = req;
@@ -115,7 +115,7 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
             // caller cannot tell the two apart by error shape.
             CloneCheckedOutcome::Handled(response) => payload_or_typed_error(response),
             CloneCheckedOutcome::Proceed(checked) => {
-                dispatch_authorized(state, checked, collection, timeout, linearizable).await
+                dispatch_authorized(state, checked, collection, deadline, linearizable).await
             }
         };
     if result.is_ok() {
@@ -534,7 +534,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             collection: "widgets",
             plan: trivial_kv_get_plan(),
-            timeout: Duration::from_secs(5),
+            deadline: StatementDeadline::after(Duration::from_secs(5)),
             admission: RequestAdmission::AlreadyAdmitted,
             linearizable: false,
         })
@@ -570,7 +570,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             collection: "widgets",
             plan: trivial_kv_get_plan(),
-            timeout: Duration::from_secs(5),
+            deadline: StatementDeadline::after(Duration::from_secs(5)),
             admission: RequestAdmission::NotYetAdmitted {
                 peer_addr: "127.0.0.1:9",
             },
@@ -605,7 +605,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             collection: "widgets",
             plan: trivial_kv_get_plan(),
-            timeout: Duration::from_secs(5),
+            deadline: StatementDeadline::after(Duration::from_secs(5)),
             admission: RequestAdmission::AlreadyAdmitted,
             linearizable: false,
         })
@@ -635,7 +635,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             collection: "widgets",
             plan: trivial_kv_get_plan(),
-            timeout: Duration::from_secs(5),
+            deadline: StatementDeadline::after(Duration::from_secs(5)),
             admission: RequestAdmission::AlreadyAdmitted,
             linearizable: false,
         })

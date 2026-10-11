@@ -55,7 +55,7 @@ pub use data_plane_error::{
 };
 pub use data_propose::{
     DataProposeRequest, DataProposeResponse, ForwardedProposeRefusal, ProposeTarget, REPLY_MARGIN,
-    attempt_budget, forwarded_deadline, remaining_budget_ms, reply_wait,
+    forwarded_deadline, remaining_budget_ms, reply_wait,
 };
 pub use execute::{
     DescriptorVersionEntry, ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd,

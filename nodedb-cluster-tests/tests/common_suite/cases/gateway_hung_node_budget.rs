@@ -1,26 +1,28 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! A node that takes a forwarded request and never answers costs a statement
-//! at most its one budget.
+//! A live slow node gets a statement's whole budget. A dead node costs it
+//! about one RPC timeout.
 //!
-//! The execute gate `exec::before_execute` parks every request that the
-//! leader of the collection's group receives. A follower forwards its
-//! statements on the collection to that leader.
+//! A follower forwards its statements on the collection to the leader of the
+//! collection's group. The leader's execute gate `exec::before_execute`
+//! slows or parks the requests it receives:
 //!
-//! - A read waits only its first attempt's share of the budget, then
-//!   retries. The test releases the gate once the retry starts, and the
-//!   read returns its row inside the statement timeout.
-//! - A write waits its whole budget, then reports an unknown outcome
-//!   (`57014`). It is never sent again.
+//! - A slow leader keeps its connection alive, so a read waits for it and
+//!   returns its row with no retry.
+//! - A parked leader never answers. A read and a write each wait their whole
+//!   budget and end `57014`, with no retry.
+//! - A leader cut off by `transport::blackhole` goes silent. Its connection
+//!   hits the QUIC idle timeout, the read retries on the new leader, and it
+//!   returns its row within two RPC timeouts.
 //!
 //! Requires `--features failpoints`.
 
 #![cfg(feature = "failpoints")]
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use nodedb_cluster::rpc_codec::REPLY_MARGIN;
+use nodedb_cluster::transport::endpoint::BLACKHOLE_FAIL_POINT;
 use nodedb_test_support::fail_point::{FailAction, FailGuard};
 use nodedb_types::id::DatabaseId;
 
@@ -29,37 +31,29 @@ use crate::common::cluster_harness::{GroupLeader, TestCluster, TestClusterNode, 
 
 const COLLECTION: &str = "hung_exec";
 const GATE: &str = "exec::before_execute";
-/// Every node's fixed RPC timeout. A read reserves this much plus the reply
-/// margin for each attempt after its first.
-const RPC_TIMEOUT_SECS: u64 = 3;
-/// The read's statement timeout. Its first attempt gets
-/// max(12 - 2 × (3 + 2), 3) = 3 s and waits 5 s with the reply margin,
-/// which leaves the retry time to answer.
-const READ_TIMEOUT: Duration = Duration::from_secs(12);
-/// The write's statement timeout. A write waits all of it.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(4);
-/// How often the test checks the follower's retry count.
-const RETRY_POLL: Duration = Duration::from_millis(10);
+/// Every node's RPC timeout, and so its QUIC idle timeout.
+const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a slow leader holds each request it receives.
+const SLOW_EXECUTE: Duration = Duration::from_secs(8);
+/// The statement timeout of a read sent to a slow leader.
+const SLOW_READ_TIMEOUT: Duration = Duration::from_secs(12);
+/// The statement timeout of a request sent to a parked leader.
+const PARKED_TIMEOUT: Duration = Duration::from_secs(4);
+/// The statement timeout of a read sent to a silent leader.
+const SILENT_READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// Scheduling slack on the upper bounds.
+const SLACK: Duration = Duration::from_secs(2);
 
-/// Release the gate at `release` once `node`'s gateway retries past
-/// `retries_before`. Gives up after `give_up`, so a read that never retries
-/// fails its own assertions instead of hanging the test.
-async fn release_on_retry(
-    node: &TestClusterNode,
-    retries_before: u64,
-    release: &Path,
-    give_up: Duration,
-) {
-    let started = Instant::now();
-    while node.not_leader_retry_count() <= retries_before && started.elapsed() < give_up {
-        tokio::time::sleep(RETRY_POLL).await;
-    }
-    std::fs::write(release, b"release").expect("release the execute gate");
+/// A 3-node cluster with one seeded row, the collection's group leader, and
+/// a follower that forwards to it.
+struct Setup {
+    cluster: TestCluster,
+    leader_id: u64,
+    follower: usize,
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn a_silent_leader_costs_a_read_one_retry_and_a_write_its_budget() {
-    let cluster = TestCluster::spawn_three_with_rpc_timeout(RPC_TIMEOUT_SECS)
+async fn setup() -> Setup {
+    let cluster = TestCluster::spawn_three_with_rpc_timeout(RPC_TIMEOUT.as_secs())
         .await
         .expect("3-node cluster");
     cluster
@@ -102,7 +96,6 @@ async fn a_silent_leader_costs_a_read_one_retry_and_a_write_its_budget() {
         .iter()
         .position(|n| n.node_id == leader_id)
         .expect("the group's leader is a cluster node");
-    let follower = &cluster.nodes[(leader + 1) % 3];
 
     cluster.nodes[leader]
         .client
@@ -114,16 +107,85 @@ async fn a_silent_leader_costs_a_read_one_retry_and_a_write_its_budget() {
     cluster
         .wait_for_full_apply_convergence(Duration::from_secs(20))
         .await;
+    Setup {
+        cluster,
+        leader_id,
+        follower: (leader + 1) % 3,
+    }
+}
 
-    // A read: its first attempt times out, its retry answers.
-    follower
-        .client
+async fn set_statement_timeout(node: &TestClusterNode, timeout: Duration) {
+    node.client
         .simple_query(&format!(
-            "SET statement_timeout = '{}s'",
-            READ_TIMEOUT.as_secs()
+            "SET statement_timeout = '{}ms'",
+            timeout.as_millis()
         ))
         .await
-        .expect("SET statement_timeout for the read");
+        .expect("SET statement_timeout");
+}
+
+fn read_sql() -> String {
+    format!("SELECT id, val FROM {COLLECTION} WHERE id = 'k1'")
+}
+
+fn row_count(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> usize {
+    messages
+        .into_iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count()
+}
+
+fn sqlstate(err: &tokio_postgres::Error) -> Option<&str> {
+    err.as_db_error().map(|db| db.code().code())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_slow_leader_gets_a_read_its_whole_budget() {
+    let Setup {
+        cluster,
+        leader_id,
+        follower,
+    } = setup().await;
+    let follower = &cluster.nodes[follower];
+    set_statement_timeout(follower, SLOW_READ_TIMEOUT).await;
+
+    let gate = FailGuard::for_node(leader_id, GATE, FailAction::Sleep(SLOW_EXECUTE));
+    let retries_before = follower.not_leader_retry_count();
+    let started = Instant::now();
+    let read = follower.client.simple_query(&read_sql()).await;
+    let elapsed = started.elapsed();
+    drop(gate);
+
+    let rows = read.unwrap_or_else(|e| panic!("the slow leader answers: {}", db_detail(&e)));
+    assert_eq!(row_count(rows), 1, "the read returns the seeded row");
+    assert_eq!(
+        follower.not_leader_retry_count(),
+        retries_before,
+        "a live slow leader is never retried"
+    );
+    assert!(
+        elapsed >= SLOW_EXECUTE,
+        "the read returned in {elapsed:?}, before the leader ran it"
+    );
+    assert!(
+        elapsed < SLOW_READ_TIMEOUT,
+        "the read finished in {elapsed:?}, past its {SLOW_READ_TIMEOUT:?} budget"
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_parked_leader_costs_a_read_its_budget() {
+    let Setup {
+        cluster,
+        leader_id,
+        follower,
+    } = setup().await;
+    let follower = &cluster.nodes[follower];
+    set_statement_timeout(follower, PARKED_TIMEOUT).await;
+
+    // A read: the live leader holds it, so it waits its whole budget.
     let read_dir = tempfile::tempdir().expect("read gate directory");
     let read_release = read_dir.path().join("release");
     let read_gate = FailGuard::for_node(
@@ -132,43 +194,38 @@ async fn a_silent_leader_costs_a_read_one_retry_and_a_write_its_budget() {
         FailAction::WaitForFile(read_release.clone()),
     );
     let retries_before = follower.not_leader_retry_count();
-    let read_sql = format!("SELECT id, val FROM {COLLECTION} WHERE id = 'k1'");
     let started = Instant::now();
-    let (read, ()) = tokio::join!(
-        follower.client.simple_query(&read_sql),
-        release_on_retry(follower, retries_before, &read_release, READ_TIMEOUT * 2),
-    );
+    let read = follower.client.simple_query(&read_sql()).await;
     let read_elapsed = started.elapsed();
+    std::fs::write(&read_release, b"release").expect("release the execute gate");
     drop(read_gate);
 
-    let rows = read
-        .unwrap_or_else(|e| panic!("the read retries past the silent leader: {}", db_detail(&e)))
-        .into_iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count();
-    assert_eq!(rows, 1, "the retried read returns the seeded row");
+    let err = read.expect_err("a read the leader never answers runs out of budget");
+    assert_eq!(
+        sqlstate(&err),
+        Some("57014"),
+        "the read reports its deadline: {}",
+        db_detail(&err)
+    );
     assert!(
         read_dir.path().join("release.parked").exists(),
-        "the leader took the read's first attempt and held it"
+        "the leader took the read and held it"
+    );
+    assert_eq!(
+        follower.not_leader_retry_count(),
+        retries_before,
+        "a live leader that holds a read is never retried"
     );
     assert!(
-        follower.not_leader_retry_count() > retries_before,
-        "the read retried after its first attempt went unanswered"
+        read_elapsed >= PARKED_TIMEOUT,
+        "the read waited {read_elapsed:?}, less than its {PARKED_TIMEOUT:?} budget"
     );
     assert!(
-        read_elapsed < READ_TIMEOUT,
-        "the read finished in {read_elapsed:?}, past its {READ_TIMEOUT:?} statement budget"
+        read_elapsed < PARKED_TIMEOUT + REPLY_MARGIN + SLACK,
+        "the read waited {read_elapsed:?}, past its budget and reply margin"
     );
 
     // A write: it waits its whole budget and is never sent again.
-    follower
-        .client
-        .simple_query(&format!(
-            "SET statement_timeout = '{}s'",
-            WRITE_TIMEOUT.as_secs()
-        ))
-        .await
-        .expect("SET statement_timeout for the write");
     let write_dir = tempfile::tempdir().expect("write gate directory");
     let write_release = write_dir.path().join("release");
     let write_gate = FailGuard::for_node(
@@ -190,7 +247,7 @@ async fn a_silent_leader_costs_a_read_one_retry_and_a_write_its_budget() {
 
     let err = write.expect_err("a write whose answer never arrives is an unknown outcome");
     assert_eq!(
-        err.as_db_error().map(|db| db.code().code()),
+        sqlstate(&err),
         Some("57014"),
         "the write reports its deadline: {}",
         db_detail(&err)
@@ -205,12 +262,53 @@ async fn a_silent_leader_costs_a_read_one_retry_and_a_write_its_budget() {
         "a write with a lost answer is never sent again"
     );
     assert!(
-        write_elapsed >= WRITE_TIMEOUT,
-        "the write waited {write_elapsed:?}, less than its {WRITE_TIMEOUT:?} budget"
+        write_elapsed >= PARKED_TIMEOUT,
+        "the write waited {write_elapsed:?}, less than its {PARKED_TIMEOUT:?} budget"
     );
     assert!(
-        write_elapsed < (WRITE_TIMEOUT + REPLY_MARGIN) * 2,
-        "the write waited {write_elapsed:?}, more than one attempt's wait"
+        write_elapsed < PARKED_TIMEOUT + REPLY_MARGIN + SLACK,
+        "the write waited {write_elapsed:?}, past its budget and reply margin"
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_silent_leader_costs_a_read_one_idle_timeout() {
+    let Setup {
+        cluster,
+        leader_id,
+        follower,
+    } = setup().await;
+    let follower = &cluster.nodes[follower];
+    set_statement_timeout(follower, SILENT_READ_TIMEOUT).await;
+
+    // The leader drops every datagram, both ways, while its process runs.
+    let blackhole = FailGuard::for_node(
+        leader_id,
+        BLACKHOLE_FAIL_POINT,
+        FailAction::Fail("cut off".into()),
+    );
+    let retries_before = follower.not_leader_retry_count();
+    let started = Instant::now();
+    let read = follower.client.simple_query(&read_sql()).await;
+    let elapsed = started.elapsed();
+    drop(blackhole);
+
+    let rows = read
+        .unwrap_or_else(|e| panic!("the read retries past the silent leader: {}", db_detail(&e)));
+    assert_eq!(
+        row_count(rows),
+        1,
+        "the retried read returns the seeded row"
+    );
+    assert!(
+        follower.not_leader_retry_count() > retries_before,
+        "the read retried after the silent leader's connection timed out"
+    );
+    assert!(
+        elapsed < RPC_TIMEOUT * 2,
+        "the read took {elapsed:?}, more than two {RPC_TIMEOUT:?} RPC timeouts"
     );
 
     cluster.shutdown().await;

@@ -321,9 +321,11 @@ impl RoutingTable {
         self.group_members.len()
     }
 
-    /// All group IDs.
+    /// All group IDs, in ascending order.
     pub fn group_ids(&self) -> Vec<u64> {
-        self.group_members.keys().copied().collect()
+        let mut ids: Vec<u64> = self.group_members.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Update the voting members of a Raft group (for membership changes).

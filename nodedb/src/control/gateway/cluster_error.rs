@@ -76,41 +76,90 @@ pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) ->
     }
 }
 
+/// One `ExecuteRequest` or `ExecuteStreamRequest` send, as its failure
+/// mapping needs it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RemoteSend {
+    pub node_id: u64,
+    pub vshard_id: u64,
+    /// A second run of the plan is harmless: the plan only reads.
+    pub resend_safe: bool,
+    /// The statement's deadline for this send.
+    pub deadline: tokio::time::Instant,
+}
+
 /// The error of a failed `ExecuteRequest` or `ExecuteStreamRequest` send.
 ///
 /// A request the target never received, and a lost answer to a read, retry as
 /// `NotLeader` with `leader_node = 0`. The unreachable node is then not kept as
-/// leader, and the next try routes locally to the real leader. A lost answer
-/// to any other plan is an unknown outcome: the plan can have run, and a
-/// second send would run it again.
-pub(super) fn send_error(
-    e: ClusterError,
-    resend_safe: bool,
-    node_id: u64,
-    vshard_id: u64,
-) -> Error {
-    if e.is_lost_answer() && !resend_safe {
-        tracing::warn!(
-            node_id,
-            vshard_id,
-            error = %e,
-            "gateway: a remote execute reached its deadline with no answer"
-        );
-        return Error::DeadlineExceeded {
-            request_id: crate::types::RequestId::new(0),
-        };
+/// leader, and the next try routes locally to the real leader.
+///
+/// These end the statement as `DeadlineExceeded` instead:
+/// - a lost answer to any other plan: it can have run, and a second send
+///   would run it again;
+/// - a lost answer once the deadline passed: the wait used the whole budget,
+///   and no retry has time left;
+/// - a `ShardTimeout`: the wait used the whole budget.
+pub(super) fn send_error(e: ClusterError, send: &RemoteSend) -> Error {
+    if matches!(e, ClusterError::ShardTimeout { .. }) {
+        return deadline_exceeded(send, &e);
+    }
+    if e.is_lost_answer() && (!send.resend_safe || tokio::time::Instant::now() >= send.deadline) {
+        return deadline_exceeded(send, &e);
     }
     Error::NotLeader {
-        vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
+        vshard_id: VShardId::new((send.vshard_id % VShardId::COUNT as u64) as u32),
         leader_node: 0,
-        leader_addr: format!("node-{node_id} (transport error: {e})"),
+        leader_addr: format!("node-{} (transport error: {e})", send.node_id),
         leader_term: 0,
+    }
+}
+
+/// The error of a remote execute whose reply wait expired.
+///
+/// The wait covers the statement's whole remaining budget plus the reply
+/// margin, so no retry has time left: the statement ends as `DeadlineExceeded`.
+pub(super) fn reply_wait_expired(send: &RemoteSend, reply_wait: std::time::Duration) -> Error {
+    let timed_out = ClusterError::ShardTimeout {
+        vshard_id: (send.vshard_id % VShardId::COUNT as u64) as u32,
+        elapsed_ms: u64::try_from(reply_wait.as_millis()).unwrap_or(u64::MAX),
+    };
+    deadline_exceeded(send, &timed_out)
+}
+
+fn deadline_exceeded(send: &RemoteSend, cause: &ClusterError) -> Error {
+    tracing::warn!(
+        node_id = send.node_id,
+        vshard_id = send.vshard_id,
+        error = %cause,
+        "gateway: a remote execute ended with no answer within the statement budget"
+    );
+    Error::DeadlineExceeded {
+        request_id: crate::types::RequestId::new(0),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A send to node 2 for vShard 7 whose statement has time left.
+    fn send(resend_safe: bool) -> RemoteSend {
+        RemoteSend {
+            node_id: 2,
+            vshard_id: 7,
+            resend_safe,
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// The same send once its statement deadline passed.
+    fn spent(resend_safe: bool) -> RemoteSend {
+        RemoteSend {
+            deadline: tokio::time::Instant::now(),
+            ..send(resend_safe)
+        }
+    }
 
     fn unanswered() -> ClusterError {
         ClusterError::Unanswered {
@@ -123,7 +172,7 @@ mod tests {
     #[test]
     fn a_lost_answer_to_a_write_is_an_unknown_outcome() {
         assert!(matches!(
-            send_error(unanswered(), false, 2, 7),
+            send_error(unanswered(), &send(false)),
             Error::DeadlineExceeded { .. }
         ));
     }
@@ -132,26 +181,71 @@ mod tests {
     #[test]
     fn a_lost_answer_to_a_read_retries() {
         assert!(matches!(
-            send_error(unanswered(), true, 2, 7),
+            send_error(unanswered(), &send(true)),
             Error::NotLeader { leader_node: 0, .. }
         ));
     }
 
-    /// A send that timed out is a lost answer: a read retries, a write is an
-    /// unknown outcome.
+    /// A send that timed out used the statement's whole budget: a read and a
+    /// write both end as `DeadlineExceeded`, with no retry.
     #[test]
-    fn a_timed_out_send_follows_the_lost_answer_rule() {
+    fn a_timed_out_read_ends_the_statement() {
         let timed_out = || ClusterError::ShardTimeout {
             vshard_id: 7,
             elapsed_ms: 1_000,
         };
         assert!(matches!(
-            send_error(timed_out(), true, 2, 7),
-            Error::NotLeader { leader_node: 0, .. }
+            send_error(timed_out(), &send(true)),
+            Error::DeadlineExceeded { .. }
         ));
         assert!(matches!(
-            send_error(timed_out(), false, 2, 7),
+            send_error(timed_out(), &send(false)),
             Error::DeadlineExceeded { .. }
+        ));
+    }
+
+    /// A live node holds a read past its budget: the transport's read timeout
+    /// ends the wait as a lost answer once the deadline passed. No retry has
+    /// time left, so the read ends as `DeadlineExceeded`, never `NotLeader`.
+    #[test]
+    fn a_lost_answer_to_a_read_past_its_deadline_ends_the_statement() {
+        assert!(matches!(
+            send_error(unanswered(), &spent(true)),
+            Error::DeadlineExceeded { .. }
+        ));
+    }
+
+    /// A request that never went out leaves nothing to wait for, so it
+    /// retries even at the deadline. The retry loop decides whether time is left.
+    #[test]
+    fn an_unsent_read_past_its_deadline_stays_retryable() {
+        let unsent = ClusterError::Transport {
+            detail: "connect refused".into(),
+        };
+        assert!(matches!(
+            send_error(unsent, &spent(true)),
+            Error::NotLeader { leader_node: 0, .. }
+        ));
+    }
+
+    /// An expired reply wait ends the statement, never a retry.
+    #[test]
+    fn an_expired_reply_wait_is_deadline_exceeded() {
+        assert!(matches!(
+            reply_wait_expired(&send(true), std::time::Duration::from_secs(14)),
+            Error::DeadlineExceeded { .. }
+        ));
+    }
+
+    /// A transport error is unsent: a read and a write both retry.
+    #[test]
+    fn an_unsent_read_retries() {
+        let unsent = ClusterError::Transport {
+            detail: "handshake timeout".into(),
+        };
+        assert!(matches!(
+            send_error(unsent, &send(true)),
+            Error::NotLeader { leader_node: 0, .. }
         ));
     }
 
@@ -162,7 +256,7 @@ mod tests {
             detail: "connect refused".into(),
         };
         assert!(matches!(
-            send_error(unsent, false, 2, 7),
+            send_error(unsent, &send(false)),
             Error::NotLeader { leader_node: 0, .. }
         ));
     }

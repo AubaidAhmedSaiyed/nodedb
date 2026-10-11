@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use nodedb_cluster::ClusterError;
 use nodedb_cluster::rpc_codec::{ExecuteRequest, RaftRpc};
 use tracing::debug;
 
@@ -18,7 +17,7 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_plan::wire as plan_wire;
 
-use super::cluster_error::{map_typed_cluster_error, send_error};
+use super::cluster_error::{RemoteSend, map_typed_cluster_error, reply_wait_expired, send_error};
 use super::dispatcher::DispatchOutcome;
 use super::version_set::GatewayVersionSet;
 
@@ -34,8 +33,6 @@ pub(super) struct RemoteDispatchArgs<'a> {
     pub trace_id: TraceId,
     /// Milliseconds left on the statement when this attempt starts.
     pub deadline_ms: u64,
-    /// The dispatch attempts this route has left, this one included.
-    pub attempts_left: usize,
     pub version_set: &'a GatewayVersionSet,
     /// Session-transaction context forwarded to the remote executor, or `None`
     /// for non-transactional dispatch.
@@ -61,12 +58,13 @@ pub(super) async fn dispatch_remote(
         database_id,
         trace_id,
         deadline_ms,
-        attempts_left,
         version_set,
         txn_id,
         linearizable,
         read_groups,
     } = args;
+    // The statement's deadline, fixed before any wait of this attempt.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
     let transport = shared.cluster_transport.as_ref().ok_or(Error::Internal {
         detail: "gateway: cluster transport not available for remote dispatch".into(),
     })?;
@@ -136,15 +134,12 @@ pub(super) async fn dispatch_remote(
 
     // A read can be sent again after a lost answer. Any other plan can have
     // run on the target, so a lost answer is an unknown outcome.
-    let resend_safe = required_permission(&plan) == Permission::Read;
-    // A read leaves time for the attempts after this one, so a node that
-    // never answers cannot spend the whole statement budget.
-    let attempt_ms = nodedb_cluster::rpc_codec::attempt_budget(
-        deadline_ms,
-        resend_safe,
-        attempts_left,
-        transport.rpc_timeout(),
-    );
+    let send = RemoteSend {
+        node_id,
+        vshard_id,
+        resend_safe: required_permission(&plan) == Permission::Read,
+        deadline,
+    };
 
     // Encode the plan.
     let plan_bytes = plan_wire::encode(&plan).map_err(|e| Error::Internal {
@@ -167,7 +162,7 @@ pub(super) async fn dispatch_remote(
         plan_bytes,
         tenant_id: tenant_id.as_u64(),
         database_id: database_id.as_u64(),
-        deadline_remaining_ms: attempt_ms,
+        deadline_remaining_ms: deadline_ms,
         trace_id: trace_id.0,
         descriptor_versions,
         txn_id,
@@ -182,28 +177,19 @@ pub(super) async fn dispatch_remote(
         "gateway: dispatching ExecuteRequest to remote node"
     );
 
-    // The remote handler works within `attempt_ms`: a write can wait at the
-    // leader's gate or in a Calvin queue for that long. The reply wait follows
-    // that budget, never the transport's fixed RPC timeout.
-    let reply_wait = nodedb_cluster::rpc_codec::reply_wait(attempt_ms);
+    // The remote handler works within the statement's whole remaining budget.
+    // A live node gets all of it. A dead node fails the send at the QUIC idle
+    // timeout, and a read then retries elsewhere.
+    let reply_wait = nodedb_cluster::rpc_codec::reply_wait(deadline_ms);
     let resp_rpc = match tokio::time::timeout(
         reply_wait,
         transport.send_rpc_with_read_timeout(node_id, req, reply_wait),
     )
     .await
     {
-        Ok(answer) => answer.map_err(|e| send_error(e, resend_safe, node_id, vshard_id))?,
-        Err(_) => {
-            return Err(send_error(
-                ClusterError::ShardTimeout {
-                    vshard_id: (vshard_id % VShardId::COUNT as u64) as u32,
-                    elapsed_ms: u64::try_from(reply_wait.as_millis()).unwrap_or(u64::MAX),
-                },
-                resend_safe,
-                node_id,
-                vshard_id,
-            ));
-        }
+        Ok(answer) => answer.map_err(|e| send_error(e, &send))?,
+        // The wait was the statement's whole budget: no retry has time left.
+        Err(_) => return Err(reply_wait_expired(&send, reply_wait)),
     };
 
     match resp_rpc {

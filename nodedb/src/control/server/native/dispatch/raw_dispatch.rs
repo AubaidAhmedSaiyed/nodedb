@@ -164,7 +164,9 @@ async fn dispatch_external_crdt_apply(
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
             authorized,
             collection: collection.as_str(),
-            timeout: std::time::Duration::from_secs(ctx.state.tuning.network.default_deadline_secs),
+            deadline: crate::control::server::shared::session::StatementDeadline::of_statement(
+                ctx.state,
+            ),
             event_source: crate::event::EventSource::User,
             policy: &policy,
         },

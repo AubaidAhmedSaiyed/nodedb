@@ -59,7 +59,7 @@ const ALLOWED: &[&str] = &[
     // Event Plane rules dispatched back through the Control Plane.
     "event/alert/executor.rs",
     // Legs of a request whose capability was consumed at the entry point.
-    "control/crdt_admission.rs",
+    "control/crdt_admission/legs.rs",
     // `sync/raft_dispatch/write.rs` is absent: a sync write proposes its
     // plan through Raft, and the entry's apply dispatches it on each replica.
 ];

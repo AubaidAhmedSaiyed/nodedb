@@ -343,9 +343,12 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
         reply_and_finish(&mut send, &auth, &response, "response").await
     };
 
+    // A dead connection can carry no answer, so its request stops using the
+    // executor. Handlers already tolerate the drop: shutdown drops `work` too.
     let outcome = tokio::select! {
         biased;
         _ = shutdown.changed() => Ok(false),
+        _ = conn.closed() => Ok(false),
         result = work => result.map(|()| true),
     };
     if let Ok(true) = outcome {

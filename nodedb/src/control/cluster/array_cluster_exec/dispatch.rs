@@ -16,7 +16,7 @@ use nodedb_cluster::distributed_array::ArrayLocalExecutor;
 use nodedb_cluster::distributed_array::handler::handle_array_shard_rpc;
 use nodedb_cluster::distributed_array::rpc::ShardRpcDispatch;
 use nodedb_cluster::error::{ClusterError, Result as ClusterResult};
-use nodedb_cluster::rpc_codec::{RaftRpc, attempt_budget, remaining_budget_ms};
+use nodedb_cluster::rpc_codec::{RaftRpc, remaining_budget_ms};
 use nodedb_cluster::wire::{VShardEnvelope, VShardMessageType};
 use nodedb_cluster::{NexarTransport, RoutingTable};
 
@@ -68,20 +68,15 @@ const RESEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[async_trait]
 impl ShardRpcDispatch for NexarArrayDispatch {
-    /// Every send shares the `timeout_ms` budget. A read leaves an RPC
-    /// timeout for its resend, so a silent shard cannot spend it all.
+    /// Every send gets what is left of the `timeout_ms` budget. A live shard
+    /// can use all of it. A dead shard fails the send at the QUIC idle
+    /// timeout, and the resend reaches the shard's current leader.
     async fn call(&self, req: VShardEnvelope, timeout_ms: u64) -> ClusterResult<VShardEnvelope> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let resend_safe = is_resend_safe(req.msg_type);
         let mut attempts_left = CALL_ATTEMPTS;
         loop {
-            let attempt_ms = attempt_budget(
-                remaining_budget_ms(deadline),
-                resend_safe,
-                attempts_left,
-                self.transport.rpc_timeout(),
-            );
-            match self.call_once(&req, attempt_ms).await {
+            match self.call_once(&req, remaining_budget_ms(deadline)).await {
                 Ok(resp) => return Ok(resp),
                 // A resend starts only while the budget has time left.
                 Err(e)
@@ -169,8 +164,8 @@ impl NexarArrayDispatch {
         // Wrap in RaftRpc and send. The remote node's handler decodes the
         // envelope bytes and dispatches to the appropriate shard handler.
         let rpc = RaftRpc::VShardEnvelope(envelope_bytes);
-        // This attempt's budget bounds the reply wait, never the transport's
-        // fixed RPC timeout.
+        // The call's remaining budget bounds the reply wait, never the
+        // transport's fixed RPC timeout.
         let reply_wait = std::time::Duration::from_millis(timeout_ms);
         let resp_rpc = tokio::time::timeout(
             reply_wait,
@@ -178,8 +173,8 @@ impl NexarArrayDispatch {
                 .send_rpc_with_read_timeout(node_id, rpc, reply_wait),
         )
         .await
-        // The request can have reached the shard: `call` resends a timeout
-        // only for a resend-safe request.
+        // The request can have reached the shard. The budget is spent, so
+        // `call` starts no resend.
         .map_err(|_| nodedb_cluster::error::ClusterError::ShardTimeout {
             vshard_id: req.vshard_id,
             elapsed_ms: timeout_ms,

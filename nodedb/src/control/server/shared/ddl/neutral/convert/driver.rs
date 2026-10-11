@@ -18,6 +18,7 @@ use crate::control::server::pgwire::types::error_to_sqlstate;
 use crate::control::server::shared::ddl::sync_dispatch::{
     SystemReason, SystemTask, dispatch_system_response_with_source,
 };
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::MetaOp;
 
@@ -114,7 +115,7 @@ pub async fn convert_collection(
             nodedb_types::CollectionKey::from_bare(database_id, &collection),
             plan,
         ),
-        Duration::from_secs(60),
+        StatementDeadline::after(Duration::from_secs(60)),
         event_source,
     )
     .await

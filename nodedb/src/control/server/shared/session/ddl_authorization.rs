@@ -41,6 +41,7 @@ pub(super) async fn barrier_at(state: &SharedState, log_index: u64) -> crate::Re
             group_id: METADATA_GROUP_ID,
             through: log_index,
         }],
+        super::StatementDeadline::of_statement(state).instant(),
     )
     .await
 }

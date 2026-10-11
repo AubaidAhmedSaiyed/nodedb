@@ -114,7 +114,6 @@ pub(super) async fn scatter_round_zero(
                 database_id,
                 trace_id: TraceId::ZERO,
                 deadline_ms,
-                attempts_left: 1,
                 version_set: &version_set,
                 txn_id,
                 linearizable,

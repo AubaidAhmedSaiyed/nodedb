@@ -63,9 +63,16 @@ pub(crate) async fn before_dispatch(node_id: u64, plan: &PhysicalPlan, wal_lsn: 
 
 /// The execute gate of node `node_id`, `exec::before_execute`: a received
 /// `ExecuteRequest` or `ExecuteStreamRequest` parks here before it is checked
-/// or run. A test arms it so one node takes a request and never answers.
+/// or run. Armed with `wait_file(<path>)`, one node takes a request and
+/// never answers. Armed with `sleep(<millis>)`, it runs the request late.
 pub(crate) async fn before_execute(node_id: u64) {
-    wait(FailScope::Node(node_id), "exec::before_execute").await;
+    let scope = FailScope::Node(node_id);
+    let name = "exec::before_execute";
+    if let Some(FailAction::Sleep(pause)) = lookup(scope, name) {
+        tokio::time::sleep(pause).await;
+        return;
+    }
+    wait(scope, name).await;
 }
 
 /// The Calvin submit gate of node `node_id`: after a transaction's collection

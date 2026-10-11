@@ -2,8 +2,6 @@
 
 //! Shape snapshot production: plan construction, RLS, and predicate filtering.
 
-use std::time::Duration;
-
 use tracing::{info, warn};
 
 use nodedb_types::sync::shape::{ShapeDefinition, ShapeType};
@@ -185,7 +183,9 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
             database_id: req.database_id,
             collection: req.collection,
             plan,
-            timeout: Duration::from_secs(10),
+            deadline: crate::control::server::shared::session::StatementDeadline::of_statement(
+                req.shared,
+            ),
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::NotYetAdmitted {
                 peer_addr: req.peer_addr,
             },

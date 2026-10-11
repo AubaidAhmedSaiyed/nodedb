@@ -220,14 +220,11 @@ async fn peer_delta_fenced_until_constraint_installed() {
         "fenced delta A must not be imported, but crdt_state returned: {landed:?}"
     );
 
-    // Install the constraint deterministically: drive one reconcile pass on
-    // every node (only the metadata leader actually proposes; the rest
-    // no-op), then poll until the UNIQUE(email) constraint is observed
-    // installed in node 0's validator.
-    for node in &cluster.nodes {
-        node.run_constraint_reconcile_once().await;
-    }
+    // Install the constraint on demand: a reconcile pass proposes only on the
+    // metadata leader, and leadership can move under load. Re-drive it on
+    // every node each round until node 0's validator holds UNIQUE(email).
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut accepted = 0usize;
     loop {
         let constraints = cluster.nodes[0]
             .crdt_constraints(TenantId::new(1), COLL)
@@ -240,9 +237,14 @@ async fn peer_delta_fenced_until_constraint_installed() {
         }
         if Instant::now() >= deadline {
             panic!(
-                "UNIQUE(email) constraint on '{COLL}' did not install within 15s of driving \
-                 reconcile on demand; observed: {constraints:?}"
+                "UNIQUE(email) constraint on '{COLL}' did not install within 15s of re-driving \
+                 reconcile on every node ({accepted} proposals accepted); observed: \
+                 {constraints:?}; groups:\n{}",
+                cluster.group_positions_report()
             );
+        }
+        for node in &cluster.nodes {
+            accepted += node.run_constraint_reconcile_once().await;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

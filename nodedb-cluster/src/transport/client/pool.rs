@@ -71,15 +71,25 @@ impl NexarTransport {
     /// a dial that ended while it waited. Only a caller with neither dials,
     /// so a burst of sends to one peer opens one connection.
     pub(super) async fn get_or_connect(&self, target: u64) -> Result<quinn::Connection> {
+        self.connect_peer(target)
+            .await
+            .map_err(|failed| failed.error)
+    }
+
+    /// [`get_or_connect`](Self::get_or_connect), with whether the peer stayed
+    /// silent through the dial.
+    pub(super) async fn connect_peer(
+        &self,
+        target: u64,
+    ) -> std::result::Result<quinn::Connection, DialError> {
         if let Some(conn) = self.pooled_connection(target) {
             return Ok(conn);
         }
         let addr = {
             let addrs = self.peer_addrs.read().unwrap_or_else(|p| p.into_inner());
-            addrs
-                .get(&target)
-                .copied()
-                .ok_or(ClusterError::NodeUnreachable { node_id: target })?
+            addrs.get(&target).copied().ok_or(DialError::answered(
+                ClusterError::NodeUnreachable { node_id: target },
+            ))?
         };
 
         let waiting_since = Instant::now();
@@ -90,10 +100,14 @@ impl NexarTransport {
             return Ok(conn);
         }
         if let Some(failure) = last_dial.failed_since(waiting_since) {
-            return Err(ClusterError::Transport {
-                detail: format!(
-                    "dial to node {target} at {addr} failed while this send waited: {failure}"
-                ),
+            return Err(DialError {
+                error: ClusterError::Transport {
+                    detail: format!(
+                        "dial to node {target} at {addr} failed while this send waited: {}",
+                        failure.detail
+                    ),
+                },
+                silent: failure.silent,
             });
         }
         self.drop_closed_connection(target);
@@ -104,37 +118,51 @@ impl NexarTransport {
                 peers.insert(target, conn.clone());
                 Ok(conn)
             }
-            Err(error) => {
+            Err(failed) => {
                 last_dial.failure = Some(DialFailure {
                     at: Instant::now(),
-                    detail: error.to_string(),
+                    detail: failed.error.to_string(),
+                    silent: failed.silent,
                 });
-                Err(error)
+                Err(failed)
             }
         }
     }
 
     /// Connect to `target` at `addr` and negotiate the wire version.
-    async fn dial(&self, target: u64, addr: SocketAddr) -> Result<quinn::Connection> {
-        // Connect — bounded by rpc_timeout so a hung QUIC handshake
-        // (peer not yet serving) doesn't block for the full 30s idle timeout.
-        let connecting = self
-            .listener
-            .endpoint()
-            .connect_with(self.client_config.clone(), addr, SNI_HOSTNAME)
-            .map_err(|e| ClusterError::Transport {
-                detail: format!("connect to node {target} at {addr}: {e}"),
-            })?;
-        let conn = tokio::time::timeout(self.rpc_timeout, connecting)
-            .await
-            .map_err(|_| ClusterError::Transport {
+    ///
+    /// A peer that answers nothing within the RPC timeout fails the dial as
+    /// silent: it is dead or cut off, and a redial in the same call is waste.
+    async fn dial(
+        &self,
+        target: u64,
+        addr: SocketAddr,
+    ) -> std::result::Result<quinn::Connection, DialError> {
+        let silent = || {
+            DialError::silent(ClusterError::Transport {
                 detail: format!(
                     "handshake timeout ({}ms) with node {target} at {addr}",
                     self.rpc_timeout.as_millis()
                 ),
-            })?
-            .map_err(|e| ClusterError::Transport {
-                detail: format!("handshake with node {target} at {addr}: {e}"),
+            })
+        };
+        let connecting = self
+            .listener
+            .endpoint()
+            .connect_with(self.client_config.clone(), addr, SNI_HOSTNAME)
+            .map_err(|e| {
+                DialError::answered(ClusterError::Transport {
+                    detail: format!("connect to node {target} at {addr}: {e}"),
+                })
+            })?;
+        let conn = tokio::time::timeout(self.rpc_timeout, connecting)
+            .await
+            .map_err(|_| silent())?
+            .map_err(|e| match e {
+                quinn::ConnectionError::TimedOut => silent(),
+                other => DialError::answered(ClusterError::Transport {
+                    detail: format!("handshake with node {target} at {addr}: {other}"),
+                }),
             })?;
 
         debug!(target, %addr, "connected to peer");
@@ -142,21 +170,18 @@ impl NexarTransport {
         // Open a dedicated bidi stream for the wire-version handshake.
         // This must complete before any RPC stream is opened on this connection.
         let agreed = {
-            let (mut hs_send, mut hs_recv) =
-                conn.open_bi().await.map_err(|e| ClusterError::Transport {
+            let (mut hs_send, mut hs_recv) = conn.open_bi().await.map_err(|e| {
+                DialError::answered(ClusterError::Transport {
                     detail: format!("open handshake stream to node {target} at {addr}: {e}"),
-                })?;
+                })
+            })?;
             let version = tokio::time::timeout(
                 self.rpc_timeout,
                 perform_version_handshake_client(&mut hs_send, &mut hs_recv),
             )
             .await
-            .map_err(|_| ClusterError::Transport {
-                detail: format!(
-                    "handshake timeout ({}ms) with node {target} at {addr}",
-                    self.rpc_timeout.as_millis()
-                ),
-            })??;
+            .map_err(|_| silent())?
+            .map_err(DialError::answered)?;
             // Finish the handshake send stream — the server reads it until FIN.
             let _ = hs_send.finish();
             version
@@ -208,12 +233,40 @@ impl NexarTransport {
     }
 }
 
+/// A failed dial, and whether the peer stayed silent through it.
+#[derive(Debug)]
+pub(super) struct DialError {
+    pub(super) error: ClusterError,
+    /// The peer sent nothing within the RPC timeout: it is dead or cut off.
+    pub(super) silent: bool,
+}
+
+impl DialError {
+    /// A dial the peer refused or broke off: the peer is up.
+    fn answered(error: ClusterError) -> Self {
+        Self {
+            error,
+            silent: false,
+        }
+    }
+
+    /// A dial the peer never answered within the RPC timeout.
+    fn silent(error: ClusterError) -> Self {
+        Self {
+            error,
+            silent: true,
+        }
+    }
+}
+
 /// The last failed dial to one peer.
 #[derive(Debug)]
 struct DialFailure {
     /// When the dial ended.
     at: Instant,
     detail: String,
+    /// The peer stayed silent through the dial.
+    silent: bool,
 }
 
 /// Outcome of the last dial to one peer, behind the peer's dial gate.
@@ -224,11 +277,8 @@ struct LastDial {
 
 impl LastDial {
     /// The failure of a dial that ended at or after `since`.
-    fn failed_since(&self, since: Instant) -> Option<&str> {
-        self.failure
-            .as_ref()
-            .filter(|failure| failure.at >= since)
-            .map(|failure| failure.detail.as_str())
+    fn failed_since(&self, since: Instant) -> Option<&DialFailure> {
+        self.failure.as_ref().filter(|failure| failure.at >= since)
     }
 }
 

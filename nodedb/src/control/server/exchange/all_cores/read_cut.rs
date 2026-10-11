@@ -22,6 +22,7 @@ use std::time::Duration;
 use nodedb_cluster::calvin::SequencerEntry;
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 
 /// How long a node waits for the marker before it proposes it again. A
@@ -81,8 +82,9 @@ async fn resolve_read_cut(state: &SharedState, marker: u64) -> crate::Result<i64
     .map_err(|error| crate::Error::Internal {
         detail: format!("graph read cut: encode the cut marker: {error}"),
     })?;
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
+    let statement = StatementDeadline::of_statement(state);
+    let budget_ms = statement.remaining().as_millis();
+    let deadline = statement.tokio_instant();
     let mut last_refusal = None;
     loop {
         if let Err(error) = proposer.propose(entry.clone()) {
@@ -96,9 +98,9 @@ async fn resolve_read_cut(state: &SharedState, marker: u64) -> crate::Result<i64
             return Err(crate::Error::Internal {
                 detail: format!(
                     "graph read cut: cut marker {marker} did not apply and pass every Calvin \
-                     scheduler of this node within {}s (vShards still before it: {:?}, last \
-                     marker refusal: {}). Retry the query",
-                    timeout.as_secs(),
+                     scheduler of this node within the statement deadline ({} ms) (vShards \
+                     still before it: {:?}, last marker refusal: {}). Retry the query",
+                    budget_ms,
                     state.calvin.cuts.lagging(marker),
                     last_refusal.as_deref().unwrap_or("none"),
                 ),

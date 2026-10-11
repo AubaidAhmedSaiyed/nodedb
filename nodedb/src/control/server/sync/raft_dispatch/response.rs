@@ -8,6 +8,7 @@
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
 use crate::control::server::dispatch_utils::RecordOwner;
 use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::event::EventSource;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
@@ -58,7 +59,14 @@ async fn sync_write(
     event_source: EventSource,
 ) -> crate::Result<Vec<u8>> {
     reject_unadmitted_crdt_apply(plan)?;
-    propose_sync_plan(state, owner, plan, event_source).await
+    propose_sync_plan(
+        state,
+        owner,
+        plan,
+        event_source,
+        StatementDeadline::of_statement(state),
+    )
+    .await
 }
 
 /// The applied payload wrapped in `Status::Ok`. A non-`Ok` status means a

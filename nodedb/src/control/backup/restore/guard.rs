@@ -37,6 +37,7 @@ use crate::Error;
 use crate::control::security::auth_fence::cluster::{
     confirmed_read_index, hosts_group, routed_groups, wait_applied,
 };
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::control::state::tenant_marks::GroupMark;
 use crate::types::{DatabaseId, TraceId};
@@ -92,8 +93,7 @@ pub(super) async fn newest_committed_write(
         }
     };
     // The statement deadline, shared by every group and every attempt.
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(state.tuning.network.default_deadline_secs);
+    let deadline = StatementDeadline::of_statement(state).tokio_instant();
     let groups: Vec<u64> = routed_groups(state)
         .into_iter()
         .filter(|group| *group != METADATA_GROUP_ID && *group != SEQUENCER_GROUP_ID)

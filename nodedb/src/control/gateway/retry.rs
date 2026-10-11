@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Typed `NotLeader` retry with 3-attempt budget + 50/100/200 ms backoff.
+//! Typed `NotLeader` retry that runs until the statement deadline.
 //!
 //! When a remote dispatch returns `Error::NotLeader`, the retry helper:
 //! 1. Extracts the hinted new leader and its term from the error.
 //! 2. Offers them to the routing table entry for the affected group. The
 //!    hint moves only when the redirect's term is above the hint's term, so
 //!    a stale redirect never undoes a newer leader.
-//! 3. Sleeps for the appropriate backoff duration.
+//! 3. Sleeps for the next backoff of its [`RetryPacing`].
 //! 4. Re-invokes the closure.
 //!
 //! If the hinted leader is unknown (no hint), we still retry after sleep
 //! without updating the routing table — a subsequent routing lookup will
 //! re-read the table from the current routing state.
 //!
-//! Every attempt shares the statement's deadline, so the attempts together
-//! stay within one statement budget. No retry starts once it has passed. The
-//! last refusal then ends the statement: it is definite, so it never becomes
-//! `DeadlineExceeded`, which means a lost answer.
-//!
-//! After `MAX_RETRIES` attempts the final `NotLeader` error is propagated.
+//! A re-election can outlast any fixed attempt count, so retries continue
+//! while the statement has time left. Every attempt shares the statement's
+//! deadline. When the next backoff would reach it, one last attempt starts
+//! at once, and its verdict ends the statement. A lost answer to a read then
+//! ends as the deadline the last send reports. No retry starts once the
+//! deadline passed. The last refusal then ends the statement: it is
+//! definite, so it never becomes `DeadlineExceeded`, which means a lost
+//! answer.
 
 use std::future::Future;
 use std::sync::RwLock;
@@ -28,15 +30,10 @@ use tokio::time::{Duration, Instant, sleep};
 use tracing::debug;
 
 use nodedb_cluster::RoutingTable;
+use nodedb_types::config::tuning::ClusterTransportTuning;
 
 use crate::Error;
 use crate::control::server::shared::session::deadline::hop_budget_ms;
-
-/// Maximum number of dispatch attempts (initial + 2 retries = 3 total).
-pub const MAX_RETRIES: usize = 3;
-
-/// Backoff durations for each retry attempt.
-const BACKOFF_MS: [u64; MAX_RETRIES] = [50, 100, 200];
 
 /// One dispatch attempt of a statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,27 +45,49 @@ pub struct Attempt {
 }
 
 impl Attempt {
-    /// The attempts left, this one included.
-    pub fn attempts_left(&self) -> usize {
-        MAX_RETRIES.saturating_sub(self.index)
-    }
-
     /// The milliseconds left on the statement now, at least 1. See
     /// [`hop_budget_ms`].
     pub fn remaining_ms(&self) -> u64 {
         hop_budget_ms(self.deadline.into_std())
     }
+}
 
-    /// The one attempt of a send that no retry follows.
-    pub fn sole(deadline: Instant) -> Self {
-        Self {
-            index: MAX_RETRIES - 1,
-            deadline,
-        }
+/// The backoff between leader retries: doubles from `first` up to `cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPacing {
+    /// The pause before the first retry.
+    pub first: Duration,
+    /// The longest pause between two retries.
+    pub cap: Duration,
+}
+
+impl RetryPacing {
+    /// Pacing from the cluster's Raft timing.
+    ///
+    /// The first pause is one Raft tick. The cap is the minimum election
+    /// timeout: no new leader can appear faster than that.
+    pub fn from_tuning(tuning: &ClusterTransportTuning) -> Self {
+        let first = Duration::from_millis(tuning.raft_tick_interval_ms.max(1));
+        let cap = Duration::from_millis(tuning.effective_election_timeout_min_ms()).max(first);
+        Self { first, cap }
+    }
+
+    /// The pause after `retries` retries already ran.
+    fn backoff(&self, retries: u32) -> Duration {
+        self.first
+            .checked_mul(2u32.saturating_pow(retries))
+            .map_or(self.cap, |d| d.min(self.cap))
     }
 }
 
-/// Execute `f` up to `MAX_RETRIES` times, retrying on `Error::NotLeader`.
+impl Default for RetryPacing {
+    fn default() -> Self {
+        Self::from_tuning(&ClusterTransportTuning::default())
+    }
+}
+
+/// Execute `f`, retrying on `Error::NotLeader` and
+/// `Error::RetryableLeaderChange` until `deadline`.
 ///
 /// `f` receives the current [`Attempt`]: its index and the statement's
 /// `deadline`, which every attempt shares.
@@ -79,6 +98,7 @@ impl Attempt {
 pub async fn retry_not_leader<F, Fut, T>(
     routing: Option<&RwLock<RoutingTable>>,
     deadline: Instant,
+    pacing: RetryPacing,
     f: F,
 ) -> Result<T, Error>
 where
@@ -86,6 +106,7 @@ where
     Fut: Future<Output = Result<T, Error>>,
 {
     let mut attempt = 0;
+    let mut last_call = false;
     loop {
         let refusal = match f(Attempt {
             index: attempt,
@@ -143,12 +164,9 @@ where
                 group_id,
                 log_index,
             }) => {
-                // The Raft entry the proposer was waiting on was
-                // overwritten by a new leader's election no-op. Re-
-                // propose: the next attempt will land at a fresh log
-                // index under the new leader's term. Same backoff
-                // schedule as NotLeader — bounded retries so a
-                // pathological cluster doesn't loop forever.
+                // A new leader's election no-op overwrote the entry the
+                // proposer waited on. The next attempt re-proposes under the
+                // new leader's term.
                 debug!(
                     attempt,
                     group_id, log_index, "gateway: leader change overwrote entry — will re-propose"
@@ -162,22 +180,23 @@ where
             Err(other) => return Err(other),
         };
 
-        // Both refusals mean nothing applied. When no retry follows, that
-        // definite refusal ends the statement, never an unknown outcome.
-        attempt += 1;
-        if attempt >= MAX_RETRIES {
-            return Err(refusal);
-        }
-        sleep(Duration::from_millis(BACKOFF_MS[attempt - 1])).await;
-        // A retry starts only while the statement has time left. That keeps
-        // every attempt's wait within the budget plus one reply margin.
-        if Instant::now() >= deadline {
+        // Both refusals mean nothing applied. Once the deadline passed, or
+        // the last call ran, that definite refusal ends the statement.
+        let now = Instant::now();
+        if last_call || now >= deadline {
             debug!(
                 attempt,
-                "gateway: statement deadline passed — no further retry"
+                "gateway: statement deadline reached — no further retry"
             );
             return Err(refusal);
         }
+        let pause = pacing.backoff(u32::try_from(attempt).unwrap_or(u32::MAX));
+        if now + pause >= deadline {
+            last_call = true;
+        } else {
+            sleep(pause).await;
+        }
+        attempt += 1;
     }
 }
 
@@ -195,9 +214,25 @@ mod tests {
         Instant::now() + Duration::from_secs(30)
     }
 
+    fn pacing() -> RetryPacing {
+        RetryPacing {
+            first: Duration::from_millis(10),
+            cap: Duration::from_millis(150),
+        }
+    }
+
+    fn not_leader(leader_node: u64, leader_term: u64) -> Error {
+        Error::NotLeader {
+            vshard_id: VShardId::new(0),
+            leader_node,
+            leader_addr: String::new(),
+            leader_term,
+        }
+    }
+
     #[tokio::test]
     async fn success_on_first_attempt() {
-        let result = retry_not_leader(None, far_deadline(), |_attempt| async {
+        let result = retry_not_leader(None, far_deadline(), pacing(), |_attempt| async {
             Ok::<u32, Error>(42)
         })
         .await;
@@ -208,17 +243,11 @@ mod tests {
     async fn success_on_second_attempt() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&call_count);
-        let result = retry_not_leader(None, far_deadline(), move |_attempt| {
+        let result = retry_not_leader(None, far_deadline(), pacing(), move |_attempt| {
             let c = Arc::clone(&count);
             async move {
-                let n = c.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    Err(Error::NotLeader {
-                        vshard_id: VShardId::new(0),
-                        leader_node: 2,
-                        leader_addr: "10.0.0.2:9400".into(),
-                        leader_term: 1,
-                    })
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(not_leader(2, 1))
                 } else {
                     Ok::<u32, Error>(99)
                 }
@@ -230,24 +259,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausts_retries_returns_not_leader() {
-        let result = retry_not_leader(None, far_deadline(), |_| async {
-            Err::<u32, Error>(Error::NotLeader {
-                vshard_id: VShardId::new(1),
-                leader_node: 0,
-                leader_addr: String::new(),
-                leader_term: 0,
-            })
-        })
-        .await;
-        assert!(matches!(result, Err(Error::NotLeader { .. })));
-    }
-
-    #[tokio::test]
     async fn non_not_leader_error_propagates_immediately() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&call_count);
-        let result = retry_not_leader(None, far_deadline(), move |_| {
+        let result = retry_not_leader(None, far_deadline(), pacing(), move |_| {
             let c = Arc::clone(&count);
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -261,6 +276,59 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
+    /// A re-election longer than a few fixed attempts is retried until the
+    /// new leader answers.
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_change_past_350_ms_is_retried_until_it_resolves() {
+        let started = Instant::now();
+        let resolves_at = started + Duration::from_millis(1_000);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let result = retry_not_leader(None, far_deadline(), pacing(), move |_| {
+            let c = Arc::clone(&count);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                if Instant::now() < resolves_at {
+                    Err(not_leader(0, 0))
+                } else {
+                    Ok::<u32, Error>(7)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert!(calls.load(Ordering::SeqCst) > 3, "more than three attempts");
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(1_000) + pacing().cap,
+            "the retry follows the resolution within one capped backoff: {waited:?}"
+        );
+    }
+
+    /// Retries stop when the next backoff reaches the deadline. The last
+    /// refusal stays the answer, never `DeadlineExceeded`.
+    #[tokio::test(start_paused = true)]
+    async fn a_passing_deadline_stops_retries_with_the_last_refusal() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(600);
+        let result = retry_not_leader(None, deadline, pacing(), |attempt| async move {
+            Err::<(), Error>(not_leader(7, attempt.index as u64 + 1))
+        })
+        .await;
+        match result {
+            Err(Error::NotLeader {
+                leader_node: 7,
+                leader_term,
+                ..
+            }) => assert!(leader_term > 1, "the last refusal returns"),
+            other => panic!("expected the last NotLeader, got {other:?}"),
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "no retry runs past the deadline"
+        );
+    }
+
     #[tokio::test]
     async fn routing_table_updated_on_not_leader_hint() {
         let table = RoutingTable::uniform(1, &[1, 2], 2);
@@ -270,17 +338,11 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&call_count);
 
-        let _ = retry_not_leader(Some(&*rt_clone), far_deadline(), move |_| {
+        let _ = retry_not_leader(Some(&*rt_clone), far_deadline(), pacing(), move |_| {
             let c = Arc::clone(&count);
             async move {
-                let n = c.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    Err(Error::NotLeader {
-                        vshard_id: VShardId::new(0),
-                        leader_node: 2,
-                        leader_addr: "addr".into(),
-                        leader_term: 4,
-                    })
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(not_leader(2, 4))
                 } else {
                     Ok::<(), Error>(())
                 }
@@ -300,14 +362,9 @@ mod tests {
         assert!(table.observe_leader(group_id, 3, 7));
         let rt = RwLock::new(table);
 
-        let _ = retry_not_leader(Some(&rt), far_deadline(), |attempt| async move {
+        let _ = retry_not_leader(Some(&rt), far_deadline(), pacing(), |attempt| async move {
             if attempt.index == 0 {
-                Err(Error::NotLeader {
-                    vshard_id: VShardId::new(0),
-                    leader_node: 2,
-                    leader_addr: "addr".into(),
-                    leader_term: 5,
-                })
+                Err(not_leader(2, 5))
             } else {
                 Ok::<(), Error>(())
             }
@@ -323,14 +380,9 @@ mod tests {
     #[tokio::test]
     async fn a_term_less_redirect_never_replaces_a_termed_hint() {
         async fn redirect_to(rt: &RwLock<RoutingTable>, leader_node: u64) {
-            let _ = retry_not_leader(Some(rt), far_deadline(), |attempt| async move {
+            let _ = retry_not_leader(Some(rt), far_deadline(), pacing(), |attempt| async move {
                 if attempt.index == 0 {
-                    Err(Error::NotLeader {
-                        vshard_id: VShardId::new(0),
-                        leader_node,
-                        leader_addr: String::new(),
-                        leader_term: 0,
-                    })
+                    Err(not_leader(leader_node, 0))
                 } else {
                     Ok::<(), Error>(())
                 }
@@ -356,44 +408,27 @@ mod tests {
 
     /// Every attempt carries the one statement deadline, so the budget left
     /// shrinks across attempts and never restarts.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_statement_deadline_is_shared_across_attempts() {
-        let deadline = far_deadline();
+        let deadline = Instant::now() + Duration::from_millis(500);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = Arc::clone(&seen);
-        let result = retry_not_leader(None, deadline, move |attempt| {
+        let result = retry_not_leader(None, deadline, pacing(), move |attempt| {
             let record = Arc::clone(&record);
             async move {
-                record.lock().unwrap().push((
-                    attempt,
-                    attempt.attempts_left(),
-                    attempt.remaining_ms(),
-                ));
-                Err::<(), Error>(Error::NotLeader {
-                    vshard_id: VShardId::new(0),
-                    leader_node: 0,
-                    leader_addr: String::new(),
-                    leader_term: 0,
-                })
+                record.lock().unwrap().push(attempt);
+                Err::<(), Error>(not_leader(0, 0))
             }
         })
         .await;
         assert!(matches!(result, Err(Error::NotLeader { .. })));
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), MAX_RETRIES);
-        for (index, (attempt, attempts_left, _)) in seen.iter().enumerate() {
+        assert!(seen.len() > 1);
+        for (index, attempt) in seen.iter().enumerate() {
             assert_eq!(attempt.index, index);
             assert_eq!(attempt.deadline, deadline);
-            assert_eq!(*attempts_left, MAX_RETRIES - index);
         }
-        let first_remaining = seen[0].2;
-        let last_remaining = seen[MAX_RETRIES - 1].2;
-        let backoff: u64 = BACKOFF_MS[..MAX_RETRIES - 1].iter().sum();
-        assert!(
-            last_remaining <= first_remaining - backoff,
-            "the last attempt has {last_remaining} ms, the first had {first_remaining} ms"
-        );
     }
 
     /// A retry never starts once the statement's deadline has passed. The
@@ -402,16 +437,11 @@ mod tests {
     async fn no_retry_starts_past_the_deadline() {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&calls);
-        let result = retry_not_leader(None, Instant::now(), move |_| {
+        let result = retry_not_leader(None, Instant::now(), pacing(), move |_| {
             let c = Arc::clone(&count);
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                Err::<(), Error>(Error::NotLeader {
-                    vshard_id: VShardId::new(0),
-                    leader_node: 7,
-                    leader_addr: String::new(),
-                    leader_term: 3,
-                })
+                Err::<(), Error>(not_leader(7, 3))
             }
         })
         .await;
@@ -429,11 +459,59 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A lost answer to a read just before the deadline gets one last call
+    /// at once. Its verdict, the deadline, ends the statement.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_call_before_the_deadline_decides_the_verdict() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let result = retry_not_leader(None, deadline, pacing(), move |_| {
+            let c = Arc::clone(&count);
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err::<(), Error>(not_leader(0, 0))
+                } else {
+                    Err(Error::DeadlineExceeded {
+                        request_id: crate::types::RequestId::new(0),
+                    })
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(result, Err(Error::DeadlineExceeded { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one last call, no more");
+    }
+
+    /// A refusal from the last call ends the statement: no call follows it.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_last_call_ends_the_retries() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let result = retry_not_leader(None, deadline, pacing(), move |_| {
+            let c = Arc::clone(&count);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err::<(), Error>(not_leader(0, 0))
+            }
+        })
+        .await;
+        assert!(
+            matches!(result, Err(Error::NotLeader { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
     /// An overwritten entry was never applied. Past the deadline it stays a
     /// definite refusal, never an unknown outcome.
     #[tokio::test]
     async fn an_overwritten_entry_past_the_deadline_stays_definite() {
-        let result = retry_not_leader(None, Instant::now(), |_| async {
+        let result = retry_not_leader(None, Instant::now(), pacing(), |_| async {
             Err::<(), Error>(Error::RetryableLeaderChange {
                 group_id: 4,
                 log_index: 9,
@@ -452,19 +530,29 @@ mod tests {
         );
     }
 
-    /// A sole attempt leaves no retry behind it.
+    /// The backoff doubles from one Raft tick and stops at the minimum
+    /// election timeout.
     #[test]
-    fn a_sole_attempt_has_one_attempt_left() {
-        let deadline = far_deadline();
-        let attempt = Attempt::sole(deadline);
-        assert_eq!(attempt.attempts_left(), 1);
-        assert_eq!(attempt.deadline, deadline);
+    fn pacing_follows_the_raft_timing() {
+        let tuning = ClusterTransportTuning {
+            raft_tick_interval_ms: 10,
+            election_timeout_min_ms: 150,
+            ..ClusterTransportTuning::default()
+        };
+        let pacing = RetryPacing::from_tuning(&tuning);
+        assert_eq!(pacing.backoff(0), Duration::from_millis(10));
+        assert_eq!(pacing.backoff(1), Duration::from_millis(20));
+        assert_eq!(pacing.backoff(4), Duration::from_millis(150));
+        assert_eq!(pacing.backoff(u32::MAX), Duration::from_millis(150));
     }
 
     /// A spent deadline still sends a 1 ms hop, so the receiver checks it.
     #[tokio::test]
     async fn remaining_ms_never_reaches_zero() {
-        let attempt = Attempt::sole(Instant::now());
+        let attempt = Attempt {
+            index: 0,
+            deadline: Instant::now(),
+        };
         assert_eq!(attempt.remaining_ms(), 1);
     }
 }

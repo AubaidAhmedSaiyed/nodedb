@@ -294,7 +294,6 @@ async fn current_versions(
                 database_id,
                 trace_id: TraceId::ZERO,
                 deadline_ms: StatementDeadline::of_statement(shared).hop_budget_ms(),
-                attempts_left: 1,
                 version_set: &GatewayVersionSet::from_pairs(Vec::new()),
                 txn_id: None,
                 // The leader proves its leadership itself: it answers each

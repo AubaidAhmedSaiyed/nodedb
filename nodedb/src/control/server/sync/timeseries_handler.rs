@@ -138,6 +138,7 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             self.shared,
             &collection,
             authorized,
+            crate::control::server::shared::session::StatementDeadline::of_statement(self.shared),
             crate::event::EventSource::CrdtSync,
         )
         .await?;

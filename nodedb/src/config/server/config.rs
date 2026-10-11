@@ -422,6 +422,24 @@ mod tests {
         assert!(msg.contains("at least 10 seconds"), "{msg}");
     }
 
+    /// The RPC timeout is the QUIC idle timeout, so one under its floor is
+    /// refused at startup.
+    #[test]
+    fn from_file_rejects_an_rpc_timeout_below_the_floor() {
+        let path = write_temp_config(
+            "nodedb-domain-rpc-timeout.toml",
+            "[tuning.cluster_transport]\nrpc_timeout_secs = 0\n",
+        );
+        let err = ServerConfig::from_file(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tuning.cluster_transport.rpc_timeout_secs"),
+            "{msg}"
+        );
+        assert!(msg.contains("at least 500 ms"), "{msg}");
+    }
+
     #[test]
     fn from_file_rejects_a_wal_write_buffer_under_the_floor() {
         let path = write_temp_config(

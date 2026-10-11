@@ -2,8 +2,6 @@
 
 //! RESTORE collection SET VERSION = 'checkpoint' WHERE id = 'doc-id'
 
-use std::time::Duration;
-
 #[cfg(test)]
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy;
@@ -11,6 +9,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 #[cfg(test)]
@@ -72,7 +71,7 @@ pub async fn restore_version(
     .await
     .map_err(|e| DdlError::from_error_in_context("surrogate assign", &e))?;
 
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
+    let deadline = StatementDeadline::of_statement(state);
     // RLS write policies are stored keyed by `db_qualified(database_id,
     // collection)`, so the policy is handed that same key or it silently
     // misses a policy on a non-default database. The admission workflow
@@ -98,7 +97,7 @@ pub async fn restore_version(
             target_version_json: &vv_json,
             surrogate,
             peer_id: identity.user_id,
-            timeout,
+            deadline,
             event_source: crate::event::EventSource::User,
             policy: &policy,
         },
@@ -169,14 +168,14 @@ async fn persist_restore_delta(
         expected_frontier_digest: None,
     });
 
-    let outcome = crate::control::crdt_admission::dispatch_crdt_apply_admitted_outcome(
+    let outcome = crate::control::crdt_admission::apply::dispatch_crdt_apply_admitted_outcome(
         state,
         crate::control::crdt_admission::CrdtApplyAdmissionRequest {
             tenant_id,
             database_id,
             collection: qualified.as_str(),
             plan,
-            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            deadline: StatementDeadline::of_statement(state),
             event_source: crate::event::EventSource::User,
             policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
         },
@@ -431,7 +430,7 @@ mod tests {
                 target_version_json: "{}",
                 surrogate: Surrogate(1),
                 peer_id: 42,
-                timeout: Duration::from_secs(2),
+                deadline: StatementDeadline::after(std::time::Duration::from_secs(2)),
                 event_source: crate::event::EventSource::User,
                 policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
             },

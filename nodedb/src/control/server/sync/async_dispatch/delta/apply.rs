@@ -3,8 +3,6 @@
 //! Dispatch a CRDT delta to the Data Plane and hand its outcome to the frame
 //! builder.
 
-use std::time::Duration;
-
 use tracing::warn;
 
 use nodedb_types::sync::wire::{EngineKind, SyncProvenance, stream_id_for};
@@ -12,6 +10,7 @@ use nodedb_types::sync::wire::{EngineKind, SyncProvenance, stream_id_for};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -81,6 +80,8 @@ pub(crate) async fn apply_delta_and_finalize(
         epoch: session_epoch,
         peer_addr,
     } = session;
+    // Pinned once: preview, propose and apply all end at this instant.
+    let deadline = StatementDeadline::of_statement(shared);
     use crate::bridge::envelope::PhysicalPlan;
     use nodedb_physical::physical_plan::CrdtOp;
 
@@ -354,7 +355,7 @@ pub(crate) async fn apply_delta_and_finalize(
                     shared,
                     &delta_msg.collection,
                     authorized,
-                    Duration::from_secs(10),
+                    deadline,
                     crate::event::EventSource::CrdtSync,
                     &policy,
                 )
