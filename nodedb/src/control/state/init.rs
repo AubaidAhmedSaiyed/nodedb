@@ -157,6 +157,7 @@ impl SharedState {
             multi_raft: std::sync::OnceLock::new(),
             cluster_epoch: std::sync::OnceLock::new(),
             raft_status_fn: std::sync::OnceLock::new(),
+            data_groups_replayed: std::sync::atomic::AtomicBool::new(false),
             cluster_observer: std::sync::OnceLock::new(),
             loop_metrics_registry: nodedb_cluster::LoopMetricsRegistry::new(),
             per_vshard_metrics: crate::control::metrics::PerVShardMetricsRegistry::new(),

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::node_life::NodeLife;
 use super::pins::ColdPins;
-use super::restore_point::RecordedCut;
+use super::restore_point::{RecordedCut, RecordedCuts};
 use crate::control::metrics::SystemMetrics;
 use crate::storage::snapshot::SnapshotCatalog;
 
@@ -35,8 +35,9 @@ pub struct PitrState {
     /// Chunk ids the kept bases and the bases in progress list.
     chunk_pins: tokio::sync::RwLock<ColdPins>,
     last_failure: Mutex<Option<PitrFailure>>,
-    /// The cut barriers the system catalog held at boot.
-    recorded_cuts: OnceLock<Vec<RecordedCut>>,
+    /// The cut barriers the system catalog held at boot, and those a
+    /// snapshot install carried since.
+    recorded_cuts: Arc<RecordedCuts>,
     /// Each group's durable applied index, as this life saved it.
     durable_applied: Mutex<HashMap<u64, u64>>,
 }
@@ -60,15 +61,14 @@ impl PitrState {
         self.cluster_catalog.get()
     }
 
-    /// Install the cut barriers read from the system catalog at boot. A
-    /// second install keeps the first.
+    /// Add the cut barriers read from the system catalog at boot.
     pub fn install_recorded_cuts(&self, cuts: Vec<RecordedCut>) {
-        let _ = self.recorded_cuts.set(cuts);
+        self.recorded_cuts.record(&cuts);
     }
 
-    /// The cut barriers the system catalog held at boot.
-    pub fn recorded_cuts(&self) -> &[RecordedCut] {
-        self.recorded_cuts.get().map_or(&[], Vec::as_slice)
+    /// The cut barriers the apply loop reads beyond the ones it applies.
+    pub fn recorded_cuts(&self) -> Arc<RecordedCuts> {
+        Arc::clone(&self.recorded_cuts)
     }
 
     /// Note that `group_id`'s durable applied index reached `index`.

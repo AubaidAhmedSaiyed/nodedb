@@ -12,8 +12,8 @@ pub use context::{DATABASE_SCOPE, IlpFlushOutcome, LostResponseWrite, TENANT_SCO
 pub use recording::{
     IndexRebuildTarget, VectorBuildTarget, apply_panicked, batch_insert_without_surrogates,
     calvin_apply_halted, calvin_barrier_log_store_failed, calvin_completion_timeout,
-    catalog_apply_orphan_row, collection_purge_row_missing, columnar_segment_corrupt,
-    consumer_group_offsets_retained, continuous_aggregate_not_applied,
+    calvin_left_state_not_forgotten, catalog_apply_orphan_row, collection_purge_row_missing,
+    columnar_segment_corrupt, consumer_group_offsets_retained, continuous_aggregate_not_applied,
     crdt_dead_letter_not_enqueued, crdt_dead_letter_not_restored, crdt_dead_letter_not_stored,
     cut_barrier_not_placed, data_plane_core_fail_stopped, data_plane_response_lost,
     data_plane_responses_lost, descriptor_lease_not_renewed, entry_kind, fts_index_update_failed,

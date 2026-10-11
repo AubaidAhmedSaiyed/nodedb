@@ -72,7 +72,7 @@ pub(super) async fn consistent_cut(state: &SharedState) -> Result<u64, Error> {
 /// Take the consistent cut at `watermark` on this node: wait until every
 /// write committed below it has a final outcome here. A remote source node
 /// runs it for the watermark the backup's coordinator picked.
-pub(crate) async fn cut_at(state: &SharedState, watermark: u64) -> Result<(), Error> {
+pub async fn cut_at(state: &SharedState, watermark: u64) -> Result<(), Error> {
     cut_at_point(state, watermark, 0).await
 }
 

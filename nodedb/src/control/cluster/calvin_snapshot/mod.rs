@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod capture;
+pub mod cut_barriers;
 pub mod install;
 pub mod requirement;
 

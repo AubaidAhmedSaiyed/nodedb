@@ -168,6 +168,10 @@ pub struct SharedState {
     /// Never call it while holding a `cluster_routing` guard.
     pub raft_status_fn:
         std::sync::OnceLock<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,
+    /// Set once boot recovery saw every mounted data group apply its
+    /// committed log here. From then on the routing table names every group
+    /// this node replicates.
+    pub data_groups_replayed: std::sync::atomic::AtomicBool,
     /// Cluster observability handle. Set once by `start_raft`.
     pub cluster_observer: OnceLock<Arc<nodedb_cluster::ClusterObserver>>,
     /// Registry of standardized per-loop metrics. Populated by `start_raft`.

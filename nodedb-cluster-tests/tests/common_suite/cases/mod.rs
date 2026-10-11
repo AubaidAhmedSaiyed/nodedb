@@ -12,6 +12,7 @@ mod assign_surrogate_cross_node;
 mod backup_schedule_failover;
 mod bitemporal_array_cluster;
 mod calvin_backup_cut_order;
+mod calvin_backup_cut_snapshot_install;
 mod calvin_cdc_net_kinds;
 mod calvin_cluster_array_read_set;
 mod calvin_cluster_pgwire_e2e;

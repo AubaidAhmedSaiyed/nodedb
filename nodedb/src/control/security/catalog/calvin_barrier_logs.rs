@@ -9,12 +9,18 @@
 //! applied floor, so an entry at or below it is never delivered again. Its
 //! row is what a barrier of the txn reads after a restart.
 //!
+//! A fold commits without persisting: the row is visible at once, and a
+//! crash rolls it back. [`SystemCatalog::persist_calvin_barrier_logs`]
+//! persists every such fold in one commit. The apply loop runs it before it
+//! saves a floor, so the floor never covers an entry whose row a crash loses.
+//!
 //! Each row holds the encoded barrier log of one txn on one vShard. This
 //! module stores the bytes and never decodes them.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::Ordering;
 
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::types::{SystemCatalog, catalog_err};
 
@@ -59,6 +65,9 @@ impl SystemCatalog {
     /// Replace the row of `(vshard_id, epoch, position)` with what `fold`
     /// returns for the row it holds, in one transaction. A fold that
     /// returns `None` keeps the row, and nothing commits.
+    ///
+    /// The commit is visible at once and persists with the next
+    /// [`Self::persist_calvin_barrier_logs`] or any durable commit.
     pub fn fold_calvin_barrier_log(
         &self,
         vshard_id: u32,
@@ -66,10 +75,13 @@ impl SystemCatalog {
         position: u32,
         fold: impl FnOnce(Option<&[u8]>) -> crate::Result<Option<Vec<u8>>>,
     ) -> crate::Result<()> {
-        let write_txn = self
+        let mut write_txn = self
             .db
             .begin_write()
             .map_err(|e| catalog_err("fold_calvin_barrier_log txn", e))?;
+        write_txn
+            .set_durability(Durability::None)
+            .map_err(|e| catalog_err("fold_calvin_barrier_log durability", e))?;
         {
             let mut table = write_txn
                 .open_table(CALVIN_BARRIER_LOGS)
@@ -90,7 +102,50 @@ impl SystemCatalog {
         }
         write_txn
             .commit()
-            .map_err(|e| catalog_err("commit calvin_barrier_logs", e))
+            .map_err(|e| catalog_err("commit calvin_barrier_logs", e))?;
+        // Set after the commit: a persist that clears the flag first
+        // persists this commit too.
+        self.calvin_barrier_logs_pending
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Persist every barrier log fold committed since the last persist, in
+    /// one durable commit. With no such fold, nothing commits.
+    ///
+    /// On an error the folds stay pending, so the next persist retries.
+    pub fn persist_calvin_barrier_logs(&self) -> crate::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_calvin_barrier_persist
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(crate::Error::Storage {
+                engine: "catalog".into(),
+                detail: "injected calvin_barrier_logs persist failure".into(),
+            });
+        }
+        if !self
+            .calvin_barrier_logs_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let persisted = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("persist_calvin_barrier_logs txn", e))
+            .and_then(|mut txn| {
+                txn.set_durability(Durability::Immediate)
+                    .map_err(|e| catalog_err("persist_calvin_barrier_logs durability", e))?;
+                txn.commit()
+                    .map_err(|e| catalog_err("persist_calvin_barrier_logs commit", e))
+            });
+        if persisted.is_err() {
+            self.calvin_barrier_logs_pending
+                .store(true, Ordering::Release);
+        }
+        persisted
     }
 
     /// The row of `(vshard_id, epoch, position)`, when one is stored.
@@ -200,6 +255,16 @@ impl SystemCatalog {
                     .map_err(|e| catalog_err("insert calvin_barrier_logs", e))?;
             }
         }
+        #[cfg(test)]
+        if self
+            .fail_next_calvin_barrier_replace
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(crate::Error::Storage {
+                engine: "catalog".into(),
+                detail: "injected calvin_barrier_logs replace failure".into(),
+            });
+        }
         write_txn
             .commit()
             .map_err(|e| catalog_err("commit calvin_barrier_logs", e))
@@ -278,6 +343,72 @@ mod tests {
             .load_calvin_barrier_logs(Some(&BTreeSet::from([4])))
             .expect("load");
         assert_eq!(only, vec![row(4, 2, 0, b"y")]);
+    }
+
+    /// The rows a crash at this instant leaves: the file as it stands,
+    /// opened from a copy while the live catalog keeps its own open.
+    fn rows_after_crash(path: &std::path::Path, copy: &std::path::Path) -> Vec<(u32, u64, u32)> {
+        std::fs::copy(path, copy).expect("copy the catalog file");
+        let db = redb::Database::create(copy).expect("open the copy");
+        let txn = db.begin_read().expect("read txn");
+        let Ok(table) = txn.open_table(CALVIN_BARRIER_LOGS) else {
+            return Vec::new();
+        };
+        table
+            .iter()
+            .expect("iter")
+            .map(|row| row.expect("row").0.value())
+            .collect()
+    }
+
+    /// A fold is visible at once, and a crash rolls it back. The persist
+    /// after it makes every fold durable, and a second persist commits
+    /// nothing.
+    #[test]
+    fn a_fold_persists_only_with_the_persist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("system.redb");
+        let catalog = SystemCatalog::open(&path).expect("catalog");
+        put(&catalog, &row(3, 7, 1, b"a"));
+        put(&catalog, &row(4, 2, 0, b"b"));
+        assert_eq!(
+            catalog.load_calvin_barrier_log(3, 7, 1).expect("load"),
+            Some(b"a".to_vec()),
+            "a fold is visible to reads"
+        );
+        assert!(
+            rows_after_crash(&path, &dir.path().join("crash-1.redb")).is_empty(),
+            "a crash rolls the folds back"
+        );
+
+        catalog.persist_calvin_barrier_logs().expect("persist");
+        assert_eq!(
+            rows_after_crash(&path, &dir.path().join("crash-2.redb")),
+            vec![(3, 7, 1), (4, 2, 0)]
+        );
+        assert!(
+            !catalog.calvin_barrier_logs_pending.load(Ordering::Acquire),
+            "nothing waits to persist"
+        );
+        catalog.persist_calvin_barrier_logs().expect("persist");
+    }
+
+    /// A failed persist keeps the folds pending, and the next persist
+    /// makes them durable.
+    #[test]
+    fn a_failed_persist_keeps_the_folds_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("system.redb");
+        let catalog = SystemCatalog::open(&path).expect("catalog");
+        put(&catalog, &row(3, 7, 1, b"a"));
+        catalog.fail_next_calvin_barrier_persist_for_test();
+        assert!(catalog.persist_calvin_barrier_logs().is_err());
+        assert!(rows_after_crash(&path, &dir.path().join("crash-1.redb")).is_empty());
+        catalog.persist_calvin_barrier_logs().expect("persist");
+        assert_eq!(
+            rows_after_crash(&path, &dir.path().join("crash-2.redb")),
+            vec![(3, 7, 1)]
+        );
     }
 
     /// A replace drops every row of the named vShards and keeps the rest.

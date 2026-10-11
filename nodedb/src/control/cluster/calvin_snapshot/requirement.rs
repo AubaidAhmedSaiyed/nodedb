@@ -188,9 +188,11 @@ pub fn rebased(shared: &SharedState, served: &[u32]) -> Vec<u32> {
 /// Forget the Calvin state of `vshards`: this node left their groups. A
 /// later return catches up from nothing, so neither their bases nor their
 /// applied positions can survive.
-pub fn forget_left(shared: &SharedState, vshards: &[u32]) {
+///
+/// On an error the stored state stays, and the caller retries the forget.
+pub fn forget_left(shared: &SharedState, vshards: &[u32]) -> crate::Result<()> {
     if vshards.is_empty() {
-        return;
+        return Ok(());
     }
     let catalog = shared.credentials.catalog();
     let resets: Vec<crate::control::security::catalog::calvin_applied::StoredCalvinApplied> =
@@ -211,13 +213,15 @@ pub fn forget_left(shared: &SharedState, vshards: &[u32]) {
     let forgotten = catalog
         .replace_calvin_applied(&resets)
         .and_then(|()| shared.calvin.bases.forget(catalog, vshards));
-    if let Err(error) = forgotten {
+    if let Err(error) = &forgotten {
         tracing::error!(
             ?vshards,
             %error,
             "calvin: the left vShards' Calvin state was not forgotten"
         );
+        crate::diag::calvin_left_state_not_forgotten(vshards, error);
     }
+    forgotten
 }
 
 /// Keep the sequencer log range only for vShards of the data groups this

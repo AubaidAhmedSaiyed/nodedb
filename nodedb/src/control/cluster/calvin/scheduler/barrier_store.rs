@@ -7,7 +7,11 @@
 //! durable applied floor of a group asserts that every entry at or below it
 //! is durable, and boot resumes Raft delivery above it. So an entry below
 //! the floor is never delivered again, and its row is what a barrier of the
-//! txn reads after a restart:
+//! txn reads after a restart.
+//!
+//! A saved event is visible at once and durable before the floor that
+//! covers it: [`save_event`] commits without persisting, and the apply
+//! loop's settle pass runs [`persist_pending`] before it saves any floor.
 //!
 //! - [`restore_at_boot`] marks the txn of every stored row stored in its
 //!   vShard's buffer, and removes the rows of finished txns;
@@ -30,6 +34,9 @@ use crate::types::CutBarrierLog;
 /// Fold `event` into the stored row of `txn` on `vshard_id`. An event the
 /// row's log does not take, a copy it holds or one after its timeout,
 /// writes nothing.
+///
+/// The row is visible at once. It is durable after the next
+/// [`persist_pending`].
 pub fn save_event(
     catalog: &SystemCatalog,
     vshard_id: u32,
@@ -47,6 +54,12 @@ pub fn save_event(
         log.note(event.clone());
         log.to_bytes().map(Some)
     })
+}
+
+/// Persist every row [`save_event`] wrote since the last persist, in one
+/// durable commit. On an error the rows stay pending for the next call.
+pub fn persist_pending(catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.persist_calvin_barrier_logs()
 }
 
 /// The stored log of `txn` on `vshard_id`. A txn with no row has an empty
@@ -98,7 +111,10 @@ fn is_applied(shared: &SharedState, vshard_id: u32, epoch: u64, position: u32) -
 /// remove the rows of finished txns. Boot runs this once the applied
 /// ledgers are filled, before the data-group apply loop and the schedulers
 /// start.
-pub fn restore_at_boot(shared: &SharedState) -> crate::Result<()> {
+///
+/// Returns the vShards that still hold rows. The first scheduler reconcile
+/// purges those this node no longer hosts.
+pub fn restore_at_boot(shared: &SharedState) -> crate::Result<BTreeSet<u32>> {
     let catalog = shared.credentials.catalog();
     let mut finished = Vec::new();
     let mut waiting: BTreeMap<u32, Vec<TxnId>> = BTreeMap::new();
@@ -113,6 +129,7 @@ pub fn restore_at_boot(shared: &SharedState) -> crate::Result<()> {
         }
     }
     catalog.remove_calvin_barrier_logs(&finished)?;
+    let holding: BTreeSet<u32> = waiting.keys().copied().collect();
     for (vshard_id, txns) in waiting {
         shared
             .calvin
@@ -120,7 +137,7 @@ pub fn restore_at_boot(shared: &SharedState) -> crate::Result<()> {
             .vshard(vshard_id)
             .mark_stored(txns);
     }
-    Ok(())
+    Ok(holding)
 }
 
 /// The stored rows of the unfinished txns of `vshards`, for a snapshot of
@@ -280,7 +297,11 @@ mod tests {
             .applied
             .install(VSHARD, NOT_YET_APPLIED_EPOCH, BTreeSet::from([(6, 0)]));
 
-        restore_at_boot(&state).expect("restore");
+        assert_eq!(
+            restore_at_boot(&state).expect("restore"),
+            BTreeSet::from([VSHARD]),
+            "boot names the vShards that still hold rows"
+        );
 
         let buffer = state.calvin.read_results.vshard(VSHARD);
         assert_eq!(buffer.waiting_txns(), 1);

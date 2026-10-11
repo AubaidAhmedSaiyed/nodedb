@@ -336,6 +336,12 @@ impl TestClusterNode {
             .unwrap_or_else(|p| p.into_inner())
             .take();
 
+        // The data-group recovery production boot runs, in the background:
+        // the harness starts nodes one at a time, and a group elects only
+        // once its peers run. It sets `data_groups_replayed`, which gates
+        // the forget of a departed vShard's Calvin state.
+        nodedb::bootstrap::data_group_recovery::spawn_data_group_recovery(&shared);
+
         // CRDT constraint reconcile loop (leader-gated). The production server
         // spawns this from `spawn_background_loops`, which the harness does not
         // call; wire it directly so cluster tests exercise constraint delivery

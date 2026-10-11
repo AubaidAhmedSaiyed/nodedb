@@ -133,6 +133,11 @@ impl CalvinBases {
         reaches
     }
 
+    /// Every vShard that holds a base here.
+    pub fn vshards(&self) -> BTreeSet<u32> {
+        self.state().bases.keys().copied().collect()
+    }
+
     /// Stop waiting for every vShard not in `mounted`, the vShards of the
     /// data groups this node mounts: an unmounted group starts no scheduler.
     pub fn retain_waiting(&self, mounted: &BTreeSet<u32>) {

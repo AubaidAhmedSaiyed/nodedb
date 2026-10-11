@@ -37,6 +37,56 @@ pub struct GroupCalvinCut {
     /// group vShard. It holds every barrier entry of the group's log at or
     /// below the snapshot's index, which the receiver never applies.
     pub barrier_logs: Vec<CutBarrierLog>,
+    /// Every backup cut barrier the builder applied in the group at or below
+    /// the snapshot's index whose cut window is open, in cut key order. The
+    /// receiver never applies them, and a cut waiting there needs them.
+    pub cut_barriers: Vec<CoveredCutBarrier>,
+    /// The group's durable cut floors at or below the snapshot's index, in
+    /// index order. Every later entry records a commit HLC above them.
+    pub cut_floors: Vec<CutFloor>,
+}
+
+/// A backup cut's barrier a [`GroupCalvinCut`] covers.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(map)]
+pub struct CoveredCutBarrier {
+    /// The cut's watermark: HLC wall time in nanoseconds.
+    pub hlc: u64,
+    /// The cluster restore point the cut takes, `0` for a backup's cut.
+    pub restore_point: u64,
+    /// A database backup's capture request.
+    pub capture: Option<nodedb_physical::physical_plan::CutCaptureRequest>,
+    /// The log index of the cut's first barrier in the group.
+    pub log_index: u64,
+}
+
+/// One durable cut floor of a group in a [`GroupCalvinCut`].
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(map)]
+pub struct CutFloor {
+    /// The barrier's log index.
+    pub index: u64,
+    /// The barrier's watermark: HLC wall time in nanoseconds.
+    pub watermark: u64,
 }
 
 /// One vShard's applied Calvin positions in a [`GroupCalvinCut`].

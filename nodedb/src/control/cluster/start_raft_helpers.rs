@@ -11,6 +11,7 @@ use crate::control::cluster::calvin::{
 };
 use crate::control::cluster::calvin_snapshot;
 use crate::control::cluster::handle::ClusterHandle;
+use crate::control::cluster::left_vshard_forget;
 use crate::control::state::SharedState;
 
 /// The vShards whose scheduler this node started and has not stopped.
@@ -41,8 +42,11 @@ fn hosted_vshards(routing: &RwLock<nodedb_cluster::RoutingTable>, node_id: u64) 
 /// from. Dropping the vShard's sequencer sender closes the scheduler's
 /// intake, and the scheduler exits. Its other channels and its lock table go
 /// too. It hands the barrier events of the txns it did not finish back to
-/// the vShard's read-result buffer. The next reconcile that finds the vShard hosted spawns a new
-/// scheduler from the vShard's base.
+/// the vShard's read-result buffer. The next reconcile that finds the vShard
+/// hosted spawns a new scheduler from the vShard's base.
+///
+/// A vShard that left has its stored Calvin state forgotten (see
+/// [`left_vshard_forget`]).
 fn retire_vshard_schedulers(
     hosted: &[u32],
     shared: &Arc<SharedState>,
@@ -67,24 +71,10 @@ fn retire_vshard_schedulers(
         }
         (left, rebased)
     };
-    calvin_snapshot::forget_left(shared, &left);
-    // A vShard that left this node keeps no barrier events here, in memory
-    // or stored. A rebased vShard keeps them for the scheduler that starts
-    // again.
-    for &vshard in &left {
-        if let Err(e) =
-            crate::control::cluster::calvin::scheduler::barrier_store::forget_vshard(shared, vshard)
-        {
-            // The rows stay. Boot marks them stored for a vShard with no
-            // scheduler, and a snapshot install of the vShard replaces them.
-            tracing::warn!(
-                vshard_id = vshard,
-                error = %e,
-                "calvin: the barrier rows of a vShard that left were not removed"
-            );
-            crate::diag::calvin_barrier_log_store_failed(vshard, None, "remove", &e);
-        }
-    }
+    // A vShard that left this node keeps no Calvin state here, in memory or
+    // stored. A rebased vShard keeps its barrier events for the scheduler
+    // that starts again.
+    left_vshard_forget::forget_left_vshards(shared, &left);
     for &vshard in &rebased {
         tracing::info!(
             vshard_id = vshard,
@@ -164,6 +154,11 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
     } = params;
 
     let hosted = hosted_vshards(routing, node_id);
+    // Forgets that failed on an earlier pass, or wait since boot, go first.
+    left_vshard_forget::retry_pending_forgets(
+        shared,
+        &left_vshard_forget::replicated_vshards(routing, node_id),
+    );
     retire_vshard_schedulers(
         &hosted,
         shared,

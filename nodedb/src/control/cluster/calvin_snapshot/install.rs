@@ -13,6 +13,8 @@
 //!
 //! The stored dependent-read barrier logs of the group's vShards become the
 //! cut's too: the snapshot covers barrier entries this node never applies.
+//! So do the group's backup cut barriers and cut floors (see
+//! [`super::cut_barriers`]).
 //!
 //! A WAL `SnapshotInstalled` record of the group, written before this runs,
 //! makes boot recovery drop the vShards' applied markers from before it.
@@ -20,6 +22,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::control::cluster::calvin::scheduler::barrier_store;
+use crate::control::cluster::calvin_snapshot::cut_barriers::install_cut_barriers;
 use crate::control::cluster::snapshot_install::SnapshotInstallError;
 use crate::control::security::catalog::calvin_applied::StoredCalvinApplied;
 use crate::control::state::SharedState;
@@ -80,5 +83,12 @@ pub fn install_calvin_cut(
         .calvin
         .bases
         .record_snapshot(catalog, &ids, cut.through)
-        .map_err(settle_error)
+        .map_err(settle_error)?;
+    install_cut_barriers(shared, group_id, &cut.cut_barriers, &cut.cut_floors).map_err(|source| {
+        SnapshotInstallError::Settle {
+            group_id,
+            step: crate::control::cluster::snapshot_install::SettleStep::CutBarriers,
+            source,
+        }
+    })
 }

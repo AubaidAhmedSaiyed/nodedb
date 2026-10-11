@@ -5,8 +5,9 @@
 //! floors, which raise the commit HLC of every entry after a cut barrier.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-use crate::control::pitr::restore_point::RecordedCut;
+use crate::control::pitr::restore_point::RecordedCuts;
 
 /// Per-group apply state.
 #[derive(Debug, Default)]
@@ -15,23 +16,29 @@ pub(super) struct GroupWatch {
     /// Per group, barrier log index to the lowest commit HLC an entry after
     /// that barrier records: one above the barrier's watermark.
     cut_floors: HashMap<u64, BTreeMap<u64, u64>>,
+    /// The cut barriers this loop never applied: those of an earlier node
+    /// life, and those a snapshot install carried.
+    recorded: Arc<RecordedCuts>,
+    /// The generation of `recorded` merged into `cut_floors`.
+    merged: u64,
 }
 
 impl GroupWatch {
-    /// A watch that knows the restore point cuts this node applied before a
-    /// restart: the entries it applies again after one of them record above
-    /// it, as they did the first time.
-    pub(super) fn with_cuts(cuts: &[RecordedCut]) -> Self {
-        let mut watch = Self::default();
-        for cut in cuts {
-            watch.raise_cut(cut.group_id, cut.barrier_index, cut.hlc);
-        }
+    /// A watch that knows the cuts of `recorded`: the entries it applies
+    /// after one of them record above it, as on every other replica.
+    pub(super) fn with_cuts(recorded: Arc<RecordedCuts>) -> Self {
+        let mut watch = Self {
+            recorded,
+            ..Self::default()
+        };
+        watch.merge_recorded();
         watch
     }
 
     /// Note that the apply loop applies `(group_id, log_index)`. Reports an
     /// index at or below one it already applied as a second apply.
     pub(super) fn note_apply(&mut self, group_id: u64, log_index: u64) {
+        self.merge_recorded();
         let highest = self.highest_applied.entry(group_id).or_insert(0);
         if log_index <= *highest {
             crate::diag::raft_entry_reapplied(group_id, log_index, *highest);
@@ -69,7 +76,28 @@ impl GroupWatch {
             .cut_floors
             .get(&group_id)
             .and_then(|floors| floors.range(..log_index).map(|(_, floor)| *floor).max());
-        floor.map_or(write_hlc, |floor| write_hlc.max(floor))
+        // A cut recorded since the last merge binds this entry too.
+        let unmerged = (self.recorded.generation() != self.merged)
+            .then(|| self.recorded.watermark_below(group_id, log_index))
+            .flatten()
+            .map(|watermark| watermark.saturating_add(1));
+        floor
+            .into_iter()
+            .chain(unmerged)
+            .max()
+            .map_or(write_hlc, |floor| write_hlc.max(floor))
+    }
+
+    /// Merge the cuts `recorded` holds once its generation moved.
+    fn merge_recorded(&mut self) {
+        let generation = self.recorded.generation();
+        if generation == self.merged {
+            return;
+        }
+        for cut in self.recorded.all() {
+            self.raise_cut(cut.group_id, cut.barrier_index, cut.hlc);
+        }
+        self.merged = generation;
     }
 
     /// Fold every barrier below `log_index` into the highest of them: entries
@@ -96,6 +124,7 @@ impl GroupWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::pitr::restore_point::RecordedCut;
 
     #[test]
     fn an_entry_after_a_cut_records_above_the_cut() {
@@ -117,6 +146,42 @@ mod tests {
         );
     }
 
+    fn watch_of(cuts: &[RecordedCut]) -> GroupWatch {
+        let recorded = RecordedCuts::new();
+        recorded.record(cuts);
+        GroupWatch::with_cuts(Arc::new(recorded))
+    }
+
+    /// A snapshot install carries a barrier the follower never applied. The
+    /// follower's next entries record above it, as the leader's do.
+    #[test]
+    fn an_installed_floor_binds_like_an_applied_one() {
+        let mut leader = GroupWatch::default();
+        leader.note_apply(1, 10);
+        leader.raise_cut(1, 10, 100);
+
+        let recorded = Arc::new(RecordedCuts::new());
+        let mut follower = GroupWatch::with_cuts(Arc::clone(&recorded));
+        assert_eq!(follower.commit_hlc(1, 11, 50), 50, "nothing installed yet");
+        recorded.replace_group(
+            1,
+            &[RecordedCut {
+                group_id: 1,
+                barrier_index: 10,
+                hlc: 100,
+            }],
+        );
+        // Read before the entry's apply notes it, as the pipeline stamps it.
+        assert_eq!(follower.commit_hlc(1, 11, 50), leader.commit_hlc(1, 11, 50));
+        follower.note_apply(1, 11);
+        leader.note_apply(1, 11);
+        assert_eq!(follower.commit_hlc(1, 11, 50), 101);
+        assert_eq!(
+            follower.commit_hlc(1, 12, 300),
+            leader.commit_hlc(1, 12, 300)
+        );
+    }
+
     #[test]
     fn an_entry_applied_again_after_a_restart_records_as_before() {
         let cuts = [
@@ -131,7 +196,7 @@ mod tests {
                 hlc: 200,
             },
         ];
-        let mut watch = GroupWatch::with_cuts(&cuts);
+        let mut watch = watch_of(&cuts);
         // Delivery resumes between the two barriers.
         watch.note_apply(1, 15);
         assert_eq!(watch.commit_hlc(1, 15, 50), 101);
@@ -205,7 +270,7 @@ mod tests {
 
         // The restart reads the floors back from the catalog.
         let catalog = SystemCatalog::open(&catalog_path).unwrap();
-        let mut watch = GroupWatch::with_cuts(&load_recorded_cuts(&catalog).unwrap());
+        let mut watch = watch_of(&load_recorded_cuts(&catalog).unwrap());
         watch.note_apply(1, 11);
         assert_eq!(watch.commit_hlc(1, 11, 50), 101);
     }

@@ -213,6 +213,7 @@ fn gate_view(
 
 /// Hold startup until every locally hosted data group has replayed its retained
 /// Raft log on this node. A group awaiting a snapshot install does not hold it.
+/// On success it sets `SharedState::data_groups_replayed`.
 ///
 /// Refuses when `start_raft` installed no Raft status source.
 pub async fn await_data_group_recovery(shared: &Arc<SharedState>) -> anyhow::Result<()> {
@@ -235,6 +236,9 @@ pub async fn await_data_group_recovery(shared: &Arc<SharedState>) -> anyhow::Res
                 );
             }
             info!("all local data raft groups replayed — opening client gateway");
+            shared
+                .data_groups_replayed
+                .store(true, std::sync::atomic::Ordering::Release);
             return Ok(());
         }
 
@@ -256,6 +260,32 @@ pub async fn await_data_group_recovery(shared: &Arc<SharedState>) -> anyhow::Res
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Run [`await_data_group_recovery`] in a loop on `shared`'s shutdown
+/// watch until it succeeds, without holding the caller. A host that brings
+/// nodes up one at a time uses it: a group here elects only once its peers
+/// run. Each failed attempt is logged, and the next one starts at once.
+pub fn spawn_data_group_recovery(shared: &Arc<SharedState>) {
+    let task_shared = Arc::clone(shared);
+    crate::control::shutdown::spawn_loop(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "data_group_recovery",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
+        move |mut shutdown| async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait_cancelled() => break,
+                    recovered = await_data_group_recovery(&task_shared) => match recovered {
+                        Ok(()) => break,
+                        Err(error) => warn!(%error, "data raft group recovery did not finish; retrying"),
+                    },
+                }
+            }
+        },
+    );
 }
 
 #[cfg(test)]

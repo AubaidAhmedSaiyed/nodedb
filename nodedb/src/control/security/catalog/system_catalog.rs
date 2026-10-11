@@ -24,6 +24,13 @@ pub struct SystemCatalog {
     /// Committed DEFINE EVENT definitions, for readers that must not read
     /// redb.
     pub(super) event_defs: Arc<super::event_defs_index::EventDefsIndex>,
+    /// Whether a barrier log row committed without persisting since the
+    /// last `persist_calvin_barrier_logs`.
+    pub(super) calvin_barrier_logs_pending: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(super) fail_next_calvin_barrier_persist: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(super) fail_next_calvin_barrier_replace: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(super) fail_next_user_counter_write: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -61,6 +68,11 @@ impl SystemCatalog {
             db: Arc::new(db),
             crdt_signing_root: Arc::new(std::sync::RwLock::new(None)),
             event_defs: Arc::new(super::event_defs_index::EventDefsIndex::new()),
+            calvin_barrier_logs_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_calvin_barrier_persist: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_calvin_barrier_replace: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -89,6 +101,11 @@ impl SystemCatalog {
             db: Arc::new(db),
             crdt_signing_root: Arc::new(std::sync::RwLock::new(None)),
             event_defs: Arc::new(super::event_defs_index::EventDefsIndex::new()),
+            calvin_barrier_logs_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_calvin_barrier_persist: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_calvin_barrier_replace: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -137,6 +154,21 @@ impl SystemCatalog {
     #[cfg(test)]
     pub(crate) fn fail_next_redo_snapshot_owed_write_for_test(&self) {
         self.fail_next_redo_snapshot_owed_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make the next `persist_calvin_barrier_logs` raise. The pending rows
+    /// stay pending.
+    #[cfg(test)]
+    pub(crate) fn fail_next_calvin_barrier_persist_for_test(&self) {
+        self.fail_next_calvin_barrier_persist
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make the next `replace_calvin_barrier_logs` raise before it commits.
+    #[cfg(test)]
+    pub(crate) fn fail_next_calvin_barrier_replace_for_test(&self) {
+        self.fail_next_calvin_barrier_replace
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 

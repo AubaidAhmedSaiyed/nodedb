@@ -55,7 +55,8 @@ pub use quota::{
     quota_scope_replay_aborted, scope_quota_not_installed,
 };
 pub use raft_apply::{
-    calvin_barrier_log_store_failed, raft_entries_reapplied, raft_entry_reapplied,
+    calvin_barrier_log_store_failed, calvin_left_state_not_forgotten, raft_entries_reapplied,
+    raft_entry_reapplied,
 };
 pub use recovery::{
     batch_insert_without_surrogates, fts_index_update_failed, orphaned_index_entry_after_delete,
