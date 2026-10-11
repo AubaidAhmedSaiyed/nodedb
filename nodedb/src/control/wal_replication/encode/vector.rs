@@ -8,6 +8,8 @@ use nodedb_physical::physical_plan::{
 };
 use nodedb_types::Surrogate;
 
+use crate::control::server::wal_dispatch::{check_logged_patch, logged_rows};
+
 /// Encode a `VectorOp` write variant into its `ReplicatedWrite` wire shape.
 ///
 /// Returns `None` for the read / DDL-Alter variants (`Search`,
@@ -15,8 +17,11 @@ use nodedb_types::Surrogate;
 /// `SparseSearch`, `MultiVectorScoreSearch`) — none of those are replicated.
 /// Exhaustive over `VectorOp` (not a catch-all): a new variant forces an
 /// explicit decision here instead of silently falling through.
-pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
-    Some(match op {
+///
+/// A direct write names its rows and values. A row predicate or a patch
+/// expression is refused: `write_resolve` resolves it first.
+pub(super) fn encode(op: &VectorOp) -> crate::Result<Option<ReplicatedWrite>> {
+    Ok(Some(match op {
         VectorOp::Insert {
             collection,
             vector,
@@ -158,7 +163,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             on_conflict_updates,
             returning,
             rls_filters,
-        }),
+        })?,
         VectorOp::DirectInsert {
             collection,
             field,
@@ -185,7 +190,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             on_conflict_updates: &[],
             returning,
             rls_filters,
-        }),
+        })?,
         VectorOp::DirectInsertIfAbsent {
             collection,
             field,
@@ -212,7 +217,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             on_conflict_updates: &[],
             returning,
             rls_filters,
-        }),
+        })?,
         VectorOp::DirectDelete {
             collection,
             field,
@@ -223,7 +228,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
         } => ReplicatedWrite::VectorDirectDelete {
             collection: collection.as_str().to_owned(),
             field: field.to_owned(),
-            targets: targets.clone(),
+            rows: logged_rows(collection.as_str(), targets)?.to_vec(),
             returning: super::entry::encode_returning(returning),
             rls_filters: rls_filters.clone(),
         },
@@ -248,18 +253,21 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             returning,
             rls_filters,
             rls_write_check: _,
-        } => ReplicatedWrite::VectorDirectUpdate {
-            collection: collection.as_str().to_owned(),
-            field: field.to_owned(),
-            targets: targets.clone(),
-            new_vector: new_vector.clone(),
-            payload_patch: payload_patch.clone(),
-            quantization: *quantization,
-            storage_dtype: *storage_dtype,
-            payload_indexes: payload_indexes.clone(),
-            returning: super::entry::encode_returning(returning),
-            rls_filters: rls_filters.clone(),
-        },
+        } => {
+            check_logged_patch(collection.as_str(), payload_patch)?;
+            ReplicatedWrite::VectorDirectUpdate {
+                collection: collection.as_str().to_owned(),
+                field: field.to_owned(),
+                rows: logged_rows(collection.as_str(), targets)?.to_vec(),
+                new_vector: new_vector.clone(),
+                payload_patch: payload_patch.clone(),
+                quantization: *quantization,
+                storage_dtype: *storage_dtype,
+                payload_indexes: payload_indexes.clone(),
+                returning: super::entry::encode_returning(returning),
+                rls_filters: rls_filters.clone(),
+            }
+        }
         VectorOp::DropIndex {
             collection,
             field_name,
@@ -296,8 +304,8 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
         | VectorOp::CompactIndex { .. }
         | VectorOp::Rebuild { .. }
         | VectorOp::SparseSearch { .. }
-        | VectorOp::MultiVectorScoreSearch { .. } => return None,
-    })
+        | VectorOp::MultiVectorScoreSearch { .. } => return Ok(None),
+    }))
 }
 
 /// Fields shared by the three insert-family ops, bundled so [`direct_write`]
@@ -318,8 +326,9 @@ struct DirectWriteFields<'a> {
     rls_filters: &'a [u8],
 }
 
-fn direct_write(f: DirectWriteFields<'_>) -> ReplicatedWrite {
-    ReplicatedWrite::DirectUpsert {
+fn direct_write(f: DirectWriteFields<'_>) -> crate::Result<ReplicatedWrite> {
+    check_logged_patch(f.collection, f.on_conflict_updates)?;
+    Ok(ReplicatedWrite::DirectUpsert {
         collection: f.collection.to_owned(),
         field: f.field.to_owned(),
         surrogate: f.surrogate.as_u32(),
@@ -333,7 +342,7 @@ fn direct_write(f: DirectWriteFields<'_>) -> ReplicatedWrite {
         on_conflict_updates: f.on_conflict_updates.to_vec(),
         returning: super::entry::encode_returning(f.returning),
         rls_filters: f.rls_filters.to_vec(),
-    }
+    })
 }
 
 pub(super) fn insert(
@@ -558,6 +567,41 @@ mod tests {
         assert_eq!(mutations.len(), 1);
         assert_eq!(response_payload, vec![0x81]);
         assert!(!rls_write_check.has_predicate());
+    }
+
+    /// A row predicate never reaches the wire, even with no write policy:
+    /// replay would evaluate it again. A delete naming rows replicates them.
+    #[test]
+    fn an_ungoverned_predicate_delete_is_refused_and_named_rows_replicate() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let by_predicate = predicate_delete(nodedb_types::RlsWriteCheck::NoPolicyApplies);
+        assert!(to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &by_predicate).is_err());
+
+        let by_rows = PhysicalPlan::Vector(VectorOp::DirectDelete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            field: "emb".into(),
+            targets: nodedb_physical::physical_plan::VectorWriteTargets::Surrogates(vec![
+                Surrogate::new(4),
+            ]),
+            returning: None,
+            rls_filters: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &by_rows)
+            .expect("encode must not error")
+            .expect("a delete naming rows must replicate");
+        let (_, _, decoded, _) =
+            crate::control::wal_replication::decode_replicated_entry(&entry.to_bytes())
+                .expect("decode")
+                .expect("a replicated entry");
+        let PhysicalPlan::Vector(VectorOp::DirectDelete { targets, .. }) = decoded else {
+            panic!("decoded to the wrong shape");
+        };
+        assert_eq!(
+            targets,
+            nodedb_physical::physical_plan::VectorWriteTargets::Surrogates(vec![Surrogate::new(4)])
+        );
     }
 
     /// A vector-primary truncate replicates with its `restart_identity`

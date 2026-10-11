@@ -5,8 +5,11 @@
 
 pub mod append;
 pub mod encode;
+pub mod logged;
 
 pub(crate) use append::wal_append_vector_op;
+#[cfg(test)]
+pub(crate) use encode::encode_vector_direct_delete_payload;
 pub(crate) use encode::{
     VectorDirectDeleteRecord, VectorDirectTruncateRecord, VectorDirectUpdateRecord,
     VectorDirectUpsertRecord, encode_multi_vector_delete_payload, encode_multi_vector_put_payload,
@@ -18,3 +21,4 @@ pub(crate) use encode::{
     VectorResolvedDirectWritePayload, VectorResolvedDirectWriteRecord,
     encode_vector_resolved_direct_write_payload,
 };
+pub(crate) use logged::{check_logged_patch, logged_rows};

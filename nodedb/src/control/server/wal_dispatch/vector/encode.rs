@@ -152,6 +152,7 @@ pub(crate) fn encode_vector_direct_upsert_payload(
         intent,
         on_conflict_updates,
     } = args;
+    super::logged::check_logged_patch(collection, on_conflict_updates)?;
     zerompk::to_msgpack_vec(&(
         collection,
         field,
@@ -173,28 +174,22 @@ pub(crate) fn encode_vector_direct_upsert_payload(
 
 /// Encode the payload of a `VectorDirectDelete` WAL record.
 ///
-/// Produces the 3-element shape `(collection, field, targets)`. Replay
-/// resolves `targets` against the state it rebuilt; a surrogate with no node
-/// is skipped, so re-applying over a restored checkpoint is idempotent.
+/// Produces the 3-element shape `(collection, field, rows)`: the rows the
+/// delete removed, never a predicate. Replay removes each row whose node it
+/// rebuilt, so re-applying over a restored checkpoint is idempotent.
 pub(crate) fn encode_vector_direct_delete_payload(
     collection: &str,
     field: &str,
-    targets: &nodedb_physical::physical_plan::VectorWriteTargets,
+    rows: &[nodedb_types::Surrogate],
 ) -> crate::Result<Vec<u8>> {
-    zerompk::to_msgpack_vec(&(collection, field, targets)).map_err(|e| {
-        crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("wal vector direct delete: {e}"),
-        }
+    zerompk::to_msgpack_vec(&(collection, field, rows)).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal vector direct delete: {e}"),
     })
 }
 
 /// The decoded form of a `VectorDirectDelete` record.
-pub(crate) type VectorDirectDeleteRecord = (
-    String,
-    String,
-    nodedb_physical::physical_plan::VectorWriteTargets,
-);
+pub(crate) type VectorDirectDeleteRecord = (String, String, Vec<nodedb_types::Surrogate>);
 
 /// Encode a `VectorDirectTruncate` record: `(collection, field)`. The
 /// `restart_identity` flag is a Control-Plane sequence concern and never
@@ -216,7 +211,8 @@ pub(crate) type VectorDirectTruncateRecord = (String, String);
 pub(crate) struct VectorDirectUpdatePayload<'a> {
     pub collection: &'a str,
     pub field: &'a str,
-    pub targets: &'a nodedb_physical::physical_plan::VectorWriteTargets,
+    /// The rows the update rewrote, never a predicate.
+    pub rows: &'a [nodedb_types::Surrogate],
     pub new_vector: Option<&'a [f32]>,
     pub payload_patch: &'a [(String, nodedb_physical::physical_plan::UpdateValue)],
     pub quantization: nodedb_types::VectorQuantization,
@@ -229,7 +225,7 @@ pub(crate) struct VectorDirectUpdatePayload<'a> {
 pub(crate) type VectorDirectUpdateRecord = (
     String,
     String,
-    nodedb_physical::physical_plan::VectorWriteTargets,
+    Vec<nodedb_types::Surrogate>,
     Option<Vec<f32>>,
     Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
     nodedb_types::VectorQuantization,
@@ -239,27 +235,28 @@ pub(crate) type VectorDirectUpdateRecord = (
 
 /// Encode the payload of a `VectorDirectUpdate` WAL record.
 ///
-/// Produces the 8-element shape `(collection, field, targets, new_vector,
-/// payload_patch, quantization, storage_dtype, payload_indexes)`. Replay
-/// re-runs the update handler, so a row the update already reached before
-/// the crash is patched to the same image again.
+/// Produces the 8-element shape `(collection, field, rows, new_vector,
+/// payload_patch, quantization, storage_dtype, payload_indexes)`. The patch
+/// holds literals only, so a row the update already reached before the
+/// crash is patched to the same image again.
 pub(crate) fn encode_vector_direct_update_payload(
     args: VectorDirectUpdatePayload<'_>,
 ) -> crate::Result<Vec<u8>> {
     let VectorDirectUpdatePayload {
         collection,
         field,
-        targets,
+        rows,
         new_vector,
         payload_patch,
         quantization,
         storage_dtype,
         payload_indexes,
     } = args;
+    super::logged::check_logged_patch(collection, payload_patch)?;
     zerompk::to_msgpack_vec(&(
         collection,
         field,
-        targets,
+        rows,
         new_vector,
         payload_patch,
         quantization,

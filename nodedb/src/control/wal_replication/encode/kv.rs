@@ -61,37 +61,6 @@ pub(super) fn put(
     }
 }
 
-/// Encode a KV predicate `UPDATE`: the predicate itself, never a row set. Only
-/// reached for a collection with no write policy.
-pub(super) fn predicate_update(
-    collection: &str,
-    filters: &[u8],
-    updates: &[(String, Vec<u8>)],
-    returning: WireReturning<'_>,
-) -> ReplicatedWrite {
-    ReplicatedWrite::KvPredicateUpdate {
-        collection: collection.to_owned(),
-        filters: filters.to_vec(),
-        updates: updates.to_vec(),
-        returning: encode_returning(returning.returning),
-        rls_filters: returning.rls_filters.to_vec(),
-    }
-}
-
-/// Encode a KV predicate `DELETE` — see [`predicate_update`].
-pub(super) fn predicate_delete(
-    collection: &str,
-    filters: &[u8],
-    returning: WireReturning<'_>,
-) -> ReplicatedWrite {
-    ReplicatedWrite::KvPredicateDelete {
-        collection: collection.to_owned(),
-        filters: filters.to_vec(),
-        returning: encode_returning(returning.returning),
-        rls_filters: returning.rls_filters.to_vec(),
-    }
-}
-
 pub(super) fn delete(
     collection: &str,
     keys: &[Vec<u8>],

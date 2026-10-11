@@ -98,11 +98,16 @@ impl CoreLoop {
         }
 
         let mut removed: Vec<(StorageKey, Vec<u8>)> = Vec::with_capacity(surrogates.len());
-        for surrogate in &surrogates {
+        for (at, surrogate) in surrogates.iter().enumerate() {
             match self.remove_vector_direct_row(&index_key, tid, collection, *surrogate) {
                 Ok(Some(row)) => removed.push((StorageKey::for_surrogate(*surrogate), row.bytes)),
                 Ok(None) => {}
-                Err(e) => return self.response_error(task, e),
+                Err(e) => {
+                    // The failed row stays whole. The rows before it are removed.
+                    let before = &surrogates[..at];
+                    self.finish_vector_direct_write(task, &index_key, tid, collection, before);
+                    return self.response_error(task, e);
+                }
             }
         }
         if !removed.is_empty() {

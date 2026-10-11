@@ -231,7 +231,8 @@ pub(crate) fn wal_append_vector_op(
             rls_filters: _,
             rls_write_check: _,
         } => {
-            let entry = encode_vector_direct_delete_payload(collection.as_str(), field, targets)?;
+            let rows = super::logged::logged_rows(collection.as_str(), targets)?;
+            let entry = encode_vector_direct_delete_payload(collection.as_str(), field, rows)?;
             Some(wal.append_vector_direct_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         // `restart_identity` is applied by the Control Plane after commit,
@@ -258,10 +259,11 @@ pub(crate) fn wal_append_vector_op(
             rls_filters: _,
             rls_write_check: _,
         } => {
+            let rows = super::logged::logged_rows(collection.as_str(), targets)?;
             let entry = encode_vector_direct_update_payload(VectorDirectUpdatePayload {
                 collection: collection.as_str(),
                 field,
-                targets,
+                rows,
                 new_vector: new_vector.as_deref(),
                 payload_patch,
                 quantization: *quantization,

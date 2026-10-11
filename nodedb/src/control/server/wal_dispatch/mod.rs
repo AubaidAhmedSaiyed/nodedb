@@ -37,6 +37,8 @@ pub(crate) use text::encode_text_op_record;
 pub(crate) use timeseries::{
     TimeseriesIngestRecord, encode_columnar_truncate_payload, encode_timeseries_ingest_payload,
 };
+#[cfg(test)]
+pub(crate) use vector::encode_vector_direct_delete_payload;
 pub(crate) use vector::{
     VectorDirectDeleteRecord, VectorDirectTruncateRecord, VectorDirectUpdateRecord,
     VectorDirectUpsertRecord, VectorResolvedDirectWritePayload, VectorResolvedDirectWriteRecord,
@@ -46,6 +48,7 @@ pub(crate) use vector::{
     encode_vector_delete_payload, encode_vector_direct_truncate_payload, encode_vector_put_payload,
     encode_vector_resolved_direct_write_payload,
 };
+pub(crate) use vector::{check_logged_patch, logged_rows};
 
 pub(crate) use super::wal_dispatch_fts_spatial::{
     encode_spatial_delete_payload, encode_spatial_put_payload,

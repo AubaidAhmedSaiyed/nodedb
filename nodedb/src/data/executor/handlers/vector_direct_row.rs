@@ -190,6 +190,10 @@ impl CoreLoop {
     /// Remove every trace of `surrogate`'s row: bitmap entries, HNSW node,
     /// sidecar row, and the cached sidecar. Returns the sidecar that was
     /// stored, or `None` when no node was bound to the surrogate.
+    ///
+    /// The sidecar delete is the only fallible step, so it runs first. A
+    /// failure leaves the row fully present. A crash after it leaves a node
+    /// with no sidecar, which replay of the delete record removes.
     pub(in crate::data::executor) fn remove_vector_direct_row(
         &mut self,
         index_key: &VectorIndexKey,
@@ -202,19 +206,23 @@ impl CoreLoop {
             return Ok(None);
         };
         let sidecar = self.vector_sidecar_row(database_id, tid, collection, surrogate)?;
-        let Some(coll) = self.vector_collections.get_mut(index_key) else {
-            return Ok(None);
-        };
-        if let Some(row) = &sidecar {
-            coll.payload.delete_row(node_id, &row.fields);
-        }
-        coll.delete(node_id);
         let key = StorageKey::for_surrogate(surrogate);
+        crate::fail_point_err!(
+            self.fail_scope,
+            "vector_direct::sidecar_delete",
+            |detail: String| ErrorCode::Internal { detail }
+        );
         self.sparse
             .delete(database_id, tid, collection, &key)
             .map_err(ErrorCode::from)?;
         self.doc_cache
             .invalidate(database_id, tid, collection, &key);
+        if let Some(coll) = self.vector_collections.get_mut(index_key) {
+            if let Some(row) = &sidecar {
+                coll.payload.delete_row(node_id, &row.fields);
+            }
+            coll.delete(node_id);
+        }
         Ok(Some(sidecar.unwrap_or_else(|| VectorSidecarRow {
             bytes: Vec::new(),
             fields: HashMap::new(),
@@ -284,5 +292,78 @@ impl CoreLoop {
         for surrogate in surrogates {
             self.note_surrogate_write(task, tid, collection, surrogate.as_u32());
         }
+    }
+}
+
+#[cfg(all(test, feature = "failpoints"))]
+mod tests {
+    use nodedb_physical::physical_plan::VectorWriteTargets;
+    use nodedb_types::fail_point::FailGuard;
+    use nodedb_types::{RlsWriteCheck, Surrogate};
+
+    use crate::bridge::envelope::Status;
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+    use crate::data::executor::handlers::vector_direct_delete::VectorDirectDeleteParams;
+    use crate::data::executor::handlers::vector_direct_test_rows::{
+        COLLECTION, FIELD, TID, has_node, has_sidecar, seed,
+    };
+
+    const SIDECAR_DELETE: &str = "vector_direct::sidecar_delete";
+
+    fn delete(core: &mut CoreLoop, surrogate: Surrogate) -> Status {
+        let task = make_default_task();
+        let targets = VectorWriteTargets::Surrogates(vec![surrogate]);
+        core.execute_vector_direct_delete(VectorDirectDeleteParams {
+            task: &task,
+            tid: TID,
+            collection: COLLECTION,
+            field: FIELD,
+            targets: &targets,
+            returning: None,
+            rls_filters: &[],
+            rls_write_check: &RlsWriteCheck::decided_earlier_in_request(),
+        })
+        .status
+    }
+
+    #[test]
+    fn a_failed_sidecar_delete_leaves_the_row_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let row = Surrogate::new(5);
+        seed(&mut core, row);
+
+        {
+            let _fail = FailGuard::fail(SIDECAR_DELETE, "disk full");
+            assert_ne!(delete(&mut core, row), Status::Ok);
+            assert!(has_node(&core, row), "a refused delete keeps the node");
+            assert!(
+                has_sidecar(&core, row),
+                "a refused delete keeps the sidecar"
+            );
+        }
+
+        assert_eq!(delete(&mut core, row), Status::Ok);
+        assert!(!has_node(&core, row));
+        assert!(!has_sidecar(&core, row));
+    }
+
+    #[test]
+    fn a_failed_sidecar_delete_leaves_a_truncated_row_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let row = Surrogate::new(9);
+        seed(&mut core, row);
+
+        let _fail = FailGuard::fail(SIDECAR_DELETE, "disk full");
+        let task = make_default_task();
+        let resp = core.execute_vector_direct_truncate(&task, TID, COLLECTION, FIELD);
+        assert_ne!(resp.status, Status::Ok);
+        assert!(has_node(&core, row), "a refused truncate keeps the node");
+        assert!(
+            has_sidecar(&core, row),
+            "a refused truncate keeps the sidecar"
+        );
     }
 }

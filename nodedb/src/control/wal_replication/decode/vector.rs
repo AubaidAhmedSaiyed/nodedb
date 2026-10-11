@@ -157,13 +157,13 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
         ReplicatedWrite::VectorDirectDelete {
             collection,
             field,
-            targets,
+            rows,
             returning,
             rls_filters,
         } => Ok(super::vector_direct::direct_delete(
             collection,
             field,
-            targets,
+            rows,
             decode_sync_engines::decode_returning(returning)?,
             rls_filters,
         )),
@@ -179,7 +179,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
         ReplicatedWrite::VectorDirectUpdate {
             collection,
             field,
-            targets,
+            rows,
             new_vector,
             payload_patch,
             quantization,
@@ -191,7 +191,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
             super::vector_direct::DirectUpdateFields {
                 collection,
                 field,
-                targets,
+                rows,
                 new_vector,
                 payload_patch,
                 quantization: *quantization,

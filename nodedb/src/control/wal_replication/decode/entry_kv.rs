@@ -264,34 +264,6 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<(PhysicalPlan
             mutations,
             response_payload,
         } => kv_resolved::resolved_write(mutations, response_payload)?,
-        ReplicatedWrite::KvPredicateUpdate {
-            collection,
-            filters,
-            updates,
-            returning,
-            rls_filters,
-        } => kv::predicate_update(
-            collection,
-            filters,
-            updates,
-            ReturningFields {
-                returning: decode_returning(returning)?,
-                rls_filters,
-            },
-        ),
-        ReplicatedWrite::KvPredicateDelete {
-            collection,
-            filters,
-            returning,
-            rls_filters,
-        } => kv::predicate_delete(
-            collection,
-            filters,
-            ReturningFields {
-                returning: decode_returning(returning)?,
-                rls_filters,
-            },
-        ),
         ReplicatedWrite::KvTransferItem {
             source_collection,
             dest_collection,

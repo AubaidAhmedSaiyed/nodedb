@@ -172,9 +172,7 @@ fn to_physical_plan(
         | ReplicatedWrite::KvFieldSet { .. }
         | ReplicatedWrite::KvTransfer { .. }
         | ReplicatedWrite::KvTransferItem { .. }
-        | ReplicatedWrite::KvResolvedWrite { .. }
-        | ReplicatedWrite::KvPredicateUpdate { .. }
-        | ReplicatedWrite::KvPredicateDelete { .. } => entry_kv::decode_arm(write),
+        | ReplicatedWrite::KvResolvedWrite { .. } => entry_kv::decode_arm(write),
         // A timeseries ingest carries the proposer's instant for its untimed
         // rows, installed on every replica as `resolved_now_ms`.
         ReplicatedWrite::TimeseriesIngest {

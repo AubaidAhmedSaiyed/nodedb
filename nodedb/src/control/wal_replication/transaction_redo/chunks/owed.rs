@@ -7,13 +7,14 @@
 //! hold a later chunk or the final entry of a dropped stream. Here it
 //! refuses, while every other replica installs the redo. So the drop marks
 //! the group owed, durably, before the streams release their WAL floor
-//! holds:
+//! holds. The apply loop also marks a group owed when its apply holds an
+//! entry this replica cannot apply as its peers do.
 //!
 //! - The group's snapshot requirement holds on this node while it is owed.
-//!   Its replica refuses log entries, and its leader sends a snapshot. The
-//!   snapshot carries the group's open streams.
+//!   Its replica refuses log entries, never leads, and its leader sends a
+//!   snapshot. The snapshot carries the group's open streams.
 //! - A refusal of a chunk or final entry of an owed group holds the group's
-//!   durable floor instead of passing the entry.
+//!   apply at the entry instead of passing it.
 //! - A snapshot install of the group settles the debt.
 //!
 //! The set is a leaf lock: no other lock is taken while it is held.

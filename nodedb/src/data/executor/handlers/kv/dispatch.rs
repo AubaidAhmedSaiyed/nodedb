@@ -2,7 +2,7 @@
 
 //! KV operation dispatch: routes `KvOp` variants to their handler methods.
 
-use crate::bridge::envelope::Response;
+use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::KvOp;
@@ -441,44 +441,20 @@ impl CoreLoop {
                 cursor,
                 *count,
             ),
-            KvOp::PredicateUpdate {
-                collection,
-                filters,
-                updates,
-                rls_write_check,
-                returning,
-                rls_filters,
-            } => self.execute_kv_predicate_update(
-                task,
-                super::predicate::KvPredicateCtx {
-                    did,
-                    tid,
-                    collection: collection.as_str(),
-                    filters,
-                    rls_write_check,
-                    returning: returning.as_ref(),
-                    rls_filters,
-                },
-                updates,
-            ),
-            KvOp::PredicateDelete {
-                collection,
-                filters,
-                rls_write_check,
-                returning,
-                rls_filters,
-            } => self.execute_kv_predicate_delete(
-                task,
-                super::predicate::KvPredicateCtx {
-                    did,
-                    tid,
-                    collection: collection.as_str(),
-                    filters,
-                    rls_write_check,
-                    returning: returning.as_ref(),
-                    rls_filters,
-                },
-            ),
+            // A predicate write resolves to a mutation list before it is
+            // logged, and a transaction stages it. It never applies directly.
+            KvOp::PredicateUpdate { collection, .. } | KvOp::PredicateDelete { collection, .. } => {
+                self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!(
+                            "kv predicate UPDATE/DELETE on '{}' reached the apply path \
+                             unresolved; it resolves to a mutation list first",
+                            collection.as_str()
+                        ),
+                    },
+                )
+            }
             KvOp::ResolveWrite(inner) => self.execute_kv_resolve_write(task, did, tid, inner),
             KvOp::ResolvedWrite {
                 mutations,

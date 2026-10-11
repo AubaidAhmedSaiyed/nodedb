@@ -2,11 +2,15 @@
 
 //! Vector-primary implementation of [`EngineWriteResolver`].
 //!
-//! Resolves a governed vector-primary write — `DirectDelete`, `DirectUpdate`,
-//! or a `DirectUpsert` whose conflict patch is decided on the Data Plane —
-//! into `VectorOp::ResolvedDirectWrite`: a row-mutation list plus the
-//! response payload, each mutation carrying the sidecar it read so the apply
-//! refuses a resolution that drifted.
+//! Resolves a vector-primary write into `VectorOp::ResolvedDirectWrite`: a
+//! row-mutation list plus the response payload, each mutation carrying the
+//! sidecar it read so the apply refuses a resolution that drifted.
+//!
+//! A write resolves when it carries a live write predicate, a row predicate,
+//! or a patch expression. The sidecar store is written through while the
+//! index restores from its checkpoint, so replay runs against newer sidecars.
+//! A log record therefore names rows and their values, never something
+//! replay evaluates again.
 
 use async_trait::async_trait;
 use nodedb_types::{QualifiedCollection, RlsWriteCheck};
@@ -14,7 +18,9 @@ use nodedb_types::{QualifiedCollection, RlsWriteCheck};
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::maintenance::clone_materializer::dispatch_local;
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::{VectorOp, VectorResolveOutcome};
+use nodedb_physical::physical_plan::{
+    UpdateValue, VectorOp, VectorResolveOutcome, VectorWriteTargets,
+};
 
 use super::resolved_rows::ResolvedRows;
 use super::resolver::{EngineWriteResolver, WriteResolveContext};
@@ -41,42 +47,78 @@ pub struct VectorWriteResolver {
     op: VectorOp,
 }
 
-/// The resolver for `op`, or `None` when it carries no live write predicate.
-/// Exhaustive over `VectorOp` — a new op fails to compile here.
+/// Whether `targets` names rows by a predicate replay would evaluate again.
+fn by_predicate(targets: &VectorWriteTargets) -> bool {
+    match targets {
+        VectorWriteTargets::Predicate(_) => true,
+        VectorWriteTargets::Surrogates(_) => false,
+    }
+}
+
+/// Whether `patch` holds an expression replay would evaluate again.
+fn has_expression(patch: &[(String, UpdateValue)]) -> bool {
+    patch.iter().any(|(_, value)| match value {
+        UpdateValue::Expr(_) => true,
+        UpdateValue::Literal(_) => false,
+    })
+}
+
+/// The resolver for `op`, or `None` when the op logs as it is. Exhaustive
+/// over `VectorOp` — a new op fails to compile here.
 pub(super) fn resolver_for_vector_op(op: &VectorOp) -> Option<Box<dyn EngineWriteResolver>> {
     let (collection, field, settings) = match op {
         VectorOp::DirectDelete {
             collection,
             field,
+            targets,
             rls_write_check,
             ..
         } => {
-            if !rls_write_check.has_predicate() {
+            if !rls_write_check.has_predicate() && !by_predicate(targets) {
                 return None;
             }
             (collection, field, ResolvedIndexSettings::default())
         }
-        // Only a conflict patch leaves an upsert's predicate live: a
-        // whole-row upsert is decided Control-Plane-side against its payload.
         VectorOp::DirectUpdate {
             collection,
             field,
-            quantization,
-            storage_dtype,
-            payload_indexes,
-            rls_write_check,
-            ..
-        }
-        | VectorOp::DirectUpsert {
-            collection,
-            field,
+            targets,
+            payload_patch,
             quantization,
             storage_dtype,
             payload_indexes,
             rls_write_check,
             ..
         } => {
-            if !rls_write_check.has_predicate() {
+            if !rls_write_check.has_predicate()
+                && !by_predicate(targets)
+                && !has_expression(payload_patch)
+            {
+                return None;
+            }
+            (
+                collection,
+                field,
+                ResolvedIndexSettings {
+                    quantization: *quantization,
+                    storage_dtype: *storage_dtype,
+                    payload_indexes: payload_indexes.clone(),
+                },
+            )
+        }
+        // A whole-row upsert is decided Control-Plane-side against its
+        // payload. A conflict patch is decided against the stored row.
+        VectorOp::DirectUpsert {
+            collection,
+            field,
+            on_conflict_updates,
+            quantization,
+            storage_dtype,
+            payload_indexes,
+            rls_write_check,
+            ..
+        } => {
+            if !rls_write_check.has_predicate() && !has_expression(on_conflict_updates) {
                 return None;
             }
             (
@@ -204,45 +246,81 @@ impl EngineWriteResolver for VectorWriteResolver {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_physical::physical_plan::{VectorOp, VectorWriteTargets};
-    use nodedb_types::{DatabaseId, QualifiedCollection, RlsWriteCheck};
+    use nodedb_physical::physical_plan::{UpdateValue, VectorOp, VectorWriteTargets};
+    use nodedb_types::{DatabaseId, QualifiedCollection, RlsWriteCheck, Surrogate};
 
     use super::resolver_for_vector_op;
     use crate::bridge::envelope::PhysicalPlan;
 
-    fn predicate_delete(check: RlsWriteCheck) -> VectorOp {
+    fn delete(targets: VectorWriteTargets, check: RlsWriteCheck) -> VectorOp {
         VectorOp::DirectDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field: "emb".into(),
-            targets: VectorWriteTargets::Predicate(Vec::new()),
+            targets,
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: check,
         }
     }
 
-    /// Only a live predicate needs resolving; a decided or absent policy
-    /// replicates the write as it is.
+    fn update(targets: VectorWriteTargets, value: UpdateValue) -> VectorOp {
+        VectorOp::DirectUpdate {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            field: "emb".into(),
+            targets,
+            new_vector: None,
+            payload_patch: vec![("n".into(), value)],
+            quantization: nodedb_types::VectorQuantization::None,
+            storage_dtype: nodedb_types::VectorStorageDtype::F32,
+            payload_indexes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+        }
+    }
+
+    fn rows() -> VectorWriteTargets {
+        VectorWriteTargets::Surrogates(vec![Surrogate::new(4)])
+    }
+
+    /// A write that names its rows and values logs as it is.
     #[test]
-    fn only_a_live_predicate_selects_the_resolver() {
-        assert!(
-            resolver_for_vector_op(&predicate_delete(RlsWriteCheck::NoPolicyApplies)).is_none()
+    fn a_write_naming_rows_and_values_logs_as_it_is() {
+        for check in [
+            RlsWriteCheck::NoPolicyApplies,
+            RlsWriteCheck::decided_earlier_in_request(),
+        ] {
+            assert!(resolver_for_vector_op(&delete(rows(), check)).is_none());
+        }
+        let literal = UpdateValue::Literal(vec![0x01]);
+        assert!(resolver_for_vector_op(&update(rows(), literal)).is_none());
+    }
+
+    /// A live write predicate, a row predicate, or a patch expression is
+    /// resolved to rows and values before it is logged.
+    #[test]
+    fn anything_replay_evaluates_again_selects_the_resolver() {
+        let governed = delete(rows(), RlsWriteCheck::from_injected(vec![1, 2, 3]));
+        let by_predicate = delete(
+            VectorWriteTargets::Predicate(Vec::new()),
+            RlsWriteCheck::NoPolicyApplies,
         );
-        assert!(
-            resolver_for_vector_op(&predicate_delete(
-                RlsWriteCheck::decided_earlier_in_request()
-            ))
-            .is_none()
-        );
-        let resolver =
-            resolver_for_vector_op(&predicate_delete(RlsWriteCheck::from_injected(vec![
-                1, 2, 3,
-            ])))
-            .expect("a live predicate selects the resolver");
-        assert_eq!(resolver.collection(), "vecs");
-        assert!(matches!(
-            resolver.build_resolve_op(),
-            PhysicalPlan::Vector(VectorOp::ResolveDirectWrite(_))
-        ));
+        let literal = UpdateValue::Literal(vec![0x01]);
+        let update_by_predicate = update(VectorWriteTargets::Predicate(Vec::new()), literal);
+        let expression = UpdateValue::Expr(nodedb_query::expr::SqlExpr::Column("n".into()));
+        let update_by_expression = update(rows(), expression);
+        for op in [
+            governed,
+            by_predicate,
+            update_by_predicate,
+            update_by_expression,
+        ] {
+            let resolver = resolver_for_vector_op(&op).expect("the op resolves before logging");
+            assert_eq!(resolver.collection(), "vecs");
+            assert!(matches!(
+                resolver.build_resolve_op(),
+                PhysicalPlan::Vector(VectorOp::ResolveDirectWrite(_))
+            ));
+        }
     }
 }

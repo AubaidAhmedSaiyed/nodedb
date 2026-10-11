@@ -3,7 +3,8 @@
 //! KV implementation of [`EngineWriteResolver`].
 //!
 //! Resolves a governed state-dependent KV write (increment, CAS, field
-//! merge, TTL, transfer, predicate UPDATE/DELETE) into `KvOp::ResolvedWrite`
+//! merge, TTL, transfer), and every predicate UPDATE/DELETE, into
+//! `KvOp::ResolvedWrite`
 //! — a mutation list plus response payload, since e.g. a `CAS` miss owes a
 //! reply while writing nothing.
 
@@ -80,21 +81,15 @@ pub(super) fn resolver_for_kv_op(op: &KvOp) -> Option<Box<dyn EngineWriteResolve
             collection,
             rls_write_check,
             ..
-        }
-        // A predicate write resolves like a state-dependent point write.
-        | KvOp::PredicateUpdate {
-            collection,
-            rls_write_check,
-            ..
-        }
-        | KvOp::PredicateDelete {
-            collection,
-            rls_write_check,
-            ..
         } => {
             if !rls_write_check.has_predicate() {
                 return None;
             }
+            collection
+        }
+        // A predicate write always resolves: the row set it scans depends on
+        // the clock (TTL expiry), so a log record names the rows instead.
+        KvOp::PredicateUpdate { collection, .. } | KvOp::PredicateDelete { collection, .. } => {
             collection
         }
         // Both collections checked: an identity may give a row up but not
