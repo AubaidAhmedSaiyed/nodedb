@@ -15,6 +15,7 @@ use crate::control::array_sync::raft_apply::{
 use nodedb_raft::message::LogEntry;
 
 use crate::control::backup::cut_order::OrderedCut;
+use crate::control::distributed_applier::propose_tracker::ProposeTracker;
 use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite};
 use crate::types::{DatabaseId, TenantId};
 
@@ -58,7 +59,8 @@ pub(super) fn prepare_entry<'a>(
     watch.note_apply(group_id, log_index);
 
     if entry.data.is_empty() {
-        return conclude_leader_change_noop(ctx, group_id, log_index);
+        conclude_leader_change_noop(ctx.tracker, group_id, log_index);
+        return Prepared::Concluded(EntryOutcome::Skipped);
     }
 
     // `0` for unparseable / pre-key entries; the tracker treats 0 as "no key"
@@ -94,21 +96,15 @@ pub(super) fn prepare_entry<'a>(
     prepare_replicated(ctx, watch, pos, log_term, entry, scope, replicated)
 }
 
-/// A leader-change no-op committed where a proposer can wait. The
-/// proposer's data is gone; firing an empty success tells it the
-/// write applied. `RetryableLeaderChange` makes the gateway re-propose.
-fn conclude_leader_change_noop<'a>(
-    ctx: ApplyContext<'a>,
-    group_id: u64,
-    log_index: u64,
-) -> Prepared<'a> {
-    tracing::error!(
-        group_id,
-        log_index,
-        "leader-change no-op committed at index where a proposer was waiting; \
-         surfacing RetryableLeaderChange so the gateway re-proposes"
-    );
-    ctx.tracker.complete(
+/// Conclude the leader-change no-op at `log_index`. Every new leader commits
+/// one. Returns whether a proposer waited at the index.
+///
+/// A proposer whose entry held the index lost it to the leader change. It
+/// gets `RetryableLeaderChange`, so the gateway re-proposes; an empty success
+/// would tell it the write applied. A proposer that registers later finds
+/// the same answer stored. Only an overwritten waiter is logged.
+fn conclude_leader_change_noop(tracker: &ProposeTracker, group_id: u64, log_index: u64) -> bool {
+    let overwritten = tracker.complete(
         group_id,
         log_index,
         0,
@@ -117,7 +113,15 @@ fn conclude_leader_change_noop<'a>(
             log_index,
         }),
     );
-    Prepared::Concluded(EntryOutcome::Skipped)
+    if overwritten {
+        tracing::warn!(
+            group_id,
+            log_index,
+            "a leader-change no-op committed where a proposer was waiting; surfacing \
+             RetryableLeaderChange so the gateway re-proposes"
+        );
+    }
+    overwritten
 }
 
 /// The scope a decoded entry applies under. The entry's incarnations move
@@ -367,4 +371,37 @@ fn prepare_array_op<'a>(
             },
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A no-op at an index a proposer waits on answers it with
+    /// `RetryableLeaderChange`.
+    #[tokio::test]
+    async fn a_noop_over_a_waiter_surfaces_a_leader_change() {
+        let tracker = ProposeTracker::new();
+        let waiter = tracker.register(4, 9, 77);
+        assert!(conclude_leader_change_noop(&tracker, 4, 9));
+        let answer = waiter.await.expect("the waiter is answered");
+        assert!(
+            matches!(
+                answer,
+                Err(crate::Error::RetryableLeaderChange {
+                    group_id: 4,
+                    log_index: 9
+                })
+            ),
+            "{answer:?}"
+        );
+    }
+
+    /// A no-op at an index no proposer waits on, as after every election,
+    /// finds no waiter and logs nothing.
+    #[test]
+    fn a_noop_with_no_waiter_finds_none() {
+        let tracker = ProposeTracker::new();
+        assert!(!conclude_leader_change_noop(&tracker, 4, 1));
+    }
 }

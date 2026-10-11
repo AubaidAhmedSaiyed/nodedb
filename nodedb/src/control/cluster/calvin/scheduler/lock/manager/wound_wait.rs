@@ -36,14 +36,16 @@ impl LockManager {
             let Some(entry) = self.table.get(key) else {
                 return ConflictResolution::Block;
             };
-            if !entry.waiters.is_empty() || entry.mode != LockMode::Shared {
+            if !entry.waiters.is_empty() {
                 return ConflictResolution::Block;
             }
-            let mut others = entry.holders.iter().filter(|h| **h != txn).peekable();
+            let mut others = entry.holders.iter().filter(|(h, _)| *h != txn).peekable();
             if others.peek().is_none() {
                 return ConflictResolution::Block;
             }
-            if others.any(|holder| !holder.is_reservation() || txn >= *holder) {
+            if others.any(|(holder, held)| {
+                *held != LockMode::Shared || !holder.is_reservation() || txn >= *holder
+            }) {
                 return ConflictResolution::Block;
             }
         }
@@ -58,13 +60,9 @@ impl LockManager {
         let Some(entry) = self.table.get_mut(key) else {
             return;
         };
-        let wanted = if entry.holders.contains(&txn) {
-            entry.mode.merge(mode)
-        } else {
-            mode
-        };
+        let wanted = entry.mode_of(txn).map_or(mode, |own| own.merge(mode));
         entry.holders.clear();
-        entry.holders.push(txn);
+        entry.holders.push((txn, wanted));
         entry.mode = wanted;
     }
 
@@ -117,8 +115,8 @@ mod tests {
 
         let entry = lm.table.get(&key("s")).unwrap();
         assert_eq!(entry.mode, LockMode::Shared);
-        assert!(entry.holders.contains(&r1));
-        assert!(entry.holders.contains(&r2));
+        assert!(entry.holds(r1));
+        assert!(entry.holds(r2));
     }
 
     #[test]
@@ -162,7 +160,7 @@ mod tests {
 
         let entry = lm.table.get(&key("k")).unwrap();
         assert_eq!(entry.mode, LockMode::Exclusive);
-        assert_eq!(entry.holders.as_slice(), &[writer]);
+        assert_eq!(entry.holder_ids(), vec![writer]);
     }
 
     #[test]
@@ -181,7 +179,7 @@ mod tests {
         );
         let entry = lm.table.get(&coll).unwrap();
         assert_eq!(entry.mode, LockMode::Intent);
-        assert_eq!(entry.holders.as_slice(), &[writer]);
+        assert_eq!(entry.holder_ids(), vec![writer]);
     }
 
     #[test]
@@ -197,8 +195,8 @@ mod tests {
         );
 
         let entry = lm.table.get(&key("k")).unwrap();
-        assert!(entry.holders.contains(&r), "the shared holder still holds");
-        assert!(!entry.holders.contains(&writer));
+        assert!(entry.holds(r), "the shared holder still holds");
+        assert!(!entry.holds(writer));
         assert!(entry.has_waiter(writer));
     }
 
@@ -212,7 +210,7 @@ mod tests {
         assert_eq!(lm.acquire(t1, exclusive(&["k"])), AcquireOutcome::Blocked);
 
         let entry = lm.table.get(&key("k")).unwrap();
-        assert_eq!(entry.holders.as_slice(), &[t2]);
+        assert_eq!(entry.holder_ids(), vec![t2]);
         assert!(entry.has_waiter(t1));
     }
 
@@ -234,7 +232,7 @@ mod tests {
         for k in ["k1", "k2"] {
             let entry = lm.table.get(&key(k)).unwrap();
             assert_eq!(entry.mode, LockMode::Exclusive);
-            assert_eq!(entry.holders.as_slice(), &[r]);
+            assert_eq!(entry.holder_ids(), vec![r]);
         }
     }
 
@@ -256,7 +254,7 @@ mod tests {
         );
         for (k, holder) in [("k1", s1), ("k2", s2)] {
             let entry = lm.table.get(&key(k)).unwrap();
-            assert_eq!(entry.holders.as_slice(), &[holder]);
+            assert_eq!(entry.holder_ids(), vec![holder]);
             assert!(entry.has_waiter(r));
         }
     }
@@ -272,7 +270,7 @@ mod tests {
         assert_eq!(lm.acquire(r_old, exclusive(&["k"])), AcquireOutcome::Ready);
         let entry = lm.table.get(&key("k")).unwrap();
         assert_eq!(entry.mode, LockMode::Exclusive);
-        assert_eq!(entry.holders.as_slice(), &[r_old]);
+        assert_eq!(entry.holder_ids(), vec![r_old]);
 
         // The younger one's self-upgrade drops its own hold and waits.
         let mut lm = LockManager::new();
@@ -284,13 +282,13 @@ mod tests {
         );
         let entry = lm.table.get(&key("k")).unwrap();
         assert_eq!(entry.mode, LockMode::Shared);
-        assert_eq!(entry.holders.as_slice(), &[r_old]);
+        assert_eq!(entry.holder_ids(), vec![r_old]);
         assert!(entry.has_waiter(r_young));
 
         assert_eq!(lm.release(r_old), vec![r_young]);
         let entry = lm.table.get(&key("k")).unwrap();
         assert_eq!(entry.mode, LockMode::Exclusive);
-        assert_eq!(entry.holders.as_slice(), &[r_young]);
+        assert_eq!(entry.holder_ids(), vec![r_young]);
     }
 
     #[test]
@@ -311,6 +309,6 @@ mod tests {
 
         let k2 = lm.table.get(&key("k2")).unwrap();
         assert_eq!(k2.mode, LockMode::Exclusive);
-        assert_eq!(k2.holders.as_slice(), &[writer]);
+        assert_eq!(k2.holder_ids(), vec![writer]);
     }
 }

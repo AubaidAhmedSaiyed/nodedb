@@ -7,10 +7,10 @@
 //! leader over one `SubmitCalvinTxn` RPC.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use nodedb_cluster::calvin::types::TxClass;
+use nodedb_cluster::rpc_codec::reply_wait;
 use nodedb_cluster::{
     ClusterError, RaftRpc, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
 };
@@ -18,6 +18,7 @@ use nodedb_cluster::{
 use crate::Error;
 use crate::bridge::envelope::Response;
 use crate::control::cluster::warm_peers::register_peers_from_topology;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 
 use super::local::{submit_prepared_and_await, synthetic_returning_response};
@@ -119,11 +120,12 @@ pub async fn submit_calvin_routed(
         });
     }
 
+    // Every wait of this submit ends at the statement's deadline.
+    let deadline = StatementDeadline::of_statement(state).tokio_instant();
     // Leader is self: submit-and-await locally (a self-RPC will be a pointless
     // extra hop and the local registry is the one that completes).
     if leader == state.node_id {
-        let timeout = super::budget::statement_budget(state)?;
-        return submit_prepared_and_await(state, tx_class, stream, timeout).await;
+        return submit_prepared_and_await(state, tx_class, stream, deadline).await;
     }
 
     // Remote leader: ensure its address is registered before dispatch, then send
@@ -138,7 +140,7 @@ pub async fn submit_calvin_routed(
     })?;
 
     // The leader works on the transaction only as long as the statement waits.
-    let deadline_remaining_ms = super::budget::statement_budget_ms(state)?;
+    let deadline_remaining_ms = super::budget::budget_ms_until(deadline)?;
     let req = SubmitCalvinTxnRequest {
         tx_class_bytes,
         deadline_remaining_ms,
@@ -150,7 +152,7 @@ pub async fn submit_calvin_routed(
     // short `rpc_timeout` (a normal request/response round-trip budget) will
     // abort the call long before that, so bound the response read by the
     // forwarded deadline plus a margin for the round-trip itself.
-    let read_timeout = Duration::from_millis(deadline_remaining_ms.saturating_add(2_000));
+    let read_timeout = reply_wait(deadline_remaining_ms);
     let header = transport.send_rpc_with_read_timeout(
         leader,
         RaftRpc::SubmitCalvinTxnRequest(req),
@@ -163,7 +165,8 @@ pub async fn submit_calvin_routed(
         None => header.await,
         Some(stream) => {
             tokio::pin!(header);
-            let streaming = stream_parts(state, StreamTarget::Remote(leader), stream, false);
+            let streaming =
+                stream_parts(state, StreamTarget::Remote(leader), stream, false, deadline);
             tokio::pin!(streaming);
             tokio::select! {
                 reply = &mut header => reply,

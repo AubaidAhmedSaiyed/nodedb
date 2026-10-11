@@ -98,7 +98,8 @@ pub(super) async fn dispatch_local(
             shared,
             proposer,
             entry,
-            crate::control::wal_replication::statement_propose_deadline(shared),
+            crate::control::server::shared::session::StatementDeadline::of_statement(shared)
+                .tokio_instant(),
         )
         .await?;
         return Ok(DispatchOutcome {

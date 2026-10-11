@@ -13,7 +13,7 @@
 //!   that holds edges it also lives on the key vShard of its key: a live edge
 //!   write carries each endpoint's surrogate from the collection home, and
 //!   every replica of each endpoint home binds it on apply.
-//! - An array cell lives on the vShard its Hilbert prefix routes to.
+//! - An array cell lives on the vShard its tile key routes to.
 //!
 //! Every collection is collection-homed. Key-homed data is graph data, whose
 //! partition key is the node id.
@@ -38,7 +38,7 @@ pub enum HomedRecord<'a> {
         key: &'a [u8],
         holds_edges: bool,
     },
-    /// Array cells whose Hilbert prefixes route to `vshard`.
+    /// Array cells whose tile keys route to `vshard`.
     ArrayCells { vshard: VShardId },
 }
 

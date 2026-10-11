@@ -115,7 +115,7 @@ mod tests {
             success: true,
             last_log_index: idx,
             round: UNTRACKED_ROUND,
-            needs_snapshot: false,
+            replica: crate::state::ReplicaState::Whole,
         }
     }
 
@@ -261,7 +261,7 @@ mod tests {
                 success: false,
                 last_log_index: 0,
                 round: UNTRACKED_ROUND,
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
         assert_eq!(leader.role(), NodeRole::Follower);

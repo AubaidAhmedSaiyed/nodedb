@@ -15,10 +15,11 @@ use crate::control::server::shared::clone_write::CloneCheckedTask;
 use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::core::{Gateway, QueryContext, authorized_plan_for_context};
-use super::dispatcher::{DispatchRouteStreamParams, dispatch_route_stream, statement_deadline_ms};
+use super::dispatcher::{DispatchRouteStreamParams, dispatch_route_stream};
 use super::live_leaders::resolve_live_decision;
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
+use crate::control::server::shared::session::StatementDeadline;
 
 impl Gateway {
     /// Streaming sibling of [`execute`](Gateway::execute).
@@ -63,7 +64,8 @@ impl Gateway {
 
         let routes = self.compute_routes(plan, ctx)?;
 
-        let deadline_ms = statement_deadline_ms(&shared);
+        // One deadline for every route and attempt of the statement.
+        let deadline = StatementDeadline::of_statement(&shared).tokio_instant();
 
         let mut per_route: Vec<ResultStream> = Vec::with_capacity(routes.len());
         for route in routes {
@@ -78,8 +80,8 @@ impl Gateway {
             // attempt re-resolves the routing decision and re-opens the stream;
             // a pre-row NotLeader / DescriptorMismatch is retryable, anything
             // after the first frame is terminal (handled inside the stream).
-            let stream = retry_not_leader(routing_ref, move |attempt| {
-                if attempt > 0 {
+            let stream = retry_not_leader(routing_ref, deadline, move |attempt| {
+                if attempt.index > 0 {
                     retry_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 let plan = plan_for_retry.clone();
@@ -102,7 +104,8 @@ impl Gateway {
                         tenant_id,
                         database_id,
                         trace_id,
-                        deadline_ms,
+                        deadline_ms: attempt.remaining_ms(),
+                        attempts_left: attempt.attempts_left(),
                         version_set: &version_set,
                         linearizable,
                     })

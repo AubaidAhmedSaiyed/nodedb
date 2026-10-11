@@ -69,6 +69,19 @@ impl TestCluster {
         .await
     }
 
+    /// [`Self::spawn_three`] with `rpc_timeout_secs` as every node's fixed
+    /// RPC timeout. A test sets it to size the time a read reserves for its
+    /// retries.
+    pub async fn spawn_three_with_rpc_timeout(
+        rpc_timeout_secs: u64,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_with_tuning(ClusterTransportTuning {
+            rpc_timeout_secs,
+            ..fast_cluster_tuning()
+        })
+        .await
+    }
+
     /// Spawn a 3-node cluster with a custom `ClusterTransportTuning`.
     /// Used by the descriptor-lease renewal tests to drive the
     /// renewal loop on a much faster cadence than the production

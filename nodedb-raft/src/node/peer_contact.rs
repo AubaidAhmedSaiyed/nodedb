@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use crate::node::core::RaftNode;
-use crate::state::NodeRole;
+use crate::state::{NodeRole, ReplicaState};
 use crate::storage::LogStorage;
 
 impl<S: LogStorage> RaftNode<S> {
@@ -57,12 +57,19 @@ impl<S: LogStorage> RaftNode<S> {
             .max(lowest_live_voter.min(self.volatile.commit_index))
     }
 
-    /// Whether `peer`'s latest response to this leader asked for a snapshot.
-    /// Such a peer holds no state to lead from. `false` off the leader.
-    pub fn peer_awaits_snapshot(&self, peer: u64) -> bool {
+    /// Whether `peer`'s latest response this term reported it whole. `false`
+    /// for a peer not heard this term, and off the leader.
+    pub fn peer_answered_whole(&self, peer: u64) -> bool {
+        self.peer_replica_state(peer) == Some(ReplicaState::Whole)
+    }
+
+    /// `peer`'s state as its latest response this term reported it. `None`
+    /// for a peer not heard this term, and off the leader: its state is
+    /// unknown.
+    pub fn peer_replica_state(&self, peer: u64) -> Option<ReplicaState> {
         self.leader_state
             .as_ref()
-            .is_some_and(|leader| leader.awaiting_snapshot.contains(&peer))
+            .and_then(|leader| leader.peer_states.get(&peer).copied())
     }
 
     /// The leader this node names at `now`, when it has proof the leader is
@@ -178,7 +185,7 @@ mod tests {
             success: true,
             last_log_index: 1,
             round: 1,
-            needs_snapshot: false,
+            replica: crate::state::ReplicaState::Whole,
         };
         node.handle_append_entries_response(2, &ack);
         assert_eq!(node.replicated_floor(), 0, "voter 3 holds nothing yet");
@@ -216,7 +223,7 @@ mod tests {
             success,
             last_log_index,
             round: node.lease.next_round - 1,
-            needs_snapshot: false,
+            replica: crate::state::ReplicaState::Whole,
         };
         node.handle_append_entries_response(peer, &resp);
     }

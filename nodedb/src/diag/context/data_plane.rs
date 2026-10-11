@@ -69,7 +69,8 @@ pub(in crate::diag) struct CalvinCompletionTimeout {
     pub epoch: u64,
     pub position: u32,
     pub participants: usize,
-    pub timeout_secs: u64,
+    /// How long the completion wait ran before the statement deadline.
+    pub waited_ms: u64,
 }
 
 impl DomainContext for CalvinCompletionTimeout {
@@ -88,10 +89,10 @@ impl DomainContext for CalvinCompletionTimeout {
             "epoch": self.epoch,
             "position": self.position,
             "participants": self.participants,
-            "timeout_secs": self.timeout_secs,
+            "waited_ms": self.waited_ms,
             "why_fatal": "this timeout is the only signal a Calvin-routed write ever \
                           produces for a completion ack that never arrived; the caller \
-                          sees a generic internal error with no indication of which \
+                          sees a deadline error with no indication of which \
                           participant or stage stalled, and the write's outcome is \
                           unknown to the client",
             "operator_action": "check the sequencer-group leader and the listed \

@@ -74,11 +74,12 @@ pub struct MultiRaft {
     pub(super) snapshot_requirement: Option<SnapshotRequirement>,
 }
 
-/// Whether this node's replica of a data group must take a snapshot before
-/// it takes log entries. Called with the group id and the first index the
+/// What this node's replica of a data group needs before it takes log
+/// entries: nothing, a snapshot it may lead without, or a snapshot it must
+/// not lead without. Called with the group id and the first index the
 /// Calvin sequencer log still holds here, under the `MultiRaft` lock: it
 /// must not take that lock.
-pub type SnapshotRequirement = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
+pub type SnapshotRequirement = Arc<dyn Fn(u64, u64) -> nodedb_raft::ReplicaState + Send + Sync>;
 
 /// Aggregated output from all Raft groups after a tick.
 #[derive(Debug, Default)]
@@ -148,7 +149,7 @@ impl MultiRaft {
         let sequencer_first = self.sequencer_first_available();
         for (&group_id, node) in &mut self.groups {
             if is_data_group(group_id) {
-                node.set_snapshot_required(requirement(group_id, sequencer_first));
+                node.set_replica_state(requirement(group_id, sequencer_first));
             }
         }
         self.snapshot_requirement = Some(requirement);

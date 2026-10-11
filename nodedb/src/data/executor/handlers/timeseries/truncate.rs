@@ -165,6 +165,8 @@ impl CoreLoop {
 
         self.checkpoint_coordinator
             .mark_dirty("timeseries", truncated as usize);
+        // No wipe: timeseries reads record only `Predicate` keys, which the
+        // collection version bounds.
         self.note_collection_write(task, collection);
         self.invalidate_aggregate_cache_for_collection(db.as_u64(), tid.as_u64(), collection);
 

@@ -248,6 +248,12 @@ impl NexarTransport {
         &self.circuit_breaker
     }
 
+    /// The fixed timeout of one RPC on this transport, from
+    /// `ClusterTransportTuning::rpc_timeout_secs`.
+    pub fn rpc_timeout(&self) -> Duration {
+        self.rpc_timeout
+    }
+
     /// The local address this transport is listening on.
     pub fn local_addr(&self) -> SocketAddr {
         self.listener.local_addr()
@@ -471,7 +477,7 @@ pub(super) mod tests {
                         success: true,
                         last_log_index: req.prev_log_index + req.entries.len() as u64,
                         round: req.round,
-                        needs_snapshot: false,
+                        replica: nodedb_raft::ReplicaState::Whole,
                     }))
                 }
                 RaftRpc::RequestVoteRequest(req) if req.group_id == STALLED_GROUP => {

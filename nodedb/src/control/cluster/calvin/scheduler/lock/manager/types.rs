@@ -81,11 +81,6 @@ impl Default for LockManager {
 }
 
 impl LockEntry {
-    /// Whether `txn` is the only holder of this entry.
-    pub(super) fn held_solely_by(&self, txn: TxnId) -> bool {
-        self.holders.len() == 1 && self.holders[0] == txn
-    }
-
     /// Whether `txn` is already enqueued as a waiter on this entry.
     pub(super) fn has_waiter(&self, txn: TxnId) -> bool {
         self.waiters.iter().any(|(w, _)| *w == txn)

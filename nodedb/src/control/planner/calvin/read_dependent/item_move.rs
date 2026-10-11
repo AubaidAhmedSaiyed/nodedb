@@ -40,6 +40,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::authorization::authorize_task_set;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
@@ -196,7 +197,7 @@ pub async fn move_item_across_shards(
         registry,
         orchestrator,
         predicate_class_hash: class_hash,
-        timeout: std::time::Duration::from_secs(state.tuning.network.default_deadline_secs),
+        deadline: StatementDeadline::of_statement(state).tokio_instant(),
         ollp_max_retries: u32::from(orchestrator.ollp_max_retries()),
         initial_predicted: initial_item,
         submit,

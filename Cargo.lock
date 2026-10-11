@@ -4679,6 +4679,7 @@ dependencies = [
  "smallvec",
  "sonic-rs",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
  "tokio-tungstenite 0.30.0",

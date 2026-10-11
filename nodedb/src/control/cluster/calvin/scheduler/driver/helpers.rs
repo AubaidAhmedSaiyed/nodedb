@@ -64,17 +64,18 @@ pub(super) fn decode_lock_key(wire: &LockKeyWire) -> LockKey {
 ///   `Exclusive`, and its collection key is `Intent`.
 /// - A write [`EngineKeySet::Collection`] and a write array are `Exclusive`
 ///   on the collection key.
-/// - A read row key is `Shared`, with no collection key.
-/// - A read [`EngineKeySet::Collection`] is `Shared` on the collection key.
+/// - A read row key is `Shared`, and its collection key is `IntentShared`.
+/// - A read [`EngineKeySet::Collection`] and a read array are `Shared` on the
+///   collection key.
 ///
 /// A key named twice takes the merged mode (see [`LockMode::merge`]).
 pub(crate) fn expand_rw_set(txn: &SequencedTxn) -> BTreeMap<LockKey, LockMode> {
     let mut keys = BTreeMap::new();
     for ks in &txn.tx_class.read_set.0 {
-        add_key_set(&mut keys, ks, LockMode::Shared);
+        add_key_set(&mut keys, ks, Access::Read);
     }
     for ks in &txn.tx_class.write_set.0 {
-        add_key_set(&mut keys, ks, LockMode::Exclusive);
+        add_key_set(&mut keys, ks, Access::Write);
     }
     keys
 }
@@ -86,14 +87,39 @@ pub(crate) fn expand_rw_set(txn: &SequencedTxn) -> BTreeMap<LockKey, LockMode> {
 pub(crate) fn expand_write_key_sets(sets: &[EngineKeySet]) -> BTreeMap<LockKey, LockMode> {
     let mut keys = BTreeMap::new();
     for ks in sets {
-        add_key_set(&mut keys, ks, LockMode::Exclusive);
+        add_key_set(&mut keys, ks, Access::Write);
     }
     keys
 }
 
-/// Add the keys of `ks` to `keys`. `row_mode` is `Shared` for a read set and
-/// `Exclusive` for a write set.
-fn add_key_set(keys: &mut BTreeMap<LockKey, LockMode>, ks: &EngineKeySet, row_mode: LockMode) {
+/// Whether a key set comes from a read set or a write set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+}
+
+impl Access {
+    /// The mode of a row key, and of a whole-collection key set.
+    fn row_mode(self) -> LockMode {
+        match self {
+            Access::Read => LockMode::Shared,
+            Access::Write => LockMode::Exclusive,
+        }
+    }
+
+    /// The mode a row key announces on its collection key.
+    fn announce_mode(self) -> LockMode {
+        match self {
+            Access::Read => LockMode::IntentShared,
+            Access::Write => LockMode::Intent,
+        }
+    }
+}
+
+/// Add the keys of `ks` to `keys` for `access`.
+fn add_key_set(keys: &mut BTreeMap<LockKey, LockMode>, ks: &EngineKeySet, access: Access) {
+    let row_mode = access.row_mode();
     let coll: Arc<str> = Arc::from(ks.collection());
     let whole = LockKey::Collection {
         collection: Arc::clone(&coll),
@@ -145,11 +171,10 @@ fn add_key_set(keys: &mut BTreeMap<LockKey, LockMode>, ks: &EngineKeySet, row_mo
             return;
         }
     }
-    // A row writer announces itself on its collection, so a collection-wide
-    // writer or a predicate reader of that collection orders against it.
-    if row_mode == LockMode::Exclusive {
-        request(keys, whole, LockMode::Intent);
-    }
+    // A row key announces itself on its collection, so a collection-wide
+    // writer orders against every row reader and writer of the collection,
+    // and a predicate reader orders against every row writer.
+    request(keys, whole, access.announce_mode());
 }
 
 /// Request `key` in `mode`, merged with any mode already requested for it.

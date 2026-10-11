@@ -12,12 +12,12 @@
 //! lags therefore never mistakes a finished minute for a due one.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::blocking::off_runtime;
 use crate::config::server::BackupScheduleSettings;
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::cluster::linearizable_read::confirm_linearizable_read;
+use crate::control::cluster::linearizable_read::{StatementDeadline, confirm_linearizable_read};
 use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::backup_schedule_marks::StoredBackupScheduleMark;
 use crate::control::state::SharedState;
@@ -52,7 +52,7 @@ pub async fn settled_through_linearizable(
     confirm_linearizable_read(
         state,
         &[nodedb_cluster::METADATA_GROUP_ID],
-        Instant::now() + MARK_READ_TIMEOUT,
+        StatementDeadline::after(MARK_READ_TIMEOUT),
     )
     .await?;
     let (state, schedule) = (Arc::clone(state), schedule.clone());

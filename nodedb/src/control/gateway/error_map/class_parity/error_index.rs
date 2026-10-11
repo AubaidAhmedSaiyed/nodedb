@@ -3,7 +3,7 @@
 //! A dense index per `crate::Error` variant.
 
 /// The number of `crate::Error` variants [`error_variant_index`] numbers.
-pub(super) const ERROR_VARIANT_COUNT: usize = 121;
+pub(super) const ERROR_VARIANT_COUNT: usize = 123;
 
 /// A dense index per `crate::Error` variant. Exhaustive, so a new variant
 /// fails to compile here until it gets an index, and
@@ -72,6 +72,8 @@ pub(crate) fn error_variant_index(err: &crate::Error) -> usize {
         E::GroupQuorumUnavailable { .. } => 58,
         E::GroupMarksUnavailable { .. } => 59,
         E::MetadataLeaderUnavailable => 60,
+        E::MetadataGroupGone { .. } => 121,
+        E::MetadataDdlSuperseded { .. } => 122,
         E::AuthorizationStateBehind { .. } => 61,
         E::ExecutionLimitExceeded { .. } => 62,
         E::LimitExceeded { .. } => 63,

@@ -199,7 +199,8 @@ async fn match_across_shards(
         ctx.tenant_id(),
         ctx.database_id(),
         query.clone(),
-        crate::control::gateway::dispatcher::statement_deadline_ms(ctx.state),
+        crate::control::server::shared::session::StatementDeadline::of_statement(ctx.state)
+            .hop_budget_ms(),
         crate::control::server::graph_dispatch::GraphRead {
             txn_id,
             // The native protocol has no read-consistency setting.

@@ -9,5 +9,6 @@ pub mod leadership;
 pub mod lifecycle;
 pub mod native_client;
 pub mod raw_pgwire;
+pub mod remount;
 
 pub use lifecycle::TestClusterNode;

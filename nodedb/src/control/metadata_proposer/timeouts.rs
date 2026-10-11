@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! How long a metadata proposal and a DDL drain wait.
+//! How long a DDL drain waits.
 
 use std::time::Duration;
-
-/// Default window of no apply progress after which a metadata propose
-/// returns an error.
-pub const DEFAULT_PROPOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default upper bound on how long a DDL drain will wait for
 /// prior-version leases to release before giving up. Must be at

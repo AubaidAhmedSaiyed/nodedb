@@ -197,8 +197,9 @@ async fn an_outsider_follows_a_redirect_to_the_new_leader_and_ignores_a_stale_on
 
     // A stale redirect naming the old leader at the old term, through the
     // gateway's retry path, leaves the hint on the new leader.
-    let _ = retry_not_leader(Some(&**routing), |attempt| async move {
-        if attempt == 0 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let _ = retry_not_leader(Some(&**routing), deadline, |attempt| async move {
+        if attempt.index == 0 {
             Err(nodedb::Error::NotLeader {
                 vshard_id: VShardId::new(vshard_id),
                 leader_node: old_leader,

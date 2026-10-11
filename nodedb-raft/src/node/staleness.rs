@@ -31,14 +31,19 @@ pub enum StalenessVerdict {
 }
 
 impl<S: LogStorage> RaftNode<S> {
-    /// Whether this replica is within `max_staleness` of the leader.
+    /// Whether this replica is within `max_staleness` of the leader, given
+    /// `applied`: the highest index whose state is visible to reads here.
+    ///
+    /// `applied` is the caller's, not Raft's `last_applied`. Raft advances
+    /// `last_applied` when it hands an entry to the state machine, before
+    /// the entry's state is visible.
     ///
     /// The leader is always fresh — it is the source of the bound, not a
     /// consumer of it. A follower is fresh when it has applied everything
     /// the leader had committed as of a contact no older than the bound:
     /// anything committed since is at most `max_staleness` old, which is
     /// precisely what was promised.
-    pub fn staleness_verdict(&self, max_staleness: Duration) -> StalenessVerdict {
+    pub fn staleness_verdict(&self, max_staleness: Duration, applied: u64) -> StalenessVerdict {
         if self.role == NodeRole::Leader {
             return StalenessVerdict::Fresh;
         }
@@ -48,18 +53,30 @@ impl<S: LogStorage> RaftNode<S> {
         if contact.at.elapsed() > max_staleness {
             return StalenessVerdict::NoRecentContact;
         }
-        if self.volatile.last_applied < contact.leader_commit {
+        if applied < contact.leader_commit {
             return StalenessVerdict::Behind {
                 leader_commit: contact.leader_commit,
-                applied: self.volatile.last_applied,
+                applied,
             };
         }
         StalenessVerdict::Fresh
     }
 
-    /// Whether a read with `max_staleness` can be served from this replica.
-    pub fn within_staleness_bound(&self, max_staleness: Duration) -> bool {
-        self.staleness_verdict(max_staleness) == StalenessVerdict::Fresh
+    /// Whether a read with `max_staleness` can be served from this replica,
+    /// whose reads see state through `applied`.
+    pub fn within_staleness_bound(&self, max_staleness: Duration, applied: u64) -> bool {
+        self.staleness_verdict(max_staleness, applied) == StalenessVerdict::Fresh
+    }
+
+    /// Whether this replica heard from its leader within `window`. The
+    /// leader itself always has. How far behind the replica applies does not
+    /// count.
+    pub fn leader_contact_within(&self, window: Duration) -> bool {
+        if self.role == NodeRole::Leader {
+            return true;
+        }
+        self.leader_contact
+            .is_some_and(|contact| contact.at.elapsed() <= window)
     }
 }
 
@@ -115,16 +132,17 @@ mod tests {
     fn a_replica_that_never_heard_from_a_leader_is_not_fresh() {
         let node = follower();
         assert_eq!(
-            node.staleness_verdict(BOUND),
+            node.staleness_verdict(BOUND, 0),
             StalenessVerdict::NoRecentContact
         );
+        assert!(!node.leader_contact_within(BOUND));
     }
 
     #[test]
     fn a_caught_up_replica_in_recent_contact_is_fresh() {
         let mut node = follower();
         heartbeat(&mut node, 0);
-        assert_eq!(node.staleness_verdict(BOUND), StalenessVerdict::Fresh);
+        assert_eq!(node.staleness_verdict(BOUND, 0), StalenessVerdict::Fresh);
     }
 
     /// The failure the old measure could not see: applying steadily while
@@ -134,9 +152,8 @@ mod tests {
     fn a_replica_behind_the_leader_is_not_fresh_however_recent_the_contact() {
         let mut node = follower();
         heartbeat(&mut node, 500);
-        node.advance_applied(10);
         assert_eq!(
-            node.staleness_verdict(BOUND),
+            node.staleness_verdict(BOUND, 10),
             StalenessVerdict::Behind {
                 leader_commit: 500,
                 applied: 10,
@@ -150,8 +167,31 @@ mod tests {
     fn an_idle_cluster_does_not_make_a_caught_up_replica_look_stale() {
         let mut node = follower();
         heartbeat(&mut node, 7);
-        node.advance_applied(7);
-        assert_eq!(node.staleness_verdict(BOUND), StalenessVerdict::Fresh);
+        assert_eq!(node.staleness_verdict(BOUND, 7), StalenessVerdict::Fresh);
+    }
+
+    /// Raft's own `last_applied` at the leader's commit proves nothing: the
+    /// entries can still be applying. The verdict reads the caller's
+    /// watermark, so a lagging one is stale and one at the commit is fresh.
+    #[test]
+    fn the_verdict_reads_the_callers_watermark_not_the_hand_off_index() {
+        let mut node = follower();
+        heartbeat(&mut node, 9);
+        node.advance_applied(9);
+        assert_eq!(node.last_applied(), 9);
+        assert_eq!(
+            node.staleness_verdict(BOUND, 4),
+            StalenessVerdict::Behind {
+                leader_commit: 9,
+                applied: 4,
+            }
+        );
+        assert!(!node.within_staleness_bound(BOUND, 4));
+        assert!(node.within_staleness_bound(BOUND, 9));
+        assert!(
+            node.leader_contact_within(BOUND),
+            "a lagging apply keeps contact"
+        );
     }
 
     #[test]
@@ -160,9 +200,10 @@ mod tests {
         heartbeat(&mut node, 0);
         node.leader_contact_at_override(Instant::now() - Duration::from_secs(30));
         assert_eq!(
-            node.staleness_verdict(BOUND),
+            node.staleness_verdict(BOUND, 0),
             StalenessVerdict::NoRecentContact
         );
+        assert!(!node.leader_contact_within(BOUND));
     }
 
     /// The leader is the source of the bound, so it needs no contact of its
@@ -173,6 +214,7 @@ mod tests {
         node.election_deadline_override(Instant::now() - Duration::from_millis(1));
         node.tick();
         assert_eq!(node.role(), NodeRole::Leader);
-        assert_eq!(node.staleness_verdict(BOUND), StalenessVerdict::Fresh);
+        assert_eq!(node.staleness_verdict(BOUND, 0), StalenessVerdict::Fresh);
+        assert!(node.leader_contact_within(BOUND));
     }
 }

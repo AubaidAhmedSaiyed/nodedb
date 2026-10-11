@@ -4,6 +4,7 @@
 
 use nodedb_raft::RaftNode;
 
+use crate::conf_change::ConfChange;
 use crate::error::{ClusterError, Result};
 use crate::group_disk::StagedLogStorage;
 use crate::multi_raft::core::MultiRaft;
@@ -53,6 +54,9 @@ impl MultiRaft {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .group_for_vshard(vshard_id)?;
+        if let Some(change) = ConfChange::from_entry_data(&data) {
+            self.admit_conf_change(group_id, &change)?;
+        }
         let node = self
             .groups
             .get_mut(&group_id)
@@ -78,6 +82,9 @@ impl MultiRaft {
     ///
     /// Returns the committed log index on success.
     pub fn propose_to_group(&mut self, group_id: u64, data: Vec<u8>) -> Result<u64> {
+        if let Some(change) = ConfChange::from_entry_data(&data) {
+            self.admit_conf_change(group_id, &change)?;
+        }
         let node = self
             .groups
             .get_mut(&group_id)
@@ -123,13 +130,19 @@ impl MultiRaft {
             .map(|n| n.first_available_index())
     }
 
-    /// Make this node's replica of `group_id` refuse log entries until a
-    /// snapshot installs, or lift that. Its leader answers the refusal with
-    /// a snapshot. Returns whether this node hosts the group.
-    pub fn set_snapshot_required(&mut self, group_id: u64, required: bool) -> bool {
+    /// Raise what this node's replica of `group_id` needs to `state`, never
+    /// lowering it: it refuses log entries until a snapshot installs, and
+    /// its leader answers the refusal with a snapshot. A replica whose data
+    /// diverged also steps down from leadership and never campaigns. Only an
+    /// install lifts it (see [`Self::refresh_snapshot_requirement`]).
+    /// Returns whether this node hosts the group.
+    pub fn require_snapshot(&mut self, group_id: u64, state: nodedb_raft::ReplicaState) -> bool {
         match self.groups.get_mut(&group_id) {
             Some(node) => {
-                node.set_snapshot_required(required);
+                let raised = node.replica_state().raised_to(state);
+                if raised != node.replica_state() {
+                    node.set_replica_state(raised);
+                }
                 true
             }
             None => false,
@@ -159,7 +172,7 @@ impl MultiRaft {
         let sequencer_first = self.sequencer_first_available();
         for group_id in groups {
             if let Some(node) = self.groups.get_mut(&group_id) {
-                node.set_snapshot_required(requirement(group_id, sequencer_first));
+                node.set_replica_state(requirement(group_id, sequencer_first));
             }
         }
     }
@@ -180,6 +193,12 @@ impl MultiRaft {
         self.groups
             .get(&group_id)
             .is_some_and(|node| node.snapshot_required())
+    }
+
+    /// What this node's replica of `group_id` needs before it takes log
+    /// entries. `None` when the group is not mounted here.
+    pub fn replica_state(&self, group_id: u64) -> Option<nodedb_raft::ReplicaState> {
+        self.groups.get(&group_id).map(|node| node.replica_state())
     }
 
     /// Auto-compact a group's log if its configured threshold has been

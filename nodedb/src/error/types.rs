@@ -470,10 +470,29 @@ pub enum Error {
     )]
     BackupCaptureMoved { group_id: u64 },
 
-    /// No leader elected on the metadata group yet. Transient — an election
-    /// is in progress — so callers can wait it out instead of failing.
-    #[error("metadata raft group has no elected leader yet; retry needed")]
+    /// The metadata group has no leader to take a proposal right now. Nothing
+    /// was proposed. An election, a leadership transfer, a stale leader or an
+    /// unreachable leader causes it. Callers can wait it out and re-propose.
+    #[error("metadata raft group has no reachable leader; retry needed")]
     MetadataLeaderUnavailable,
+
+    /// The metadata group left this node before it applied the entry this
+    /// node proposed at `log_index`. The entry's outcome is unknown, so no
+    /// caller re-proposes it blindly.
+    #[error(
+        "metadata entry at log index {log_index}: the metadata raft group left this node before \
+         it applied the entry; its outcome is unknown. Check the catalog before any retry"
+    )]
+    MetadataGroupGone { log_index: u64 },
+
+    /// Another owner took the DDL preparation lease before the DDL this node
+    /// proposed at `log_index` applied. Its apply skipped the DDL, so
+    /// nothing changed and the client can retry the statement.
+    #[error(
+        "metadata DDL at log index {log_index} was superseded: the DDL preparation lease moved to \
+         another owner before it applied; nothing changed. Retry the statement"
+    )]
+    MetadataDdlSuperseded { log_index: u64 },
 
     /// A statement cannot be planned yet: this node's roles, grants, policies
     /// or permission trees may be behind a change already acknowledged, and

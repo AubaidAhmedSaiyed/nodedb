@@ -192,7 +192,7 @@ fn learner_catchup_then_promotion_lifecycle() {
         success: true,
         last_log_index: idx,
         round: 0,
-        needs_snapshot: false,
+        replica: nodedb_raft::ReplicaState::Whole,
     };
     node.handle_append_entries_response(2, &voter_ack);
     assert_eq!(node.commit_index(), idx);
@@ -203,7 +203,7 @@ fn learner_catchup_then_promotion_lifecycle() {
         success: true,
         last_log_index: idx,
         round: 0,
-        needs_snapshot: false,
+        replica: nodedb_raft::ReplicaState::Whole,
     };
     node.handle_append_entries_response(3, &learner_ack);
     assert_eq!(node.match_index_for(3), Some(idx));

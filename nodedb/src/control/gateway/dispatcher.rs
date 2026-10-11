@@ -53,6 +53,9 @@ pub struct DispatchRouteParams<'a> {
     pub database_id: DatabaseId,
     pub trace_id: TraceId,
     pub deadline_ms: u64,
+    /// The dispatch attempts this route has left, this one included. A
+    /// caller that never retries passes 1.
+    pub attempts_left: usize,
     pub version_set: &'a GatewayVersionSet,
     pub txn_id: Option<TxnId>,
     /// The route is a leg of a linearizable read (see
@@ -71,6 +74,7 @@ pub(crate) async fn dispatch_route(
         database_id,
         trace_id,
         deadline_ms,
+        attempts_left,
         version_set,
         txn_id,
         linearizable,
@@ -103,6 +107,7 @@ pub(crate) async fn dispatch_route(
                 database_id,
                 trace_id,
                 deadline_ms,
+                attempts_left,
                 version_set,
                 txn_id,
                 linearizable,
@@ -139,6 +144,8 @@ pub struct DispatchRouteStreamParams<'a> {
     pub database_id: DatabaseId,
     pub trace_id: TraceId,
     pub deadline_ms: u64,
+    /// The dispatch attempts this route has left, this one included.
+    pub attempts_left: usize,
     pub version_set: &'a GatewayVersionSet,
     /// The route is a leg of a linearizable read.
     pub linearizable: bool,
@@ -172,6 +179,7 @@ pub(crate) async fn dispatch_route_stream(
         database_id,
         trace_id,
         deadline_ms,
+        attempts_left,
         version_set,
         linearizable,
     } = args;
@@ -205,6 +213,7 @@ pub(crate) async fn dispatch_route_stream(
                 database_id,
                 trace_id,
                 deadline_ms,
+                attempts_left,
                 version_set,
                 // No session-transaction context crosses the streaming gateway
                 // boundary yet (see `resolve/exchange.rs`), so `None`.
@@ -225,18 +234,6 @@ pub(crate) async fn dispatch_route_stream(
             leader_term: 0,
         }),
     }
-}
-
-/// Milliseconds left on the running statement, for a remote hop's
-/// `ExecuteRequest.deadline_remaining_ms`.
-///
-/// The session's `statement_timeout` when one is installed on this connection,
-/// else the node's configured default. A forwarded route must stop when the
-/// statement that spawned it does, not on a budget of its own.
-pub fn statement_deadline_ms(shared: &SharedState) -> u64 {
-    crate::control::server::shared::session::statement_deadline_ms(
-        shared.tuning.network.default_deadline_secs,
-    )
 }
 
 #[cfg(test)]

@@ -3,9 +3,9 @@
 //! Propose a catalog entry and wait until this node applied it.
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::Instant;
 
-use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, WaitOutcome, encode_entry};
+use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, encode_entry};
 
 use crate::control::catalog_entry::{self, CatalogEntry};
 use crate::control::propose_outcome::ProposeOutcome;
@@ -14,8 +14,9 @@ use crate::error::Error;
 
 use super::ddl_prepare::{acquire_ddl_prepare_lease_async, lock_ddl_preparation_async};
 use super::handle::MetadataRaftHandle;
-use super::timeouts::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_PROPOSE_TIMEOUT};
-use super::wait::wait_tracking_progress_async;
+use super::timeouts::DEFAULT_DRAIN_TIMEOUT;
+use super::wait::await_applied;
+use crate::control::server::shared::session::StatementDeadline;
 
 /// Propose a `CatalogEntry` and wait until this node applied it, on any
 /// runtime flavor.
@@ -80,7 +81,7 @@ async fn propose_and_apply_locally(
             handle.as_ref(),
             lease.token(),
             catalog_ddl_entry(&stamped)?,
-            DEFAULT_PROPOSE_TIMEOUT,
+            StatementDeadline::of_statement(shared).instant(),
         )
         .await
     }
@@ -205,17 +206,18 @@ pub(super) fn catalog_ddl_entry_with(
 }
 
 /// Propose `entry` under the preparation lease `token` and wait until this
-/// node applied it. Returns the log index. Fails when another lease owner
-/// superseded `token` before the apply.
+/// node applied it, until `deadline`. Returns the log index.
 ///
-/// `timeout` bounds a stall, not the whole wait, as
-/// [`super::wait::wait_tracking_progress_async`] describes.
+/// - Past `deadline`: `Error::DeadlineExceeded`. The entry was proposed, so
+///   its outcome is unknown and no caller resends it.
+/// - Another lease owner superseded `token` before the apply:
+///   `Error::MetadataDdlSuperseded`. The apply skipped the entry.
 pub(super) async fn propose_prepared(
     shared: &SharedState,
     handle: &dyn MetadataRaftHandle,
     token: u64,
     entry: MetadataEntry,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<u64, Error> {
     let raw = encode_entry(&MetadataEntry::DdlPrepared {
         token,
@@ -226,79 +228,100 @@ pub(super) async fn propose_prepared(
     })?;
     let log_index = handle.propose_async(raw).await?;
     let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
-    let outcome =
-        wait_tracking_progress_async(std::sync::Arc::clone(&watcher), log_index, timeout, || {
-            shared.metadata_apply_progress.load(Ordering::Acquire)
-        })
-        .await?;
-    match outcome {
-        WaitOutcome::Reached
-            if shared.metadata_ddl.applied_token.load(Ordering::Acquire) == token =>
-        {
-            Ok(log_index)
-        }
-        WaitOutcome::Reached => Err(Error::Config {
-            detail: "metadata DDL preparation ownership was superseded before apply".into(),
-        }),
-        WaitOutcome::TimedOut => Err(Error::Config {
-            detail: format!(
-                "metadata propose timed out after {timeout:?} without apply progress waiting \
-                 for log index {log_index} (current: {})",
-                watcher.current()
-            ),
-        }),
-        WaitOutcome::GroupGone => Err(Error::Config {
-            detail: "metadata group no longer hosted on this node".into(),
-        }),
+    await_applied(&watcher, log_index, deadline).await?;
+    if shared.metadata_ddl.applied_token.load(Ordering::Acquire) == token {
+        Ok(log_index)
+    } else {
+        Err(Error::MetadataDdlSuperseded { log_index })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-
-    use nodedb_cluster::AppliedIndexWatcher;
+    use std::time::Duration;
 
     use super::*;
 
-    const WINDOW: Duration = Duration::from_millis(60);
+    /// A handle that assigns every proposal log index 5.
+    struct AtFive;
 
-    /// Progress that keeps moving for many windows never times out; the wait
-    /// ends when the entry applies.
-    #[tokio::test]
-    async fn steady_progress_never_times_out() {
-        let watcher = Arc::new(AppliedIndexWatcher::new());
-        let progress = Arc::new(AtomicU64::new(0));
-        let driver = {
-            let (watcher, progress) = (Arc::clone(&watcher), Arc::clone(&progress));
-            std::thread::spawn(move || {
-                for _ in 0..20 {
-                    std::thread::sleep(Duration::from_millis(20));
-                    progress.fetch_add(1, Ordering::Release);
-                }
-                watcher.bump(5);
-            })
-        };
-        let outcome = wait_tracking_progress_async(Arc::clone(&watcher), 5, WINDOW, || {
-            progress.load(Ordering::Acquire)
-        })
-        .await
-        .expect("the wait finishes");
-        driver.join().unwrap();
-        assert!(outcome.is_reached(), "{outcome:?}");
+    impl MetadataRaftHandle for AtFive {
+        fn propose_async<'a>(
+            &'a self,
+            _bytes: Vec<u8>,
+        ) -> crate::control::metadata_proposer::ProposeFuture<'a> {
+            Box::pin(async { Ok::<u64, Error>(5) })
+        }
     }
 
-    /// A stall of one window times the wait out.
+    fn test_state() -> (Arc<SharedState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(
+            crate::wal::WalManager::open_for_testing(&dir.path().join("propose.wal")).expect("wal"),
+        );
+        let (dispatcher, _sides) = crate::bridge::dispatch::Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        (state, dir)
+    }
+
+    fn ddl() -> MetadataEntry {
+        MetadataEntry::CatalogDdl {
+            payload: Vec::new(),
+        }
+    }
+
+    /// An apply that lands after a 1 s quiet gap, inside a 2 s deadline,
+    /// answers the log index.
     #[tokio::test]
-    async fn a_stall_times_out() {
-        let watcher = Arc::new(AppliedIndexWatcher::new());
-        let started = std::time::Instant::now();
-        let outcome = wait_tracking_progress_async(watcher, 5, WINDOW, || 7)
-            .await
-            .expect("the wait finishes");
-        assert!(matches!(outcome, WaitOutcome::TimedOut), "{outcome:?}");
-        assert!(started.elapsed() < WINDOW * 4);
+    async fn a_slow_apply_inside_the_deadline_succeeds() {
+        const TOKEN: u64 = 77;
+        let (state, _dir) = test_state();
+        let applier = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                state
+                    .metadata_ddl
+                    .applied_token
+                    .store(TOKEN, Ordering::Release);
+                state.applied_index_watcher(METADATA_GROUP_ID).bump(5);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let applied = propose_prepared(&state, &AtFive, TOKEN, ddl(), deadline).await;
+        applier.await.expect("join applier");
+        assert_eq!(applied.expect("the entry applied"), 5);
+    }
+
+    /// An entry that never applies ends at the deadline as `DeadlineExceeded`,
+    /// never as a config error: it was proposed, so its outcome is unknown.
+    #[tokio::test]
+    async fn an_entry_that_never_applies_ends_at_the_deadline() {
+        let (state, _dir) = test_state();
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let result = propose_prepared(&state, &AtFive, 1, ddl(), started + budget).await;
+        assert!(
+            matches!(result, Err(Error::DeadlineExceeded { .. })),
+            "{result:?}"
+        );
+        assert!(started.elapsed() >= budget);
+    }
+
+    /// An entry whose apply skipped it under another lease owner is
+    /// superseded, not a success.
+    #[tokio::test]
+    async fn a_superseded_token_is_a_typed_refusal() {
+        let (state, _dir) = test_state();
+        state.metadata_ddl.applied_token.store(9, Ordering::Release);
+        state.applied_index_watcher(METADATA_GROUP_ID).bump(5);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = propose_prepared(&state, &AtFive, 1, ddl(), deadline).await;
+        assert!(
+            matches!(result, Err(Error::MetadataDdlSuperseded { log_index: 5 })),
+            "{result:?}"
+        );
     }
 
     /// A one-node cluster stamps a create, commits it through its metadata

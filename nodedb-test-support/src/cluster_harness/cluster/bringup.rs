@@ -36,6 +36,7 @@ impl TestCluster {
             backup_storage: None,
             pitr: None,
             node_timeseries_tuning: std::collections::HashMap::new(),
+            redo_chunk_limits: None,
         };
         Self::spawn_three_with_config(config).await
     }
@@ -60,6 +61,7 @@ impl TestCluster {
             backup_storage: None,
             pitr: None,
             node_timeseries_tuning: std::collections::HashMap::new(),
+            redo_chunk_limits: None,
         })
         .await
     }
@@ -83,6 +85,7 @@ impl TestCluster {
             backup_storage: None,
             pitr: None,
             node_timeseries_tuning: std::collections::HashMap::new(),
+            redo_chunk_limits: None,
         })
         .await
     }
@@ -106,6 +109,7 @@ impl TestCluster {
             backup_storage: None,
             pitr: None,
             node_timeseries_tuning: std::collections::HashMap::from([(node_id, timeseries_tuning)]),
+            redo_chunk_limits: None,
         })
         .await
     }
@@ -131,6 +135,7 @@ impl TestCluster {
             }),
             pitr: None,
             node_timeseries_tuning: std::collections::HashMap::new(),
+            redo_chunk_limits: None,
         })
         .await
     }
@@ -153,6 +158,37 @@ impl TestCluster {
             backup_storage: None,
             pitr: Some(pitr),
             node_timeseries_tuning: std::collections::HashMap::new(),
+            redo_chunk_limits: None,
+        })
+        .await
+    }
+
+    /// Spawn a 3-node cluster whose nodes cap a redo entry at
+    /// `max_entry_bytes`, so a commit larger than it travels as a chunked
+    /// redo stream. Uses the standard fast-election tuning and 1 core per
+    /// node.
+    pub async fn spawn_three_with_redo_entry_limit(
+        max_entry_bytes: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let calvin = nodedb_types::config::tuning::CalvinTuning::default();
+        Self::spawn_three_with_config(ClusterSpawnConfig {
+            tuning: super::types::fast_cluster_tuning(),
+            graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+            query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores: 1,
+            log_compaction_threshold: None,
+            replication_factor: 3,
+            num_groups: DEFAULT_NUM_GROUPS,
+            single_node_calvin: false,
+            backup_storage: None,
+            pitr: None,
+            node_timeseries_tuning: std::collections::HashMap::new(),
+            redo_chunk_limits: Some(
+                nodedb::control::wal_replication::transaction_redo::chunks::RedoChunkLimits {
+                    max_entry_bytes,
+                    max_open_bytes: calvin.max_open_redo_bytes,
+                },
+            ),
         })
         .await
     }

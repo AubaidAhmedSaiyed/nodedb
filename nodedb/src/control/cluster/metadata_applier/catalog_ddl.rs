@@ -81,6 +81,14 @@ impl MetadataCommitApplier {
         };
         let shared = self.shared_state()?;
 
+        // Slows one collection's create on one node, as a long apply does.
+        #[cfg(feature = "failpoints")]
+        if let catalog_entry::CatalogEntry::PutCollection(stored)
+        | catalog_entry::CatalogEntry::PutCollectionIfAbsent(stored) = &stamped
+        {
+            crate::control::fail_gate::before_catalog_ddl_apply(shared.node_id, &stored.name).await;
+        }
+
         // Holds back one node's apply of backup schedule marks with a
         // transient error, so a test can make that node's catalog lag the
         // metadata group. Raft re-delivers the entry once it is cleared.

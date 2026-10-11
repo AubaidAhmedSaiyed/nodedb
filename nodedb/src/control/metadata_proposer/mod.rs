@@ -23,12 +23,14 @@
 //! Semantics:
 //!
 //! 1. If this node is the metadata-group leader, proposes the entry, waits
-//!    until its local applied watermark reaches the assigned log index for
-//!    as long as the apply moves (a 5s stall ends the wait), and returns the
-//!    log index on success.
-//! 2. If this node is NOT the leader, returns
-//!    `Error::Config { detail: "metadata propose: not leader ..." }`.
-//!    Gateway-side redirection will make this transparent.
+//!    until its local applied watermark reaches the assigned log index, and
+//!    returns the log index. The wait ends at the statement deadline with
+//!    `Error::DeadlineExceeded`: the entry was proposed, so its outcome is
+//!    unknown.
+//! 2. If this node is NOT the leader, forwards the entry to the leader.
+//!    With no leader to take it, returns `Error::MetadataLeaderUnavailable`:
+//!    nothing was proposed. A forward with no answer returns
+//!    `Error::DeadlineExceeded`: the outcome is unknown.
 
 pub mod catalog;
 pub mod catalog_batch;
@@ -53,4 +55,4 @@ pub use replicated_entries::{
     propose_restore_point, propose_surrogate_hwm, propose_surrogate_reserve,
     propose_sync_peer_bind, propose_sync_producer_fence, propose_sync_producer_register,
 };
-pub use timeouts::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_PROPOSE_TIMEOUT};
+pub use timeouts::DEFAULT_DRAIN_TIMEOUT;

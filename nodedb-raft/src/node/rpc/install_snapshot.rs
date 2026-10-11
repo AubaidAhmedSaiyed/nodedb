@@ -261,7 +261,7 @@ mod tests {
                 success: true,
                 last_log_index: tip,
                 round: UNTRACKED_ROUND,
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
         assert_eq!(leader.commit_index(), tip);

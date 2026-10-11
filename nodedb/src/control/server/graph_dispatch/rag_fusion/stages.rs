@@ -9,10 +9,9 @@ use nodedb_physical::physical_plan::{GraphOp, RagBindingRow, RagLegs, RagStage};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::gateway::TaskRoute;
-use crate::control::gateway::dispatcher::{
-    DispatchRouteParams, dispatch_route, statement_deadline_ms,
-};
+use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
 use crate::control::gateway::version_set::GatewayVersionSet;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 
@@ -73,7 +72,8 @@ pub(super) async fn export_legs(
         tenant_id,
         database_id,
         trace_id: TraceId::ZERO,
-        deadline_ms: statement_deadline_ms(state),
+        deadline_ms: StatementDeadline::of_statement(state).hop_budget_ms(),
+        attempts_left: 1,
         version_set: &GatewayVersionSet::from_pairs(Vec::new()),
         txn_id: None,
         linearizable,

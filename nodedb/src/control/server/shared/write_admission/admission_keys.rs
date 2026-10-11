@@ -20,9 +20,8 @@
 //!   alike on every replica.
 //! - Every Calvin writer of a columnar or timeseries collection locks it
 //!   `Exclusive`. So an append still orders against each Calvin writer.
-//! - A contended append waits and never routes. A routed write applies
-//!   outside the data-group log. Each replica then installs it against its
-//!   own schema at its own point.
+//! - A contended append waits and never routes. The data-group log already
+//!   orders appends, so routing one to Calvin gains nothing.
 //!
 //! A write no Calvin transaction sequences still takes keys:
 //!
@@ -352,6 +351,27 @@ mod tests {
                 "{plan:?}"
             );
         }
+    }
+
+    /// A held TRUNCATE locks its collection `Exclusive`. A fast-path point
+    /// write announces itself `Intent` on that collection, so it cannot take
+    /// its keys while the TRUNCATE holds.
+    #[test]
+    fn a_held_truncate_fences_a_point_write() {
+        let mut table = LockManager::new();
+        let truncate = PhysicalPlan::Document(DocumentOp::Truncate {
+            collection: qualified("docs"),
+            restart_identity: false,
+            resolved_sum_targets: Vec::new(),
+            declared_primary_key: None,
+        });
+        let (truncate_keys, _) = keys_of(&truncate);
+        assert!(table.try_acquire(TxnId::new(1, 0), truncate_keys));
+        let (point_keys, _) = keys_of(&doc_insert("x", 17));
+        assert!(
+            !table.try_acquire(TxnId::new(TxnId::AUTOCOMMIT_EPOCH, 0), point_keys),
+            "the point write must wait for the truncate"
+        );
     }
 
     /// A resolved write no Calvin transaction sequences still locks the rows

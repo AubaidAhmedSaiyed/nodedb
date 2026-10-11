@@ -34,6 +34,7 @@ use crate::Error;
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::graph_dispatch::{VShardRead, read_on_vshard};
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::VShardId;
 use crate::types::{DatabaseId, TenantId};
@@ -162,7 +163,7 @@ pub(super) async fn dispatch_crdt_doc_deletes(
         registry,
         orchestrator: orc,
         predicate_class_hash: pred_class,
-        timeout: std::time::Duration::from_secs(state.tuning.network.default_deadline_secs),
+        deadline: StatementDeadline::of_statement(state).tokio_instant(),
         ollp_max_retries: orc.ollp_max_retries() as u32,
         initial_predicted,
         submit,

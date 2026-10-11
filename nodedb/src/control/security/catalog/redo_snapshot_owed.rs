@@ -58,6 +58,16 @@ impl SystemCatalog {
                     .map_err(|e| catalog_err("insert redo_snapshot_owed", e))?;
             }
         }
+        #[cfg(test)]
+        if self
+            .fail_next_redo_snapshot_owed_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(crate::Error::Storage {
+                engine: "catalog".into(),
+                detail: "injected redo_snapshot_owed write failure".into(),
+            });
+        }
         txn.commit()
             .map_err(|e| catalog_err("redo_snapshot_owed commit", e))
     }

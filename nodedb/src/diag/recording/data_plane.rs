@@ -34,22 +34,22 @@ pub fn data_plane_response_lost(core_id: usize, write: context::LostResponseWrit
     .emit();
 }
 
-/// Report a Calvin cross-shard transaction whose completion wait timed out.
-/// Called from the completion-timeout arm of
-/// `submit_and_await_calvin_with_timeout`; the sibling "channel closed" arm
-/// is a different root cause and is not reported here.
+/// Report a Calvin cross-shard transaction whose completion wait reached the
+/// statement deadline. Called from the deadline arm of the coordinator's
+/// completion wait. The "channel closed" arm is a different root cause and
+/// is not reported here.
 pub fn calvin_completion_timeout(
     err: &crate::Error,
     epoch: u64,
     position: u32,
     participants: usize,
-    timeout_secs: u64,
+    waited_ms: u64,
 ) {
     let ctx = context::CalvinCompletionTimeout {
         epoch,
         position,
         participants,
-        timeout_secs,
+        waited_ms,
     };
     let _ = Capture::new(
         EventKind::Error,

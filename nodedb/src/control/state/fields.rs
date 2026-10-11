@@ -119,10 +119,6 @@ pub struct SharedState {
     pub group_watchers: Arc<nodedb_cluster::GroupAppliedWatchers>,
     /// This node's state of the replicated descriptor preparation lease.
     pub metadata_ddl: super::metadata_ddl::MetadataDdlState,
-    /// Apply-progress steps this node made on metadata entries: each batch
-    /// sub-entry and each purge-reclaim step (a core acknowledgement, a closed
-    /// scan). A proposer on a long apply reads it to tell slow from stalled.
-    pub metadata_apply_progress: AtomicU64,
     /// Node-local table of in-flight `DdlPendingPropose` records. Persisted in
     /// `SystemCatalog` and seeded at boot.
     pub pending_ddl: crate::control::pending_ddl::PendingDdlTable,

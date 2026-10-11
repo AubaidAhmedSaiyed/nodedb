@@ -30,6 +30,7 @@ use crate::control::planner::calvin::{
 use crate::control::planner::implicit_edges::{
     EdgeUpdateCtx, append_implicit_edge_delete_tasks, append_implicit_edge_update_tasks,
 };
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::OllpPredictedEdge;
@@ -241,7 +242,8 @@ async fn dispatch_dependent_edge_recon_inner(
     )
     .await?;
 
-    let timeout = std::time::Duration::from_secs(state.tuning.network.default_deadline_secs);
+    // One deadline for every attempt: the statement's.
+    let deadline = StatementDeadline::of_statement(state).tokio_instant();
     let ollp_max_retries = orc.ollp_max_retries() as u32;
 
     // `submit`: build the TxClass with the loop-supplied prediction (NOT a
@@ -422,7 +424,7 @@ async fn dispatch_dependent_edge_recon_inner(
         registry,
         orchestrator: orc,
         predicate_class_hash: pred_class,
-        timeout,
+        deadline,
         ollp_max_retries,
         initial_predicted,
         submit,

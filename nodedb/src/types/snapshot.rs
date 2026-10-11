@@ -335,7 +335,7 @@ pub struct GroupEventLane {
     pub publish_cursors: Vec<PartitionCursor>,
 }
 
-/// One array's cell versions whose Hilbert prefixes route to one vShard.
+/// One array's cell versions whose tile keys route to one vShard.
 #[derive(
     Debug,
     Clone,

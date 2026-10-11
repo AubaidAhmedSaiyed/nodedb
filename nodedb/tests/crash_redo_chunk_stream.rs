@@ -9,7 +9,8 @@
 //!
 //! - after every chunk is durable and before the final entry applies: boot
 //!   rebuilds the stream from its WAL records, and the re-delivered final
-//!   entry installs every row once;
+//!   entry installs every row once. The restart slows that install, and the
+//!   node reports ready only after it, so the first read sees every row;
 //! - after the first chunk is durable: no final entry exists, so no row
 //!   installs, and the stream drops at the group's next term. A later
 //!   chunked commit installs as usual.
@@ -36,6 +37,9 @@ const STATEMENTS: usize = 6;
 
 /// Bounded wait for the injected abort.
 const CRASH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the restart holds the re-delivered final entry's install.
+const SLOW_INSTALL_MS: u64 = 3_000;
 
 /// A harness whose server reads a config file with the lowered entry limit.
 fn harness() -> CrashHarness {
@@ -91,8 +95,12 @@ async fn commit_large_transaction(h: &CrashHarness, coll: &str, prefix: &str) ->
 }
 
 /// Arm `fail_point`, crash the server inside a chunked commit, and restart it
-/// without the fail point.
-async fn crash_inside_a_chunked_commit(h: &mut CrashHarness, fail_point: &str) {
+/// with `restart_failpoints` armed, or with none.
+async fn crash_inside_a_chunked_commit(
+    h: &mut CrashHarness,
+    fail_point: &str,
+    restart_failpoints: Option<&str>,
+) {
     h.set_env("NODEDB_FAILPOINTS", &format!("{fail_point}=abort"));
     h.spawn();
     h.wait_ready();
@@ -115,19 +123,30 @@ async fn crash_inside_a_chunked_commit(h: &mut CrashHarness, fail_point: &str) {
         h.keep_data_dir_note(),
         diagnostics::log_tail_section(&log)
     );
-    h.clear_env("NODEDB_FAILPOINTS");
+    match restart_failpoints {
+        Some(spec) => h.set_env("NODEDB_FAILPOINTS", spec),
+        None => h.clear_env("NODEDB_FAILPOINTS"),
+    }
     h.reopen();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crash_before_the_final_entry_applies_installs_the_whole_redo_once() {
     let mut h = harness();
-    crash_inside_a_chunked_commit(&mut h, "redo_chunk::before_final_install").await;
+    let slow_install = format!("redo_chunk::before_final_install=sleep({SLOW_INSTALL_MS})");
+    crash_inside_a_chunked_commit(
+        &mut h,
+        "redo_chunk::before_final_install",
+        Some(&slow_install),
+    )
+    .await;
+    // The first read after ready: readiness waits for the slowed install.
     let expected = STATEMENTS * ROWS_PER_STATEMENT;
     assert_eq!(
         count(&h, "chunk_crash").await,
         expected,
-        "the committed final entry must install every row of its rebuilt stream once\n{}",
+        "the node reported ready before the re-delivered final entry installed every row of \
+         its rebuilt stream once\n{}",
         diagnostics::log_tail_section(&h.server_log())
     );
 }
@@ -135,7 +154,7 @@ async fn a_crash_before_the_final_entry_applies_installs_the_whole_redo_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crash_between_chunk_entries_installs_nothing_and_frees_the_stream() {
     let mut h = harness();
-    crash_inside_a_chunked_commit(&mut h, "redo_chunk::after_chunk_durable").await;
+    crash_inside_a_chunked_commit(&mut h, "redo_chunk::after_chunk_durable", None).await;
     assert_eq!(
         count(&h, "chunk_crash").await,
         0,

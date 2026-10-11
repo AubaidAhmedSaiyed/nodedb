@@ -15,6 +15,8 @@ use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::cluster::calvin::executor::ollp::orchestrator::OllpOrchestrator;
 use crate::control::planner::calvin::abort_error::calvin_abort_error;
 use crate::control::planner::calvin::submit::RoutedAssignment;
+use crate::control::planner::calvin::submit::budget::budget_ms_until;
+use crate::control::planner::calvin::submit::wait::await_completion;
 use crate::{Error, OllpExhaustedCause};
 
 // ── run_dependent_with_retry ──────────────────────────────────────────────────
@@ -64,11 +66,16 @@ pub enum DependentOutcome {
 /// `submit` and `rescan` are injected so this loop is unit-testable WITHOUT a
 /// live server/executor: a fake scheduler driving the real
 /// [`CalvinCompletionRegistry`] suffices.
+///
+/// Every attempt shares the statement's `deadline`. A spent deadline before a
+/// submit refuses it, since nothing of that attempt was submitted. A
+/// completion wait that reaches the deadline is an unknown outcome, and so is
+/// a submit that answers [`Error::DeadlineExceeded`]: neither is resubmitted.
 pub struct DependentRetryArgs<'a, P, SF, RF> {
     pub registry: &'a CalvinCompletionRegistry,
     pub orchestrator: &'a OllpOrchestrator,
     pub predicate_class_hash: u64,
-    pub timeout: std::time::Duration,
+    pub deadline: tokio::time::Instant,
     pub ollp_max_retries: u32,
     pub initial_predicted: P,
     pub submit: SF,
@@ -88,7 +95,7 @@ where
         registry,
         orchestrator,
         predicate_class_hash,
-        timeout,
+        deadline,
         ollp_max_retries,
         initial_predicted,
         mut submit,
@@ -97,6 +104,7 @@ where
     let mut predicted = initial_predicted;
     let mut retry: u32 = 0;
     loop {
+        budget_ms_until(deadline)?;
         let assignment = match submit(&predicted).await {
             Ok(Some(assignment)) => assignment,
             // Nothing to write: the prediction decided an empty write set, so
@@ -107,6 +115,12 @@ where
             // it, so surface the real error instead of retrying and reporting
             // predicate drift that never happened.
             Err(OllpError::Terminal(error)) => return Err(*error),
+            // The submit can have been sequenced. A resubmit can apply it twice.
+            Err(OllpError::Retryable(error))
+                if matches!(*error, Error::DeadlineExceeded { .. }) =>
+            {
+                return Err(*error);
+            }
             Err(ollp_err) => {
                 // PRE-ADMISSION failure (routed submit / circuit / budget).
                 // Nothing executed, so there is no aborted attempt to re-scan
@@ -132,15 +146,7 @@ where
         // registry, which receives the replicated completion ack on every
         // sequencer-group member.
         let txn_id = TxnId::new(assignment.epoch, assignment.position);
-        let completion_rx = registry.register_completion_report(txn_id, assignment.participants);
-        let report = tokio::time::timeout(timeout, completion_rx)
-            .await
-            .map_err(|_| Error::Internal {
-                detail: "timed out waiting for Calvin completion".into(),
-            })?
-            .map_err(|_| Error::Internal {
-                detail: "Calvin completion channel closed".into(),
-            })?;
+        let report = await_completion(registry, txn_id, assignment.participants, deadline).await?;
 
         match report.outcome {
             // Return the completed txn's id so the caller can drain the applied
@@ -223,6 +229,11 @@ mod tests {
     use nodedb_cluster::calvin::VerdictOutcome;
     use nodedb_cluster::calvin::sequencer::error::SequencerError;
 
+    /// A deadline no test reaches.
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+    }
+
     /// Build an orchestrator with zero backoff so the retry loop runs instantly.
     fn zero_backoff_orchestrator() -> OllpOrchestrator {
         OllpOrchestrator::new(OllpConfig {
@@ -296,7 +307,7 @@ mod tests {
                     registry: &registry,
                     orchestrator: &orchestrator,
                     predicate_class_hash: 0xABCD,
-                    timeout: std::time::Duration::from_secs(5),
+                    deadline: far_deadline(),
                     ollp_max_retries: 5,
                     initial_predicted: vec![1, 2, 3],
                     submit: move |_predicted: &Vec<u32>| {
@@ -367,7 +378,7 @@ mod tests {
                     registry: &registry,
                     orchestrator: &orchestrator,
                     predicate_class_hash: 0xABCD,
-                    timeout: std::time::Duration::from_secs(5),
+                    deadline: far_deadline(),
                     ollp_max_retries: 3,
                     initial_predicted: vec![1],
                     submit: move |_predicted: &Vec<u32>| {
@@ -436,7 +447,7 @@ mod tests {
                     registry: &registry,
                     orchestrator: &orchestrator,
                     predicate_class_hash: 0xABCD,
-                    timeout: std::time::Duration::from_secs(5),
+                    deadline: far_deadline(),
                     ollp_max_retries: 5,
                     initial_predicted: vec![1],
                     submit: move |_predicted: &Vec<u32>| {
@@ -503,7 +514,7 @@ mod tests {
                     registry: &registry,
                     orchestrator: &orchestrator,
                     predicate_class_hash: 0xABCD,
-                    timeout: std::time::Duration::from_secs(5),
+                    deadline: far_deadline(),
                     ollp_max_retries: 5,
                     initial_predicted: Vec::<u32>::new(),
                     // A zero-match prediction builds no TxClass, so nothing is
@@ -551,7 +562,7 @@ mod tests {
                     registry: &registry,
                     orchestrator: &orchestrator,
                     predicate_class_hash: 0xABCD,
-                    timeout: std::time::Duration::from_secs(5),
+                    deadline: far_deadline(),
                     ollp_max_retries: 5,
                     initial_predicted: vec![1],
                     submit: move |_predicted: &Vec<u32>| {
@@ -597,7 +608,7 @@ mod tests {
                 registry: &registry,
                 orchestrator: &orchestrator,
                 predicate_class_hash: 0xABCD,
-                timeout: std::time::Duration::from_secs(5),
+                deadline: far_deadline(),
                 ollp_max_retries: 2,
                 initial_predicted: vec![1],
                 // Retryable every time: the loop exhausts, and the carried cause
@@ -668,7 +679,7 @@ mod tests {
                     registry: &registry,
                     orchestrator: &orchestrator,
                     predicate_class_hash: 0xABCD,
-                    timeout: std::time::Duration::from_secs(5),
+                    deadline: far_deadline(),
                     ollp_max_retries: 5,
                     initial_predicted: vec![1],
                     submit: move |_predicted: &Vec<u32>| {
@@ -734,5 +745,113 @@ mod tests {
         );
         assert_eq!(submits, 1);
         assert_eq!(rescans, 0);
+    }
+
+    /// A submit whose assignment the fake never completes. The completion
+    /// wait ends at the statement's deadline as an unknown outcome.
+    #[tokio::test(start_paused = true)]
+    async fn the_completion_wait_ends_at_the_statement_deadline() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let orchestrator = zero_backoff_orchestrator();
+        let start = tokio::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(100);
+        let submit_calls = Arc::new(AtomicU64::new(0));
+
+        let result = {
+            let submit_calls = Arc::clone(&submit_calls);
+            run_dependent_with_retry(DependentRetryArgs {
+                registry: &registry,
+                orchestrator: &orchestrator,
+                predicate_class_hash: 0xABCD,
+                deadline,
+                ollp_max_retries: 5,
+                initial_predicted: vec![1],
+                submit: move |_predicted: &Vec<u32>| {
+                    let submit_calls = Arc::clone(&submit_calls);
+                    async move {
+                        let n = submit_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<Option<RoutedAssignment>, OllpError>(Some(fake_assignment(n + 1)))
+                    }
+                },
+                rescan: move || async move { Ok(vec![1]) },
+            })
+            .await
+        };
+
+        assert!(
+            matches!(result, Err(Error::DeadlineExceeded { .. })),
+            "expected an unknown outcome, got {result:?}"
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(100)
+                && waited < std::time::Duration::from_millis(200),
+            "the wait ends at the statement deadline, not later: {waited:?}"
+        );
+        assert_eq!(
+            submit_calls.load(Ordering::SeqCst),
+            1,
+            "an unknown outcome is never resubmitted"
+        );
+    }
+
+    /// A drift abort whose re-read ends past the deadline. The next attempt
+    /// is refused before its submit: nothing of it was submitted.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_the_deadline_is_refused_before_submit() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let orchestrator = zero_backoff_orchestrator();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<TxnId>(16);
+        let fake = spawn_fake_scheduler(Arc::clone(&registry), rx, u32::MAX);
+        let seq = Arc::new(AtomicU64::new(1));
+        let submit_calls = Arc::new(AtomicU64::new(0));
+
+        let result = {
+            let seq = Arc::clone(&seq);
+            let submit_calls = Arc::clone(&submit_calls);
+            let tx = tx.clone();
+            run_dependent_with_retry(DependentRetryArgs {
+                registry: &registry,
+                orchestrator: &orchestrator,
+                predicate_class_hash: 0xABCD,
+                deadline,
+                ollp_max_retries: 5,
+                initial_predicted: vec![1],
+                submit: move |_predicted: &Vec<u32>| {
+                    let seq = Arc::clone(&seq);
+                    let submit_calls = Arc::clone(&submit_calls);
+                    let tx = tx.clone();
+                    async move {
+                        submit_calls.fetch_add(1, Ordering::SeqCst);
+                        let assignment = fake_assignment(seq.fetch_add(1, Ordering::SeqCst));
+                        let txn = TxnId::new(assignment.epoch, assignment.position);
+                        tx.send(txn).await.expect("fake recv alive");
+                        Ok::<Option<RoutedAssignment>, OllpError>(Some(assignment))
+                    }
+                },
+                rescan: move || async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    Ok(vec![2])
+                },
+            })
+            .await
+        };
+
+        let Err(Error::DataPlane(code)) = &result else {
+            panic!("expected a definite refusal, got {result:?}");
+        };
+        assert_eq!(
+            code,
+            &crate::bridge::envelope::ErrorCode::ExpiredBeforeExecution
+        );
+        assert_eq!(
+            submit_calls.load(Ordering::SeqCst),
+            1,
+            "the attempt after the deadline is never submitted"
+        );
+        drop(tx);
+        let _ = fake.await;
     }
 }

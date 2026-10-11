@@ -200,6 +200,16 @@ impl TestClusterNode {
         // cloned. Before `EventPlane::spawn` below: the Event Plane starts the
         // cross-shard drain only when its sender is wired.
         if let Some(state) = Arc::get_mut(&mut shared) {
+            // No stream is open yet: the store with the test's bounds
+            // replaces the default one before any entry applies.
+            if let Some(limits) = config.redo_chunk_limits {
+                state.redo_chunks = Arc::new(
+                    nodedb::control::wal_replication::transaction_redo::RedoChunkStore::new(
+                        Arc::clone(&wal),
+                        limits,
+                    ),
+                );
+            }
             // Consumer offsets, job history, MV state and the array-sync
             // stores live in the data directory in the production layout. A
             // restart reopens them there, since no metadata entry below the

@@ -210,7 +210,6 @@ impl SharedState {
             .0,
             group_watchers: Arc::new(nodedb_cluster::GroupAppliedWatchers::new()),
             metadata_ddl: crate::control::state::MetadataDdlState::new(),
-            metadata_apply_progress: std::sync::atomic::AtomicU64::new(0),
             pending_ddl: crate::control::pending_ddl::PendingDdlTable::new(),
             metadata_apply_wedge: std::sync::Arc::default(),
             sequencer_halt: std::sync::Arc::default(),

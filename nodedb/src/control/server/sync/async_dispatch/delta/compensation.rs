@@ -54,6 +54,7 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         | crate::Error::GroupMarksUnavailable { .. }
         | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::MetadataDdlSuperseded { .. }
         | crate::Error::AuthorizationStateBehind { .. }
         | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::DispatchCapacity { .. }
@@ -69,7 +70,8 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         },
         // The write committed or was overwritten, and nothing here says which.
         // Never re-pushed: a committed write will apply twice.
-        other @ crate::Error::ProposalOutcomeUnknown { .. } => CompensationHint::Custom {
+        other @ (crate::Error::ProposalOutcomeUnknown { .. }
+        | crate::Error::MetadataGroupGone { .. }) => CompensationHint::Custom {
             constraint: "proposal_outcome_unknown".into(),
             detail: other.to_string(),
         },

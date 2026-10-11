@@ -283,16 +283,18 @@ impl DataPlaneSnapshotApplier {
         if floor == 0 || watcher.current() >= floor {
             return Ok(());
         }
-        let waiting = Arc::clone(&watcher);
-        let outcome = tokio::task::spawn_blocking(move || waiting.wait_for(floor, limit)).await;
+        let outcome = watcher
+            .wait_for_async(floor, std::time::Instant::now() + limit)
+            .await;
         match outcome {
-            Ok(nodedb_cluster::WaitOutcome::Reached) => Ok(()),
-            Ok(nodedb_cluster::WaitOutcome::TimedOut | nodedb_cluster::WaitOutcome::GroupGone)
-            | Err(_) => Err(SnapshotInstallError::MetadataBehind {
-                group_id,
-                floor,
-                applied: watcher.current(),
-            }),
+            nodedb_cluster::WaitOutcome::Reached => Ok(()),
+            nodedb_cluster::WaitOutcome::TimedOut | nodedb_cluster::WaitOutcome::GroupGone => {
+                Err(SnapshotInstallError::MetadataBehind {
+                    group_id,
+                    floor,
+                    applied: watcher.current(),
+                })
+            }
         }
     }
 

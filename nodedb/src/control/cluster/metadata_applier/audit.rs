@@ -121,9 +121,10 @@ pub(super) fn emit_ddl_audit(
     // mutex lets audit-log contention stall EVERY metadata apply, and with it
     // collection materialization, DDL, and any proposer waiting on the applied
     // index. That is a liveness bug rather than a slow path: one contended
-    // acquisition here was measured parking the loop for a full 5s propose
-    // timeout, so peer `CollectionSchema` announces never materialized and the
-    // engine writes that followed them were rejected as unknown collections.
+    // acquisition here was measured parking the loop past a proposer's whole
+    // apply wait, so peer `CollectionSchema` announces never materialized and
+    // the engine writes that followed them were rejected as unknown
+    // collections.
     //
     // The record's payload is fully built above and needs nothing further from
     // the apply loop, so deferring the emit keeps the compliance row (no silent

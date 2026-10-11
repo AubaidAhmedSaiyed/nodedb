@@ -157,7 +157,7 @@ threads-required = 'num-test-threads'
 # Every test in the `wire` target spawns its own real `nodedb` server process.
 # At full fan-out the box runs one server per core, and each server carries a
 # Data Plane plus Raft groups — enough CPU starvation that a metadata propose
-# misses its 5s deadline and the statement fails. Capping concurrent servers
+# misses its statement deadline and the statement fails. Capping concurrent servers
 # fixes the starvation; widening that deadline would only hide it, and the
 # deadline is real.
 #

@@ -35,6 +35,6 @@ pub use snapshot_framing::{
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC, SnapshotEngineId, SnapshotFramingError,
     decode_snapshot_chunk, encode_snapshot_chunk,
 };
-pub use state::{HardState, NodeRole, PeerRole};
+pub use state::{HardState, NodeRole, PeerRole, ReplicaState};
 pub use storage::LogStorage;
 pub use transport::RaftTransport;

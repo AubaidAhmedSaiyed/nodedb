@@ -100,6 +100,7 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
             database_id,
             trace_id: TraceId::ZERO,
             deadline_ms,
+            attempts_left: 1,
             version_set,
             // This resolve path carries no session-transaction context.
             txn_id: None,

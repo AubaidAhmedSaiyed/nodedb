@@ -108,6 +108,7 @@ impl TestClusterNode {
             backup_storage: None,
             pitr: None,
             node_timeseries_tuning: std::collections::HashMap::new(),
+            redo_chunk_limits: None,
         };
         Self::spawn_with_full_config(node_id, seed_nodes, &config).await
     }
@@ -166,6 +167,7 @@ impl TestClusterNode {
             backup_storage: None,
             pitr: None,
             node_timeseries_tuning: std::collections::HashMap::new(),
+            redo_chunk_limits: None,
         };
         Self::spawn_with_full_config_at(1, vec![], &config, data_dir_path, None).await
     }

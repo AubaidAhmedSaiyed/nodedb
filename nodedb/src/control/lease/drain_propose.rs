@@ -194,31 +194,10 @@ fn lease_holder_is_member(shared: &SharedState, node_id: u64) -> bool {
     }
 }
 
-/// How long a drain variant's propose waits for its local apply.
-pub(super) const DRAIN_PROPOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Encode a drain variant for the metadata group.
 pub(super) fn encode_drain(entry: &MetadataEntry, operation: &str) -> Result<Vec<u8>, Error> {
     encode_entry(entry).map_err(|e| Error::Config {
         detail: format!("descriptor drain {operation} encode: {e}"),
-    })
-}
-
-/// The result of waiting for a drain variant's apply at `log_index`.
-pub(super) fn drain_applied_or_error(
-    outcome: nodedb_cluster::WaitOutcome,
-    operation: &str,
-    log_index: u64,
-    current: u64,
-) -> Result<(), Error> {
-    if outcome.is_reached() {
-        return Ok(());
-    }
-    Err(Error::Config {
-        detail: format!(
-            "descriptor drain {operation} did not apply within {DRAIN_PROPOSE_TIMEOUT:?} \
-             (log index {log_index}, current: {current}, outcome: {outcome:?})"
-        ),
     })
 }
 

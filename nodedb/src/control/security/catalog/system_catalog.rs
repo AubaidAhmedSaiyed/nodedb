@@ -32,6 +32,8 @@ pub struct SystemCatalog {
     pub(super) fail_next_collection_write: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(super) fail_next_surrogate_write: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(super) fail_next_redo_snapshot_owed_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl crate::storage::RedbBacked for SystemCatalog {
@@ -67,6 +69,8 @@ impl SystemCatalog {
             fail_next_collection_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_surrogate_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_redo_snapshot_owed_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         catalog.bootstrap_default_database()?;
         catalog.reload_event_definitions()?;
@@ -93,6 +97,8 @@ impl SystemCatalog {
             fail_next_collection_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_surrogate_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_redo_snapshot_owed_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         catalog.bootstrap_default_database()?;
         catalog.reload_event_definitions()?;
@@ -123,6 +129,14 @@ impl SystemCatalog {
     #[cfg(test)]
     pub(crate) fn fail_next_surrogate_write_for_test(&self) {
         self.fail_next_surrogate_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make the next `save_redo_snapshot_owed` raise, so a held group's debt
+    /// write fails once.
+    #[cfg(test)]
+    pub(crate) fn fail_next_redo_snapshot_owed_write_for_test(&self) {
+        self.fail_next_redo_snapshot_owed_write
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 

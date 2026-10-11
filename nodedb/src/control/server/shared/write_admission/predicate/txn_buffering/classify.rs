@@ -466,11 +466,42 @@ mod tests {
         )
     }
 
+    /// A write whose rows a predicate names. It resolves to rows before it is
+    /// logged, so the log encoder refuses its raw form.
+    fn resolves_before_log(plan: &PhysicalPlan) -> bool {
+        matches!(
+            plan,
+            PhysicalPlan::Kv(KvOp::PredicateUpdate { .. } | KvOp::PredicateDelete { .. })
+                | PhysicalPlan::Vector(
+                    VectorOp::DirectDelete {
+                        targets: nodedb_physical::physical_plan::VectorWriteTargets::Predicate(_),
+                        ..
+                    } | VectorOp::DirectUpdate {
+                        targets: nodedb_physical::physical_plan::VectorWriteTargets::Predicate(_),
+                        ..
+                    }
+                )
+        )
+    }
+
+    /// The classifier agrees with the encoder. A predicate write is refused
+    /// at the log boundary with a typed error and still buffers in a
+    /// transaction, where staging resolves it.
     fn assert_matches_oracle(plan: &PhysicalPlan) {
-        let expected = to_replicated_entry(tenant(), db(), vshard(), plan)
+        let encoded = to_replicated_entry(tenant(), db(), vshard(), plan);
+        let actual = plan_requires_txn_buffering(plan);
+        if resolves_before_log(plan) {
+            assert!(
+                matches!(encoded, Err(crate::Error::Internal { .. })),
+                "expected {plan:?} to be refused at the log boundary, got {:?}",
+                encoded.as_ref().err()
+            );
+            assert!(actual, "expected {plan:?} to require txn buffering");
+            return;
+        }
+        let expected = encoded
             .expect("encode must not error for this fixture")
             .is_some();
-        let actual = plan_requires_txn_buffering(plan);
         assert_eq!(
             actual, expected,
             "plan_requires_txn_buffering disagrees with to_replicated_entry for {plan:?}"
@@ -2001,7 +2032,7 @@ mod tests {
                 attr_projection: Vec::new(),
                 limit: 0,
                 cell_filter: None,
-                hilbert_range: None,
+                shard_bucket: None,
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
             }),
@@ -2016,7 +2047,7 @@ mod tests {
                 group_by_dim: -1,
                 cell_filter: None,
                 return_partial: false,
-                hilbert_range: None,
+                shard_bucket: None,
                 system_as_of: None,
                 valid_at_ms: None,
             }),
@@ -2063,7 +2094,7 @@ mod tests {
                 slice_msgpack: Vec::new(),
                 attr_projection: Vec::new(),
                 limit: 0,
-                slice_hilbert_ranges: Vec::new(),
+                slice_tile_keys: Vec::new(),
                 prefix_bits: 0,
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
@@ -2073,7 +2104,7 @@ mod tests {
                 attr_idx: 0,
                 reducer_msgpack: Vec::new(),
                 group_by_dim: -1,
-                slice_hilbert_ranges: Vec::new(),
+                slice_tile_keys: Vec::new(),
                 prefix_bits: 0,
                 system_as_of: None,
                 valid_at_ms: None,

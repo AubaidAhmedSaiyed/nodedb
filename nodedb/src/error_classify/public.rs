@@ -219,12 +219,13 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         )),
         // Internal class `XX`: no driver or pool treats it as transient, so
         // nothing re-proposes a write that already committed.
-        Error::CommittedResultUnavailable { .. } | Error::ProposalOutcomeUnknown { .. } => {
-            NodeDbError::internal(e.to_string())
-        }
+        Error::CommittedResultUnavailable { .. }
+        | Error::ProposalOutcomeUnknown { .. }
+        | Error::MetadataGroupGone { .. } => NodeDbError::internal(e.to_string()),
         Error::MetadataLeaderUnavailable => NodeDbError::dispatch(
-            "metadata raft group has no elected leader yet; retry exhausted".to_string(),
+            "metadata raft group has no reachable leader; retry exhausted".to_string(),
         ),
+        Error::MetadataDdlSuperseded { .. } => NodeDbError::dispatch(e.to_string()),
         // The code renders `55P03`, the SQLSTATE pgwire gives the variant, so
         // the class survives a node hop as a bare numeric code.
         Error::AuthorizationStateBehind { .. } | Error::LinearizableReadRefused { .. } => {

@@ -34,11 +34,13 @@ pub(super) fn async_propose_error(vshard_id: u32, error: ClusterError) -> crate:
         )
         | ClusterError::ReadIndexNotLeader { .. }
         | ClusterError::MigrationInProgress { .. }
-        | ClusterError::WrongOwner { .. }
+        | ClusterError::WrongOwner { .. } => crate::Error::NoLeader {
+            vshard_id: VShardId::new(vshard_id),
+        },
         // The forward never reached the leader whole: the leader is not in
         // this node's topology, or the connect, stream open or write failed.
         // Nothing was proposed. A written forward ends as `Unanswered`.
-        | ClusterError::Transport { .. } => crate::Error::NoLeader {
+        unsent if unsent.is_unsent() => crate::Error::NoLeader {
             vshard_id: VShardId::new(vshard_id),
         },
         // The forward did not answer before its timeout. The leader can have
@@ -46,7 +48,7 @@ pub(super) fn async_propose_error(vshard_id: u32, error: ClusterError) -> crate:
         // deadline class, the same class the array fan-out gives it. A
         // forward whose stream failed after the request was written can
         // also have been proposed, so it takes the same class.
-        error @ (ClusterError::ShardTimeout { .. } | ClusterError::Unanswered { .. }) => {
+        error if error.is_lost_answer() => {
             tracing::warn!(
                 vshard_id,
                 %error,
@@ -110,7 +112,11 @@ pub(super) fn async_propose_error(vshard_id: u32, error: ClusterError) -> crate:
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
         | ClusterError::ShufflePush(_)
-        | ClusterError::RemoteUntyped { .. }) => crate::Error::Internal {
+        | ClusterError::RemoteUntyped { .. }
+        // The guards above take these. They stay named for exhaustiveness.
+        | ClusterError::Transport { .. }
+        | ClusterError::ShardTimeout { .. }
+        | ClusterError::Unanswered { .. }) => crate::Error::Internal {
             detail: format!("raft propose (async): {other}"),
         },
     }

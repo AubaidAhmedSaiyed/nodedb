@@ -6,22 +6,25 @@
 //! the OLLP coordinator loop drives the transaction to completion itself.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use nodedb_cluster::calvin::types::TxClass;
-use nodedb_cluster::{ClusterError, RaftRpc, SubmitCalvinInboxRequest, SubmitCalvinInboxResponse};
+use nodedb_cluster::rpc_codec::reply_wait;
+use nodedb_cluster::{
+    ClusterError, RaftRpc, SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, TypedClusterError,
+};
 
 use super::stream::{PartStream, StreamTarget, stream_parts};
 use crate::Error;
 use crate::control::cluster::warm_peers::register_peers_from_topology;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 
 /// The sequencer ASSIGNMENT for a submitted dependent (OLLP) `TxClass`.
 ///
 /// Returned by [`submit_calvin_routed_assign`] AS SOON AS the sequencer assigns
 /// the transaction — completion is NOT awaited (the OLLP coordinator loop drives
-/// the dependent transaction to completion itself in a later unit).
+/// the dependent transaction to completion itself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutedAssignment {
     pub inbox_seq: u64,
@@ -31,38 +34,39 @@ pub struct RoutedAssignment {
 }
 
 /// Submit `tx_class` to THIS node's Calvin sequencer inbox and await only its
-/// ASSIGNMENT (NOT completion), bounded by `timeout`.
+/// ASSIGNMENT (NOT completion), until `deadline`.
 ///
 /// PRECONDITION: this node is the sequencer-group leader (its service assigns).
 /// Callers that are not the leader MUST route via
 /// [`submit_calvin_routed_assign`]. The local primitive for the OLLP dependent
-/// path — the sibling of [`super::local::submit_and_await_calvin_with_timeout`] that stops at
-/// the assignment phase.
+/// path — the sibling of [`super::local::submit_and_await_calvin_until`] that
+/// stops at the assignment phase.
 ///
 /// `pub(crate)` so [`crate::control::server::calvin_submit::inbox_hook`] can
 /// call it after decoding the wire bytes, mirroring how `hook.rs` delegates to
-/// `submit_and_await_calvin_with_timeout`.
+/// `submit_and_await_calvin_until`.
 pub(crate) async fn submit_local_assign(
     state: &SharedState,
     mut tx_class: TxClass,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> crate::Result<RoutedAssignment> {
     super::local::raise_metadata_floor(state, &mut tx_class);
     super::local::stamp_incarnations(state, &mut tx_class)?;
     super::unique_claims::stamp_unique_claims(state, &mut tx_class)?;
     let stream = super::parts::split_into_parts(state, &mut tx_class)?;
-    assign_prepared(state, tx_class, stream, timeout).await
+    assign_prepared(state, tx_class, stream, deadline).await
 }
 
 /// Submit a stamped `tx_class` to this node's sequencer, await its
 /// assignment, then stream its parts when it carries them as parts.
 ///
-/// PRECONDITION: this node is the sequencer-group leader.
+/// PRECONDITION: this node is the sequencer-group leader. A deadline spent
+/// before the submit refuses it: nothing was submitted.
 async fn assign_prepared(
     state: &SharedState,
     tx_class: TxClass,
     stream: Option<PartStream>,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> crate::Result<RoutedAssignment> {
     let inbox = state
         .sequencer_inbox
@@ -73,6 +77,7 @@ async fn assign_prepared(
         .get()
         .ok_or(Error::SequencerUnavailable)?;
 
+    super::budget::budget_ms_until(deadline)?;
     let (inbox_seq, assignment_rx) =
         inbox
             .submit_with(tx_class, registry)
@@ -80,11 +85,11 @@ async fn assign_prepared(
                 detail: format!("Calvin sequencer rejected transaction: {e}"),
             })?;
     let (epoch, position, participants) =
-        super::local::await_assignment(registry, inbox_seq, assignment_rx, timeout).await?;
+        super::wait::await_assignment(registry, inbox_seq, assignment_rx, deadline).await?;
     // A lost stream aborts the transaction, and the caller's completion
     // wait reports it.
     if let Some(stream) = &stream {
-        stream_parts(state, StreamTarget::Local, stream, true)
+        stream_parts(state, StreamTarget::Local, stream, true, deadline)
             .await
             .into_result()?;
     }
@@ -149,11 +154,12 @@ pub async fn submit_calvin_routed_assign(
         });
     }
 
+    // Every wait of this submit ends at the statement's deadline.
+    let deadline = StatementDeadline::of_statement(state).tokio_instant();
     // Leader is self: submit-and-assign locally (a self-RPC will be a pointless
     // extra hop and the local registry is the one that gets the assignment).
     if leader == state.node_id {
-        let local_timeout = super::budget::statement_budget(state)?;
-        return assign_prepared(state, tx_class, stream, local_timeout).await;
+        return assign_prepared(state, tx_class, stream, deadline).await;
     }
 
     // Remote leader: ensure its address is registered before dispatch, then send
@@ -168,7 +174,7 @@ pub async fn submit_calvin_routed_assign(
     })?;
 
     // The leader works on the transaction only as long as the statement waits.
-    let deadline_remaining_ms = super::budget::statement_budget_ms(state)?;
+    let deadline_remaining_ms = super::budget::budget_ms_until(deadline)?;
     let req = SubmitCalvinInboxRequest {
         tx_class_bytes,
         deadline_remaining_ms,
@@ -179,7 +185,7 @@ pub async fn submit_calvin_routed_assign(
     // assigned (up to `deadline_remaining_ms`). The generic short `rpc_timeout`
     // will abort the call long before that, so bound the response read by the
     // forwarded deadline plus a margin for the round-trip itself.
-    let read_timeout = Duration::from_millis(deadline_remaining_ms.saturating_add(2_000));
+    let read_timeout = reply_wait(deadline_remaining_ms);
     let assignment = match transport
         .send_rpc_with_read_timeout(leader, RaftRpc::SubmitCalvinInboxRequest(req), read_timeout)
         .await
@@ -196,14 +202,21 @@ pub async fn submit_calvin_routed_assign(
             position,
             participants: participants as usize,
         },
+        // An error with no class keeps the leader in its message.
         Ok(RaftRpc::SubmitCalvinInboxResponse(SubmitCalvinInboxResponse {
-            error: Some(e),
+            error: Some(TypedClusterError::Internal { code: 0, message }),
             ..
         })) => {
             return Err(Error::Internal {
-                detail: format!("calvin-inbox failed on sequencer leader node {leader}: {e:?}"),
+                detail: format!("calvin-inbox failed on sequencer leader node {leader}: {message}"),
             });
         }
+        // Every other error keeps its class. A leader-side deadline stays an
+        // unknown outcome, and an expired budget stays a definite refusal.
+        Ok(RaftRpc::SubmitCalvinInboxResponse(SubmitCalvinInboxResponse {
+            error: Some(e),
+            ..
+        })) => return Err(Error::from(e)),
         Ok(other) => {
             return Err(Error::Internal {
                 detail: format!("calvin-inbox: unexpected reply from node {leader}: {other:?}"),
@@ -232,7 +245,7 @@ pub async fn submit_calvin_routed_assign(
     // stream aborts the transaction, and the caller's completion wait
     // reports it.
     if let Some(stream) = &stream {
-        stream_parts(state, StreamTarget::Remote(leader), stream, true)
+        stream_parts(state, StreamTarget::Remote(leader), stream, true, deadline)
             .await
             .into_result()?;
     }

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Map a remote node's [`TypedClusterError`] to the gateway's [`Error`].
+//! Map a remote node's [`TypedClusterError`], and a failed send to it, to
+//! the gateway's [`Error`].
 
+use nodedb_cluster::ClusterError;
 use nodedb_cluster::rpc_codec::TypedClusterError;
 
 use crate::Error;
@@ -74,9 +76,96 @@ pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) ->
     }
 }
 
+/// The error of a failed `ExecuteRequest` or `ExecuteStreamRequest` send.
+///
+/// A request the target never received, and a lost answer to a read, retry as
+/// `NotLeader` with `leader_node = 0`. The unreachable node is then not kept as
+/// leader, and the next try routes locally to the real leader. A lost answer
+/// to any other plan is an unknown outcome: the plan can have run, and a
+/// second send would run it again.
+pub(super) fn send_error(
+    e: ClusterError,
+    resend_safe: bool,
+    node_id: u64,
+    vshard_id: u64,
+) -> Error {
+    if e.is_lost_answer() && !resend_safe {
+        tracing::warn!(
+            node_id,
+            vshard_id,
+            error = %e,
+            "gateway: a remote execute reached its deadline with no answer"
+        );
+        return Error::DeadlineExceeded {
+            request_id: crate::types::RequestId::new(0),
+        };
+    }
+    Error::NotLeader {
+        vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
+        leader_node: 0,
+        leader_addr: format!("node-{node_id} (transport error: {e})"),
+        leader_term: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unanswered() -> ClusterError {
+        ClusterError::Unanswered {
+            node_id: 2,
+            detail: "stream reset".into(),
+        }
+    }
+
+    /// A write whose answer was lost can have applied: it is never sent again.
+    #[test]
+    fn a_lost_answer_to_a_write_is_an_unknown_outcome() {
+        assert!(matches!(
+            send_error(unanswered(), false, 2, 7),
+            Error::DeadlineExceeded { .. }
+        ));
+    }
+
+    /// A read whose answer was lost retries through the leader lookup.
+    #[test]
+    fn a_lost_answer_to_a_read_retries() {
+        assert!(matches!(
+            send_error(unanswered(), true, 2, 7),
+            Error::NotLeader { leader_node: 0, .. }
+        ));
+    }
+
+    /// A send that timed out is a lost answer: a read retries, a write is an
+    /// unknown outcome.
+    #[test]
+    fn a_timed_out_send_follows_the_lost_answer_rule() {
+        let timed_out = || ClusterError::ShardTimeout {
+            vshard_id: 7,
+            elapsed_ms: 1_000,
+        };
+        assert!(matches!(
+            send_error(timed_out(), true, 2, 7),
+            Error::NotLeader { leader_node: 0, .. }
+        ));
+        assert!(matches!(
+            send_error(timed_out(), false, 2, 7),
+            Error::DeadlineExceeded { .. }
+        ));
+    }
+
+    /// A request that never reached the target retries, read or write.
+    #[test]
+    fn an_unsent_request_retries() {
+        let unsent = ClusterError::Transport {
+            detail: "connect refused".into(),
+        };
+        assert!(matches!(
+            send_error(unsent, false, 2, 7),
+            Error::NotLeader { leader_node: 0, .. }
+        ));
+    }
 
     #[test]
     fn map_not_leader() {

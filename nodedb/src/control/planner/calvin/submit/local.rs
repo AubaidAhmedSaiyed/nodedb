@@ -7,17 +7,15 @@
 //! completion ack. A submit on a non-leader is drained and discarded, so
 //! non-leader callers must route through [`super::routed`].
 
-use std::time::Duration;
-
 use nodedb_cluster::calvin::types::TxClass;
-use nodedb_cluster::calvin::{
-    Assignment, AssignmentReceiver, AttemptOutcome, CalvinCompletionRegistry, TxnId,
-};
+use nodedb_cluster::calvin::{AttemptOutcome, TxnId};
 
 use super::stream::{PartStream, StreamTarget, stream_parts};
+use super::wait::{await_assignment, await_completion};
 use crate::Error;
 use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::planner::calvin::abort_error::calvin_abort_error;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::{CalvinApplyResult, SharedState};
 
 /// Build a minimal Control-Plane [`Response`] carrying only the RETURNING
@@ -95,78 +93,50 @@ pub(crate) fn stamp_incarnations(state: &SharedState, tx_class: &mut TxClass) ->
     Ok(())
 }
 
-/// Await the sequencer assignment of submission `inbox_seq`, bounded by
-/// `timeout`.
-///
-/// A closed channel means the sequencer rejected or discarded the submission
-/// without sequencing it: a read/write cycle in its epoch, a leadership
-/// change, or a halted sequencer. Nothing applied, so the caller gets a
-/// retryable refusal. On timeout the registration is dropped, so no sender
-/// stays behind. A timed-out submission can still be sequenced later.
-pub(crate) async fn await_assignment(
-    registry: &CalvinCompletionRegistry,
-    inbox_seq: u64,
-    assignment_rx: AssignmentReceiver,
-    timeout: Duration,
-) -> crate::Result<Assignment> {
-    match tokio::time::timeout(timeout, assignment_rx).await {
-        Ok(Ok(assignment)) => Ok(assignment),
-        Ok(Err(_)) => Err(Error::RetryableRefusal {
-            reason: "the Calvin sequencer did not sequence the transaction; nothing was \
-                     applied"
-                .to_owned(),
-        }),
-        Err(_) => {
-            registry.drop_assignment(inbox_seq);
-            Err(Error::Internal {
-                detail: "timed out waiting for Calvin sequencer assignment".to_owned(),
-            })
-        }
-    }
-}
-
 /// Submit `tx_class` to THIS node's Calvin sequencer inbox and await completion.
 ///
 /// PRECONDITION: this node is the sequencer-group leader (its service assigns;
 /// its registry receives the replicated completion ack). Callers that are not
 /// the leader MUST route via [`super::routed::submit_calvin_routed`].
 ///
-/// The assignment + completion waits are bounded by
-/// `state.tuning.network.default_deadline_secs`.
+/// The assignment and completion waits end at the running statement's
+/// deadline.
 pub async fn submit_and_await_calvin(
     state: &SharedState,
     tx_class: TxClass,
 ) -> crate::Result<Option<Response>> {
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    submit_and_await_calvin_with_timeout(state, tx_class, timeout).await
+    let deadline = StatementDeadline::of_statement(state).tokio_instant();
+    submit_and_await_calvin_until(state, tx_class, deadline).await
 }
 
-/// [`submit_and_await_calvin`] with an explicit deadline budget.
+/// [`submit_and_await_calvin`] with an explicit deadline.
 ///
-/// Used by the leader-side RPC handler so the forwarded submit-and-await is
-/// bounded by the coordinator's remaining deadline rather than this node's full
-/// default deadline.
-pub async fn submit_and_await_calvin_with_timeout(
+/// The leader-side RPC handler passes the coordinator's remaining deadline,
+/// so the forwarded submit-and-await never outlives the statement.
+pub async fn submit_and_await_calvin_until(
     state: &SharedState,
     mut tx_class: TxClass,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> crate::Result<Option<Response>> {
     raise_metadata_floor(state, &mut tx_class);
     stamp_incarnations(state, &mut tx_class)?;
     super::unique_claims::stamp_unique_claims(state, &mut tx_class)?;
     let stream = super::parts::split_into_parts(state, &mut tx_class)?;
-    submit_prepared_and_await(state, tx_class, stream, timeout).await
+    submit_prepared_and_await(state, tx_class, stream, deadline).await
 }
 
 /// Submit a stamped `tx_class` to this node's sequencer, stream its parts
 /// when it carries them as parts, and await its completion.
 ///
 /// PRECONDITION: this node is the sequencer-group leader.
+///
+/// A deadline spent before the submit refuses it: nothing was submitted. A
+/// wait that reaches the deadline after the submit is an unknown outcome.
 pub(crate) async fn submit_prepared_and_await(
     state: &SharedState,
     tx_class: TxClass,
     stream: Option<PartStream>,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> crate::Result<Option<Response>> {
     #[cfg(feature = "failpoints")]
     crate::control::fail_gate::after_calvin_stamp(state.node_id, &tx_class).await;
@@ -196,6 +166,7 @@ pub(crate) async fn submit_prepared_and_await(
                 .is_source_vshard(vshard.as_u32())
         });
 
+    super::budget::budget_ms_until(deadline)?;
     let (inbox_seq, assignment_rx) =
         inbox
             .submit_with(tx_class, registry)
@@ -203,40 +174,23 @@ pub(crate) async fn submit_prepared_and_await(
                 detail: format!("Calvin sequencer rejected transaction: {e}"),
             })?;
     let (epoch, position, participants) =
-        await_assignment(registry, inbox_seq, assignment_rx, timeout).await?;
+        await_assignment(registry, inbox_seq, assignment_rx, deadline).await?;
     // The header holds its locks on every participant until the parts
     // arrive. A lost stream aborts the transaction, and the completion
     // below reports it.
     if let Some(stream) = &stream {
-        stream_parts(state, StreamTarget::Local, stream, true)
+        stream_parts(state, StreamTarget::Local, stream, true, deadline)
             .await
             .into_result()?;
     }
 
-    let completion_rx =
-        registry.register_completion_report(TxnId::new(epoch, position), participants);
-    let report = tokio::time::timeout(timeout, completion_rx)
-        .await
-        .map_err(|_| {
-            let err = Error::Internal {
-                detail: "timed out waiting for Calvin transaction completion".to_owned(),
-            };
-            // This timeout is the only signal a silently-never-completed
-            // Calvin write ever produces; file it as a structured report at
-            // the one site that detects it, since the error alone gives an
-            // operator no clue which transaction or participant stalled.
-            crate::diag::calvin_completion_timeout(
-                &err,
-                epoch,
-                position,
-                participants,
-                timeout.as_secs(),
-            );
-            err
-        })?
-        .map_err(|_| Error::Internal {
-            detail: "Calvin completion channel closed".to_owned(),
-        })?;
+    let report = await_completion(
+        registry,
+        TxnId::new(epoch, position),
+        participants,
+        deadline,
+    )
+    .await?;
     // The global cross-shard verdict was ABORT and the writes were dropped.
     // The verdict's reason picks the error the client sees.
     match report.outcome {
@@ -544,43 +498,6 @@ mod tests {
 
     fn decoded(response: &Response) -> TsInstallCounts {
         TsInstallCounts::from_payload(response.payload.as_bytes()).expect("install counts")
-    }
-
-    /// The sequencer dropped the assignment of a submission it did not
-    /// sequence. The caller fails at once with a retryable refusal, long
-    /// before its timeout.
-    #[tokio::test]
-    async fn an_unsequenced_submission_is_a_retryable_refusal() {
-        let registry = CalvinCompletionRegistry::new_detached();
-        let rx = registry.register_submission(7);
-        registry.drop_assignment(7);
-        match await_assignment(&registry, 7, rx, Duration::from_secs(3600)).await {
-            Err(Error::RetryableRefusal { .. }) => {}
-            other => panic!("expected a retryable refusal, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn an_assigned_submission_returns_its_assignment() {
-        let registry = CalvinCompletionRegistry::new_detached();
-        let rx = registry.register_submission(3);
-        registry.note_assigned(3, TxnId::new(5, 1), 2);
-        let assignment = await_assignment(&registry, 3, rx, Duration::from_secs(3600))
-            .await
-            .expect("assigned");
-        assert_eq!(assignment, (5, 1, 2));
-    }
-
-    /// A wait that times out reports the timeout, not a refusal: the
-    /// submission can still be sequenced.
-    #[tokio::test]
-    async fn a_timed_out_wait_is_not_a_refusal() {
-        let registry = CalvinCompletionRegistry::new_detached();
-        let rx = registry.register_submission(8);
-        match await_assignment(&registry, 8, rx, Duration::from_millis(1)).await {
-            Err(Error::Internal { detail }) => assert!(detail.contains("timed out"), "{detail}"),
-            other => panic!("expected the timeout error, got {other:?}"),
-        }
     }
 
     /// With one replica per vShard, the coordinator's node hosts no replica of

@@ -61,14 +61,14 @@ impl nodedb_cluster::decommission::MetadataProposer for BootstrapMetadataPropose
         let index = raft_loop
             .propose_stamped_to_metadata_group_via_leader(bytes)
             .await?;
-        let watchers = Arc::clone(&self.watchers);
-        let outcome = tokio::task::spawn_blocking(move || {
-            watchers.wait_for(METADATA_GROUP_ID, index, Duration::from_secs(10))
-        })
-        .await
-        .map_err(|error| nodedb_cluster::ClusterError::Transport {
-            detail: format!("bootstrap metadata apply wait failed: {error}"),
-        })?;
+        let outcome = self
+            .watchers
+            .wait_for_async(
+                METADATA_GROUP_ID,
+                index,
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await;
         match outcome {
             WaitOutcome::Reached => Ok(index),
             WaitOutcome::TimedOut => Err(nodedb_cluster::ClusterError::Transport {

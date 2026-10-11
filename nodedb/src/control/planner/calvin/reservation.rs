@@ -17,21 +17,26 @@
 //! storage I/O or io_uring directly.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use nodedb_cluster::calvin::types::{LockKeyWire, ReleaseReason, TxnIdWire};
+use nodedb_cluster::rpc_codec::reply_wait;
 use nodedb_cluster::{
     ClusterError, RaftRpc, ReleaseReservationRequest, ReleaseReservationResponse,
-    ReserveReadRequest, ReserveReadResponse,
+    ReserveReadRequest, ReserveReadResponse, TypedClusterError,
 };
 
 use crate::Error;
 use crate::control::cluster::warm_peers::register_peers_from_topology;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 
 /// Submit a reserve-read to THIS node's reservation inbox and await the
-/// assigned owner, bounded by `timeout`.
+/// assigned owner until `deadline`.
+///
+/// A deadline spent before the submit refuses it: nothing was submitted. A
+/// wait that reaches the deadline is an unknown outcome: the service can
+/// still grant the reservation, and lease GC reaps a lost grant.
 ///
 /// PRECONDITION: this node is the sequencer-group leader (its service
 /// assigns). Callers that are not the leader MUST route via
@@ -44,27 +49,29 @@ pub(crate) async fn submit_local_reserve_read(
     key: LockKeyWire,
     vshard: u32,
     owner: Option<TxnIdWire>,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> crate::Result<TxnIdWire> {
     let inbox = state
         .reservation_inbox
         .get()
         .ok_or(Error::SequencerUnavailable)?;
 
+    super::submit::budget::budget_ms_until(deadline)?;
     let rx = inbox
         .submit_reserve(key, vshard, owner)
         .map_err(|e| Error::BadRequest {
             detail: format!("reservation service rejected reserve-read: {e}"),
         })?;
 
-    tokio::time::timeout(timeout, rx)
-        .await
-        .map_err(|_| Error::Internal {
-            detail: "timed out waiting for reservation assignment".to_owned(),
-        })?
-        .map_err(|_| Error::Internal {
+    match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(assigned)) => Ok(assigned),
+        Ok(Err(_)) => Err(Error::Internal {
             detail: "reservation assignment channel closed".to_owned(),
-        })
+        }),
+        Err(_) => Err(Error::DeadlineExceeded {
+            request_id: crate::types::RequestId::new(0),
+        }),
+    }
 }
 
 /// Submit a reserve-read, routing it to the sequencer-group leader.
@@ -111,11 +118,12 @@ pub(crate) async fn submit_reserve_read(
         });
     }
 
+    // Every wait of this reserve-read ends at the statement's deadline.
+    let deadline = StatementDeadline::of_statement(state).tokio_instant();
     // Leader is self: submit locally (a self-RPC will be a pointless extra
     // hop and the local inbox is the one that gets the assignment).
     if leader == state.node_id {
-        let local_timeout = super::submit::budget::statement_budget(state)?;
-        return submit_local_reserve_read(state, key, vshard, owner, local_timeout).await;
+        return submit_local_reserve_read(state, key, vshard, owner, deadline).await;
     }
 
     // Remote leader: ensure its address is registered before dispatch, then
@@ -138,7 +146,7 @@ pub(crate) async fn submit_reserve_read(
         .transpose()?;
 
     // The leader works on the reservation only as long as the statement waits.
-    let deadline_remaining_ms = super::submit::budget::statement_budget_ms(state)?;
+    let deadline_remaining_ms = super::submit::budget::budget_ms_until(deadline)?;
     let req = ReserveReadRequest {
         lock_key_bytes,
         vshard,
@@ -151,7 +159,7 @@ pub(crate) async fn submit_reserve_read(
     // assigned (up to `deadline_remaining_ms`). The generic short `rpc_timeout`
     // will abort the call long before that, so bound the response read by the
     // forwarded deadline plus a margin for the round-trip itself.
-    let read_timeout = Duration::from_millis(deadline_remaining_ms.saturating_add(2_000));
+    let read_timeout = reply_wait(deadline_remaining_ms);
     match transport
         .send_rpc_with_read_timeout(leader, RaftRpc::ReserveReadRequest(req), read_timeout)
         .await
@@ -163,10 +171,17 @@ pub(crate) async fn submit_reserve_read(
             format: "msgpack".to_owned(),
             detail: format!("failed to decode TxnIdWire owner from reserve-read reply: {e}"),
         }),
+        // An error with no class keeps the leader in its message.
+        Ok(RaftRpc::ReserveReadResponse(ReserveReadResponse {
+            error: Some(TypedClusterError::Internal { code: 0, message }),
+            ..
+        })) => Err(Error::Internal {
+            detail: format!("reserve-read failed on sequencer leader node {leader}: {message}"),
+        }),
+        // Every other error keeps its class. A leader-side deadline stays an
+        // unknown outcome, and an expired budget stays a definite refusal.
         Ok(RaftRpc::ReserveReadResponse(ReserveReadResponse { error: Some(e), .. })) => {
-            Err(Error::Internal {
-                detail: format!("reserve-read failed on sequencer leader node {leader}: {e:?}"),
-            })
+            Err(Error::from(e))
         }
         Ok(other) => Err(Error::Internal {
             detail: format!("reserve-read: unexpected reply from node {leader}: {other:?}"),
@@ -298,7 +313,7 @@ pub(crate) async fn release_reservation(
         deadline_remaining_ms,
         trace_id: [0u8; 16],
     };
-    let read_timeout = Duration::from_millis(deadline_remaining_ms.saturating_add(2_000));
+    let read_timeout = reply_wait(deadline_remaining_ms);
 
     match transport
         .send_rpc_with_read_timeout(

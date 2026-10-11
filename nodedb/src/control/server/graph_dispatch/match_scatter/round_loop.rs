@@ -106,6 +106,7 @@ fn push_dispatch_fut<'f>(
                     database_id,
                     trace_id: TraceId::ZERO,
                     deadline_ms,
+                    attempts_left: 1,
                     version_set: &version_set,
                     txn_id: read.txn_id,
                     linearizable: read.linearizable,

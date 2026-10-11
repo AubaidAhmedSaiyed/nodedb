@@ -65,7 +65,7 @@ impl RaftRpcHandler for EchoHandler {
                     success: true,
                     last_log_index: req.prev_log_index + req.entries.len() as u64,
                     round: req.round,
-                    needs_snapshot: false,
+                    replica: nodedb_raft::ReplicaState::Whole,
                 }))
             }
             RaftRpc::RequestVoteRequest(req) => {

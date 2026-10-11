@@ -17,6 +17,9 @@ pub(crate) struct LeaseReleaseHandle {
     node_id: u64,
     metadata_raft: Arc<dyn crate::control::metadata_proposer::MetadataRaftHandle>,
     applied_watcher: Arc<AppliedIndexWatcher>,
+    /// `tuning.network.default_deadline_secs`: the apply wait's budget
+    /// outside a statement.
+    default_deadline_secs: u64,
     grant_gate: Arc<tokio::sync::Mutex<()>>,
     refcounts: Arc<LeaseRefCount>,
 }
@@ -29,6 +32,7 @@ impl LeaseReleaseHandle {
             node_id: shared.node_id,
             metadata_raft: Arc::clone(shared.metadata_raft_handle()?),
             applied_watcher: shared.applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID),
+            default_deadline_secs: shared.tuning.network.default_deadline_secs,
             grant_gate: Arc::clone(&shared.lease_grant_gate),
             refcounts: Arc::clone(&shared.lease_refcount),
         })
@@ -90,22 +94,16 @@ impl LeaseReleaseHandle {
             detail: format!("descriptor lease release encode: {error}"),
         })?;
         let log_index = self.metadata_raft.propose_async(raw).await?;
-        let outcome = crate::control::metadata_proposer::wait::wait_applied(
-            Arc::clone(&self.applied_watcher),
+        let deadline = crate::control::server::shared::session::StatementDeadline::with_default(
+            self.default_deadline_secs,
+        )
+        .instant();
+        crate::control::metadata_proposer::wait::await_applied(
+            &self.applied_watcher,
             log_index,
-            super::PROPOSE_TIMEOUT,
+            deadline,
         )
         .await?;
-        if !outcome.is_reached() {
-            return Err(Error::Config {
-                detail: format!(
-                    "descriptor lease release did not apply within {:?} \
-                     (log index {log_index}, current: {}, outcome: {outcome:?})",
-                    super::PROPOSE_TIMEOUT,
-                    self.applied_watcher.current()
-                ),
-            });
-        }
         Ok(())
     }
 }

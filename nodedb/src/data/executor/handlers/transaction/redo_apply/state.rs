@@ -121,8 +121,16 @@ pub(in crate::data::executor) struct DeferredWriteVersion {
     pub db: crate::types::DatabaseId,
     pub tenant: crate::types::TenantId,
     pub collection: String,
-    pub key: Option<KeyRepr>,
     pub stamp: WriteStamp,
+    pub kind: DeferredWriteKind,
+}
+
+/// What a held-back write version records.
+pub(in crate::data::executor) enum DeferredWriteKind {
+    /// A write to one key (`Some`), or to the collection only (`None`).
+    Row(Option<KeyRepr>),
+    /// A write that removed every row of the collection.
+    Wipe,
 }
 
 /// `(database, tenant, collection)`.
@@ -179,8 +187,28 @@ impl RedoApplyScope {
                 db,
                 tenant,
                 collection: collection.to_string(),
-                key,
                 stamp,
+                kind: DeferredWriteKind::Row(key),
+            });
+        }
+    }
+
+    /// Hold back one whole-collection removal until the record settles. The
+    /// validate pass writes nothing, so it holds nothing.
+    pub(in crate::data::executor) fn defer_collection_wipe(
+        &mut self,
+        db: crate::types::DatabaseId,
+        tenant: crate::types::TenantId,
+        collection: &str,
+        stamp: WriteStamp,
+    ) {
+        if self.pass == RedoApplyPass::Install {
+            self.write_versions.push(DeferredWriteVersion {
+                db,
+                tenant,
+                collection: collection.to_string(),
+                stamp,
+                kind: DeferredWriteKind::Wipe,
             });
         }
     }

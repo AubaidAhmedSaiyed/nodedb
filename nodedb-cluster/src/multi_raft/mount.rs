@@ -121,7 +121,7 @@ impl MultiRaft {
         if super::core::is_data_group(group_id)
             && let Some(requirement) = self.snapshot_requirement.as_ref()
         {
-            node.set_snapshot_required(requirement(group_id, self.sequencer_first_available()));
+            node.set_replica_state(requirement(group_id, self.sequencer_first_available()));
         }
         self.groups.insert(group_id, node);
         self.apply_gates.mount(group_id);

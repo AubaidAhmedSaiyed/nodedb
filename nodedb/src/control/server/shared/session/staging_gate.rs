@@ -25,9 +25,11 @@ use std::future::Future;
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
+use crate::control::gateway::retry::Attempt;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_staged_write};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::server::shared::sql::staging_predicates::{
     is_stageable_write, require_affected_count, stageable_write_shape, stages_returning,
 };
@@ -371,9 +373,15 @@ where
         RouteDecision::Local => dispatch(stage_task)
             .await
             .map_err(StagingGateError::Dispatch)?,
-        remote => forward_to_leader(state, remote, stage_task, &task.plan)
-            .await
-            .map_err(StagingGateError::Dispatch)?,
+        remote => forward_to_leader(
+            state,
+            remote,
+            stage_task,
+            &task.plan,
+            Attempt::sole(StatementDeadline::of_statement(state).tokio_instant()),
+        )
+        .await
+        .map_err(StagingGateError::Dispatch)?,
     };
 
     if resp.status == Status::Error {

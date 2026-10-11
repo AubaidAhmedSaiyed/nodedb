@@ -23,7 +23,6 @@
 //! directly.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use nodedb_cluster::calvin::types::{LockKeyWire, ReleaseReason, TxnIdWire};
 use nodedb_cluster::{
@@ -31,6 +30,8 @@ use nodedb_cluster::{
     TypedClusterError,
 };
 
+use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
+use crate::control::cluster::forwarded_budget::hook_deadline;
 use crate::control::planner::calvin::reservation::{
     submit_local_release, submit_local_reserve_read,
 };
@@ -57,6 +58,16 @@ impl RegistryReserveRead {
 #[async_trait::async_trait]
 impl nodedb_cluster::ReserveRead for RegistryReserveRead {
     async fn on_reserve_read(&self, req: ReserveReadRequest) -> ReserveReadResponse {
+        // A spent budget is refused before any work: nothing is reserved.
+        let deadline = match hook_deadline(req.deadline_remaining_ms) {
+            Ok(deadline) => deadline,
+            Err(refusal) => {
+                return ReserveReadResponse {
+                    owner_bytes: None,
+                    error: Some(refusal),
+                };
+            }
+        };
         let key: LockKeyWire = match zerompk::from_msgpack(&req.lock_key_bytes) {
             Ok(k) => k,
             Err(e) => {
@@ -85,8 +96,7 @@ impl nodedb_cluster::ReserveRead for RegistryReserveRead {
             None => None,
         };
 
-        let timeout = Duration::from_millis(req.deadline_remaining_ms.max(1));
-        match submit_local_reserve_read(&self.state, key, req.vshard, owner, timeout).await {
+        match submit_local_reserve_read(&self.state, key, req.vshard, owner, deadline).await {
             Ok(assigned) => match zerompk::to_msgpack_vec(&assigned) {
                 Ok(bytes) => ReserveReadResponse {
                     owner_bytes: Some(bytes),
@@ -100,12 +110,11 @@ impl nodedb_cluster::ReserveRead for RegistryReserveRead {
                     }),
                 },
             },
+            // The error keeps its class: a deadline stays an unknown
+            // outcome, an expired budget a definite refusal.
             Err(e) => ReserveReadResponse {
                 owner_bytes: None,
-                error: Some(TypedClusterError::Internal {
-                    code: 0,
-                    message: format!("reserve-read local submit failed: {e}"),
-                }),
+                error: Some(execution_error_to_typed(e)),
             },
         }
     }
@@ -170,5 +179,44 @@ impl nodedb_cluster::ReleaseReservation for RegistryReleaseReservation {
                 }),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_cluster::ReserveRead;
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::bridge::envelope::ErrorCode;
+    use crate::wal::WalManager;
+
+    /// A reserve-read with a spent budget is refused unsubmitted, a definite
+    /// refusal the coordinator keeps.
+    #[tokio::test]
+    async fn a_spent_budget_is_refused_before_the_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap());
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).unwrap();
+
+        let reply = RegistryReserveRead::new(state)
+            .on_reserve_read(ReserveReadRequest {
+                lock_key_bytes: Vec::new(),
+                vshard: 0,
+                owner_bytes: None,
+                deadline_remaining_ms: 0,
+                trace_id: [0u8; 16],
+            })
+            .await;
+        let refusal = reply.error.expect("a spent budget is refused");
+        assert!(
+            matches!(
+                crate::Error::from(refusal),
+                crate::Error::DataPlane(ErrorCode::ExpiredBeforeExecution)
+            ),
+            "a spent budget must come back as ExpiredBeforeExecution"
+        );
+        assert!(reply.owner_bytes.is_none());
     }
 }

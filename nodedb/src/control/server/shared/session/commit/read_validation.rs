@@ -35,14 +35,13 @@ use std::collections::BTreeMap;
 use nodedb_physical::physical_plan::{HomeAnswer, HomeVersion, HomeVersionProbe, MetaOp};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::gateway::dispatcher::{
-    DispatchRouteParams, dispatch_route, statement_deadline_ms,
-};
+use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
 use crate::control::gateway::live_leaders::resolve_live_decision;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::exchange::all_cores::execute_plan_all_local_cores;
 use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_types::WriteVersion;
@@ -294,7 +293,8 @@ async fn current_versions(
                 tenant_id,
                 database_id,
                 trace_id: TraceId::ZERO,
-                deadline_ms: statement_deadline_ms(shared),
+                deadline_ms: StatementDeadline::of_statement(shared).hop_budget_ms(),
+                attempts_left: 1,
                 version_set: &GatewayVersionSet::from_pairs(Vec::new()),
                 txn_id: None,
                 // The leader proves its leadership itself: it answers each

@@ -54,7 +54,9 @@ pub use self::connection::{
     ConnectionId, ConnectionIdError, ConnectionMetadata, ConnectionRegistrationError, SessionId,
 };
 pub use self::cross_shard_mode::{CrossShardTxnMode, parse_value as parse_cross_shard_value};
-pub use self::deadline::{statement_budget, statement_deadline, statement_deadline_ms};
+pub use self::deadline::{
+    StatementDeadline, statement_budget, statement_deadline, statement_deadline_ms,
+};
 pub use self::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 pub use self::params::{parse_set_command, parse_show_command};
 pub use self::read_set::{

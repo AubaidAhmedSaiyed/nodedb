@@ -51,7 +51,7 @@ pub use drain::{DescriptorDrainTracker, DrainEntry};
 pub use drain_apply::{apply_drain_ends, apply_drain_start};
 pub use drain_propose_async::{drain_for_ddl_async, drain_for_owner_async, end_drain_async};
 pub use holders::{LeaseHolders, LeaseRevocation, revoke_if_fenced, revoke_on_release};
-pub(super) use leader_wait::{PROPOSE_TIMEOUT, propose_and_wait};
+pub(super) use leader_wait::propose_and_wait;
 pub use propose::{DEFAULT_LEASE_DURATION, acquire_lease, compute_expires_at, force_refresh_lease};
 pub(crate) use propose::{acquire_lease_after_admission, drain_owner_list, ensure_not_draining};
 pub use refcount::{LeaseRefCount, QueryLeaseScope};

@@ -14,6 +14,8 @@
 //!   corresponding response handlers.
 //! - [`conf_change`]: `propose_conf_change` / `apply_conf_change` with
 //!   proper voter / learner / promotion semantics.
+//! - [`conf_change_gate`]: the leader's check that a change keeps a voter
+//!   that holds the group's state.
 //! - [`membership`]: learner catch-up / promotion helpers
 //!   (`commit_index_for`, `ready_learners`, etc.) driven by the tick loop.
 //! - [`membership_sync`]: set a group's voters and learners from routing
@@ -21,6 +23,7 @@
 //! - [`read_index`]: leadership confirmation for linearizable reads.
 
 pub mod conf_change;
+pub mod conf_change_gate;
 pub mod core;
 pub mod membership;
 pub mod membership_sync;

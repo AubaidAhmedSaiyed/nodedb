@@ -247,8 +247,8 @@ fn outcome_floor_stuck_body(
 /// How long a write window can hold the outcome floor before readiness reports
 /// it: the longest path from a window's open to its final outcome.
 ///
-/// - A statement write reaches its outcome by the longest statement deadline,
-///   plus the wait the node gives a committed entry to apply.
+/// - A statement write reaches its outcome by the longest statement deadline.
+///   Its waits for a committed entry to apply end at that deadline too.
 /// - A vector index install waits two core dispatch deadlines.
 ///
 /// A window older than both is stuck.
@@ -258,8 +258,7 @@ fn outcome_floor_bound(state: &AppState) -> std::time::Duration {
         network
             .default_deadline_secs
             .max(network.copy_deadline_secs),
-    )
-    .saturating_add(crate::control::metadata_proposer::DEFAULT_PROPOSE_TIMEOUT);
+    );
     statement.max(crate::control::catalog_entry::post_apply::vector_install_longest_core_wait())
 }
 
@@ -486,8 +485,8 @@ mod tests {
         assert_ne!(body["reason"], "calvin_apply_halted");
     }
 
-    /// The bound covers the longest statement deadline plus the apply wait,
-    /// and the vector install's two core dispatch deadlines.
+    /// The bound covers the longest statement deadline, and the vector
+    /// install's two core dispatch deadlines.
     #[tokio::test]
     async fn the_outcome_floor_bound_covers_every_path_to_a_final_outcome() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -497,7 +496,7 @@ mod tests {
             network
                 .default_deadline_secs
                 .max(network.copy_deadline_secs),
-        ) + crate::control::metadata_proposer::DEFAULT_PROPOSE_TIMEOUT;
+        );
         let vector = crate::control::catalog_entry::post_apply::vector_install_longest_core_wait();
 
         let bound = outcome_floor_bound(&state);

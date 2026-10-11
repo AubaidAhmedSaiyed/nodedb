@@ -76,10 +76,10 @@ impl SurrogateHwmPersist for CombinedPersist<'_> {
         // view of the watermark.
         //
         // Awaiting it inline stalls the writer. `propose_surrogate_hwm`
-        // blocks for `DEFAULT_PROPOSE_TIMEOUT` (5s) waiting for the entry
-        // to commit. Surrogate assignment runs on the Raft apply loop as
-        // well as on the coordinator. A flush from the apply path parks
-        // the very loop that must commit the entry until the timeout fires.
+        // waits up to the statement deadline for the entry to apply.
+        // Surrogate assignment runs on the Raft apply loop as well as on the
+        // coordinator. A flush from the apply path parks the very loop that
+        // must commit the entry until the deadline passes.
         //
         // Out-of-order or duplicate delivery is safe: `apply_surrogate_alloc`
         // advances the watermark through `restore_hwm`, which is idempotent

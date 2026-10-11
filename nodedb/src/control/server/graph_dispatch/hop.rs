@@ -55,12 +55,11 @@ use std::collections::BTreeMap;
 use futures::future::join_all;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::gateway::dispatcher::{
-    DispatchRouteParams, dispatch_route, statement_deadline_ms,
-};
+use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
 use crate::control::gateway::live_leaders::LiveLeaders;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
@@ -356,7 +355,7 @@ async fn expand_remote(
     // owning `SharedState`.
     let shared_arc = super::cluster_resolve::gateway_shared(shared)?;
 
-    let deadline_ms = statement_deadline_ms(&shared_arc);
+    let deadline_ms = StatementDeadline::of_statement(&shared_arc).hop_budget_ms();
     // Graph structural ops touch no named collection, so the version set is
     // empty (descriptor-version checks do not apply to node-id-keyed edges).
     let version_set = GatewayVersionSet::from_pairs(Vec::new());
@@ -386,6 +385,7 @@ async fn expand_remote(
                 database_id,
                 trace_id: TraceId::ZERO,
                 deadline_ms,
+                attempts_left: 1,
                 version_set: &version_set,
                 txn_id,
                 linearizable,

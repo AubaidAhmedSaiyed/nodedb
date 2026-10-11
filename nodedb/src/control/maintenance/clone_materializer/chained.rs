@@ -259,7 +259,8 @@ async fn commit_relink(
     target: RedoTarget,
     payload: &TransactionRedoPayload,
 ) -> crate::Result<()> {
-    let deadline = crate::control::wal_replication::statement_propose_deadline(state);
+    let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(state)
+        .tokio_instant();
     propose_transaction_redo(state, target, payload, deadline).await?;
     Ok(())
 }

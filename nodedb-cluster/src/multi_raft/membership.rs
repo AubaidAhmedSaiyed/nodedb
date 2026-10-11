@@ -9,8 +9,8 @@
 //! - `ready_learners(group)`: used by the tick loop's "promote
 //!   caught-up learners" phase — returns every learner in the group
 //!   whose `match_index` on this (leader) node is at least the current
-//!   `commit_index`, i.e. learners that have replicated enough log to be
-//!   safely promoted.
+//!   `commit_index` and that answered whole this term, i.e. learners that hold
+//!   the group's state and enough log to be safely promoted.
 //! - `group_leader(group)`: leader id observed by this node's local
 //!   RaftNode state, used by the join flow to decide redirect vs admit.
 //! - `group_role_is_leader(group)`: cheap leader-check helper.
@@ -36,8 +36,10 @@ impl MultiRaft {
         self.groups.get(&group_id).map(|n| n.commit_index())
     }
 
-    /// Learners in `group_id` whose `match_index` on this leader has
-    /// caught up to the current `commit_index` — safe to promote.
+    /// Learners in `group_id` that caught up to this leader's commit index
+    /// and answered whole this term — safe to promote. A remounted learner whose
+    /// log matches still lacks the group's state until its snapshot
+    /// installs.
     ///
     /// Returns an empty vec if this node is not the leader of the group
     /// or the group is not hosted here.
@@ -45,14 +47,10 @@ impl MultiRaft {
         let Some(node) = self.groups.get(&group_id) else {
             return Vec::new();
         };
-        if node.role() != NodeRole::Leader {
-            return Vec::new();
-        }
-        let commit = node.commit_index();
         node.learners()
             .iter()
             .copied()
-            .filter(|&learner| node.match_index_for(learner).unwrap_or(0) >= commit)
+            .filter(|&learner| self.peer_caught_up(group_id, learner))
             .collect()
     }
 
@@ -89,15 +87,16 @@ impl MultiRaft {
     }
 
     /// Whether `peer` holds every entry this leader has committed in
-    /// `group_id`, and did not ask for a snapshot last. `false` when this
-    /// node does not lead the group.
+    /// `group_id`, and its latest reply this term reported it whole. `false`
+    /// when this node does not lead the group, or has not heard `peer` this
+    /// term.
     pub fn peer_caught_up(&self, group_id: u64, peer: u64) -> bool {
         let Some(node) = self.groups.get(&group_id) else {
             return false;
         };
         node.role() == NodeRole::Leader
             && node.match_index_for(peer).unwrap_or(0) >= node.commit_index()
-            && !node.peer_awaits_snapshot(peer)
+            && node.peer_answered_whole(peer)
     }
 
     /// Initiate a leadership transfer for `group_id` to `target`.
@@ -114,20 +113,12 @@ impl MultiRaft {
         node.transfer_leadership(target).map_err(ClusterError::Raft)
     }
 
-    /// Hand this node's leadership of `group_id` to another voter that holds
-    /// every committed entry and did not ask for a snapshot last. Returns the
-    /// target. `None` when this node does not lead the group, no voter
-    /// qualifies, or the transfer did not start.
+    /// Hand this node's leadership of `group_id` to the voter
+    /// `RaftNode::hand_off_target` names. Returns the target. `None` when
+    /// this node does not lead the group, no voter qualifies, or the transfer
+    /// did not start.
     pub fn hand_off_leadership(&mut self, group_id: u64) -> Option<u64> {
-        let membership = self.group_membership(group_id)?;
-        if membership.leader_id != self.node_id {
-            return None;
-        }
-        let target = membership
-            .voters
-            .iter()
-            .copied()
-            .find(|&voter| voter != self.node_id && self.peer_caught_up(group_id, voter))?;
+        let target = self.groups.get(&group_id)?.hand_off_target()?;
         self.transfer_leadership(group_id, target).ok()?;
         Some(target)
     }

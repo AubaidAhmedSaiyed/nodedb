@@ -34,7 +34,8 @@ impl NodeDbPgHandler {
             &self.state,
             proposer,
             entry,
-            crate::control::wal_replication::statement_propose_deadline(&self.state),
+            crate::control::server::shared::session::StatementDeadline::of_statement(&self.state)
+                .tokio_instant(),
         )
         .await?;
 

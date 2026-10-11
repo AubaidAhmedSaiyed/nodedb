@@ -18,7 +18,7 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_plan::wire as plan_wire;
 
-use super::cluster_error::map_typed_cluster_error;
+use super::cluster_error::{map_typed_cluster_error, send_error};
 use super::dispatcher::DispatchOutcome;
 use super::version_set::GatewayVersionSet;
 
@@ -32,7 +32,10 @@ pub(super) struct RemoteDispatchArgs<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
     pub trace_id: TraceId,
+    /// Milliseconds left on the statement when this attempt starts.
     pub deadline_ms: u64,
+    /// The dispatch attempts this route has left, this one included.
+    pub attempts_left: usize,
     pub version_set: &'a GatewayVersionSet,
     /// Session-transaction context forwarded to the remote executor, or `None`
     /// for non-transactional dispatch.
@@ -58,6 +61,7 @@ pub(super) async fn dispatch_remote(
         database_id,
         trace_id,
         deadline_ms,
+        attempts_left,
         version_set,
         txn_id,
         linearizable,
@@ -133,6 +137,14 @@ pub(super) async fn dispatch_remote(
     // A read can be sent again after a lost answer. Any other plan can have
     // run on the target, so a lost answer is an unknown outcome.
     let resend_safe = required_permission(&plan) == Permission::Read;
+    // A read leaves time for the attempts after this one, so a node that
+    // never answers cannot spend the whole statement budget.
+    let attempt_ms = nodedb_cluster::rpc_codec::attempt_budget(
+        deadline_ms,
+        resend_safe,
+        attempts_left,
+        transport.rpc_timeout(),
+    );
 
     // Encode the plan.
     let plan_bytes = plan_wire::encode(&plan).map_err(|e| Error::Internal {
@@ -155,7 +167,7 @@ pub(super) async fn dispatch_remote(
         plan_bytes,
         tenant_id: tenant_id.as_u64(),
         database_id: database_id.as_u64(),
-        deadline_remaining_ms: deadline_ms,
+        deadline_remaining_ms: attempt_ms,
         trace_id: trace_id.0,
         descriptor_versions,
         txn_id,
@@ -170,10 +182,10 @@ pub(super) async fn dispatch_remote(
         "gateway: dispatching ExecuteRequest to remote node"
     );
 
-    // The remote handler works within `deadline_ms`: a write can wait at the
+    // The remote handler works within `attempt_ms`: a write can wait at the
     // leader's gate or in a Calvin queue for that long. The reply wait follows
     // that budget, never the transport's fixed RPC timeout.
-    let reply_wait = nodedb_cluster::rpc_codec::reply_wait(deadline_ms);
+    let reply_wait = nodedb_cluster::rpc_codec::reply_wait(attempt_ms);
     let resp_rpc = match tokio::time::timeout(
         reply_wait,
         transport.send_rpc_with_read_timeout(node_id, req, reply_wait),
@@ -249,78 +261,10 @@ pub(super) fn scoped_vshard(
     Ok(Some(VShardId::new(raw)))
 }
 
-/// The error of a failed `ExecuteRequest` send.
-///
-/// A request the target never received, and a lost answer to a read, retry as
-/// `NotLeader` with `leader_node = 0`. The unreachable node is then not kept as
-/// leader, and the next try routes locally to the real leader. A lost answer
-/// to any other plan is an unknown outcome: the plan can have run, and a
-/// second send would run it again.
-fn send_error(e: ClusterError, resend_safe: bool, node_id: u64, vshard_id: u64) -> Error {
-    let outcome_unknown = matches!(
-        e,
-        ClusterError::Unanswered { .. } | ClusterError::ShardTimeout { .. }
-    );
-    if outcome_unknown && !resend_safe {
-        tracing::warn!(
-            node_id,
-            vshard_id,
-            error = %e,
-            "gateway: a remote execute reached its deadline with no answer"
-        );
-        return Error::DeadlineExceeded {
-            request_id: crate::types::RequestId::new(0),
-        };
-    }
-    Error::NotLeader {
-        vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
-        leader_node: 0,
-        leader_addr: format!("node-{node_id} (transport error: {e})"),
-        leader_term: 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan};
-
-    fn unanswered() -> ClusterError {
-        ClusterError::Unanswered {
-            node_id: 2,
-            detail: "stream reset".into(),
-        }
-    }
-
-    /// A write whose answer was lost can have applied: it is never sent again.
-    #[test]
-    fn a_lost_answer_to_a_write_is_an_unknown_outcome() {
-        assert!(matches!(
-            send_error(unanswered(), false, 2, 7),
-            Error::DeadlineExceeded { .. }
-        ));
-    }
-
-    /// A read whose answer was lost retries through the leader lookup.
-    #[test]
-    fn a_lost_answer_to_a_read_retries() {
-        assert!(matches!(
-            send_error(unanswered(), true, 2, 7),
-            Error::NotLeader { leader_node: 0, .. }
-        ));
-    }
-
-    /// A request that never reached the target retries, read or write.
-    #[test]
-    fn an_unsent_request_retries() {
-        let unsent = ClusterError::Transport {
-            detail: "connect refused".into(),
-        };
-        assert!(matches!(
-            send_error(unsent, false, 2, 7),
-            Error::NotLeader { leader_node: 0, .. }
-        ));
-    }
 
     #[test]
     fn a_transaction_meta_op_carries_its_route_vshard() {

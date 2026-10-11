@@ -67,7 +67,8 @@ pub(crate) async fn reissue_plan_durably(
     // fire again for it.
     .with_event_source(crate::event::EventSource::Restore)
     .with_restore_id(target.restore_id);
-    let deadline = crate::control::wal_replication::statement_propose_deadline(state);
+    let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(state)
+        .tokio_instant();
     let (_, write_versions) =
         crate::control::wal_replication::propose_replicated_entry(state, proposer, entry, deadline)
             .await?;

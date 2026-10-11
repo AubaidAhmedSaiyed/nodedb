@@ -9,6 +9,10 @@
 //! and no other: later entries of its group start and finish, and other
 //! groups never wait on it. Only the group's applied index and durable floor
 //! wait for it to finish.
+//!
+//! An entry this replica cannot apply as its peers do holds its group: no
+//! later entry of the group starts until a snapshot install covers it (see
+//! [`super::held_entry`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,15 +22,17 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::control::distributed_applier::applier::ApplyBatch;
 use crate::control::distributed_applier::proposal_ledger::ProposalLedger;
-use crate::control::server::dispatch_utils::publish_settled_changes;
 use crate::control::state::SharedState;
 
-use super::bookkeeping::record_durable_apply;
-use super::context::{ApplyContext, ApplyFuture, LoopEvent, LoopFuture, Started, StartedEntry};
+use super::context::{ApplyContext, LoopEvent, LoopFuture, Started, StartedEntry};
 use super::group_watch::GroupWatch;
+use super::held_entry::{
+    HeldDebts, HoldCheck, keep_snapshot_owed, note_hold, release_covered_hold,
+};
 use super::lane::{Lane, QueuedEntry, Slot, SlotState};
 use super::metadata_floor::{HeldEntry, hold_for_metadata};
-use super::proposal_gate::{EntryOutcome, ProposalGate};
+use super::panicked::{conclude_panicked, finished_event, guarded};
+use super::proposal_gate::{EntryOutcome, HoldReason, ProposalGate};
 use super::snapshot_gate::{EntryAdmission, admit_entry, hold_permit};
 use super::start::{Prepared, prepare_entry};
 
@@ -37,6 +43,7 @@ pub(super) struct Pipeline<'a> {
     gate: ProposalGate,
     watch: GroupWatch,
     running: FuturesUnordered<LoopFuture<'a>>,
+    debts: HeldDebts,
     /// Set by a pump that left an entry queued because a snapshot install
     /// held its group's apply gate.
     install_blocked: bool,
@@ -50,14 +57,22 @@ impl<'a> Pipeline<'a> {
             gate: ProposalGate::new(ledger),
             watch: GroupWatch::with_cuts(ctx.state.pitr.recorded_cuts()),
             running: FuturesUnordered::new(),
+            debts: HeldDebts::default(),
             install_blocked: false,
         }
     }
 
-    /// Whether the last pump left an entry queued behind a snapshot install.
-    /// The loop pumps again once an install releases its gate.
-    pub fn install_blocked(&self) -> bool {
-        self.install_blocked
+    /// Whether a group waits for a snapshot install: the last pump left an
+    /// entry queued behind one, or an entry holds its group's lane. The loop
+    /// pumps again once an install releases its gate.
+    pub fn awaits_install(&self) -> bool {
+        self.install_blocked || self.lanes.values().any(Lane::is_held)
+    }
+
+    /// Whether a held group's snapshot debt did not persist. The loop wakes
+    /// on a timer to write it again.
+    pub fn retries_debt(&self) -> bool {
+        self.debts.retry_due()
     }
 
     /// Queue a batch the applier handed off, behind its group's earlier
@@ -116,12 +131,33 @@ impl<'a> Pipeline<'a> {
                     .note_concluded(finished.group_id, finished.log_index);
                 let gate = &mut self.gate;
                 let wrote_rows = finished.outcome.wrote_rows();
+                let hold = finished.outcome.hold_reason();
                 let handled = self.lanes.get_mut(&finished.group_id).is_some_and(|lane| {
                     lane.conclude(finished.log_index, wrote_rows, |proposal_key| {
                         gate.conclude(proposal_key, true, finished.outcome)
                     })
                 });
+                // The pump that follows records the group's debt under its
+                // apply gate.
+                if handled && let Some(reason) = hold {
+                    note_hold(finished.group_id, finished.log_index, reason);
+                }
                 (finished.group_id, finished.log_index, handled)
+            }
+            LoopEvent::Panicked {
+                group_id,
+                log_index,
+                detail,
+            } => {
+                let gate = &mut self.gate;
+                let handled = self.lanes.get_mut(&group_id).is_some_and(|lane| {
+                    conclude_panicked(self.ctx, lane, gate, log_index, &detail)
+                });
+                // The pump that follows records the group's debt.
+                if handled {
+                    note_hold(group_id, log_index, HoldReason::ApplyPanicked);
+                }
+                (group_id, log_index, handled)
             }
         };
         // The entry's enqueue returned, or its exclusive apply finished:
@@ -150,7 +186,8 @@ impl<'a> Pipeline<'a> {
         };
         match started {
             Started::Running(apply) => {
-                self.running.push(finished_event(apply));
+                self.running
+                    .push(finished_event(group_id, log_index, apply));
                 lane.enqueued(log_index, SlotState::Running, collection, user_write)
             }
             Started::Concluded(outcome) => {
@@ -159,10 +196,15 @@ impl<'a> Pipeline<'a> {
                 self.ctx.tracker.note_concluded(group_id, log_index);
                 let gate = &mut self.gate;
                 let wrote_rows = outcome.wrote_rows();
-                lane.enqueued(log_index, SlotState::Running, collection, user_write)
+                let hold = outcome.hold_reason();
+                let handled = lane.enqueued(log_index, SlotState::Running, collection, user_write)
                     && lane.conclude(log_index, wrote_rows, |proposal_key| {
                         gate.conclude(proposal_key, true, outcome)
-                    })
+                    });
+                if handled && let Some(reason) = hold {
+                    note_hold(group_id, log_index, reason);
+                }
+                handled
             }
         }
     }
@@ -178,7 +220,7 @@ impl<'a> Pipeline<'a> {
         let groups: Vec<u64> = self
             .lanes
             .iter()
-            .filter(|(_, lane)| !lane.backlog.is_empty())
+            .filter(|(_, lane)| !lane.backlog.is_empty() || lane.is_held())
             .map(|(group_id, _)| *group_id)
             .collect();
         for group_id in groups {
@@ -196,6 +238,17 @@ impl<'a> Pipeline<'a> {
     fn pump_group(&mut self, group_id: u64) {
         let shared: &'a Arc<SharedState> = self.ctx.state;
         let gates = shared.raft_apply_gates.get().map(|gates| &**gates);
+        let Some(lane) = self.lanes.get_mut(&group_id) else {
+            return;
+        };
+        match release_covered_hold(self.ctx, lane, &mut self.gate, &mut self.debts, group_id) {
+            HoldCheck::Free => {}
+            HoldCheck::Held => return,
+            HoldCheck::Installing => {
+                self.install_blocked = true;
+                return;
+            }
+        }
         while let Some(queued) = self.next_startable(group_id) {
             let log_index = queued.entry.index;
             let proposal_key = queued.proposal_key();
@@ -203,8 +256,12 @@ impl<'a> Pipeline<'a> {
             let admission = admit_entry(gates, group_id, log_index, covered_through);
             // Before the entry joins the lane: no entry above the installed
             // index settles before the lane covers it.
-            if let Some(lane) = self.lanes.get_mut(&group_id) {
-                lane.cover_through(admission.installed_through);
+            if let Some(lane) = self.lanes.get_mut(&group_id)
+                && let Some(proposal_key) = lane.cover_through(admission.installed_through)
+            {
+                // The install holds every entry through its index: a held
+                // one concludes.
+                self.gate.note_covered(proposal_key);
             }
             let permit = match admission.decision {
                 EntryAdmission::Installing => {
@@ -282,12 +339,14 @@ impl<'a> Pipeline<'a> {
                 held,
                 prepare_entry(self.ctx, &mut self.watch, &self.gate, group_id, queued),
             );
+            let mut hold = None;
             let (state, blocks, user_write) = match prepared {
                 Prepared::Concluded(outcome) => {
                     release_admission_holds(shared, group_id, log_index);
                     let user_write = matches!(outcome, EntryOutcome::Repeat) && repeat_writes;
+                    hold = outcome.hold_reason();
                     (
-                        SlotState::Concluded(self.gate.conclude(proposal_key, false, outcome)),
+                        SlotState::from(self.gate.conclude(proposal_key, false, outcome)),
                         false,
                         user_write,
                     )
@@ -300,12 +359,12 @@ impl<'a> Pipeline<'a> {
                     self.gate.open(proposal_key);
                     self.ctx.tracker.note_dispatched(group_id, log_index);
                     let enqueue = hold_permit(permit, enqueue);
-                    self.running
-                        .push(Box::pin(enqueue.map(move |entry| LoopEvent::Enqueued {
-                            group_id,
-                            log_index,
-                            entry,
-                        })));
+                    let enqueued = Box::pin(enqueue.map(move |entry| LoopEvent::Enqueued {
+                        group_id,
+                        log_index,
+                        entry,
+                    }));
+                    self.running.push(guarded(group_id, log_index, enqueued));
                     // The enqueue reports whether the plan writes user data.
                     (SlotState::Starting, true, false)
                 }
@@ -313,8 +372,11 @@ impl<'a> Pipeline<'a> {
                     // An array op or cell write: user data.
                     self.gate.open(proposal_key);
                     self.ctx.tracker.note_dispatched(group_id, log_index);
-                    self.running
-                        .push(finished_event(hold_permit(permit, apply)));
+                    self.running.push(finished_event(
+                        group_id,
+                        log_index,
+                        hold_permit(permit, apply),
+                    ));
                     (SlotState::Running, true, true)
                 }
             };
@@ -332,6 +394,19 @@ impl<'a> Pipeline<'a> {
                 user_write,
                 state,
             });
+            // The entry's admission permit is still held: no install that
+            // covers the entry settles the debt first.
+            if let Some(reason) = hold {
+                note_hold(group_id, log_index, reason);
+                let installed_through = admission.installed_through;
+                keep_snapshot_owed(
+                    shared,
+                    &mut self.debts,
+                    group_id,
+                    log_index,
+                    installed_through,
+                );
+            }
         }
     }
 
@@ -350,7 +425,7 @@ impl<'a> Pipeline<'a> {
         self.ctx
             .tracker
             .complete_covered(group_id, log_index, proposal_key);
-        let concluded = SlotState::Concluded(self.gate.conclude(proposal_key, false, outcome));
+        let concluded = SlotState::from(self.gate.conclude(proposal_key, false, outcome));
         let Some(lane) = self.lanes.get_mut(&group_id) else {
             return false;
         };
@@ -367,13 +442,14 @@ impl<'a> Pipeline<'a> {
 
     /// Take the next entry of `group_id` when it can start now.
     ///
-    /// It waits while the group's previous write is in its enqueue or an
-    /// exclusive entry of the group runs, while it is exclusive and an
-    /// earlier entry of the group has not concluded, and while a copy of its
-    /// proposal runs: the ledger decides it once that copy concludes.
+    /// It waits while an entry holds the group's lane, while the group's
+    /// previous write is in its enqueue or an exclusive entry of the group
+    /// runs, while it is exclusive and an earlier entry of the group has not
+    /// concluded, and while a copy of its proposal runs: the ledger decides
+    /// it once that copy concludes.
     fn next_startable(&mut self, group_id: u64) -> Option<QueuedEntry> {
         let lane = self.lanes.get_mut(&group_id)?;
-        if lane.blocking.is_some() {
+        if lane.blocking.is_some() || lane.is_held() {
             return None;
         }
         let front = lane.backlog.front()?;
@@ -386,49 +462,10 @@ impl<'a> Pipeline<'a> {
         lane.backlog.pop_front()
     }
 
-    /// Settle every group's concluded entries in log order, release their
-    /// window, and save each durable floor that moved.
-    ///
-    /// The tenant write marks of the settled entries are persisted before any
-    /// floor that covers them. An entry above the saved floor is delivered
-    /// again after a restart and records its mark again, so every committed
-    /// write keeps a durable mark.
+    /// Settle every group's concluded entries in log order. See
+    /// [`super::settle::settle_lanes`].
     pub fn settle(&mut self) {
-        let state = self.ctx.state;
-        let tracker = self.ctx.tracker;
-        for (group_id, lane) in &mut self.lanes {
-            let first = lane.front_index();
-            let settled = lane.settle(tracker, &state.tenant_marks);
-            if settled > 0 {
-                tracker.window().release(*group_id, settled);
-                // The entries' change events publish in log order, at their
-                // log positions, on every replica.
-                if let (Some(first), Some(last)) = (first, lane.last_settled()) {
-                    publish_settled_changes(state, *group_id, first, last);
-                }
-            }
-            if !lane.floor_pending() {
-                continue;
-            }
-            // One save per pass that moved the floor, never one per entry:
-            // each save is an fsync, and the pass coalesces every apply that
-            // finished before it.
-            if let Err(error) = state.tenant_marks.persist(state.credentials.catalog()) {
-                // The floor stays where it is, so every entry above it keeps
-                // its place in the log. The next pass persists and saves again.
-                tracing::error!(
-                    group_id = *group_id,
-                    %error,
-                    "apply loop: tenant write marks did not persist; the applied floor waits"
-                );
-                continue;
-            }
-            if let Some(floor) = lane.take_floor_to_save() {
-                // Every entry the floor covers keeps its changes on disk.
-                state.change_stream.journal_group(*group_id, floor);
-                record_durable_apply(state, *group_id, floor);
-            }
-        }
+        super::settle::settle_lanes(self.ctx, &mut self.lanes);
     }
 }
 
@@ -441,6 +478,233 @@ fn release_admission_holds(state: &SharedState, group_id: u64, log_index: u64) {
         .release_through(group_id, log_index);
 }
 
-fn finished_event(apply: ApplyFuture<'_>) -> LoopFuture<'_> {
-    Box::pin(apply.map(LoopEvent::Finished))
+#[cfg(test)]
+mod tests {
+    use nodedb_cluster::{GroupAppliedWatchers, GroupApplyGates};
+    use nodedb_raft::message::LogEntry;
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::distributed_applier::proposal_ledger::PROPOSAL_LEDGER_CAPACITY;
+    use crate::control::distributed_applier::propose_tracker::ProposeTracker;
+    use crate::wal::WalManager;
+
+    use super::super::context::FinishedApply;
+    use super::super::proposal_gate::PrefixStep;
+
+    const GROUP: u64 = 4;
+
+    fn slot(log_index: u64, state: SlotState) -> Slot {
+        Slot {
+            log_index,
+            proposal_key: 0,
+            collection: None,
+            write_mark: None,
+            user_write: false,
+            state,
+        }
+    }
+
+    /// Entry 5 holds its group with entry 6 queued behind it. Entry 6 never
+    /// starts and the applied index stays at 4 until an install covers 6.
+    /// Then 5 and 6 conclude covered and the applied index moves to 6.
+    #[tokio::test]
+    async fn a_held_entry_stops_its_group_until_an_install_covers_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("wal")).expect("wal"));
+        let (dispatcher, _sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        let gates = Arc::new(GroupApplyGates::new());
+        gates.mount(GROUP);
+        assert!(state.raft_apply_gates.set(Arc::clone(&gates)).is_ok());
+        let watchers = Arc::new(GroupAppliedWatchers::new());
+        let tracker = Arc::new(ProposeTracker::new().with_group_watchers(Arc::clone(&watchers)));
+        let ctx = ApplyContext {
+            state: &state,
+            tracker: &tracker,
+        };
+        let mut pipeline = Pipeline::new(ctx, ProposalLedger::new(PROPOSAL_LEDGER_CAPACITY));
+
+        let mut lane = Lane::new(GROUP);
+        lane.push(slot(4, SlotState::Concluded(PrefixStep::Record(true))));
+        lane.push(slot(5, SlotState::Held));
+        lane.backlog.push_back(QueuedEntry::new(LogEntry {
+            term: 1,
+            index: 6,
+            data: Vec::new(),
+        }));
+        pipeline.lanes.insert(GROUP, lane);
+
+        pipeline.pump();
+        pipeline.settle();
+        assert_eq!(
+            pipeline.lanes[&GROUP].backlog.len(),
+            1,
+            "entry 6 waits behind the held entry"
+        );
+        assert!(
+            tracker.started_through(GROUP) < 6,
+            "entry 6 never starts while entry 5 holds"
+        );
+        assert_eq!(watchers.get_or_create(GROUP).current(), 4);
+        assert!(pipeline.awaits_install());
+        assert!(
+            state.redo_chunks.owes_snapshot(GROUP),
+            "a held group owes a snapshot install"
+        );
+        assert!(!pipeline.retries_debt(), "the debt persisted");
+
+        // A snapshot through entry 4 installs: entry 5 still holds.
+        gates.install(GROUP).await.adopted(4);
+        pipeline.pump();
+        pipeline.settle();
+        assert!(pipeline.lanes[&GROUP].is_held());
+        assert_eq!(watchers.get_or_create(GROUP).current(), 4);
+
+        // A snapshot through entry 6 installs.
+        gates.install(GROUP).await.adopted(6);
+        pipeline.pump();
+        pipeline.settle();
+        let lane = &pipeline.lanes[&GROUP];
+        assert!(!lane.is_held());
+        assert!(lane.backlog.is_empty());
+        assert_eq!(tracker.started_through(GROUP), 6);
+        assert_eq!(
+            watchers.get_or_create(GROUP).current(),
+            6,
+            "entries 5 and 6 settle once the install covers them"
+        );
+        assert!(!pipeline.awaits_install());
+    }
+
+    /// The apply of a running entry that never returns a result.
+    fn exploding_apply() -> FinishedApply {
+        panic!("the apply of entry 5 exploded")
+    }
+
+    /// Entry 5's apply panics with entry 6 queued behind it. Its waiter
+    /// receives an error at once, entry 5 holds the group, entry 6 never
+    /// starts, and the applied index stays at 4.
+    #[tokio::test]
+    async fn a_panicking_apply_answers_its_waiter_and_holds_its_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("wal")).expect("wal"));
+        let (dispatcher, _sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        let gates = Arc::new(GroupApplyGates::new());
+        gates.mount(GROUP);
+        assert!(state.raft_apply_gates.set(Arc::clone(&gates)).is_ok());
+        let watchers = Arc::new(GroupAppliedWatchers::new());
+        let tracker = Arc::new(ProposeTracker::new().with_group_watchers(Arc::clone(&watchers)));
+        let ctx = ApplyContext {
+            state: &state,
+            tracker: &tracker,
+        };
+        let mut pipeline = Pipeline::new(ctx, ProposalLedger::new(PROPOSAL_LEDGER_CAPACITY));
+
+        const KEY: u64 = 77;
+        let waiter = tracker.register(GROUP, 5, KEY);
+        let mut lane = Lane::new(GROUP);
+        lane.push(slot(4, SlotState::Concluded(PrefixStep::Record(true))));
+        lane.push(Slot {
+            proposal_key: KEY,
+            ..slot(5, SlotState::Running)
+        });
+        lane.backlog.push_back(QueuedEntry::new(LogEntry {
+            term: 1,
+            index: 6,
+            data: Vec::new(),
+        }));
+        pipeline.lanes.insert(GROUP, lane);
+        pipeline.running.push(finished_event(
+            GROUP,
+            5,
+            Box::pin(async { exploding_apply() }),
+        ));
+
+        let event = pipeline.next_event().await.expect("the apply concludes");
+        assert!(matches!(event, LoopEvent::Panicked { log_index: 5, .. }));
+        pipeline.handle(event);
+        pipeline.pump();
+        pipeline.settle();
+
+        let answered = waiter.await.expect("the waiter is answered");
+        assert!(answered.is_err(), "a panicked apply answers with an error");
+        let lane = &pipeline.lanes[&GROUP];
+        assert_eq!(lane.held_index(), Some(5), "entry 5 holds its group");
+        assert_eq!(lane.backlog.len(), 1, "entry 6 waits behind entry 5");
+        assert_eq!(watchers.get_or_create(GROUP).current(), 4);
+        assert!(pipeline.awaits_install());
+        assert!(
+            state.redo_chunks.owes_snapshot(GROUP),
+            "a group held by a panic owes a snapshot install"
+        );
+    }
+
+    /// A held group's debt write fails twice and files one report. The
+    /// loop's Raft-tick wake writes it again, with no batch or install, and
+    /// the debt persists.
+    ///
+    /// The recorder is process-wide: nextest runs this test in its own
+    /// process.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_debt_write_persists_on_a_later_tick() {
+        let reports = tempfile::tempdir().expect("reports dir");
+        assert!(
+            faultbox::init(
+                faultbox::Config::new("nodedb-test", "0.0.0", reports.path())
+                    .install_panic_hook(false),
+            ),
+            "this test must be the first initializer of the recorder"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("wal")).expect("wal"));
+        let (dispatcher, _sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        let gates = Arc::new(GroupApplyGates::new());
+        gates.mount(GROUP);
+        assert!(state.raft_apply_gates.set(Arc::clone(&gates)).is_ok());
+        let watchers = Arc::new(GroupAppliedWatchers::new());
+        let tracker = Arc::new(ProposeTracker::new().with_group_watchers(watchers));
+        let ctx = ApplyContext {
+            state: &state,
+            tracker: &tracker,
+        };
+        let mut pipeline = Pipeline::new(ctx, ProposalLedger::new(PROPOSAL_LEDGER_CAPACITY));
+        let mut lane = Lane::new(GROUP);
+        lane.push(slot(4, SlotState::Concluded(PrefixStep::Record(true))));
+        lane.push(slot(5, SlotState::Held));
+        pipeline.lanes.insert(GROUP, lane);
+        let catalog = state.credentials.catalog();
+
+        catalog.fail_next_redo_snapshot_owed_write_for_test();
+        pipeline.pump();
+        assert!(pipeline.retries_debt());
+        catalog.fail_next_redo_snapshot_owed_write_for_test();
+        pipeline.pump();
+        assert!(pipeline.retries_debt(), "the second write failed too");
+        assert!(!state.redo_chunks.owes_snapshot(GROUP));
+
+        // The sender stays open: only the timed wake can pump.
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<ApplyBatch>(1);
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::super::driver::drive(&mut pipeline, &mut rx, &state),
+        )
+        .await;
+        assert!(ran.is_err(), "the loop waits for the held entry's install");
+        assert!(!pipeline.retries_debt(), "a tick wrote the debt");
+        assert!(state.redo_chunks.owes_snapshot(GROUP));
+        assert!(pipeline.lanes[&GROUP].is_held());
+
+        let debt_reports: u64 = faultbox::reader::list(reports.path())
+            .expect("list reports")
+            .iter()
+            .filter(|group| {
+                group.first.domain_kind.as_deref() == Some("nodedb.held_entry_debt_not_recorded")
+            })
+            .map(faultbox::reader::Group::occurrences)
+            .sum();
+        assert_eq!(debt_reports, 1, "one report for the failure run");
+    }
 }

@@ -22,7 +22,7 @@ use futures::future::{BoxFuture, Either, Ready, ready};
 
 use crate::bridge::envelope::{ErrorCode, Payload, PhysicalPlan, Response, Status};
 use crate::control::cluster::linearizable_read::{
-    confirm_linearizable_read, hosted_groups_of_vshards, statement_read_deadline,
+    StatementDeadline, confirm_linearizable_read, hosted_groups_of_vshards,
 };
 use crate::control::gateway::RouteDecision;
 use crate::control::gateway::core::QueryContext;
@@ -78,7 +78,7 @@ async fn route_cluster_read(
     scope: OwnedReadScope,
     plan: PhysicalPlan,
 ) -> crate::Result<OwnedRead> {
-    let deadline = statement_read_deadline(shared);
+    let deadline = StatementDeadline::of_statement(shared);
     if nodedb_physical::physical_plan::plan_contains_cluster_partitioned_leaf(&plan) {
         if scope.linearizable {
             let groups = crate::control::server::graph_dispatch::graph_read_groups(
@@ -200,7 +200,8 @@ pub(crate) async fn prepare_local_pass(
 ) -> crate::Result<()> {
     match read_placement(shared, vshard_id, txn_id)? {
         ReadPlacement::Here(hosted) => {
-            confirm_linearizable_read(shared, &hosted, statement_read_deadline(shared)).await
+            confirm_linearizable_read(shared, &hosted, StatementDeadline::of_statement(shared))
+                .await
         }
         ReadPlacement::Owner => {
             let (leader_node, leader_term) = shared

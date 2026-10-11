@@ -248,6 +248,8 @@ pub(crate) fn error_samples() -> Vec<crate::Error> {
         },
         E::BackupCaptureMoved { group_id: 1 },
         E::MetadataLeaderUnavailable,
+        E::MetadataGroupGone { log_index: 2 },
+        E::MetadataDdlSuperseded { log_index: 2 },
         E::AuthorizationStateBehind { detail: text() },
         E::LinearizableReadRefused {
             group_id: 1,

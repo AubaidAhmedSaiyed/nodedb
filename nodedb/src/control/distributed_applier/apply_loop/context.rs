@@ -69,6 +69,12 @@ pub(super) enum LoopEvent<'a> {
         entry: StartedEntry<'a>,
     },
     Finished(FinishedApply),
+    /// The entry's enqueue or apply panicked. `detail` is the panic payload.
+    Panicked {
+        group_id: u64,
+        log_index: u64,
+        detail: String,
+    },
 }
 
 /// A future the loop collects.

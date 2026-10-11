@@ -8,19 +8,17 @@
 //! runtime flavor. Every node runs a metadata group, a one-node cluster
 //! included.
 
-use std::sync::Arc;
-
-use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, encode_entry};
+use nodedb_cluster::{MetadataEntry, encode_entry};
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::state::SharedState;
 use crate::error::Error;
 use crate::event::cdc::consumer_group::OffsetCommit;
 
-use super::timeouts::DEFAULT_PROPOSE_TIMEOUT;
+use super::wait::await_metadata_apply;
 
-/// Propose `entry` and wait until this node reaches its log index. `label`
-/// names the entry in the errors.
+/// Propose `entry` and wait until this node reaches its log index, until the
+/// statement deadline. `label` names the entry in the errors.
 async fn propose_and_wait(
     shared: &SharedState,
     entry: &MetadataEntry,
@@ -32,17 +30,7 @@ async fn propose_and_wait(
     })?;
 
     let log_index = handle.propose_async(raw).await?;
-
-    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
-    let outcome =
-        super::wait::wait_applied(Arc::clone(&watcher), log_index, DEFAULT_PROPOSE_TIMEOUT).await?;
-    if !outcome.is_reached() {
-        return Err(Error::Config {
-            detail: format!("{label} propose timed out waiting for log index {log_index}"),
-        });
-    }
-
-    Ok(log_index)
+    await_metadata_apply(shared, log_index).await
 }
 
 /// Propose a cluster restore point at watermark `hlc` and wait until this
@@ -86,7 +74,7 @@ pub async fn propose_surrogate_hwm(shared: &SharedState, hwm: u32) -> Result<u64
 /// at apply time on every node by advancing the global watermark in
 /// identical log order (see `MetadataEntry::SurrogateReserve`). The
 /// caller therefore cannot learn the range from this commit-wait alone
-/// — `wait_for` returns on COMMIT, before the apply handler runs. The
+/// — the wait returns on COMMIT, before the apply handler runs. The
 /// owning node's apply handler fires an explicit completion signal
 /// (`SurrogateAssigner::complete_reservation`) that the caller awaits
 /// separately to learn the range.
@@ -245,14 +233,15 @@ pub async fn propose_cursor_commit_audited(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use nodedb_cluster::AppliedIndexWatcher;
 
-    #[test]
-    fn watcher_helper_returns_reached_on_past_target() {
+    #[tokio::test]
+    async fn watcher_helper_returns_reached_on_past_target() {
         let w = AppliedIndexWatcher::new();
         w.bump(10);
-        assert!(w.wait_for(5, Duration::from_millis(1)).is_reached());
+        let deadline = Instant::now() + Duration::from_millis(1);
+        assert!(w.wait_for_async(5, deadline).await.is_reached());
     }
 }

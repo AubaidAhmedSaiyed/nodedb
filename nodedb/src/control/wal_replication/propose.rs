@@ -19,14 +19,6 @@ const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 /// Longest wait between two re-proposals.
 const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// The deadline a proposal made now carries: the running statement's
-/// deadline, or the node default outside a statement.
-pub(crate) fn statement_propose_deadline(state: &SharedState) -> tokio::time::Instant {
-    tokio::time::Instant::from_std(crate::control::server::shared::session::statement_deadline(
-        state.tuning.network.default_deadline_secs,
-    ))
-}
-
 /// Stamp this node's metadata floor on `entry`: the catalog the write was
 /// planned against, including the batch being applied now (see
 /// `AppliedIndexWatcher::floor`). Every replica applies the entry only once

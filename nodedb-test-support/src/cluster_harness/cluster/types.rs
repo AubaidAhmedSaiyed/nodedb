@@ -49,6 +49,10 @@ pub(crate) struct ClusterSpawnConfig {
     /// runs `TimeseriesToning::default()`.
     pub(crate) node_timeseries_tuning:
         std::collections::HashMap<u64, nodedb_types::config::tuning::TimeseriesToning>,
+    /// Chunked-redo bounds every node runs. `None` keeps the default
+    /// `[tuning.calvin]` bounds.
+    pub(crate) redo_chunk_limits:
+        Option<nodedb::control::wal_replication::transaction_redo::chunks::RedoChunkLimits>,
 }
 
 impl ClusterSpawnConfig {

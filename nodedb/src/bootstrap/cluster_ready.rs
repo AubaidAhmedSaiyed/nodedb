@@ -44,8 +44,8 @@ pub async fn await_cluster_ready(
     // Boot-time readiness gate: wait until the metadata raft group has
     // applied its first entry on this node before opening any
     // client-facing listener. This eliminates the restart-window race
-    // where the first DDL observes `metadata propose: not leader`
-    // because the election has not yet completed.
+    // where the first DDL finds no metadata leader because the election
+    // has not yet completed.
     wait_for_raft_ready(
         shared,
         &mut raft_ready_rx,

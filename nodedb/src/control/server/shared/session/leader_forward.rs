@@ -34,10 +34,9 @@
 //! on a non-leader.
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response};
-use crate::control::gateway::dispatcher::{
-    DispatchRouteParams, dispatch_route, statement_deadline_ms,
-};
+use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
 use crate::control::gateway::live_leaders::resolve_live_decision;
+use crate::control::gateway::retry::Attempt;
 use crate::control::gateway::{GatewayVersionSet, RouteDecision, TaskRoute};
 use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 use crate::control::server::shared::write_admission::bare_ok_response;
@@ -68,11 +67,16 @@ pub(crate) fn resolve_leader(task: &PhysicalTask, state: &SharedState) -> RouteD
 /// write, so the forwarded stage carries the same descriptor versions a normal
 /// remote write does and is not spuriously rejected; a `DropTxnOverlay` touches
 /// no user collection, so its version set is empty.
+///
+/// `attempt` carries the deadline and the attempts left. A caller inside a
+/// retry loop passes the loop's attempt. A one-shot caller passes
+/// [`Attempt::sole`].
 pub(crate) async fn forward_to_leader(
     state: &SharedState,
     decision: RouteDecision,
     forward_task: PhysicalTask,
     version_plan: &PhysicalPlan,
+    attempt: Attempt,
 ) -> crate::Result<Response> {
     // The remote dispatch primitive needs an owned `Arc<SharedState>`; upgrade
     // the gateway's back-reference (loud typed error if the gateway is not wired
@@ -99,7 +103,8 @@ pub(crate) async fn forward_to_leader(
         tenant_id: forward_task.tenant_id,
         database_id: forward_task.database_id,
         trace_id: TraceId::ZERO,
-        deadline_ms: statement_deadline_ms(&shared),
+        deadline_ms: attempt.remaining_ms(),
+        attempts_left: attempt.attempts_left(),
         version_set: &version_set,
         // The leader's session-less staging handler reads THIS to key the
         // per-transaction overlay; forwarding it is the whole point.

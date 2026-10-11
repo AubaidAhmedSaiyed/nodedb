@@ -18,7 +18,7 @@ impl<S: LogStorage> RaftNode<S> {
                 success: false,
                 last_log_index: self.log.last_index(),
                 round: req.round,
-                needs_snapshot: false,
+                replica: self.replica,
             };
         }
 
@@ -49,13 +49,13 @@ impl<S: LogStorage> RaftNode<S> {
 
         // A follower with no state to resume from takes no entries. The
         // leader answers the refusal with a snapshot.
-        if self.snapshot_required {
+        if self.replica.wants_snapshot() {
             return AppendEntriesResponse {
                 term: self.hard_state.current_term,
                 success: false,
                 last_log_index: self.log.last_index(),
                 round: req.round,
-                needs_snapshot: true,
+                replica: self.replica,
             };
         }
 
@@ -68,7 +68,7 @@ impl<S: LogStorage> RaftNode<S> {
                 success: false,
                 last_log_index: self.volatile.last_applied,
                 round: req.round,
-                needs_snapshot: false,
+                replica: self.replica,
             };
         }
 
@@ -82,7 +82,7 @@ impl<S: LogStorage> RaftNode<S> {
                         success: false,
                         last_log_index: self.log.last_index(),
                         round: req.round,
-                        needs_snapshot: false,
+                        replica: self.replica,
                     };
                 }
             }
@@ -97,7 +97,7 @@ impl<S: LogStorage> RaftNode<S> {
                     success: false,
                     last_log_index: self.log.last_index(),
                     round: req.round,
-                    needs_snapshot: false,
+                    replica: self.replica,
                 };
             }
         };
@@ -116,7 +116,7 @@ impl<S: LogStorage> RaftNode<S> {
             success: true,
             last_log_index: self.claimable_match(matched, wrote),
             round: req.round,
-            needs_snapshot: false,
+            replica: self.replica,
         }
     }
 
@@ -147,6 +147,11 @@ impl<S: LogStorage> RaftNode<S> {
     pub fn handle_append_entries_response(&mut self, peer: u64, resp: &AppendEntriesResponse) {
         if resp.term > self.hard_state.current_term {
             self.become_follower(resp.term);
+            return;
+        }
+        // A reply to a request of an earlier term says nothing about this
+        // term's log, acks, or peer states.
+        if resp.term < self.hard_state.current_term {
             return;
         }
 
@@ -205,7 +210,7 @@ impl<S: LogStorage> RaftNode<S> {
         // the follower recorded this leader's contact before its log check.
         // The lease settles at the round's send time. Check-quorum dates the
         // answer at its arrival.
-        if peer_is_voter && resp.term == self.hard_state.current_term {
+        if peer_is_voter {
             let now = std::time::Instant::now();
             self.record_lease_ack(peer, resp.round, now);
             self.settle_lease();
@@ -216,11 +221,7 @@ impl<S: LogStorage> RaftNode<S> {
             None => return,
         };
 
-        if resp.needs_snapshot {
-            leader.awaiting_snapshot.insert(peer);
-        } else {
-            leader.awaiting_snapshot.remove(&peer);
-        }
+        leader.peer_states.insert(peer, resp.replica);
         if resp.success {
             let new_match = resp.last_log_index;
             if new_match > leader.match_index_for(peer) {
@@ -231,7 +232,7 @@ impl<S: LogStorage> RaftNode<S> {
                 self.try_advance_commit_index();
                 self.replicated_floor = self.replicated_floor();
             }
-        } else if resp.needs_snapshot {
+        } else if resp.replica.wants_snapshot() {
             // The peer holds no state to resume from: entries from any index
             // leave it as it is, so it gets a snapshot.
             if !self.ready.snapshots_needed.contains(&peer) {
@@ -365,12 +366,12 @@ mod tests {
     }
 
     /// A follower that requires a snapshot refuses entries with
-    /// `needs_snapshot`, and its leader flags it for a snapshot even though
+    /// the state it wants, and its leader flags it for a snapshot even though
     /// the leader's log holds every entry.
     #[test]
     fn a_follower_that_requires_a_snapshot_gets_one() {
         let mut follower = RaftNode::new(test_config(2, vec![1]), MemStorage::new());
-        follower.set_snapshot_required(true);
+        follower.set_replica_state(crate::state::ReplicaState::WantsSnapshot);
         let req = AppendEntriesRequest {
             term: 1,
             leader_id: 1,
@@ -388,7 +389,7 @@ mod tests {
         };
         let refusal = follower.handle_append_entries(&req);
         assert!(!refusal.success);
-        assert!(refusal.needs_snapshot);
+        assert_eq!(refusal.replica, crate::state::ReplicaState::WantsSnapshot);
         assert_eq!(follower.last_log_index(), 0, "no entry was appended");
         assert_eq!(follower.leader_id(), 1, "the leader's contact still counts");
 
@@ -406,7 +407,7 @@ mod tests {
         leader.handle_append_entries_response(2, &refusal);
         assert!(leader.take_ready().snapshots_needed.contains(&2));
 
-        follower.set_snapshot_required(false);
+        follower.set_replica_state(crate::state::ReplicaState::Whole);
         assert!(follower.handle_append_entries(&req).success);
     }
 
@@ -430,7 +431,7 @@ mod tests {
             success,
             last_log_index,
             round: 1,
-            needs_snapshot: false,
+            replica: crate::state::ReplicaState::Whole,
         };
         node.handle_append_entries_response(2, &answer(true, 1));
         node.handle_append_entries_response(2, &answer(false, 0));
@@ -461,6 +462,44 @@ mod tests {
 
         node.become_follower(2);
         assert_eq!(node.hard_state.voted_for, 0, "a new term frees the vote");
+    }
+
+    /// A reply carrying an earlier term answers a request of that term. It
+    /// records no ack, match, or peer state in this term.
+    #[test]
+    fn a_reply_from_an_earlier_term_records_nothing() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        force_election(&mut node);
+        let _ = node.take_ready();
+        node.handle_request_vote_response(
+            2,
+            &RequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(node.role(), NodeRole::Leader);
+
+        let stale = AppendEntriesResponse {
+            term: 0,
+            success: true,
+            last_log_index: node.last_log_index(),
+            round: UNTRACKED_ROUND,
+            replica: crate::state::ReplicaState::AwaitingSnapshot,
+        };
+        node.handle_append_entries_response(2, &stale);
+        assert_eq!(node.peer_replica_state(2), None);
+        assert_eq!(node.peer_ack_count(2), Some(0));
+        assert_eq!(node.match_index_for(2), Some(0));
+        assert!(node.take_ready().snapshots_needed.is_empty());
+
+        let current = AppendEntriesResponse { term: 1, ..stale };
+        node.handle_append_entries_response(2, &current);
+        assert_eq!(
+            node.peer_replica_state(2),
+            Some(crate::state::ReplicaState::AwaitingSnapshot)
+        );
+        assert_eq!(node.peer_ack_count(2), Some(1));
     }
 
     #[test]
@@ -564,7 +603,7 @@ mod tests {
             success: true,
             last_log_index: 2,
             round: UNTRACKED_ROUND,
-            needs_snapshot: false,
+            replica: crate::state::ReplicaState::Whole,
         };
         node.handle_append_entries_response(4, &ae_ok);
         assert_eq!(
@@ -669,7 +708,7 @@ mod tests {
             success: true,
             last_log_index: idx,
             round: UNTRACKED_ROUND,
-            needs_snapshot: false,
+            replica: crate::state::ReplicaState::Whole,
         };
         leader.handle_append_entries_response(2, &ae_ok);
         assert_eq!(leader.commit_index(), idx);
@@ -723,7 +762,7 @@ mod tests {
             success: true,
             last_log_index: idx,
             round: UNTRACKED_ROUND,
-            needs_snapshot: false,
+            replica: crate::state::ReplicaState::Whole,
         };
         node1.handle_append_entries_response(5, &obs_ack);
         assert_eq!(
@@ -749,7 +788,7 @@ mod tests {
             success: true,
             last_log_index: idx,
             round: UNTRACKED_ROUND,
-            needs_snapshot: false,
+            replica: crate::state::ReplicaState::Whole,
         };
         leader.handle_append_entries_response(2, &voter_ack);
         assert_eq!(

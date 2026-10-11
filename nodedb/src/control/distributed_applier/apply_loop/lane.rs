@@ -9,6 +9,10 @@
 //! order: the group's applied index is the highest index with every earlier
 //! entry finished, and its durable floor is the highest index with every
 //! earlier entry durable.
+//!
+//! An entry this replica cannot apply as its peers do holds the lane. It
+//! never settles, the applied index stays below it, and no later entry
+//! starts. Only a snapshot install that covers it releases it.
 
 use std::collections::VecDeque;
 
@@ -21,7 +25,7 @@ use crate::control::state::tenant_marks::{MarkSite, TenantMarks};
 use crate::control::wal_replication::types::CalvinRedoMeta;
 use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite, decode_replicated_entry};
 
-use super::proposal_gate::PrefixStep;
+use super::proposal_gate::{PrefixStep, Settlement};
 
 /// A committed entry handed to the loop and not yet started.
 pub(super) struct QueuedEntry {
@@ -146,6 +150,18 @@ pub(super) enum SlotState {
     Barrier,
     /// The entry concluded.
     Concluded(PrefixStep),
+    /// The entry holds the lane until a snapshot install covers it. Its
+    /// reason is reported when the hold starts.
+    Held,
+}
+
+impl From<Settlement> for SlotState {
+    fn from(settlement: Settlement) -> Self {
+        match settlement {
+            Settlement::Settles(step) => Self::Concluded(step),
+            Settlement::Holds(_) => Self::Held,
+        }
+    }
 }
 
 /// A started entry not yet settled.
@@ -199,6 +215,11 @@ impl Lane {
         }
     }
 
+    /// The group this lane applies.
+    pub fn group_id(&self) -> u64 {
+        self.group_id
+    }
+
     /// The first started entry not yet settled.
     pub fn front_index(&self) -> Option<u64> {
         self.slots.front().map(|slot| slot.log_index)
@@ -207,6 +228,31 @@ impl Lane {
     /// The entry the last settle ended at.
     pub fn last_settled(&self) -> Option<u64> {
         self.last_settled
+    }
+
+    /// The entry that holds the lane, if any. No entry after it starts, so
+    /// it is the last started entry.
+    pub fn held_index(&self) -> Option<u64> {
+        self.slots.iter().find_map(|slot| match slot.state {
+            SlotState::Held => Some(slot.log_index),
+            SlotState::Starting
+            | SlotState::Running
+            | SlotState::Barrier
+            | SlotState::Concluded(_) => None,
+        })
+    }
+
+    /// Whether an entry holds the lane.
+    pub fn is_held(&self) -> bool {
+        self.held_index().is_some()
+    }
+
+    /// The proposal key of the entry at `log_index` while it starts or runs.
+    pub fn running_key(&self, log_index: u64) -> Option<u64> {
+        self.slots.iter().find_map(|slot| {
+            let running = matches!(slot.state, SlotState::Starting | SlotState::Running);
+            (slot.log_index == log_index && running).then_some(slot.proposal_key)
+        })
     }
 
     /// Whether any started entry of the group has not concluded.
@@ -257,7 +303,7 @@ impl Lane {
     }
 
     /// Conclude the running entry at `log_index`: `conclude` receives its
-    /// proposal key and returns how it moves the prefix. `wrote_rows` says
+    /// proposal key and returns how it stands in the lane. `wrote_rows` says
     /// whether the apply wrote the entry's rows; an entry that wrote none
     /// raises no tenant write mark. Returns `false` when no running entry
     /// has that index.
@@ -265,7 +311,7 @@ impl Lane {
         &mut self,
         log_index: u64,
         wrote_rows: bool,
-        conclude: impl FnOnce(u64) -> PrefixStep,
+        conclude: impl FnOnce(u64) -> Settlement,
     ) -> bool {
         let Some(slot) = self.slot_mut(log_index) else {
             return false;
@@ -274,7 +320,7 @@ impl Lane {
             return false;
         }
         slot.user_write &= wrote_rows;
-        slot.state = SlotState::Concluded(conclude(slot.proposal_key));
+        slot.state = SlotState::from(conclude(slot.proposal_key));
         if self.blocking == Some(log_index) {
             self.blocking = None;
         }
@@ -285,12 +331,13 @@ impl Lane {
     /// barrier's waiter, raise the tenant's write mark in this group, extend
     /// or break the durable prefix, and advance the applied watermark. The
     /// mark rises first, so a reader that waited for the applied index sees
-    /// it. Returns how many entries settled.
+    /// it. A held entry stops the pass: the applied index stays below it.
+    /// Returns how many entries settled.
     pub fn settle(&mut self, tracker: &ProposeTracker, marks: &TenantMarks) -> usize {
         let mut settled = 0;
         while let Some(front) = self.slots.front() {
             let step = match front.state {
-                SlotState::Starting | SlotState::Running => break,
+                SlotState::Starting | SlotState::Running | SlotState::Held => break,
                 SlotState::Barrier => {
                     // Every entry before the barrier finished; a waiting
                     // backup can snapshot this group now.
@@ -352,13 +399,19 @@ impl Lane {
 
     /// Count every entry of the group through `installed_through` durable.
     /// An installed snapshot holds their state, so a break at or below it
-    /// heals.
+    /// heals, and a held entry at or below it concludes. Returns the held
+    /// entry's proposal key when one concludes.
     ///
     /// The caller passes the index it read under the group's apply gate,
     /// before it admits an entry. Every entry above the index reaches the
     /// lane after the install, so none settles before this call.
-    pub fn cover_through(&mut self, installed_through: u64) {
+    pub fn cover_through(&mut self, installed_through: u64) -> Option<u64> {
         self.prefix.cover_through(installed_through);
+        let slot = self.slots.iter_mut().find(|slot| {
+            slot.log_index <= installed_through && matches!(slot.state, SlotState::Held)
+        })?;
+        slot.state = SlotState::Concluded(PrefixStep::Record(true));
+        Some(slot.proposal_key)
     }
 
     /// Whether the durable floor moved past the floor last saved.
@@ -381,7 +434,16 @@ impl Lane {
 
 #[cfg(test)]
 mod tests {
+    use super::super::proposal_gate::HoldReason;
     use super::*;
+
+    fn settles(durable: bool) -> Settlement {
+        Settlement::Settles(PrefixStep::Record(durable))
+    }
+
+    fn holds() -> Settlement {
+        Settlement::Holds(HoldReason::BodyMissing)
+    }
 
     fn slot(log_index: u64, state: SlotState) -> Slot {
         Slot {
@@ -402,10 +464,10 @@ mod tests {
         lane.push(slot(6, SlotState::Running));
         lane.push(slot(7, SlotState::Running));
 
-        assert!(lane.conclude(7, true, |_| PrefixStep::Record(true)));
-        assert!(lane.conclude(6, true, |_| PrefixStep::Record(true)));
+        assert!(lane.conclude(7, true, |_| settles(true)));
+        assert!(lane.conclude(6, true, |_| settles(true)));
         assert!(
-            !lane.conclude(6, true, |_| PrefixStep::Record(true)),
+            !lane.conclude(6, true, |_| settles(true)),
             "6 concluded already"
         );
         assert_eq!(
@@ -420,24 +482,86 @@ mod tests {
             "the timeout diagnostic names the entry the group waits behind"
         );
 
-        assert!(lane.conclude(5, true, |_| PrefixStep::Record(true)));
+        assert!(lane.conclude(5, true, |_| settles(true)));
         assert_eq!(lane.settle(&tracker, &TenantMarks::default()), 3);
         assert_eq!(lane.take_floor_to_save(), Some(7));
         assert_eq!(lane.take_floor_to_save(), None, "a saved floor saves once");
         assert!(tracker.applying(1).is_none());
     }
 
+    /// A held entry neither settles nor moves the applied index. Entries
+    /// before it settle.
     #[test]
-    fn a_non_durable_entry_holds_the_floor_across_later_settles() {
+    fn a_held_entry_neither_settles_nor_advances_the_applied_index() {
+        let watchers = std::sync::Arc::new(nodedb_cluster::GroupAppliedWatchers::new());
+        let tracker = ProposeTracker::new().with_group_watchers(std::sync::Arc::clone(&watchers));
+        let marks = TenantMarks::default();
+        let mut lane = Lane::new(1);
+        lane.push(slot(1, SlotState::Running));
+        lane.push(slot(2, SlotState::Running));
+        assert!(lane.conclude(2, false, |_| holds()));
+        assert_eq!(lane.held_index(), Some(2));
+        assert!(lane.has_running(), "entry 1 still runs");
+
+        assert!(lane.conclude(1, true, |_| settles(true)));
+        assert_eq!(lane.settle(&tracker, &marks), 1);
+        assert_eq!(watchers.get_or_create(1).current(), 1);
+        assert_eq!(lane.take_floor_to_save(), Some(1));
+
+        assert_eq!(lane.settle(&tracker, &marks), 0, "entry 2 holds the lane");
+        assert_eq!(
+            watchers.get_or_create(1).current(),
+            1,
+            "the applied index stays below the held entry"
+        );
+        assert_eq!(
+            tracker.applying(1).map(|entry| entry.log_index),
+            Some(2),
+            "the group waits behind the held entry"
+        );
+        assert_eq!(lane.take_floor_to_save(), None);
+    }
+
+    /// A snapshot that installs below the held entry leaves it held. One
+    /// that covers it concludes it, and the floor passes it.
+    #[test]
+    fn only_a_covering_snapshot_releases_a_held_entry() {
+        let tracker = ProposeTracker::new();
+        let marks = TenantMarks::default();
+        let mut lane = Lane::new(1);
+        lane.push(slot(1, SlotState::Concluded(PrefixStep::Record(true))));
+        let mut held = slot(2, SlotState::Running);
+        held.proposal_key = 77;
+        lane.push(held);
+        assert!(lane.conclude(2, false, |_| holds()));
+        lane.settle(&tracker, &marks);
+        assert_eq!(lane.take_floor_to_save(), Some(1));
+
+        assert_eq!(lane.cover_through(1), None, "the install is below entry 2");
+        assert!(lane.is_held());
+        assert_eq!(lane.settle(&tracker, &marks), 0);
+
+        assert_eq!(lane.cover_through(4), Some(77));
+        assert!(!lane.is_held());
+        assert_eq!(lane.settle(&tracker, &marks), 1);
+        assert_eq!(lane.last_settled(), Some(2));
+        assert_eq!(lane.take_floor_to_save(), Some(4));
+    }
+
+    /// A transient failure breaks the floor and the lane moves on. A later
+    /// entry still settles, and the floor holds below the break.
+    #[test]
+    fn a_non_durable_entry_holds_the_floor_but_not_the_lane() {
         let tracker = ProposeTracker::new();
         let mut lane = Lane::new(1);
         lane.push(slot(1, SlotState::Concluded(PrefixStep::Record(true))));
         lane.push(slot(2, SlotState::Concluded(PrefixStep::Record(false))));
-        lane.settle(&tracker, &TenantMarks::default());
+        assert_eq!(lane.settle(&tracker, &TenantMarks::default()), 2);
         assert_eq!(lane.take_floor_to_save(), Some(1));
 
         lane.push(slot(3, SlotState::Concluded(PrefixStep::Record(true))));
-        lane.settle(&tracker, &TenantMarks::default());
+        assert_eq!(lane.settle(&tracker, &TenantMarks::default()), 1);
+        assert!(!lane.is_held());
         assert_eq!(
             lane.take_floor_to_save(),
             None,
@@ -446,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn a_covering_snapshot_lets_the_floor_pass_a_held_entry() {
+    fn a_covering_snapshot_lets_the_floor_pass_a_broken_entry() {
         let tracker = ProposeTracker::new();
         let marks = TenantMarks::default();
         let mut lane = Lane::new(1);
@@ -457,10 +581,10 @@ mod tests {
         assert_eq!(lane.take_floor_to_save(), Some(1));
 
         // A snapshot at index 4 installs while entry 3 still runs.
-        lane.cover_through(4);
+        assert_eq!(lane.cover_through(4), None);
         assert_eq!(lane.take_floor_to_save(), Some(4));
 
-        assert!(lane.conclude(3, false, |_| PrefixStep::Record(false)));
+        assert!(lane.conclude(3, false, |_| settles(false)));
         lane.push(slot(5, SlotState::Concluded(PrefixStep::Record(true))));
         lane.settle(&tracker, &marks);
         assert_eq!(
@@ -471,11 +595,11 @@ mod tests {
     }
 
     #[test]
-    fn a_held_entry_above_the_snapshot_still_holds_the_floor() {
+    fn a_broken_entry_above_the_snapshot_still_holds_the_floor() {
         let tracker = ProposeTracker::new();
         let marks = TenantMarks::default();
         let mut lane = Lane::new(1);
-        lane.cover_through(4);
+        assert_eq!(lane.cover_through(4), None);
         lane.push(slot(5, SlotState::Concluded(PrefixStep::Record(false))));
         lane.push(slot(6, SlotState::Concluded(PrefixStep::Record(true))));
         lane.settle(&tracker, &marks);
@@ -559,7 +683,7 @@ mod tests {
         refused.collection = Some("docs".to_owned());
         lane.push(refused);
 
-        assert!(lane.conclude(1, false, |_| PrefixStep::Record(true)));
+        assert!(lane.conclude(1, false, |_| settles(true)));
         lane.settle(&tracker, &marks);
         assert_eq!(
             marks.get(4, 7),
@@ -579,7 +703,7 @@ mod tests {
         lane.settle(&tracker, &TenantMarks::default());
         assert!(barrier.try_recv().is_err(), "entry 1 still runs");
 
-        assert!(lane.conclude(1, true, |_| PrefixStep::Record(true)));
+        assert!(lane.conclude(1, true, |_| settles(true)));
         lane.settle(&tracker, &TenantMarks::default());
         assert!(matches!(barrier.try_recv(), Ok(Ok(_))));
     }

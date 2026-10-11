@@ -50,6 +50,63 @@ pub enum NodeRole {
     Observer,
 }
 
+/// Whether a replica holds the state beside its log that it serves and
+/// leads from. A follower reports it on every `AppendEntries` reply.
+///
+/// Variants order from least to most strict.
+#[repr(u8)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(c_enum)]
+pub enum ReplicaState {
+    /// Its state matches the log it holds.
+    Whole = 0,
+    /// Its data matches its log, but state its host keeps beside the log
+    /// lags. It refuses log entries so its leader sends a snapshot. It
+    /// still campaigns and leads.
+    WantsSnapshot = 1,
+    /// Its data diverged from the log. It refuses log entries, never stands
+    /// for election, and leads nothing until a snapshot installs.
+    AwaitingSnapshot = 2,
+}
+
+impl ReplicaState {
+    /// The stricter of `self` and `other`.
+    pub fn raised_to(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    /// Whether the replica refuses log entries until a snapshot installs.
+    pub fn wants_snapshot(self) -> bool {
+        match self {
+            Self::Whole => false,
+            Self::WantsSnapshot | Self::AwaitingSnapshot => true,
+        }
+    }
+
+    /// Whether the replica may campaign and lead.
+    pub fn may_lead(self) -> bool {
+        match self {
+            Self::Whole | Self::WantsSnapshot => true,
+            Self::AwaitingSnapshot => false,
+        }
+    }
+}
+
 /// Role of a remote peer as seen by the local leader.
 ///
 /// Used to classify tracked peers so the leader can send entries to both
@@ -183,9 +240,9 @@ pub struct LeaderState {
     /// timed: leadership is confirmed by a quorum of these rising after a
     /// heartbeat round.
     pub ack_count: Vec<(u64, u64)>,
-    /// Peers whose latest `AppendEntries` response asked for a snapshot.
-    /// Such a peer holds no state to lead from.
-    pub awaiting_snapshot: std::collections::HashSet<u64>,
+    /// Each peer's state as its latest `AppendEntries` response this term
+    /// reported it. A peer not heard this term has no entry.
+    pub peer_states: std::collections::HashMap<u64, ReplicaState>,
 }
 
 impl LeaderState {
@@ -195,7 +252,7 @@ impl LeaderState {
             next_index: peers.iter().map(|&id| (id, last_log_index + 1)).collect(),
             match_index: peers.iter().map(|&id| (id, 0)).collect(),
             ack_count: peers.iter().map(|&id| (id, 0)).collect(),
-            awaiting_snapshot: std::collections::HashSet::new(),
+            peer_states: std::collections::HashMap::new(),
             observer_states: observers
                 .iter()
                 .map(|&id| {
@@ -254,7 +311,7 @@ impl LeaderState {
         self.next_index.retain(|&(id, _)| id != peer);
         self.match_index.retain(|&(id, _)| id != peer);
         self.ack_count.retain(|&(id, _)| id != peer);
-        self.awaiting_snapshot.remove(&peer);
+        self.peer_states.remove(&peer);
     }
 
     /// Responses received from `peer` in this term.

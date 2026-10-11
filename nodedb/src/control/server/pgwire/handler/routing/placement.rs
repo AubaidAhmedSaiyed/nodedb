@@ -273,15 +273,20 @@ impl NodeDbPgHandler {
     /// Whether this node's replica of `group_id` meets `consistency`.
     ///
     /// `Eventual` asks for no freshness at all, so any replica satisfies it.
-    /// `BoundedStaleness` asks how far behind the leader this replica is,
-    /// which only Raft can answer. With no gate installed there is no cluster,
-    /// and the local copy is the only copy.
+    /// `BoundedStaleness` asks how far behind the leader this replica is:
+    /// Raft's last leader contact against this node's applied watermark. With
+    /// no gate installed there is no cluster, and the local copy is the only
+    /// copy.
     fn replica_satisfies(&self, group_id: u64, consistency: ReadConsistency) -> bool {
         let Some(max_staleness) = consistency.max_staleness() else {
             return true;
         };
         match self.state.raft_read_gate.get() {
-            Some(gate) => gate.within_staleness_bound(group_id, max_staleness),
+            Some(gate) => gate.within_staleness_bound(
+                group_id,
+                max_staleness,
+                self.state.applied_index_watcher(group_id).current(),
+            ),
             None => true,
         }
     }

@@ -296,7 +296,7 @@ pub(crate) async fn await_admitted_applies(
             state,
             at.group_id,
             at.log_index,
-            deadline,
+            crate::control::cluster::linearizable_read::StatementDeadline::at(deadline),
         )
         .await?;
     }

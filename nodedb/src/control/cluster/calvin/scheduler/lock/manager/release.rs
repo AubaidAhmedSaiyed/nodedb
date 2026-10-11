@@ -29,7 +29,7 @@ impl LockManager {
             let Some(entry) = self.table.get_mut(key) else {
                 continue;
             };
-            entry.holders.retain(|h| *h != txn);
+            entry.drop_holder(txn);
             entry.waiters.retain(|(w, _)| *w != txn);
             self.promote_waiters(key, &mut newly_promoted);
         }
@@ -56,10 +56,7 @@ impl LockManager {
                 break;
             }
             entry.waiters.pop_front();
-            if entry.holders.is_empty() {
-                entry.mode = mode;
-            }
-            entry.holders.push(next);
+            entry.hold(next, mode);
             granted.push(next);
         }
         if entry.holders.is_empty() && entry.waiters.is_empty() {
@@ -70,11 +67,9 @@ impl LockManager {
             let Some(pending) = self.pending_keys.remove(&next) else {
                 continue;
             };
-            let all_held = pending.keys().all(|k| {
-                self.table
-                    .get(k)
-                    .is_some_and(|entry| entry.holders.contains(&next))
-            });
+            let all_held = pending
+                .keys()
+                .all(|k| self.table.get(k).is_some_and(|entry| entry.holds(next)));
             if all_held {
                 self.finish_ready(next, pending);
                 newly_promoted.insert(next);
@@ -187,12 +182,12 @@ mod tests {
 
         // Release t1 — t2 should become holder (FIFO).
         lm.release(t1);
-        let holder = lm.table.get(&key("x")).unwrap().holders[0];
+        let holder = lm.table.get(&key("x")).unwrap().holder_ids()[0];
         assert_eq!(holder, t2);
 
         // Release t2 — t3 should become holder.
         lm.release(t2);
-        let holder = lm.table.get(&key("x")).unwrap().holders[0];
+        let holder = lm.table.get(&key("x")).unwrap().holder_ids()[0];
         assert_eq!(holder, t3);
     }
 
@@ -228,8 +223,8 @@ mod tests {
 
         let entry = lm.table.get(&key("k")).unwrap();
         assert_eq!(entry.mode, LockMode::Shared);
-        assert!(entry.holders.contains(&s1));
-        assert!(entry.holders.contains(&s2));
+        assert!(entry.holds(s1));
+        assert!(entry.holds(s2));
     }
 
     #[test]
@@ -250,7 +245,7 @@ mod tests {
         let entry = lm.table.get(&key("k")).unwrap();
         assert_eq!(entry.mode, LockMode::Exclusive);
         assert_eq!(entry.holders.len(), 1);
-        assert_eq!(entry.holders[0], x1);
+        assert_eq!(entry.holder_ids()[0], x1);
         // x2 is still waiting behind x1.
         assert!(entry.has_waiter(x2));
     }
@@ -268,8 +263,8 @@ mod tests {
         // Releasing one shared holder leaves the other holding the key.
         lm.release(t1);
         let entry = lm.table.get(&key("k")).unwrap();
-        assert!(!entry.holders.contains(&t1));
-        assert!(entry.holders.contains(&t2));
+        assert!(!entry.holds(t1));
+        assert!(entry.holds(t2));
         assert_eq!(lm.lock_count(), 1);
 
         // Releasing the last shared holder frees the key.

@@ -45,7 +45,7 @@ use crate::types::TenantId;
 use crate::wal::RedoRecord;
 
 use super::passes::{RedoTarget, final_refusal};
-use super::state::{RedoApplyPass, RedoApplyScope, TsInstalled};
+use super::state::{DeferredWriteKind, RedoApplyPass, RedoApplyScope, TsInstalled};
 use super::sub_ops::{document_ops, kv_ops, label_ops};
 use crate::engine::timeseries::install_counts::TsInstallCounts;
 
@@ -198,13 +198,21 @@ impl CoreLoop {
         // Write versions and the watermark move only once the record is
         // settled.
         for version in std::mem::take(&mut scope.write_versions) {
-            self.publish_write_version(
-                version.db,
-                version.tenant,
-                &version.collection,
-                version.key,
-                version.stamp,
-            );
+            match version.kind {
+                DeferredWriteKind::Wipe => self.publish_collection_wipe(
+                    version.db,
+                    version.tenant,
+                    &version.collection,
+                    version.stamp,
+                ),
+                DeferredWriteKind::Row(key) => self.publish_write_version(
+                    version.db,
+                    version.tenant,
+                    &version.collection,
+                    key,
+                    version.stamp,
+                ),
+            }
         }
         // Events leave only once the record is settled. Every
         // one names the record's LSN: the install held the watermark back.

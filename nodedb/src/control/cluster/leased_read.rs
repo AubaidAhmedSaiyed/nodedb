@@ -10,11 +10,9 @@
 //! misses. A group whose lease this node does not hold is refused, with the
 //! leader and term its routing table names.
 
-use std::time::Instant;
-
 use crate::control::state::SharedState;
 
-use super::linearizable_read::wait_applied_through;
+use super::linearizable_read::{StatementDeadline, wait_applied_through};
 
 /// A group this node does not serve a leased read of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,13 +29,13 @@ pub struct LeaseRefusal {
 /// leases.
 ///
 /// Returns the groups whose lease this node does not hold. Every other group
-/// is applied here through its lease read index before this returns. A node
-/// with no routing table serves every group: without a cluster there is one
-/// copy and nothing to prove.
+/// is applied here through its lease read index, within `deadline`, before
+/// this returns. A node with no routing table serves every group: without a
+/// cluster there is one copy and nothing to prove.
 pub async fn confirm_leased_read(
     state: &SharedState,
     groups: &[u64],
-    deadline: Instant,
+    deadline: StatementDeadline,
 ) -> crate::Result<Vec<LeaseRefusal>> {
     let Some(routing) = state.cluster_routing.as_ref() else {
         return Ok(Vec::new());
@@ -91,7 +89,7 @@ pub async fn confirm_leased_read(
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, RwLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
     use nodedb_cluster::RoutingTable;
@@ -130,7 +128,12 @@ mod tests {
             Err(ReadIndexRefusal::NotLeader)
         }
 
-        fn within_staleness_bound(&self, _group_id: u64, _max_staleness: Duration) -> bool {
+        fn within_staleness_bound(
+            &self,
+            _group_id: u64,
+            _max_staleness: Duration,
+            _applied: u64,
+        ) -> bool {
             self.probe();
             false
         }
@@ -178,7 +181,7 @@ mod tests {
         );
         let groups = routing.read().expect("routing lock").group_ids();
 
-        let refusals = confirm_leased_read(&state, &groups, Instant::now())
+        let refusals = confirm_leased_read(&state, &groups, StatementDeadline::at(Instant::now()))
             .await
             .expect("a refused lease is not an error");
         assert!(

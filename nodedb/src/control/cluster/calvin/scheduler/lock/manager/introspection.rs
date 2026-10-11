@@ -35,7 +35,7 @@ impl LockManager {
                     key: key.clone(),
                     requested: *mode,
                     held: entry.mode,
-                    holders: entry.holders.to_vec(),
+                    holders: entry.holder_ids(),
                     waiters: entry.waiters.iter().copied().collect(),
                 })
             })
@@ -56,8 +56,8 @@ impl LockManager {
     pub fn is_ready(&self, txn: TxnId, keys: &BTreeMap<LockKey, LockMode>) -> bool {
         keys.keys().all(|key| {
             match self.table.get(key) {
-                None => true,                                // key is free
-                Some(entry) => entry.holders.contains(&txn), // txn is a current holder
+                None => true,                    // key is free
+                Some(entry) => entry.holds(txn), // txn is a current holder
             }
         })
     }
@@ -69,7 +69,7 @@ impl LockManager {
     pub fn reservation_holder_count(&self, key: &LockKey) -> usize {
         self.table
             .get(key)
-            .map(|e| e.holders.iter().filter(|h| h.is_reservation()).count())
+            .map(|e| e.holders.iter().filter(|(h, _)| h.is_reservation()).count())
             .unwrap_or(0)
     }
 

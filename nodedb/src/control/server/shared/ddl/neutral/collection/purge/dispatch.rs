@@ -102,8 +102,8 @@ pub async fn dispatch_unregister_collection(
         }
     }
 
-    // Each core's acknowledgement counts as apply progress as it arrives, so
-    // a proposer waiting on this purge sees a slow reclaim move.
+    // Every core is awaited, so the first error never cuts a core's reclaim
+    // short.
     let mut pending: FuturesUnordered<_> = receivers
         .into_iter()
         .map(|(_request_id, core_id, mut receiver)| async move {
@@ -134,15 +134,8 @@ pub async fn dispatch_unregister_collection(
 
     let mut first_error = None;
     while let Some(response) = pending.next().await {
-        match response {
-            Ok(()) => {
-                state
-                    .metadata_apply_progress
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
+        if let Err(error) = response {
+            first_error.get_or_insert(error);
         }
     }
     first_error.map_or(Ok(()), Err)

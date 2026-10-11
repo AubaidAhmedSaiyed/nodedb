@@ -214,21 +214,27 @@ mod tests {
 
     #[test]
     fn roundtrip_append_entries_response() {
-        let resp = AppendEntriesResponse {
-            term: 5,
-            success: true,
-            last_log_index: 100,
-            round: 11,
-            needs_snapshot: true,
-        };
-        match roundtrip(RaftRpc::AppendEntriesResponse(resp)) {
-            RaftRpc::AppendEntriesResponse(d) => {
-                assert_eq!(d.term, 5);
-                assert_eq!(d.round, 11);
-                assert!(d.success);
-                assert!(d.needs_snapshot);
+        for replica in [
+            nodedb_raft::ReplicaState::Whole,
+            nodedb_raft::ReplicaState::WantsSnapshot,
+            nodedb_raft::ReplicaState::AwaitingSnapshot,
+        ] {
+            let resp = AppendEntriesResponse {
+                term: 5,
+                success: true,
+                last_log_index: 100,
+                round: 11,
+                replica,
+            };
+            match roundtrip(RaftRpc::AppendEntriesResponse(resp)) {
+                RaftRpc::AppendEntriesResponse(d) => {
+                    assert_eq!(d.term, 5);
+                    assert_eq!(d.round, 11);
+                    assert!(d.success);
+                    assert_eq!(d.replica, replica, "the follower's state crosses the wire");
+                }
+                other => panic!("expected AppendEntriesResponse, got {other:?}"),
             }
-            other => panic!("expected AppendEntriesResponse, got {other:?}"),
         }
     }
 

@@ -24,7 +24,11 @@ use crate::control::state::SharedState;
 /// exists to drain or release this node's leases, so the node never fences.
 pub(crate) fn lease_use_is_fenced(shared: &SharedState) -> bool {
     match shared.raft_read_gate.get() {
-        Some(gate) => !gate.within_staleness_bound(METADATA_GROUP_ID, LEASE_SELF_FENCE_WINDOW),
+        Some(gate) => !gate.within_staleness_bound(
+            METADATA_GROUP_ID,
+            LEASE_SELF_FENCE_WINDOW,
+            shared.applied_index_watcher(METADATA_GROUP_ID).current(),
+        ),
         None => false,
     }
 }
@@ -66,7 +70,12 @@ mod tests {
             Err(ReadIndexRefusal::NotLeader)
         }
 
-        fn within_staleness_bound(&self, group_id: u64, max_staleness: Duration) -> bool {
+        fn within_staleness_bound(
+            &self,
+            group_id: u64,
+            max_staleness: Duration,
+            _applied: u64,
+        ) -> bool {
             group_id == METADATA_GROUP_ID
                 && Duration::from_millis(self.contact_age_ms.load(Ordering::SeqCst))
                     <= max_staleness

@@ -89,13 +89,13 @@ impl DomainContext for RedoStreamLostHere {
             "entry": self.entry,
             "refusal": self.refusal,
             "impact": "the other replicas can install the stream's redo, which this replica \
-                       lacks. Its durable floor holds at the entry, so a restart applies the \
-                       entry again. Later entries of the group apply here on the state \
-                       without the redo until a snapshot of the group installs",
-            "operator_action": "the node's membership pass makes the group's replica here \
-                                 refuse log entries, and moves a leadership it holds. The \
-                                 group's leader then sends a snapshot. When the group has no \
-                                 other replica, no snapshot comes: restore the group from a \
+                       lacks. The group's apply here holds at the entry: no later entry \
+                       applies, its applied index stays below the entry, and reads wait \
+                       until a snapshot of the group installs",
+            "operator_action": "the group's replica here refuses log entries, steps down \
+                                 from leadership, and never campaigns. The group's leader \
+                                 then sends a snapshot. When the group has no other \
+                                 replica, no snapshot comes: restore the group from a \
                                  backup",
         })
     }

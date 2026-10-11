@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! `RegistryCalvinSubmit` — bridges the cluster `SubmitCalvinTxn` trigger to a
-//! node-local Calvin submit-and-await (Cv1).
+//! node-local Calvin submit-and-await.
 //!
 //! `nodedb-cluster` cannot depend on `nodedb` (circular), so the submit logic
 //! lives here and is exposed to the transport via the
@@ -17,9 +17,10 @@
 //! 1. decodes `tx_class_bytes` (msgpack) into a `TxClass` and re-derives its
 //!    cached participating-vshard set via `restore_derived`;
 //! 2. submits it to this node's Calvin sequencer inbox and awaits assignment +
-//!    completion through `submit_and_await_calvin_with_timeout`, bounded by the
-//!    forwarded `deadline_remaining_ms` so it cannot outlive the coordinator's
-//!    remaining budget;
+//!    completion through `submit_and_await_calvin_until`, ending at the
+//!    deadline the forwarded `deadline_remaining_ms` names, so it cannot
+//!    outlive the coordinator's remaining budget. A spent budget is refused
+//!    unsubmitted, a definite refusal;
 //! 3. maps `Ok(())` → `error: None` and `Err` → a typed cluster error that
 //!    keeps the Data-Plane verdict's code — never a silent drop.
 //!
@@ -32,13 +33,13 @@
 //! io_uring directly.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use nodedb_cluster::calvin::types::TxClass;
 use nodedb_cluster::{SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError};
 
 use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
-use crate::control::planner::calvin::submit_and_await_calvin_with_timeout;
+use crate::control::cluster::forwarded_budget::hook_deadline;
+use crate::control::planner::calvin::submit_and_await_calvin_until;
 use crate::control::state::SharedState;
 
 /// `nodedb`-side implementation of [`nodedb_cluster::CalvinSubmit`].
@@ -62,6 +63,17 @@ impl RegistryCalvinSubmit {
 #[async_trait::async_trait]
 impl nodedb_cluster::CalvinSubmit for RegistryCalvinSubmit {
     async fn on_submit_calvin_txn(&self, req: SubmitCalvinTxnRequest) -> SubmitCalvinTxnResponse {
+        // A spent budget is refused before any work: nothing is submitted.
+        let deadline = match hook_deadline(req.deadline_remaining_ms) {
+            Ok(deadline) => deadline,
+            Err(refusal) => {
+                return SubmitCalvinTxnResponse {
+                    error: Some(refusal),
+                    payload_bytes: None,
+                };
+            }
+        };
+
         let mut tx_class: TxClass = match zerompk::from_msgpack(&req.tx_class_bytes) {
             Ok(tc) => tc,
             Err(e) => {
@@ -86,8 +98,7 @@ impl nodedb_cluster::CalvinSubmit for RegistryCalvinSubmit {
             };
         }
 
-        let timeout = Duration::from_millis(req.deadline_remaining_ms.max(1));
-        match submit_and_await_calvin_with_timeout(&self.state, tx_class, timeout).await {
+        match submit_and_await_calvin_until(&self.state, tx_class, deadline).await {
             // Forward the applied RETURNING payload (drained from this leader's
             // local sidecar) back to the remote coordinator over the non-Raft
             // RPC response; `None` for a plain write with no rows to surface.
@@ -103,5 +114,42 @@ impl nodedb_cluster::CalvinSubmit for RegistryCalvinSubmit {
                 payload_bytes: None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_cluster::CalvinSubmit;
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::bridge::envelope::ErrorCode;
+    use crate::wal::WalManager;
+
+    /// A forward with a spent budget is refused unsubmitted. The coordinator
+    /// sees a definite refusal, never a 1 ms wait that ends unknown.
+    #[tokio::test]
+    async fn a_spent_budget_is_refused_before_the_submit() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap());
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).unwrap();
+
+        let reply = RegistryCalvinSubmit::new(state)
+            .on_submit_calvin_txn(SubmitCalvinTxnRequest {
+                tx_class_bytes: Vec::new(),
+                deadline_remaining_ms: 0,
+                trace_id: [0u8; 16],
+            })
+            .await;
+        let refusal = reply.error.expect("a spent budget is refused");
+        assert!(
+            matches!(
+                crate::Error::from(refusal),
+                crate::Error::DataPlane(ErrorCode::ExpiredBeforeExecution)
+            ),
+            "a spent budget must come back as ExpiredBeforeExecution"
+        );
+        assert!(reply.payload_bytes.is_none());
     }
 }

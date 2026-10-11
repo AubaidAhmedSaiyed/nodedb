@@ -11,10 +11,11 @@ use nodedb_physical::physical_plan::wire as plan_wire;
 use tracing::debug;
 
 use crate::Error;
+use crate::control::security::identity::{Permission, required_permission};
 use crate::control::server::result_stream::{ResultStream, RowBatch};
 use crate::types::{Lsn, VShardId};
 
-use super::cluster_error::map_typed_cluster_error;
+use super::cluster_error::{map_typed_cluster_error, send_error};
 use super::dispatch_remote::{RemoteDispatchArgs, scoped_vshard};
 
 /// Remote streaming dispatch via the multi-frame `ExecuteStreamRequest` RPC.
@@ -35,6 +36,10 @@ use super::dispatch_remote::{RemoteDispatchArgs, scoped_vshard};
 /// `Err` and never retried (re-running the plan duplicates the rows
 /// already streamed to the client).
 ///
+/// The open and the first frame wait at most `reply_wait` of this attempt's
+/// budget. A read leaves time there for the attempts after it. The remote
+/// runs the stream within the statement's whole remaining budget.
+///
 /// The returned stream re-emits the buffered first batch followed by the rest.
 pub(super) async fn dispatch_remote_stream(
     args: RemoteDispatchArgs<'_>,
@@ -48,6 +53,7 @@ pub(super) async fn dispatch_remote_stream(
         database_id,
         trace_id,
         deadline_ms,
+        attempts_left,
         version_set,
         txn_id,
         linearizable,
@@ -91,6 +97,16 @@ pub(super) async fn dispatch_remote_stream(
         crate::control::server::exchange::Resolved::Stream(s) => return Ok(s),
     };
 
+    // A read can be sent again after a lost answer. Any other plan can have
+    // run on the target, so a lost answer is an unknown outcome.
+    let resend_safe = required_permission(&plan) == Permission::Read;
+    let attempt_ms = nodedb_cluster::rpc_codec::attempt_budget(
+        deadline_ms,
+        resend_safe,
+        attempts_left,
+        transport.rpc_timeout(),
+    );
+
     let plan_bytes = plan_wire::encode(&plan).map_err(|e| Error::Internal {
         detail: format!("gateway: plan encode failed: {e}"),
     })?;
@@ -110,6 +126,8 @@ pub(super) async fn dispatch_remote_stream(
         plan_bytes,
         tenant_id: tenant_id.as_u64(),
         database_id: database_id.as_u64(),
+        // The remote bounds the whole stream with this budget, so it keeps
+        // the statement's remainder. Only the first frame waits on `attempt_ms`.
         deadline_remaining_ms: deadline_ms,
         trace_id: trace_id.0,
         descriptor_versions,
@@ -125,25 +143,37 @@ pub(super) async fn dispatch_remote_stream(
         "gateway: dispatching ExecuteStreamRequest to remote node"
     );
 
-    // Open the stream eagerly. A failure to even open / send the request is a
-    // pre-row condition: map it like a transport failure in `dispatch_remote`
-    // so the retry loop routes elsewhere on the next attempt.
-    let stream = transport
-        .send_rpc_stream(node_id, req)
-        .await
-        .map_err(|e| Error::NotLeader {
-            vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
-            leader_node: 0,
-            leader_addr: format!("node-{node_id} (stream open error: {e})"),
-            leader_term: 0,
-        })?;
-    // The `async_stream` body is `!Unpin`; pin it on the heap so we can pull
-    // the eager first frame and then keep the tail around for `.chain`.
-    let mut stream = Box::pin(stream);
-
-    // Eagerly pull the FIRST frame so a pre-row terminal error is catchable and
+    // Open the stream and pull the FIRST frame eagerly, within this attempt's
+    // reply wait, so a pre-row error or a silent node is catchable and
     // retryable. Any error here is a pre-row error.
-    let first = match stream.next().await {
+    let reply_wait = nodedb_cluster::rpc_codec::reply_wait(attempt_ms);
+    let opened = tokio::time::timeout(reply_wait, async move {
+        let stream = transport
+            .send_rpc_stream(node_id, req)
+            .await
+            .map_err(|e| send_error(e, resend_safe, node_id, vshard_id))?;
+        // The `async_stream` body is `!Unpin`; pin it on the heap so the tail
+        // stays usable for `.chain` after the first frame.
+        let mut stream = Box::pin(stream);
+        let first = stream.next().await;
+        Ok::<_, Error>((stream, first))
+    })
+    .await;
+    let (stream, first) = match opened {
+        Ok(opened) => opened?,
+        Err(_) => {
+            return Err(send_error(
+                ClusterError::ShardTimeout {
+                    vshard_id: (vshard_id % VShardId::COUNT as u64) as u32,
+                    elapsed_ms: u64::try_from(reply_wait.as_millis()).unwrap_or(u64::MAX),
+                },
+                resend_safe,
+                node_id,
+                vshard_id,
+            ));
+        }
+    };
+    let first = match first {
         Some(Ok((payload, lsn))) => RowBatch {
             payload,
             watermark_lsn: Lsn::new(lsn),
@@ -151,7 +181,9 @@ pub(super) async fn dispatch_remote_stream(
             // read version is threaded on this remote path.
             read_versions: crate::types::ReadVersions::new(),
         },
-        Some(Err(e)) => return Err(map_stream_cluster_error(e, vshard_id)),
+        Some(Err(e)) => {
+            return Err(map_stream_cluster_error(e, resend_safe, node_id, vshard_id));
+        }
         // Clean EOF with zero rows: a valid empty result. Return an empty stream.
         None => return Ok(Box::pin(futures::stream::empty())),
     };
@@ -179,11 +211,17 @@ pub(super) async fn dispatch_remote_stream(
 ///
 /// A typed error (`StreamTerminal`, `ShardExecution`) maps through the same
 /// [`map_typed_cluster_error`] used by the one-shot path, so the gateway retry
-/// loop handles it identically. A Data-Plane verdict keeps its code. Any other
-/// cluster error becomes a transport-style `NotLeader` (leader_node = 0), so
-/// the next attempt re-resolves routing rather than re-entrenching an
-/// unreachable node.
-fn map_stream_cluster_error(err: ClusterError, vshard_id: u64) -> Error {
+/// loop handles it identically. A Data-Plane verdict keeps its code. A lost
+/// answer goes through [`send_error`]: a read retries, any other plan is an
+/// unknown outcome. Any other cluster error becomes a transport-style
+/// `NotLeader` (leader_node = 0), so the next attempt re-resolves routing
+/// rather than re-entrenching an unreachable node.
+fn map_stream_cluster_error(
+    err: ClusterError,
+    resend_safe: bool,
+    node_id: u64,
+    vshard_id: u64,
+) -> Error {
     match err {
         ClusterError::StreamTerminal { error, .. } | ClusterError::ShardExecution { error, .. } => {
             map_typed_cluster_error(*error, vshard_id)
@@ -191,6 +229,8 @@ fn map_stream_cluster_error(err: ClusterError, vshard_id: u64) -> Error {
         // A verdict from a shard that answered. Retrying it on another route
         // repeats it, so it keeps its SQLSTATE.
         ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
+        // The request can have run on the remote node.
+        lost if lost.is_lost_answer() => send_error(lost, resend_safe, node_id, vshard_id),
         other @ (ClusterError::Raft(_)
         | ClusterError::VShardNotMapped { .. }
         | ClusterError::GroupNotFound { .. }
@@ -200,8 +240,6 @@ fn map_stream_cluster_error(err: ClusterError, vshard_id: u64) -> Error {
         | ClusterError::NodeUnreachable { .. }
         | ClusterError::GhostNotFound { .. }
         | ClusterError::Transport { .. }
-        | ClusterError::ShardTimeout { .. }
-        | ClusterError::Unanswered { .. }
         | ClusterError::Storage { .. }
         | ClusterError::Codec { .. }
         | ClusterError::UnsupportedWireVersion { .. }
@@ -227,11 +265,65 @@ fn map_stream_cluster_error(err: ClusterError, vshard_id: u64) -> Error {
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
         | ClusterError::ShufflePush(_)
-        | ClusterError::RemoteUntyped { .. }) => Error::NotLeader {
+        | ClusterError::RemoteUntyped { .. }
+        // The guards above take these. They stay named for exhaustiveness.
+        | ClusterError::ShardTimeout { .. }
+        | ClusterError::Unanswered { .. }) => Error::NotLeader {
             vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
             leader_node: 0,
             leader_addr: format!("stream dispatch error: {other}"),
             leader_term: 0,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unanswered() -> ClusterError {
+        ClusterError::Unanswered {
+            node_id: 2,
+            detail: "stream reset".into(),
+        }
+    }
+
+    /// A read whose stream answer was lost retries through the leader lookup.
+    #[test]
+    fn a_lost_stream_answer_to_a_read_retries() {
+        assert!(matches!(
+            map_stream_cluster_error(unanswered(), true, 2, 7),
+            Error::NotLeader { leader_node: 0, .. }
+        ));
+    }
+
+    /// Any other plan can have run when its stream answer was lost, so it
+    /// is never sent again.
+    #[test]
+    fn a_lost_stream_answer_to_a_non_read_is_an_unknown_outcome() {
+        assert!(matches!(
+            map_stream_cluster_error(unanswered(), false, 2, 7),
+            Error::DeadlineExceeded { .. }
+        ));
+        let timed_out = ClusterError::ShardTimeout {
+            vshard_id: 7,
+            elapsed_ms: 1_000,
+        };
+        assert!(matches!(
+            map_stream_cluster_error(timed_out, false, 2, 7),
+            Error::DeadlineExceeded { .. }
+        ));
+    }
+
+    /// A transport error before any row retries, read or not.
+    #[test]
+    fn a_pre_row_transport_error_retries() {
+        let unsent = ClusterError::Transport {
+            detail: "connect refused".into(),
+        };
+        assert!(matches!(
+            map_stream_cluster_error(unsent, false, 2, 7),
+            Error::NotLeader { leader_node: 0, .. }
+        ));
     }
 }

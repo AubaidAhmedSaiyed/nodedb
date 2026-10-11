@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::Instant;
 
 use super::watcher::{AppliedIndexWatcher, WaitOutcome};
 
@@ -77,12 +77,18 @@ impl GroupAppliedWatchers {
         }
     }
 
-    /// Block until `group_id`'s applied watermark reaches `target`,
-    /// the timeout elapses, or the group is removed. Lazily creates
-    /// the watcher if it does not yet exist (waiters proposed before
-    /// the first apply on this node would otherwise miss the wake-up).
-    pub fn wait_for(&self, group_id: u64, target: u64, timeout: Duration) -> WaitOutcome {
-        self.get_or_create(group_id).wait_for(target, timeout)
+    /// Wait until `group_id`'s applied watermark reaches `target`,
+    /// `deadline` passes, or the group is removed. Creates the watcher
+    /// when absent, so a wait that starts before the first apply here
+    /// still wakes.
+    pub async fn wait_for_async(
+        &self,
+        group_id: u64,
+        target: u64,
+        deadline: Instant,
+    ) -> WaitOutcome {
+        let watcher = self.get_or_create(group_id);
+        watcher.wait_for_async(target, deadline).await
     }
 
     /// Number of groups currently registered. Useful for metrics.
@@ -117,7 +123,11 @@ impl GroupAppliedWatchers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::time::Duration;
+
+    fn after(duration: Duration) -> Instant {
+        Instant::now() + duration
+    }
 
     #[test]
     fn separate_groups_have_independent_watermarks() {
@@ -128,32 +138,40 @@ mod tests {
         assert_eq!(r.get(2).unwrap().current(), 10);
     }
 
-    #[test]
-    fn wait_returns_reached_after_bump() {
+    #[tokio::test]
+    async fn wait_returns_reached_after_bump() {
         let r = Arc::new(GroupAppliedWatchers::new());
-        let r2 = r.clone();
-        let h = thread::spawn(move || r2.wait_for(7, 5, Duration::from_secs(2)));
-        thread::sleep(Duration::from_millis(20));
+        let waiter = {
+            let r = Arc::clone(&r);
+            tokio::spawn(async move { r.wait_for_async(7, 5, after(Duration::from_secs(2))).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
         r.bump(7, 5);
-        assert_eq!(h.join().unwrap(), WaitOutcome::Reached);
+        assert_eq!(waiter.await.unwrap(), WaitOutcome::Reached);
     }
 
-    #[test]
-    fn remove_wakes_waiter_with_group_gone() {
+    #[tokio::test]
+    async fn remove_wakes_waiter_with_group_gone() {
         let r = Arc::new(GroupAppliedWatchers::new());
-        let r2 = r.clone();
         // Pre-create so the waiter watches the same Arc that remove() closes.
         r.get_or_create(3);
-        let h = thread::spawn(move || r2.wait_for(3, 99, Duration::from_secs(2)));
-        thread::sleep(Duration::from_millis(20));
+        let waiter = {
+            let r = Arc::clone(&r);
+            tokio::spawn(
+                async move { r.wait_for_async(3, 99, after(Duration::from_secs(2))).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
         r.remove(3);
-        assert_eq!(h.join().unwrap(), WaitOutcome::GroupGone);
+        assert_eq!(waiter.await.unwrap(), WaitOutcome::GroupGone);
     }
 
-    #[test]
-    fn missing_group_creates_watcher_lazily() {
+    #[tokio::test]
+    async fn missing_group_creates_watcher_lazily() {
         let r = GroupAppliedWatchers::new();
-        let outcome = r.wait_for(42, 1, Duration::from_millis(20));
+        let outcome = r
+            .wait_for_async(42, 1, after(Duration::from_millis(20)))
+            .await;
         assert_eq!(outcome, WaitOutcome::TimedOut);
         assert!(r.get(42).is_some());
     }

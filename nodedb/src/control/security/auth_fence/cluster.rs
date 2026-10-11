@@ -87,14 +87,10 @@ pub(crate) async fn wait_applied(
     if watcher.current() >= target {
         return Ok(());
     }
-    // The watcher parks its caller on a condition variable, so the wait runs
-    // on the blocking pool.
-    let outcome = tokio::task::spawn_blocking(move || watcher.wait_for(target, timeout))
+    match watcher
+        .wait_for_async(target, Instant::now() + timeout)
         .await
-        .map_err(|e| crate::Error::Internal {
-            detail: format!("applied-index wait for raft group {group_id} did not finish: {e}"),
-        })?;
-    match outcome {
+    {
         WaitOutcome::Reached => Ok(()),
         WaitOutcome::TimedOut => Err(behind(format!(
             "raft group {group_id} was not applied through index {target} in time"

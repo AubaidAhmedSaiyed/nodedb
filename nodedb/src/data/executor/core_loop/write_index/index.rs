@@ -50,6 +50,10 @@ pub struct WriteVersionIndex {
     /// floor: a predicate reader validates against it). Never GC'd: bounded
     /// by the live collections of the core's vShards.
     coll_write: HashMap<CollKey, WriteVersion>,
+    /// Last write that removed every row of a collection, such as a TRUNCATE
+    /// that records no per-row version. A row read validates against it.
+    /// Never GC'd: bounded like `coll_write`.
+    coll_wipe: HashMap<CollKey, WriteVersion>,
     /// Per-secondary-index-dimension write-VALUE versions, the finer-grained
     /// sibling of `coll_write` an index-range read validates against.
     pub(in crate::data::executor) index_values: IndexValueVersionIndex,
@@ -103,6 +107,28 @@ impl WriteVersionIndex {
         self.raise_latest(vshard, version);
     }
 
+    /// Record a committed write at `version` on `vshard` that removed every
+    /// row of `collection`. Advances the collection's version and its wipe
+    /// version, so every row read older than `version` fails validation.
+    pub fn note_wipe(
+        &mut self,
+        db: DatabaseId,
+        tenant: TenantId,
+        vshard: VShardId,
+        collection: &str,
+        version: WriteVersion,
+    ) {
+        self.note_write(db, tenant, vshard, collection, None, version);
+        let coll_key = CollKey {
+            vshard,
+            db,
+            tenant,
+            collection: Box::from(collection),
+        };
+        let slot = self.coll_wipe.entry(coll_key).or_default();
+        *slot = (*slot).max(version);
+    }
+
     /// Raise `vshard`'s latest version to `version` when it is higher.
     pub(in crate::data::executor) fn raise_latest(
         &mut self,
@@ -120,6 +146,7 @@ impl WriteVersionIndex {
     pub fn install(&mut self, vshard: VShardId, version: WriteVersion) {
         self.last_write.retain(|key, _| key.vshard != vshard);
         self.coll_write.retain(|key, _| key.vshard != vshard);
+        self.coll_wipe.retain(|key, _| key.vshard != vshard);
         self.index_values.drop_vshard(vshard);
         let bounds = self.vshards.entry(vshard).or_default();
         bounds.installed = bounds.installed.max(version);
@@ -203,6 +230,24 @@ impl WriteVersionIndex {
             .unwrap_or_else(|| self.bounds(vshard).installed)
     }
 
+    /// The version of the last write that removed every row of
+    /// `collection` on `vshard`, `ZERO` when none is recorded.
+    fn collection_wipe(
+        &self,
+        db: DatabaseId,
+        tenant: TenantId,
+        vshard: VShardId,
+        collection: &str,
+    ) -> WriteVersion {
+        let key = CollKey {
+            vshard,
+            db,
+            tenant,
+            collection: Box::from(collection),
+        };
+        self.coll_wipe.get(&key).copied().unwrap_or_default()
+    }
+
     fn bounds(&self, vshard: VShardId) -> VShardBounds {
         self.vshards.get(&vshard).copied().unwrap_or_default()
     }
@@ -218,6 +263,9 @@ impl WriteVersionIndex {
     /// A key or value with no recorded version was not written since the
     /// vShard was installed, or GC evicted it. Its version is then at most
     /// the installed or evicted bound, and never above the collection's.
+    ///
+    /// A write that removed every row of the collection also removed the
+    /// key or value read, so its version bounds every point and index read.
     pub(crate) fn read_is_valid(
         &self,
         db: DatabaseId,
@@ -230,6 +278,7 @@ impl WriteVersionIndex {
         let collection_current = self.collection_current(db, tenant, vshard, collection);
         let bounds = self.bounds(vshard);
         let unrecorded = collection_current.min(bounds.installed.max(bounds.evicted));
+        let wipe = self.collection_wipe(db, tenant, vshard, collection);
         match key {
             ReadKeyIdent::Point(repr) => {
                 let write_key = WriteKey {
@@ -243,6 +292,7 @@ impl WriteVersionIndex {
                     .get(&write_key)
                     .copied()
                     .unwrap_or(unrecorded)
+                    .max(wipe)
                     <= read
             }
             ReadKeyIdent::Predicate => collection_current <= read,
@@ -256,7 +306,9 @@ impl WriteVersionIndex {
                 };
                 match self.index_values.eq_version(dim, value) {
                     IndexVersion::Untracked => collection_current <= read,
-                    IndexVersion::Tracked(recorded) => recorded.unwrap_or(unrecorded) <= read,
+                    IndexVersion::Tracked(recorded) => {
+                        recorded.unwrap_or(unrecorded).max(wipe) <= read
+                    }
                 }
             }
             ReadKeyIdent::IndexRange { field, lo, hi } => {
@@ -275,7 +327,7 @@ impl WriteVersionIndex {
                     // A value GC evicted from the range is unknown, so the
                     // range takes the unrecorded bound as well.
                     IndexVersion::Tracked(recorded) => {
-                        recorded.unwrap_or_default().max(unrecorded) <= read
+                        recorded.unwrap_or_default().max(unrecorded).max(wipe) <= read
                     }
                 }
             }
@@ -288,7 +340,7 @@ impl WriteVersionIndex {
     /// latest version in the same epoch, then, if more than
     /// [`MAX_KEY_ENTRIES`] per-key entries remain, drops the lowest versions
     /// until back within bound. Each vShard's evicted bound rises to the
-    /// highest version it lost. The per-collection map is left untouched.
+    /// highest version it lost. The per-collection and wipe maps are left untouched.
     pub fn gc(&mut self) {
         let latest: HashMap<VShardId, WriteVersion> = self.latest_by_vshard().collect();
         let mut evicted: HashMap<VShardId, WriteVersion> = HashMap::new();
@@ -415,6 +467,55 @@ mod tests {
         assert!(valid(&index, &ReadKeyIdent::Predicate, 20));
         write(&mut index, None, 20);
         assert!(!valid(&index, &ReadKeyIdent::Predicate, 10));
+    }
+
+    #[test]
+    fn a_collection_write_leaves_a_point_read_valid() {
+        let mut index = WriteVersionIndex::new();
+        write(&mut index, Some(KeyRepr::Surrogate(7)), 5);
+        write(&mut index, None, 20);
+        assert!(valid(&index, &point(7), 10));
+    }
+
+    #[test]
+    fn a_wipe_after_the_read_invalidates_a_point_read() {
+        let mut index = WriteVersionIndex::new();
+        write(&mut index, Some(KeyRepr::Surrogate(7)), 5);
+        index.note_wipe(db(), tenant(), vshard(), "orders", at(20));
+        assert!(!valid(&index, &point(7), 10), "the wipe removed row 7");
+        assert!(
+            !valid(&index, &point(8), 10),
+            "the wipe bounds a row with no recorded version"
+        );
+        assert!(!valid(&index, &ReadKeyIdent::Predicate, 10));
+        assert!(valid(&index, &point(7), 20));
+        assert!(valid(&index, &point(8), 20));
+    }
+
+    #[test]
+    fn a_wipe_invalidates_a_tracked_index_read() {
+        let mut index = WriteVersionIndex::new();
+        record_value(&mut index, "email", "a@b.c", 5);
+        index.note_wipe(db(), tenant(), vshard(), "orders", at(20));
+        let eq = ReadKeyIdent::IndexEq {
+            field: "email".to_string(),
+            value: "a@b.c".to_string(),
+        };
+        let range = ReadKeyIdent::IndexRange {
+            field: "email".to_string(),
+            lo: Some("a".to_string()),
+            hi: Some("b".to_string()),
+        };
+        assert!(!valid(&index, &eq, 10));
+        assert!(!valid(&index, &range, 10));
+        assert!(valid(&index, &eq, 20));
+    }
+
+    #[test]
+    fn a_wipe_on_another_collection_leaves_a_point_read_valid() {
+        let mut index = WriteVersionIndex::new();
+        index.note_wipe(db(), tenant(), vshard(), "items", at(20));
+        assert!(valid(&index, &point(7), 10));
     }
 
     #[test]

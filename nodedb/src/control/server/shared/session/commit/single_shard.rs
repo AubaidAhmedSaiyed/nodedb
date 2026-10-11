@@ -207,7 +207,8 @@ async fn commit_redo(
     // The proposal forwards to the group leader and returns once the redo is
     // committed and applied on this node by the apply loop. A redo past the
     // entry limit travels as chunks, then its final entry.
-    let deadline = crate::control::wal_replication::statement_propose_deadline(state);
+    let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(state)
+        .tokio_instant();
     match propose_transaction_redo(state, target, payload, deadline).await {
         Ok((applied, _)) => Ok(super::ts_rejections::applied_rejected_by_collection(
             &applied,

@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, PendingDdlObject, encode_entry};
+use nodedb_cluster::{MetadataEntry, PendingDdlObject, encode_entry};
 
 use crate::control::catalog_entry::{self, CatalogEntry};
 use crate::control::metadata_proposer::{DdlPrepareLease, MetadataRaftHandle};
@@ -123,7 +123,7 @@ impl PendingDdlHandle<'_> {
 }
 
 /// Propose `entry` to the metadata group and wait until this node's applied
-/// watermark reaches its log index.
+/// watermark reaches its log index, until the statement deadline.
 pub(super) async fn propose_and_await(
     state: &SharedState,
     handle: &dyn MetadataRaftHandle,
@@ -133,22 +133,7 @@ pub(super) async fn propose_and_await(
         detail: format!("metadata entry encode: {e}"),
     })?;
     let log_index = handle.propose_async(raw).await?;
-    let watcher = state.applied_index_watcher(METADATA_GROUP_ID);
-    let outcome = crate::control::metadata_proposer::wait::wait_applied(
-        Arc::clone(&watcher),
-        log_index,
-        crate::control::metadata_proposer::DEFAULT_PROPOSE_TIMEOUT,
-    )
-    .await?;
-    if !outcome.is_reached() {
-        return Err(crate::Error::Internal {
-            detail: format!(
-                "metadata propose timed out waiting for log index {log_index} (current: {})",
-                watcher.current()
-            ),
-        });
-    }
-    Ok(log_index)
+    crate::control::metadata_proposer::wait::await_metadata_apply(state, log_index).await
 }
 
 /// The committed prior value for `entry`, encoded the same shape its
@@ -307,20 +292,9 @@ async fn reserve_buffered(
     // The propose reserves only while `token` owns the lease. A lease the
     // metadata leader reclaimed meanwhile left no record.
     if !state.pending_ddl.contains(token) {
-        return Err(superseded(token, "reserved"));
+        return Err(crate::Error::MetadataDdlSuperseded { log_index });
     }
     Ok((log_index, objects))
-}
-
-/// The error for a pending DDL whose preparation lease the metadata leader
-/// reclaimed before its `step` applied.
-fn superseded(token: u64, step: &str) -> crate::Error {
-    crate::Error::Config {
-        detail: format!(
-            "metadata DDL preparation ownership of token {token} was reclaimed before the \
-             buffered DDL was {step}; nothing was applied"
-        ),
-    }
 }
 
 /// Commit the objects `handle` reserved: propose `DdlPendingFinalize`, wait
@@ -378,7 +352,7 @@ async fn finalize_reserved(
         .load(std::sync::atomic::Ordering::Acquire)
         != token
     {
-        return Err(superseded(token, "finalized"));
+        return Err(crate::Error::MetadataDdlSuperseded { log_index });
     }
     Ok((log_index, bears_authorization))
 }

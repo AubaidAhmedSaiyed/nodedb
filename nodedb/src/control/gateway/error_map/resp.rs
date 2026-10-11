@@ -107,6 +107,8 @@ impl GatewayErrorMap {
             | Error::GroupMarksUnavailable { .. }
             | Error::BackupCaptureMoved { .. }
             | Error::MetadataLeaderUnavailable
+            | Error::MetadataGroupGone { .. }
+            | Error::MetadataDdlSuperseded { .. }
             | Error::AuthorizationStateBehind { .. }
             | Error::LinearizableReadRefused { .. }
             | Error::ExecutionLimitExceeded { .. }

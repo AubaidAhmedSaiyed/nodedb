@@ -6,9 +6,7 @@
 use std::sync::Arc;
 
 use crate::bridge::envelope::Response;
-use crate::control::cluster::linearizable_read::{
-    confirm_linearizable_read, statement_read_deadline,
-};
+use crate::control::cluster::linearizable_read::{StatementDeadline, confirm_linearizable_read};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::exchange::ReadScope;
 use crate::control::server::exchange::resolve::{
@@ -228,7 +226,7 @@ impl NodeDbPgHandler {
             match read_placement(&self.state, checked.vshard_id(), checked.txn_id())? {
                 ReadPlacement::Here(groups) => {
                     if linearizable {
-                        let deadline = statement_read_deadline(&self.state);
+                        let deadline = StatementDeadline::of_statement(&self.state);
                         confirm_linearizable_read(&self.state, &groups, deadline).await?;
                     }
                 }
