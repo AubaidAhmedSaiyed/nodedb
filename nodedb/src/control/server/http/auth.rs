@@ -356,7 +356,7 @@ impl IntoResponse for ApiError {
             ApiError::Overloaded { message, code } => {
                 let body = HttpError::with_code(message, code.to_string());
                 let resp = (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-                with_retry_after(resp, OVERLOAD_RETRY_AFTER_SECS)
+                overloaded(resp)
             }
             ApiError::Coded {
                 status,
@@ -364,18 +364,14 @@ impl IntoResponse for ApiError {
                 code,
                 cause,
             } => {
-                let overloaded = numeric_code_to_sqlstate(code) == sqlstate::SERVER_OVERLOAD;
+                let is_overload = numeric_code_to_sqlstate(code) == sqlstate::SERVER_OVERLOAD;
                 let body = HttpError::with_code(message, code.to_string());
                 let body = match cause {
                     Some(cause) => body.caused_by(&cause),
                     None => body,
                 };
                 let resp = (status, axum::Json(body)).into_response();
-                if overloaded {
-                    with_retry_after(resp, OVERLOAD_RETRY_AFTER_SECS)
-                } else {
-                    resp
-                }
+                if is_overload { overloaded(resp) } else { resp }
             }
             ApiError::Unauthorized(msg) => plain(StatusCode::UNAUTHORIZED, msg),
             ApiError::Forbidden(msg) => plain(StatusCode::FORBIDDEN, msg),
@@ -391,6 +387,14 @@ impl IntoResponse for ApiError {
 
 /// Seconds a client waits before it retries a `57P03` capacity refusal.
 const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
+
+/// Finish a `57P03` answer: add `Retry-After` and count it under `http`.
+/// Every overload answer HTTP sends passes through here.
+fn overloaded(resp: Response) -> Response {
+    crate::control::metrics::overload_responses()
+        .record(crate::control::metrics::OverloadProtocol::Http);
+    with_retry_after(resp, OVERLOAD_RETRY_AFTER_SECS)
+}
 
 /// Set the `Retry-After` header of `resp` to `secs`.
 fn with_retry_after(mut resp: Response, secs: u64) -> Response {
@@ -728,6 +732,47 @@ mod tests {
         }
         .into_response();
         assert_eq!(retry_after(&internal), None);
+    }
+
+    /// Each overload answer counts once under `http`. Another answer does
+    /// not count.
+    #[test]
+    fn an_overload_answer_counts_under_http() {
+        use crate::control::metrics::{OverloadProtocol, overload_responses};
+        let before = overload_responses().sent(OverloadProtocol::Http);
+
+        let _ = ApiError::from(crate::Error::DispatchCapacity {
+            scope: crate::DispatchCapacityScope::QueueFull {
+                core_id: 0,
+                capacity: 4,
+            },
+        })
+        .into_response();
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Http),
+            before + 1
+        );
+
+        let _ = ApiError::Coded {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "busy".into(),
+            code: nodedb_types::error::ErrorCode::SERVER_OVERLOAD,
+            cause: None,
+        }
+        .into_response();
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Http),
+            before + 2
+        );
+
+        let _ = ApiError::from(crate::Error::Internal {
+            detail: "boom".into(),
+        })
+        .into_response();
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Http),
+            before + 2
+        );
     }
 
     #[test]

@@ -809,6 +809,11 @@ mod tests {
                 .refusals(&tenant_scope)
         };
         let busy_before = busy();
+        let answers = || {
+            crate::control::metrics::OverloadProtocol::ALL
+                .map(|protocol| crate::control::metrics::overload_responses().sent(protocol))
+        };
+        let answers_before = answers();
         let first = TxnId::new(0, 0);
         let second = TxnId::new(1, 0);
 
@@ -846,6 +851,11 @@ mod tests {
             "each attempt refuses once"
         );
         assert_eq!(busy() - busy_before, 1 + SATURATED_PASSES);
+        assert_eq!(
+            answers(),
+            answers_before,
+            "a refusal the scheduler absorbs reaches no client"
+        );
         assert_eq!(
             metrics.intake_gate_closed_counts[intake_closure_reason::DEFERRED_DISPATCH]
                 .load(Ordering::Relaxed),

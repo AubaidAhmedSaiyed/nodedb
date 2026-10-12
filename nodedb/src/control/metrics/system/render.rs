@@ -19,6 +19,7 @@ impl SystemMetrics {
         self.io_metrics.write_prometheus(&mut out);
         self.spsc_throttle.write_prometheus(&mut out);
         self.dispatch_capacity.write_prometheus(&mut out);
+        super::super::overload_responses::overload_responses().write_prometheus(&mut out);
         self.core_fail_stops.write_prometheus(&mut out);
         out
     }

@@ -126,7 +126,16 @@ impl ErrorHandler for WireSafeErrorHandler {
         // bytes.
         if let PgWireError::UserError(info) = error {
             sanitize_error_info(info);
+            count_overload(info);
         }
+    }
+}
+
+/// Count an error the client receives as the overload class (`57P03`).
+fn count_overload(info: &ErrorInfo) {
+    if info.code == nodedb_types::error::sqlstate::SERVER_OVERLOAD {
+        crate::control::metrics::overload_responses()
+            .record(crate::control::metrics::OverloadProtocol::Pgwire);
     }
 }
 
@@ -380,6 +389,40 @@ mod tests {
         assert!(
             fields.iter().all(|(_, v)| !v.contains('\u{0}')),
             "no field value may carry a NUL onto the wire: {fields:?}"
+        );
+    }
+
+    fn user_error_info(err: &crate::Error) -> ErrorInfo {
+        match crate::control::server::pgwire::types::error_to_pg(err) {
+            PgWireError::UserError(info) => *info,
+            other => panic!("error_to_pg builds a user error, got {other:?}"),
+        }
+    }
+
+    /// A capacity refusal sent to the client counts once under `pgwire`.
+    /// Another class does not count.
+    #[test]
+    fn an_overload_answer_counts_under_pgwire() {
+        use crate::control::metrics::{OverloadProtocol, overload_responses};
+        let before = overload_responses().sent(OverloadProtocol::Pgwire);
+
+        count_overload(&user_error_info(&crate::Error::DispatchCapacity {
+            scope: crate::DispatchCapacityScope::QueueFull {
+                core_id: 0,
+                capacity: 4,
+            },
+        }));
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Pgwire),
+            before + 1
+        );
+
+        count_overload(&user_error_info(&crate::Error::Internal {
+            detail: "boom".into(),
+        }));
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Pgwire),
+            before + 1
         );
     }
 }
