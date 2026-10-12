@@ -1,28 +1,39 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Advisory acknowledgement and catch-up handlers for array sync.
+//!
+//! A refused advisory request draws an `ArrayAdvisoryRefused` reply. It
+//! names no local op, so it never touches the client's push window.
 
 use std::sync::Arc;
 
 use nodedb_array::sync::hlc::Hlc;
-use nodedb_types::sync::wire::array::{ArrayAckMsg, ArrayCatchupRequestMsg, ArrayRejectMsg};
+use nodedb_types::sync::wire::array::{
+    ArrayAckMsg, ArrayAdvisoryKind, ArrayAdvisoryRefusedMsg, ArrayCatchupRequestMsg,
+    ArrayRejectReason,
+};
 use tracing::warn;
 
 use super::catchup::OriginCatchupServer;
 use super::inbound::{InboundOutcome, OriginArrayInbound};
+use super::reject::reason_for_engine_error;
 
 impl OriginArrayInbound {
     /// Record a peer ack for GC frontier tracking.
     ///
     /// Forwards the ack into the `ArrayAckRegistry` on `SharedState` so the
     /// GC task can compute the min-ack frontier for each array.
-    pub fn handle_ack(&self, msg: &ArrayAckMsg) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
+    pub fn handle_ack(&self, msg: &ArrayAckMsg) -> Result<InboundOutcome, ArrayAdvisoryRefusedMsg> {
         let ack_hlc = Hlc::from_bytes(&msg.ack_hlc_bytes);
-        let _authorization = self.authorize_array(
-            &msg.array,
-            ack_hlc,
-            crate::control::security::identity::Permission::Write,
-        )?;
+        let _authorization = self
+            .authorize_array(
+                &msg.array,
+                ack_hlc,
+                crate::control::security::identity::Permission::Write,
+            )
+            .map_err(|reject| {
+                ArrayAdvisoryRefusedMsg::from_reject(ArrayAdvisoryKind::Ack, reject)
+            })?;
         let replica_id = nodedb_array::sync::replica_id::ReplicaId::new(msg.replica_id);
         self.shared.array_ack_registry.record_in_database(
             self.database_id(),
@@ -42,19 +53,40 @@ impl OriginArrayInbound {
 
     /// Handle a catch-up request from a Lite peer.
     ///
-    /// Delegates to [`OriginCatchupServer`] which validates the array, selects
-    /// the op-stream or snapshot delivery path, and enqueues outbound frames.
+    /// Delegates to [`OriginCatchupServer`] which selects the op-stream or
+    /// snapshot delivery path and enqueues outbound frames. A denial, an
+    /// unknown array, and a serve error each draw a typed refusal.
     pub fn handle_catchup_request(
         &self,
         msg: &ArrayCatchupRequestMsg,
         session_id: &str,
-    ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
+    ) -> Result<InboundOutcome, ArrayAdvisoryRefusedMsg> {
+        let refuse = |reason: ArrayRejectReason, detail: String| ArrayAdvisoryRefusedMsg {
+            array: msg.array.clone(),
+            request: ArrayAdvisoryKind::CatchupRequest,
+            reason,
+            detail,
+        };
         let from_hlc = Hlc::from_bytes(&msg.from_hlc_bytes);
-        let _authorization = self.authorize_array(
-            &msg.array,
-            from_hlc,
-            crate::control::security::identity::Permission::Read,
-        )?;
+        let _authorization = self
+            .authorize_array(
+                &msg.array,
+                from_hlc,
+                crate::control::security::identity::Permission::Read,
+            )
+            .map_err(|reject| {
+                ArrayAdvisoryRefusedMsg::from_reject(ArrayAdvisoryKind::CatchupRequest, reject)
+            })?;
+        if self
+            .schemas
+            .schema_hlc_in_database(self.database_id(), self.tenant_id().as_u64(), &msg.array)
+            .is_none()
+        {
+            return Err(refuse(
+                ArrayRejectReason::ArrayUnknown,
+                format!("array '{}' not known to this replica", msg.array),
+            ));
+        }
         let server = OriginCatchupServer::new(
             crate::control::array_sync::ArrayServerScope::new(
                 self.database_id(),
@@ -75,6 +107,10 @@ impl OriginArrayInbound {
                 error = %error,
                 "array_inbound: catchup server error"
             );
+            return Err(refuse(
+                reason_for_engine_error(&error),
+                format!("catch-up serve: {error}"),
+            ));
         }
 
         Ok(InboundOutcome::CatchupRequested)
@@ -154,13 +190,14 @@ mod tests {
 
         let rejection = inbound
             .handle_ack(&msg)
-            .expect_err("read permission must not authorize ack mutation")
-            .expect("authorization denial must produce an array rejection");
+            .expect_err("read permission must not authorize ack mutation");
 
         assert_eq!(
             rejection.reason,
-            nodedb_types::sync::wire::array::ArrayRejectReason::EngineRejected
+            nodedb_types::sync::wire::array::ArrayRejectReason::PermissionDenied
         );
+        assert_eq!(rejection.request, ArrayAdvisoryKind::Ack);
+        assert_eq!(rejection.array, ARRAY);
         assert_eq!(
             shared
                 .array_ack_registry
@@ -187,13 +224,14 @@ mod tests {
 
         let rejection = inbound
             .handle_catchup_request(&msg, session_id)
-            .expect_err("write permission must not authorize catchup reads")
-            .expect("authorization denial must produce an array rejection");
+            .expect_err("write permission must not authorize catchup reads");
 
         assert_eq!(
             rejection.reason,
-            nodedb_types::sync::wire::array::ArrayRejectReason::EngineRejected
+            nodedb_types::sync::wire::array::ArrayRejectReason::PermissionDenied
         );
+        assert_eq!(rejection.request, ArrayAdvisoryKind::CatchupRequest);
+        assert_eq!(rejection.array, ARRAY);
         assert!(
             shared
                 .array_subscriber_cursors

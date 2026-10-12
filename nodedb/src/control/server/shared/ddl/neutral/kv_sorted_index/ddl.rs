@@ -27,7 +27,8 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::super::refuse_gate::RefusingReadGate;
 use super::dispatch::{SortedIndexTarget, drop_in_engine, register_in_engine};
 use super::gate::owning_collection;
-use super::parse::{ddl_err, parse_key_column, parse_sort_columns, parse_window_clause};
+use super::parse::{ddl_err, parse_sort_columns};
+use super::tail::{IndexTail, parse_index_tail};
 
 /// Building the index reads every row of the collection into the order-stat
 /// tree, so the caller must be allowed to read it, and a read policy makes the
@@ -44,8 +45,6 @@ pub async fn create_sorted_index(
     database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let upper = sql.to_ascii_uppercase();
-
     // Extract index name.
     let rest = nodedb_types::strip_prefix_ascii_case_insensitive(sql, "CREATE SORTED INDEX ")
         .ok_or_else(|| ddl_err("42601", "expected CREATE SORTED INDEX"))?;
@@ -76,11 +75,9 @@ pub async fn create_sorted_index(
     let cols_str = &sql[paren_start + 1..paren_end];
     let sort_columns = parse_sort_columns(cols_str)?;
 
-    // Extract KEY column.
-    let key_column = parse_key_column(&upper)?;
-
-    // Extract WINDOW clause (optional).
-    let (window_type, window_ts_col, window_start, window_end) = parse_window_clause(&upper);
+    // KEY column and optional WINDOW clause, from the original text so quoted
+    // identifiers keep their case.
+    let IndexTail { key_column, window } = parse_index_tail(&sql[paren_end + 1..], &sort_columns)?;
 
     let tenant_id = identity.tenant_id;
     if state
@@ -104,10 +101,10 @@ pub async fn create_sorted_index(
         index_name: index_name.clone(),
         sort_columns,
         key_column,
-        window_type,
-        window_timestamp_column: window_ts_col,
-        window_start_ms: window_start,
-        window_end_ms: window_end,
+        window_type: window.window_type,
+        window_timestamp_column: window.timestamp_column,
+        window_start_ms: window.start_ms,
+        window_end_ms: window.end_ms,
     });
 
     // Inside an explicit transaction the records are buffered first and the

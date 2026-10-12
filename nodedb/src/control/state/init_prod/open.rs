@@ -32,11 +32,12 @@ impl SharedState {
         governor: Arc<nodedb_mem::MemoryGovernor>,
     ) -> crate::Result<Arc<Self>> {
         let DataPlaneHandles {
-            dispatcher,
+            mut dispatcher,
             quiesce,
             array_catalog,
             system_metrics,
         } = handles;
+        dispatcher.adopt_capacity_metrics(Arc::clone(&system_metrics.dispatch_capacity));
         let super::bootstrap::ProdBootstrap {
             credentials,
             producer_registry,

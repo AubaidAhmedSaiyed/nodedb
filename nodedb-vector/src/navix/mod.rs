@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod acorn;
+mod beam;
 pub mod selectivity;
 pub mod traversal;
 

@@ -6,6 +6,8 @@
 
 use std::cell::RefCell;
 
+use nodedb_types::vector_dtype::VectorStorageDtype;
+
 use crate::distance::DistanceMetric;
 use crate::error::VectorError;
 use crate::hnsw::arena::BeamSearchArena;
@@ -16,6 +18,71 @@ use crate::hnsw::graph::{ARENA_INITIAL_CAPACITY, HnswIndex, Node, NodeStorage, X
 const HNSW_RKYV_MAGIC: &[u8; 6] = b"RKHNS\0";
 /// Current format version for rkyv-serialized HNSW snapshots.
 pub const HNSW_FORMAT_VERSION: u8 = 1;
+
+/// Storage dtype of every index restored from a checkpoint.
+///
+/// The snapshot stores f32 vectors and no dtype. An F16/BF16 index
+/// checkpoints its vectors decoded to f32 and restores as an F32 index.
+const CHECKPOINT_DTYPE: VectorStorageDtype = VectorStorageDtype::F32;
+
+/// Decode a checkpoint metric code written as `DistanceMetric as u8`.
+///
+/// # Errors
+///
+/// [`VectorError::CheckpointDeserializationError`] for a code no metric uses.
+pub(crate) fn metric_from_code(code: u8) -> Result<DistanceMetric, VectorError> {
+    match code {
+        0 => Ok(DistanceMetric::L2),
+        1 => Ok(DistanceMetric::Cosine),
+        2 => Ok(DistanceMetric::InnerProduct),
+        3 => Ok(DistanceMetric::Manhattan),
+        4 => Ok(DistanceMetric::Chebyshev),
+        5 => Ok(DistanceMetric::Hamming),
+        6 => Ok(DistanceMetric::Jaccard),
+        7 => Ok(DistanceMetric::Pearson),
+        _ => Err(VectorError::CheckpointDeserializationError {
+            detail: format!("unknown distance metric code {code}"),
+        }),
+    }
+}
+
+/// Check that a decoded snapshot describes one consistent graph.
+fn validate_snapshot(snap: &HnswSnapshotRkyv) -> Result<(), VectorError> {
+    let count = snap.node_vectors.len();
+    if snap.node_neighbors.len() != count || snap.node_deleted.len() != count {
+        return Err(VectorError::CheckpointDeserializationError {
+            detail: format!(
+                "node counts disagree: {count} vectors, {} neighbor lists, {} deleted flags",
+                snap.node_neighbors.len(),
+                snap.node_deleted.len()
+            ),
+        });
+    }
+    // An empty vector is a graph-only placeholder served by a backing.
+    if let Some(v) = snap
+        .node_vectors
+        .iter()
+        .find(|v| !v.is_empty() && v.len() != snap.dim)
+    {
+        return Err(VectorError::StoredDimensionMismatch {
+            expected: snap.dim,
+            got: v.len(),
+        });
+    }
+    let in_range = |id: u32| (id as usize) < count;
+    let neighbors_in_range = snap
+        .node_neighbors
+        .iter()
+        .flatten()
+        .flatten()
+        .all(|&id| in_range(id));
+    if !neighbors_in_range || snap.entry_point.is_some_and(|ep| !in_range(ep)) {
+        return Err(VectorError::CheckpointDeserializationError {
+            detail: format!("a neighbor or entry point id is outside {count} nodes"),
+        });
+    }
+    Ok(())
+}
 
 /// rkyv-serialized HNSW snapshot. SoA layout for better rkyv compatibility
 /// (flat Vecs instead of Vec<struct>).
@@ -153,15 +220,14 @@ impl HnswIndex {
     }
 
     /// Reconstruct HnswIndex from deserialized snapshot fields.
+    ///
+    /// The snapshot is untrusted input. Inconsistent node counts, a vector of
+    /// the wrong dimension, or an out-of-range node id fail the restore.
     fn from_hnsw_snapshot(snap: HnswSnapshotRkyv) -> Result<Self, VectorError> {
         use nodedb_types::hnsw::HnswParams;
 
-        let metric = match snap.metric {
-            0 => DistanceMetric::L2,
-            1 => DistanceMetric::Cosine,
-            2 => DistanceMetric::InnerProduct,
-            _ => DistanceMetric::Cosine,
-        };
+        let metric = metric_from_code(snap.metric)?;
+        validate_snapshot(&snap)?;
 
         let flat = FlatNeighborStore::from_nested(&snap.node_neighbors);
 
@@ -184,7 +250,7 @@ impl HnswIndex {
                 m0: snap.m0,
                 ef_construction: snap.ef_construction,
                 metric,
-                dtype: nodedb_types::vector_dtype::VectorStorageDtype::F32,
+                dtype: CHECKPOINT_DTYPE,
             },
             nodes,
             entry_point: snap.entry_point,
@@ -200,7 +266,9 @@ impl HnswIndex {
 
 #[cfg(test)]
 mod tests {
+    use super::HnswSnapshotRkyv;
     use crate::distance::DistanceMetric;
+    use crate::error::VectorError;
     use crate::hnsw::{HnswIndex, HnswParams};
 
     fn make_index() -> HnswIndex {
@@ -289,6 +357,104 @@ mod tests {
             Err(crate::error::VectorError::CheckpointDeserializationError { .. }) => {}
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("expected CheckpointDeserializationError, got Ok"),
+        }
+    }
+
+    /// Every metric survives a checkpoint round trip.
+    #[test]
+    fn every_metric_round_trips() {
+        for metric in [
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+            DistanceMetric::InnerProduct,
+            DistanceMetric::Manhattan,
+            DistanceMetric::Chebyshev,
+            DistanceMetric::Hamming,
+            DistanceMetric::Jaccard,
+            DistanceMetric::Pearson,
+        ] {
+            let mut idx = HnswIndex::with_seed(
+                3,
+                HnswParams {
+                    metric,
+                    ..make_index().params().clone()
+                },
+                1,
+            );
+            idx.insert(vec![1.0, 2.0, 3.0]).unwrap();
+            let restored = HnswIndex::from_checkpoint(&idx.checkpoint_to_bytes().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.metric(), metric);
+        }
+    }
+
+    /// A valid snapshot of three 2-dim nodes in a line, entry point 0.
+    fn snapshot() -> HnswSnapshotRkyv {
+        HnswSnapshotRkyv {
+            dim: 2,
+            m: 4,
+            m0: 8,
+            ef_construction: 32,
+            metric: DistanceMetric::L2 as u8,
+            entry_point: Some(0),
+            max_layer: 0,
+            rng_state: 1,
+            node_vectors: vec![vec![0.0, 0.0], vec![1.0, 0.0], vec![2.0, 0.0]],
+            node_neighbors: vec![vec![vec![1]], vec![vec![0, 2]], vec![vec![1]]],
+            node_deleted: vec![false; 3],
+        }
+    }
+
+    fn encode(snap: &HnswSnapshotRkyv) -> Vec<u8> {
+        let mut buf = super::HNSW_RKYV_MAGIC.to_vec();
+        buf.push(super::HNSW_FORMAT_VERSION);
+        buf.extend_from_slice(&rkyv::to_bytes::<rkyv::rancor::Error>(snap).unwrap());
+        buf
+    }
+
+    #[test]
+    fn a_valid_snapshot_restores() {
+        let idx = HnswIndex::from_checkpoint(&encode(&snapshot()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(idx.search(&[2.0, 0.0], 1, 8).unwrap()[0].id, 2);
+    }
+
+    /// A corrupt snapshot fails the restore instead of panicking a later search.
+    #[test]
+    fn a_corrupt_snapshot_is_a_typed_error() {
+        let mut wrong_dim = snapshot();
+        wrong_dim.node_vectors[1] = vec![1.0, 0.0, 0.0];
+        let mut short_flags = snapshot();
+        short_flags.node_deleted.pop();
+        let mut bad_neighbor = snapshot();
+        bad_neighbor.node_neighbors[2][0].push(9);
+        let mut bad_entry = snapshot();
+        bad_entry.entry_point = Some(3);
+        let mut bad_metric = snapshot();
+        bad_metric.metric = 200;
+
+        assert!(matches!(
+            HnswIndex::from_checkpoint(&encode(&wrong_dim)),
+            Err(VectorError::StoredDimensionMismatch {
+                expected: 2,
+                got: 3
+            })
+        ));
+        for (name, snap) in [
+            ("short flags", short_flags),
+            ("bad neighbor", bad_neighbor),
+            ("bad entry", bad_entry),
+            ("bad metric", bad_metric),
+        ] {
+            assert!(
+                matches!(
+                    HnswIndex::from_checkpoint(&encode(&snap)),
+                    Err(VectorError::CheckpointDeserializationError { .. })
+                ),
+                "{name} must fail the restore"
+            );
         }
     }
 }

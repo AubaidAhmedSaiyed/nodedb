@@ -110,8 +110,8 @@ impl zerompk::ToMessagePack for TextFields {
         write_opt_field!(writer, FID_WINDOW_START_MS, self.window_start_ms);
         write_opt_field!(writer, FID_WINDOW_END_MS, self.window_end_ms);
         write_opt_field!(writer, FID_TOP_K_COUNT, self.top_k_count);
-        write_opt_field!(binary writer, FID_SCORE_MIN, self.score_min);
-        write_opt_field!(binary writer, FID_SCORE_MAX, self.score_max);
+        write_opt_field!(writer, FID_SCORE_MIN, self.score_min);
+        write_opt_field!(writer, FID_SCORE_MAX, self.score_max);
         write_opt_field!(writer, FID_UPDATES, self.updates);
         write_opt_field!(binary writer, FID_FILTERS, self.filters);
         write_opt_field!(writer, FID_VECTOR, self.vector);

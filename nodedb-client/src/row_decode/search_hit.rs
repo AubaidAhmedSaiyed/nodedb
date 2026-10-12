@@ -193,4 +193,43 @@ mod tests {
         let null_score = vec![vec![Value::String("a".into()), Value::Null]];
         assert!(decode_search_hits(&SOURCE, &columns, &null_score).is_err());
     }
+
+    #[test]
+    fn a_wrong_cell_type_is_an_error_naming_the_source() {
+        let columns = names(&["id", "distance"]);
+        let bool_id = vec![vec![Value::Bool(true), Value::Float(1.0)]];
+        let err = decode_search_hits(&SOURCE, &columns, &bool_id).expect_err("bool id");
+        assert!(err.to_string().contains("vector_search 'c'"), "{err}");
+        assert!(err.to_string().contains("row 0"), "{err}");
+        let bool_score = vec![
+            vec![Value::String("a".into()), Value::Float(1.0)],
+            vec![Value::String("b".into()), Value::Bool(false)],
+        ];
+        let err = decode_search_hits(&SOURCE, &columns, &bool_score).expect_err("bool score");
+        assert!(
+            err.to_string().contains("row 1 ('b') has distance"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_score_column_comes_from_the_source() {
+        let text = HitSource {
+            op: "text_search",
+            collection: "docs",
+            score_column: "score",
+        };
+        let columns = names(&["id", "distance", "score"]);
+        let rows = vec![vec![
+            Value::String("a".into()),
+            Value::Float(9.0),
+            Value::Float(0.75),
+        ]];
+        let hits = decode_search_hits(&text, &columns, &rows).expect("decode");
+        assert_eq!(hits[0].distance, 0.75);
+        let err = decode_search_hits(&text, &names(&["id", "distance"]), &rows)
+            .expect_err("no score column");
+        assert!(err.to_string().contains("text_search 'docs'"), "{err}");
+        assert!(err.to_string().contains("'score'"), "{err}");
+    }
 }

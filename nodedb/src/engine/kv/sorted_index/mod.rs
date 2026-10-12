@@ -4,7 +4,10 @@ pub mod checkpoint;
 pub mod index;
 pub mod key;
 pub mod manager;
+pub mod number;
+pub mod timestamp;
 pub mod tree;
+pub mod value;
 pub mod window;
 mod windowed_query;
 
@@ -12,5 +15,6 @@ pub use checkpoint::SortedIndexSnapshot;
 pub use index::SortedIndex;
 pub use key::{SortDirection, SortKeyEncoder};
 pub use manager::SortedIndexManager;
+pub use timestamp::ColumnTimestamp;
 pub use tree::OrderStatTree;
-pub use window::{WindowConfig, WindowType};
+pub use window::{WindowBounds, WindowConfig, WindowType};

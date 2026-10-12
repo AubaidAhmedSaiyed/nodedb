@@ -12,7 +12,10 @@
 //!
 //! The sorted index stores ALL entries (no data deletion). Window filtering
 //! is applied at query time by comparing the entry's timestamp against the
-//! current window boundary.
+//! current [`WindowBounds`]. An entry outside the bounds, or with no
+//! timestamp, is hidden from rank, top-k, range and count.
+
+use super::timestamp::ColumnTimestamp;
 
 /// Window type for a time-windowed sorted index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,31 +82,60 @@ impl WindowConfig {
         self.window_type == WindowType::None
     }
 
-    /// Compute the start of the current window (inclusive) given `now_ms`.
+    /// The timestamp bounds of the window that contains `now_ms`.
     ///
     /// Returns `None` for `WindowType::None` (no filtering).
-    /// Returns `Some(start_ms)` for all other types — entries with timestamp
-    /// >= start_ms are in the current window.
-    pub fn window_start(&self, now_ms: u64) -> Option<u64> {
+    /// Daily, weekly and monthly windows admit every timestamp at or after
+    /// their start. A custom window admits `[start_ms, end_ms)` while `now_ms`
+    /// is inside it, and nothing otherwise.
+    pub fn bounds(&self, now_ms: u64) -> Option<WindowBounds> {
+        let open_from = |start_ms| WindowBounds {
+            start_ms,
+            end_ms: None,
+        };
         match &self.window_type {
             WindowType::None => None,
-            WindowType::Daily => Some(start_of_day_utc(now_ms)),
-            WindowType::Weekly => Some(start_of_week_utc(now_ms)),
-            WindowType::Monthly => Some(start_of_month_utc(now_ms)),
+            WindowType::Daily => Some(open_from(start_of_day_utc(now_ms))),
+            WindowType::Weekly => Some(open_from(start_of_week_utc(now_ms))),
+            WindowType::Monthly => Some(open_from(start_of_month_utc(now_ms))),
             WindowType::Custom { start_ms, end_ms } => {
-                if now_ms >= *start_ms && now_ms < *end_ms {
-                    Some(*start_ms)
+                let end_ms = if now_ms >= *start_ms && now_ms < *end_ms {
+                    *end_ms
                 } else {
-                    // Outside the custom window — no entries visible.
-                    Some(u64::MAX)
-                }
+                    // An empty range: no timestamp is both >= and < start_ms.
+                    *start_ms
+                };
+                Some(WindowBounds {
+                    start_ms: *start_ms,
+                    end_ms: Some(end_ms),
+                })
             }
         }
     }
+}
 
-    /// Compute the window start for a specific target timestamp (for historical queries).
-    pub fn window_start_at(&self, target_ms: u64) -> Option<u64> {
-        self.window_start(target_ms)
+/// The half-open timestamp range `[start_ms, end_ms)` of the visible entries.
+///
+/// `end_ms: None` has no upper bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowBounds {
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+}
+
+impl WindowBounds {
+    /// `true` when `ts` falls inside the range.
+    pub fn contains(&self, ts: ColumnTimestamp) -> bool {
+        match ts {
+            ColumnTimestamp::Millis(ms) => {
+                ms >= i128::from(self.start_ms)
+                    && self.end_ms.is_none_or(|end| ms < i128::from(end))
+            }
+            // NaN fails both comparisons and stays outside.
+            ColumnTimestamp::FractionalMillis(ms) => {
+                ms >= self.start_ms as f64 && self.end_ms.is_none_or(|end| ms < end as f64)
+            }
+        }
     }
 }
 
@@ -184,28 +216,34 @@ mod tests {
     fn unwindowed_always_visible() {
         let config = WindowConfig::none();
         assert!(config.is_unwindowed());
-        assert!(config.window_start(1000).is_none());
+        assert!(config.bounds(1000).is_none());
+    }
+
+    fn start_of(config: &WindowConfig, now_ms: u64) -> u64 {
+        let bounds = config.bounds(now_ms).expect("windowed config has bounds");
+        assert_eq!(bounds.end_ms, None, "calendar windows have no upper bound");
+        bounds.start_ms
     }
 
     #[test]
     fn daily_window_start() {
-        // 2024-05-02 15:30:00 UTC = 1714664200000 ms
+        // 2024-05-02 15:36:40 UTC = 1714664200000 ms
         let now_ms = 1714664200000u64;
         let config = WindowConfig::daily("updated_at");
-        let start = config.window_start(now_ms).unwrap();
-        // Should be 2024-05-02 00:00:00 UTC = 1714608000000 ms
-        assert_eq!(start, start_of_day_utc(now_ms));
-        assert!(start <= now_ms);
+        let start = start_of(&config, now_ms);
+        // 2024-05-02 00:00:00 UTC = 1714608000000 ms
+        assert_eq!(start, 1_714_608_000_000);
         assert!(now_ms - start < MS_PER_DAY);
     }
 
     #[test]
     fn weekly_window_start() {
-        // 2024-05-02 (Thursday) 15:30:00 UTC
+        // 2024-05-02 (Thursday) 15:36:40 UTC
         let now_ms = 1714664200000u64;
         let config = WindowConfig::weekly("updated_at");
-        let start = config.window_start(now_ms).unwrap();
-        // Monday of that week: 2024-04-29 00:00:00 UTC
+        let start = start_of(&config, now_ms);
+        // Monday 2024-04-29 00:00:00 UTC.
+        assert_eq!(start, 1_714_348_800_000);
         assert!(start <= now_ms);
         assert!(now_ms - start < 7 * MS_PER_DAY);
         // Verify it's a Monday.
@@ -219,8 +257,8 @@ mod tests {
         // 2024-05-15 12:00:00 UTC
         let now_ms = 1715774400000u64;
         let config = WindowConfig::monthly("updated_at");
-        let start = config.window_start(now_ms).unwrap();
-        // Should be 2024-05-01 00:00:00 UTC
+        let start = start_of(&config, now_ms);
+        // 2024-05-01 00:00:00 UTC
         let (y, m, d) = seconds_to_ymd(start / MS_PER_SECOND);
         assert_eq!(y, 2024);
         assert_eq!(m, 5);
@@ -233,11 +271,52 @@ mod tests {
         let end = 2000u64;
         let config = WindowConfig::custom("ts", start, end);
 
-        // Inside window.
-        assert_eq!(config.window_start(1500), Some(1000));
+        // Inside the window: the configured range.
+        let inside = config.bounds(1500).expect("custom window has bounds");
+        assert_eq!(
+            inside,
+            WindowBounds {
+                start_ms: 1000,
+                end_ms: Some(2000)
+            }
+        );
 
-        // Outside window.
-        assert_eq!(config.window_start(2500), Some(u64::MAX));
+        // Before or after the window: a range that admits nothing.
+        for now_ms in [500, 2000, 2500] {
+            let outside = config.bounds(now_ms).expect("custom window has bounds");
+            for ts in [0, 999, 1000, 1999, 2000, i128::from(u64::MAX)] {
+                assert!(!outside.contains(ColumnTimestamp::Millis(ts)));
+            }
+            assert!(!outside.contains(ColumnTimestamp::FractionalMillis(f64::INFINITY)));
+        }
+    }
+
+    #[test]
+    fn bounds_contain_only_the_half_open_range() {
+        let bounds = WindowBounds {
+            start_ms: 1000,
+            end_ms: Some(2000),
+        };
+        assert!(!bounds.contains(ColumnTimestamp::Millis(999)));
+        assert!(bounds.contains(ColumnTimestamp::Millis(1000)));
+        assert!(bounds.contains(ColumnTimestamp::Millis(1999)));
+        assert!(!bounds.contains(ColumnTimestamp::Millis(2000)));
+        assert!(!bounds.contains(ColumnTimestamp::Millis(-1)));
+        assert!(!bounds.contains(ColumnTimestamp::FractionalMillis(999.5)));
+        assert!(bounds.contains(ColumnTimestamp::FractionalMillis(1000.5)));
+        assert!(!bounds.contains(ColumnTimestamp::FractionalMillis(2000.0)));
+        assert!(!bounds.contains(ColumnTimestamp::FractionalMillis(f64::NAN)));
+    }
+
+    #[test]
+    fn open_bounds_have_no_upper_limit() {
+        let bounds = WindowBounds {
+            start_ms: 1000,
+            end_ms: None,
+        };
+        assert!(bounds.contains(ColumnTimestamp::Millis(i128::from(u64::MAX))));
+        assert!(bounds.contains(ColumnTimestamp::FractionalMillis(1e300)));
+        assert!(!bounds.contains(ColumnTimestamp::Millis(999)));
     }
 
     #[test]

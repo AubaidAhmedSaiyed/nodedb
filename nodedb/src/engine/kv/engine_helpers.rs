@@ -2,6 +2,8 @@
 
 //! Key encoding and field extraction helpers for the KV engine.
 
+use super::sorted_index::number;
+
 /// Compute a numeric key for per-collection HashMap lookups.
 ///
 /// Uses FxHash on `(database_id, tenant_id, collection)` to produce a `u64` —
@@ -56,25 +58,30 @@ pub(super) fn parse_expiry_key(composite: &[u8]) -> Option<(u64, u64, String, Ve
 // Field extraction from MessagePack values (for secondary index maintenance)
 // ---------------------------------------------------------------------------
 
+/// Decode a MessagePack-encoded KV value. `None` when it does not decode.
+pub(super) fn decode_document(data: &[u8]) -> Option<serde_json::Value> {
+    nodedb_types::json_from_msgpack(data).ok()
+}
+
 /// Extract all field name → value bytes pairs from a MessagePack-encoded document.
 ///
 /// The value is assumed to be a MessagePack map (as produced by SQL INSERT).
-/// Returns `(field_name, value_bytes)` where `value_bytes` is the JSON-serialized
-/// scalar value suitable for B-Tree comparison.
+/// Returns `(field_name, value_bytes)` where `value_bytes` is the secondary
+/// index encoding of the scalar value.
 pub(super) fn extract_all_field_values_from_msgpack(data: &[u8]) -> Vec<(String, Vec<u8>)> {
-    let Ok(value) = nodedb_types::json_from_msgpack(data) else {
+    decode_document(data)
+        .map(|doc| document_field_values(&doc))
+        .unwrap_or_default()
+}
+
+/// Every top-level field of `document` with its secondary index encoding.
+/// Empty when `document` is not an object.
+pub(super) fn document_field_values(document: &serde_json::Value) -> Vec<(String, Vec<u8>)> {
+    let Some(obj) = document.as_object() else {
         return Vec::new();
     };
-
-    let Some(obj) = value.as_object() else {
-        return Vec::new();
-    };
-
     obj.iter()
-        .map(|(k, v)| {
-            let bytes = json_value_to_index_bytes(v);
-            (k.clone(), bytes)
-        })
+        .map(|(k, v)| (k.clone(), json_value_to_index_bytes(v)))
         .collect()
 }
 
@@ -96,28 +103,12 @@ pub(super) fn extract_field_values_from_msgpack(data: &[u8], field: &str) -> Vec
 
 /// Convert a JSON value to bytes suitable for B-Tree ordering.
 ///
-/// Strings are stored as UTF-8 bytes. Numbers are stored as big-endian bytes
-/// for correct lexicographic ordering. Booleans as 0/1. Null as empty.
+/// Strings are stored as UTF-8 bytes. Numbers use the sorted index number
+/// encoding, so 11 and 11.0 are one key. Booleans as 0/1. Null as empty.
 fn json_value_to_index_bytes(v: &serde_json::Value) -> Vec<u8> {
     match v {
         serde_json::Value::String(s) => s.as_bytes().to_vec(),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                // Shift to unsigned for correct B-Tree ordering (negatives sort before positives).
-                let sortable = (i as u64) ^ (1u64 << 63);
-                sortable.to_be_bytes().to_vec()
-            } else if let Some(f) = n.as_f64() {
-                let bits = f.to_bits();
-                let sortable = if bits >> 63 == 1 {
-                    !bits // Negative: flip all bits for correct ordering.
-                } else {
-                    bits | (1u64 << 63) // Positive: set sign bit.
-                };
-                sortable.to_be_bytes().to_vec()
-            } else {
-                Vec::new()
-            }
-        }
+        serde_json::Value::Number(n) => number::encode_json_number(n).to_vec(),
         serde_json::Value::Bool(b) => vec![*b as u8],
         serde_json::Value::Null => Vec::new(),
         // Arrays and objects: serialize as JSON string for comparison.

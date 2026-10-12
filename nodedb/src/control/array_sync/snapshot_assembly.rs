@@ -2,13 +2,15 @@
 
 //! Snapshot chunk buffering and assembly for inbound array sync.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::MutexGuard;
 
 use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::op_codec;
 use nodedb_array::sync::snapshot::{SnapshotChunk, SnapshotHeader, assemble_chunks};
 use nodedb_types::sync::wire::array::{
-    ArrayRejectMsg, ArrayRejectReason, ArraySnapshotChunkMsg, ArraySnapshotMsg,
+    ArrayOpResult, ArrayOpResultsMsg, ArrayRejectMsg, ArrayRejectReason, ArraySnapshotChunkMsg,
+    ArraySnapshotMsg,
 };
 use tracing::{error, warn};
 
@@ -47,25 +49,62 @@ impl SnapshotAssembly {
     }
 }
 
-fn reject(array: &str, hlc: Hlc, detail: impl Into<String>) -> Option<ArrayRejectMsg> {
-    Some(build_reject(
-        array,
-        hlc,
-        ArrayRejectReason::ShapeInvalid,
-        detail.into(),
-    ))
+type SnapshotBuffers = HashMap<SnapshotKey, SnapshotAssembly>;
+
+fn reject(array: &str, hlc: Hlc, detail: impl Into<String>) -> ArrayRejectMsg {
+    build_reject(array, hlc, ArrayRejectReason::ShapeInvalid, detail.into())
+}
+
+/// The session's snapshot buffers are full. Nothing is wrong with the chunk.
+fn capacity_reject(array: &str, hlc: Hlc, detail: &str) -> ArrayRejectMsg {
+    build_reject(array, hlc, ArrayRejectReason::SnapshotCapacity, detail)
 }
 
 impl OriginArrayInbound {
-    fn discard_snapshot_assembly(&self, key: &SnapshotKey) {
-        if let Ok(mut snapshots) = self.snapshots().lock() {
-            snapshots.remove(key);
-        }
+    /// Lock the session's snapshot buffers.
+    ///
+    /// A poisoned lock means a thread panicked mid-assembly, so no buffer can
+    /// be trusted. Every buffer is discarded, the poison is cleared, a capture
+    /// is filed, and the frame draws a transient `SnapshotBufferLost` reject.
+    fn lock_snapshots(
+        &self,
+        array: &str,
+        hlc: Hlc,
+    ) -> Result<MutexGuard<'_, SnapshotBuffers>, ArrayRejectMsg> {
+        let poisoned = match self.snapshots().lock() {
+            Ok(guard) => return Ok(guard),
+            Err(poisoned) => poisoned,
+        };
+        let mut buffers = poisoned.into_inner();
+        let discarded = buffers.len();
+        buffers.clear();
+        drop(buffers);
+        self.snapshots().clear_poison();
+        error!(
+            array = %array,
+            discarded,
+            "array_inbound: snapshot lock poisoned; discarded every partial snapshot"
+        );
+        crate::diag::array_snapshot_buffer_poisoned(
+            array,
+            self.tenant_id().as_u64(),
+            self.database_id().as_u64(),
+            discarded,
+        );
+        Err(build_reject(
+            array,
+            hlc,
+            ArrayRejectReason::SnapshotBufferLost,
+            "snapshot buffers discarded after a fault; re-send the whole snapshot",
+        ))
     }
 
-    fn buffered_snapshot_bytes(
-        snapshots: &std::collections::HashMap<SnapshotKey, SnapshotAssembly>,
-    ) -> usize {
+    fn discard_snapshot_assembly(&self, key: &SnapshotKey, hlc: Hlc) -> Result<(), ArrayRejectMsg> {
+        self.lock_snapshots(&key.0, hlc)?.remove(key);
+        Ok(())
+    }
+
+    fn buffered_snapshot_bytes(snapshots: &SnapshotBuffers) -> usize {
         snapshots.values().map(|entry| entry.payload_bytes).sum()
     }
 
@@ -73,7 +112,7 @@ impl OriginArrayInbound {
     pub fn handle_snapshot_header(
         &self,
         msg: &ArraySnapshotMsg,
-    ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
+    ) -> Result<InboundOutcome, ArrayRejectMsg> {
         let header: SnapshotHeader = match zerompk::from_msgpack(&msg.header_payload) {
             Ok(h) => h,
             Err(e) => {
@@ -97,7 +136,7 @@ impl OriginArrayInbound {
             )?
             .into_scope();
         if header.array != msg.array {
-            self.discard_snapshot_assembly(&key);
+            self.discard_snapshot_assembly(&key, header.snapshot_hlc)?;
             return Err(reject(
                 &msg.array,
                 header.snapshot_hlc,
@@ -105,7 +144,7 @@ impl OriginArrayInbound {
             ));
         }
         if header.total_chunks == 0 || header.total_chunks > MAX_CHUNKS_PER_SNAPSHOT {
-            self.discard_snapshot_assembly(&key);
+            self.discard_snapshot_assembly(&key, header.snapshot_hlc)?;
             return Err(reject(
                 &msg.array,
                 header.snapshot_hlc,
@@ -113,15 +152,9 @@ impl OriginArrayInbound {
             ));
         }
 
-        let mut snapshots = match self.snapshots().lock() {
-            Ok(g) => g,
-            Err(_) => {
-                error!(array = %msg.array, "array_inbound: snapshot mutex poisoned");
-                return Err(None);
-            }
-        };
+        let mut snapshots = self.lock_snapshots(&msg.array, header.snapshot_hlc)?;
         if !snapshots.contains_key(&key) && snapshots.len() >= MAX_CONCURRENT_ASSEMBLIES {
-            return Err(reject(
+            return Err(capacity_reject(
                 &msg.array,
                 header.snapshot_hlc,
                 "too many concurrent snapshot assemblies",
@@ -162,7 +195,7 @@ impl OriginArrayInbound {
     pub async fn handle_snapshot_chunk(
         &self,
         msg: &ArraySnapshotChunkMsg,
-    ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
+    ) -> Result<InboundOutcome, ArrayRejectMsg> {
         let snapshot_hlc = Hlc::from_bytes(&msg.snapshot_hlc_bytes);
         let key = (msg.array.clone(), msg.snapshot_hlc_bytes);
 
@@ -176,7 +209,7 @@ impl OriginArrayInbound {
             )?
             .into_scope();
         if msg.total_chunks == 0 || msg.total_chunks > MAX_CHUNKS_PER_SNAPSHOT {
-            self.discard_snapshot_assembly(&key);
+            self.discard_snapshot_assembly(&key, snapshot_hlc)?;
             return Err(reject(
                 &msg.array,
                 snapshot_hlc,
@@ -184,7 +217,7 @@ impl OriginArrayInbound {
             ));
         }
         if msg.chunk_index >= msg.total_chunks {
-            self.discard_snapshot_assembly(&key);
+            self.discard_snapshot_assembly(&key, snapshot_hlc)?;
             return Err(reject(
                 &msg.array,
                 snapshot_hlc,
@@ -192,7 +225,7 @@ impl OriginArrayInbound {
             ));
         }
         if msg.payload.len() > MAX_CHUNK_BYTES {
-            self.discard_snapshot_assembly(&key);
+            self.discard_snapshot_assembly(&key, snapshot_hlc)?;
             return Err(reject(
                 &msg.array,
                 snapshot_hlc,
@@ -201,15 +234,9 @@ impl OriginArrayInbound {
         }
 
         let assembled: Option<(SnapshotHeader, Vec<SnapshotChunk>)> = {
-            let mut snapshots = match self.snapshots().lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    error!(array = %msg.array, "array_inbound: snapshot mutex poisoned (chunk)");
-                    return Err(None);
-                }
-            };
+            let mut snapshots = self.lock_snapshots(&msg.array, snapshot_hlc)?;
             if !snapshots.contains_key(&key) && snapshots.len() >= MAX_CONCURRENT_ASSEMBLIES {
-                return Err(reject(
+                return Err(capacity_reject(
                     &msg.array,
                     snapshot_hlc,
                     "too many concurrent snapshot assemblies",
@@ -267,7 +294,7 @@ impl OriginArrayInbound {
                     > MAX_BUFFERED_SNAPSHOT_BYTES
             {
                 snapshots.remove(&key);
-                return Err(reject(
+                return Err(capacity_reject(
                     &msg.array,
                     snapshot_hlc,
                     "snapshot buffer byte limit exceeded",
@@ -295,10 +322,7 @@ impl OriginArrayInbound {
         };
 
         let Some((header, mut chunks)) = assembled else {
-            let snapshots = match self.snapshots().lock() {
-                Ok(g) => g,
-                Err(_) => return Err(None),
-            };
+            let snapshots = self.lock_snapshots(&msg.array, snapshot_hlc)?;
             let received = snapshots
                 .get(&key)
                 .map(|e| e.chunks.len() as u32)
@@ -332,25 +356,123 @@ impl OriginArrayInbound {
             }
         };
 
-        let mut ops_applied = 0;
-        for op in &ops {
-            let raw = match op_codec::encode_op(op) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    return Err(reject(
-                        &msg.array,
-                        header.snapshot_hlc,
-                        format!("snapshot op encode: {e}"),
-                    ));
-                }
+        // Every op is attempted. A reject names its op and stops nothing.
+        let mut results = Vec::with_capacity(ops.len());
+        for op in ops {
+            let result = match op_codec::encode_op(&op) {
+                Ok(raw) => self.apply_op_for_result(op, &raw, None).await,
+                Err(e) => ArrayOpResult::rejected(build_reject(
+                    &msg.array,
+                    op.header.hlc,
+                    ArrayRejectReason::ShapeInvalid,
+                    format!("snapshot op encode: {e}"),
+                )),
             };
-            match self.apply_op(op.clone(), &raw, None).await {
-                Ok(InboundOutcome::Applied) => ops_applied += 1,
-                Ok(_) => {}
-                Err(reject) => return Err(reject),
-            }
+            results.push(result);
         }
 
-        Ok(InboundOutcome::SnapshotApplied { ops_applied })
+        Ok(InboundOutcome::SnapshotApplied(ArrayOpResultsMsg {
+            array: msg.array.clone(),
+            results,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nodedb_array::sync::replica_id::ReplicaId;
+    use nodedb_array::sync::snapshot::CoordRange;
+    use nodedb_types::sync::wire::array::ArrayRejectClass;
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::array_sync::OriginApplyEngine;
+    use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
+    use crate::control::state::SharedState;
+    use crate::types::{DatabaseId, TenantId};
+    use crate::wal::WalManager;
+
+    const ARRAY: &str = "poisoned-snapshot-array";
+
+    fn writer(dir: &std::path::Path) -> OriginArrayInbound {
+        let wal = Arc::new(WalManager::open_for_testing(&dir.join("snap.wal")).expect("wal"));
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let shared = SharedState::new(dispatcher, wal).expect("shared state");
+        let identity = AuthenticatedIdentity::new_regular(
+            1,
+            "snapshot-writer",
+            TenantId::new(7),
+            AuthMethod::Trust,
+            vec![Role::ReadWrite],
+            Some(DatabaseId::DEFAULT),
+            AuthenticatedIdentity::default_database_set(false),
+        );
+        let engine = Arc::new(OriginApplyEngine::new(
+            Arc::clone(&shared.array_sync_schemas),
+            Arc::clone(&shared.array_sync_op_log),
+        ));
+        OriginArrayInbound::new(
+            engine,
+            Arc::clone(&shared.array_sync_schemas),
+            shared,
+            identity,
+        )
+    }
+
+    fn header(ms: u64) -> ArraySnapshotMsg {
+        let header = SnapshotHeader {
+            array: ARRAY.into(),
+            coord_range: CoordRange {
+                lo: Vec::new(),
+                hi: Vec::new(),
+            },
+            total_chunks: 2,
+            snapshot_hlc: Hlc::new(ms, 0, ReplicaId(3)).expect("hlc"),
+            schema_hlc: Hlc::ZERO,
+        };
+        ArraySnapshotMsg {
+            array: ARRAY.into(),
+            header_payload: zerompk::to_msgpack_vec(&header).expect("encode header"),
+        }
+    }
+
+    #[test]
+    fn a_poisoned_lock_discards_every_buffer_and_draws_a_transient_reject() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let inbound = writer(dir.path());
+        assert!(matches!(
+            inbound.handle_snapshot_header(&header(1)),
+            Ok(InboundOutcome::SnapshotPartial { .. })
+        ));
+
+        std::thread::scope(|scope| {
+            let panicked = scope
+                .spawn(|| {
+                    let _guard = inbound.snapshots().lock().expect("unpoisoned lock");
+                    panic!("poison the snapshot lock");
+                })
+                .join();
+            assert!(panicked.is_err());
+        });
+        assert!(inbound.snapshots().is_poisoned());
+
+        let reject = inbound
+            .handle_snapshot_header(&header(2))
+            .expect_err("a poisoned lock must draw a reject, never silence");
+        assert_eq!(reject.reason, ArrayRejectReason::SnapshotBufferLost);
+        assert_eq!(reject.class(), ArrayRejectClass::Transient);
+        assert_eq!(reject.array, ARRAY);
+
+        assert!(!inbound.snapshots().is_poisoned(), "the poison is cleared");
+        assert!(
+            inbound.snapshots().lock().expect("lock").is_empty(),
+            "every untrusted buffer is discarded"
+        );
+        assert!(matches!(
+            inbound.handle_snapshot_header(&header(2)),
+            Ok(InboundOutcome::SnapshotPartial { .. })
+        ));
     }
 }

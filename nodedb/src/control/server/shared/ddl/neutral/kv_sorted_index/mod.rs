@@ -4,7 +4,7 @@
 //! (leaderboards).
 //!
 //! DDL:
-//!   CREATE SORTED INDEX name ON collection (score DESC [, tiebreak ASC]) KEY key_col [WINDOW DAILY ON ts_col]
+//!   CREATE SORTED INDEX name ON collection (score DESC [, ts ASC]) KEY key_col [WINDOW DAILY ON ts]
 //!   DROP SORTED INDEX name
 //!
 //! SQL functions (intercepted in DDL router):
@@ -18,9 +18,11 @@ pub mod dispatch;
 pub mod gate;
 pub mod parse;
 pub mod query;
+mod tail;
 mod txn_read;
 
 pub use ddl::{create_sorted_index, drop_sorted_index};
 pub use dispatch::{SortedIndexTarget, drop_in_engine};
+pub(crate) use parse::encode_score_bound;
 pub(crate) use query::run_read;
 pub use query::{select_range, select_rank, select_sorted_count, select_topk};

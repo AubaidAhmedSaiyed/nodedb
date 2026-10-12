@@ -402,25 +402,23 @@ mod tests {
         assert_eq!(idx.materialize_vector(1).unwrap(), vec![4.0, 5.0, 6.0]);
     }
 
-    /// A node with no vector source must rank last, not abort the search worker.
+    /// A node with no vector source is not a hit. Search must neither abort the
+    /// worker nor return such a node at infinite distance.
     #[test]
-    fn search_on_a_vectorless_index_does_not_panic() {
-        let mut src = HnswIndex::with_seed(3, make_params(VectorStorageDtype::F32), 1);
-        src.insert(vec![1.0, 2.0, 3.0]).unwrap();
-        let graph_only = src.graph_checkpoint_to_bytes().unwrap();
-        // No backing attached: every node's storage is an empty placeholder.
-        let idx = HnswIndex::from_checkpoint(&graph_only)
-            .unwrap()
-            .expect("graph checkpoint must be recognized");
+    fn search_before_with_backing_returns_no_vectorless_hits() {
+        use crate::test_support::{graph_only_restore, seeded_index, seeded_vectors};
 
-        let results = idx.search(&[1.0, 2.0, 3.0], 5, 16).unwrap();
-        for r in &results {
-            assert!(
-                r.distance.is_infinite(),
-                "a node with no vector source must score infinity, got {}",
-                r.distance
-            );
-        }
+        let vectors = seeded_vectors(50, 3, 0x9E37_79B9_7F4A_7C15);
+        let src = seeded_index(&vectors, DistanceMetric::L2, VectorStorageDtype::F32);
+        // No backing attached: every node's storage is an empty placeholder.
+        let idx = graph_only_restore(&src);
+        assert_eq!(idx.len(), 50, "graph topology must survive");
+
+        let filter: roaring::RoaringBitmap = (0..50u32).collect();
+        let unfiltered = idx.search(&vectors[0], 5, 64).unwrap();
+        let filtered = idx.search_filtered(&vectors[0], 5, 64, &filter).unwrap();
+        assert!(unfiltered.is_empty(), "got {unfiltered:?}");
+        assert!(filtered.is_empty(), "got {filtered:?}");
     }
 
     #[test]

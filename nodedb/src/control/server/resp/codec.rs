@@ -103,6 +103,12 @@ impl RespValue {
                 buf.extend_from_slice(b"\r\n");
             }
             Self::Error(s) => {
+                // Every RESP error reply is written here, so a `BUSY` overload
+                // reply counts here once.
+                if s.starts_with("BUSY ") {
+                    crate::control::metrics::overload_responses()
+                        .record(crate::control::metrics::OverloadProtocol::Resp);
+                }
                 buf.push(b'-');
                 buf.extend_from_slice(s.as_bytes());
                 buf.extend_from_slice(b"\r\n");
@@ -422,6 +428,32 @@ mod tests {
         assert_eq!(
             RespValue::err("ERR unknown command").to_bytes(),
             b"-ERR unknown command\r\n"
+        );
+    }
+
+    /// A `BUSY` reply counts once under `resp`, nested replies included.
+    /// Another error reply does not count.
+    #[test]
+    fn a_busy_reply_counts_under_resp() {
+        use crate::control::metrics::{OverloadProtocol, overload_responses};
+        let before = overload_responses().sent(OverloadProtocol::Resp);
+        let busy = RespValue::from_error(&crate::Error::DispatchCapacity {
+            scope: crate::DispatchCapacityScope::QueueFull {
+                core_id: 0,
+                capacity: 4,
+            },
+        });
+
+        let _ = busy.to_bytes();
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Resp),
+            before + 1
+        );
+
+        let _ = RespValue::array(vec![busy, RespValue::err("ERR unknown command")]).to_bytes();
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Resp),
+            before + 2
         );
     }
 

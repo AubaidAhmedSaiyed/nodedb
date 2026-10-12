@@ -165,6 +165,59 @@ async fn create_vector_index_refusal_keeps_its_sqlstate() {
     );
 }
 
+/// A dispatcher capacity refusal keeps its type through the system door, so
+/// the statement answers the retryable `57P03`, never `XX000`.
+#[tokio::test]
+async fn dispatch_system_keeps_a_capacity_refusal_retryable() {
+    let (state, mut side, _dir) = fixture();
+    // Tenant 1 takes every in-flight slot. Popping each request keeps the
+    // ring and the weighted-fair queue empty, so only the tenant cap refuses.
+    {
+        let mut dispatcher = state
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let filled = (1_000_000..1_000_128u64)
+            .take_while(|&id| {
+                let admitted = dispatcher
+                    .dispatch(crate::bridge::dispatch::test_requests::make_request_for_db(
+                        0, 1, id,
+                    ))
+                    .is_ok();
+                while side.request_rx.try_pop().is_ok() {}
+                admitted
+            })
+            .count();
+        assert!(filled > 0, "the tenant cap admits some requests first");
+        assert!(filled < 128, "the tenant reaches its in-flight cap");
+    }
+
+    let result = dispatch_system(
+        &state,
+        SystemTask::new(
+            SystemReason::DdlApply,
+            TenantId::new(1),
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, COLLECTION),
+            set_params_plan(),
+        ),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let err = result.expect_err("the tenant is at its in-flight cap");
+    assert!(
+        matches!(
+            err,
+            crate::Error::DispatchCapacity {
+                scope: crate::DispatchCapacityScope::TenantInflight { .. }
+            }
+        ),
+        "expected a tenant-cap refusal, got {err:?}"
+    );
+    let (state_code, _) = crate::control::gateway::GatewayErrorMap::to_pgwire(&err);
+    assert_eq!(state_code, sqlstate::SERVER_OVERLOAD);
+}
+
 /// A refusal with no code has no class of its own, so it is the one case
 /// that stays internal.
 #[tokio::test]

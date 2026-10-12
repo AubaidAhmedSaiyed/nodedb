@@ -50,16 +50,15 @@ impl HnswIndex {
             return Ok(());
         };
 
-        // Encode query once to the index dtype for all dist_to_node calls below.
-        let query = vector;
-        let query_bytes = cast_from_f32(&query, self.params.dtype);
+        // One probe serves every distance against the new vector below.
+        let probe = self.probe(&vector);
 
         let mut current_ep = ep;
 
         // Phase 1: Greedy descent from top layer to new_layer + 1.
         if self.max_layer > new_layer {
             for layer in (new_layer + 1..=self.max_layer).rev() {
-                let results = search_layer(self, &query_bytes, current_ep, 1, layer, None, 0);
+                let results = search_layer(self, &probe, current_ep, 1, layer, None, 0);
                 if let Some(nearest) = results.first() {
                     current_ep = nearest.id;
                 }
@@ -70,7 +69,7 @@ impl HnswIndex {
         let insert_top = new_layer.min(self.max_layer);
         for layer in (0..=insert_top).rev() {
             let ef = self.params.ef_construction;
-            let candidates = search_layer(self, &query_bytes, current_ep, ef, layer, None, 0);
+            let candidates = search_layer(self, &probe, current_ep, ef, layer, None, 0);
 
             let m = self.max_neighbors(layer);
             let selected = select_neighbors_heuristic(self, &candidates, m);
@@ -82,8 +81,7 @@ impl HnswIndex {
                 self.nodes[nid].neighbors[layer].push(new_id);
 
                 if self.nodes[nid].neighbors[layer].len() > m {
-                    let node_bytes = self.nodes[nid].storage.as_bytes().to_vec();
-                    self.prune_neighbors(nid, layer, &node_bytes, m);
+                    self.prune_neighbors(neighbor.id, layer, m);
                 }
             }
 
@@ -101,20 +99,28 @@ impl HnswIndex {
     }
 
     /// Prune a node's neighbor list using the diversity heuristic.
-    fn prune_neighbors(&mut self, node_idx: usize, layer: usize, node_bytes: &[u8], m: usize) {
-        let neighbor_ids: Vec<u32> = self.nodes[node_idx].neighbors[layer].clone();
-
-        let mut candidates: Vec<Candidate> = neighbor_ids
-            .iter()
-            .map(|&nid| Candidate {
-                id: nid,
-                dist: self.dist_to_node(node_bytes, nid),
-            })
-            .collect();
-        candidates.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
-
-        let selected = select_neighbors_heuristic(self, &candidates, m);
-        self.nodes[node_idx].neighbors[layer] = selected.iter().map(|c| c.id).collect();
+    fn prune_neighbors(&mut self, node_id: u32, layer: usize, m: usize) {
+        let metric = self.params.metric;
+        let node_idx = node_id as usize;
+        let selected: Vec<u32> = {
+            let probe = self.node_probe(node_id);
+            let mut candidates: Vec<Candidate> = self.nodes[node_idx].neighbors[layer]
+                .iter()
+                .map(|&nid| Candidate {
+                    id: nid,
+                    dist: probe
+                        .as_ref()
+                        .and_then(|p| self.dist_to_node(p, nid, metric))
+                        .unwrap_or(f32::INFINITY),
+                })
+                .collect();
+            candidates.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
+            select_neighbors_heuristic(self, &candidates, m)
+                .iter()
+                .map(|c| c.id)
+                .collect()
+        };
+        self.nodes[node_idx].neighbors[layer] = selected;
     }
 }
 
@@ -124,6 +130,7 @@ fn select_neighbors_heuristic(
     candidates: &[Candidate],
     m: usize,
 ) -> Vec<Candidate> {
+    let metric = index.params.metric;
     let mut selected: Vec<Candidate> = Vec::with_capacity(m);
 
     for candidate in candidates {
@@ -131,17 +138,13 @@ fn select_neighbors_heuristic(
             break;
         }
 
-        let candidate_bytes = index.nodes[candidate.id as usize].storage.as_bytes();
+        // Borrowed from node storage: the pairwise loop below allocates nothing.
+        let candidate_probe = index.node_probe(candidate.id);
         let is_diverse = selected.iter().all(|s| {
-            let selected_bytes = index.nodes[s.id as usize].storage.as_bytes();
-            let dist_to_selected = crate::distance::dispatch::distance_typed(
-                index.params.metric,
-                index.params.dtype,
-                candidate_bytes,
-                selected_bytes,
-                index.dim,
-            )
-            .unwrap_or(f32::MAX);
+            let dist_to_selected = candidate_probe
+                .as_ref()
+                .and_then(|p| index.dist_to_node(p, s.id, metric))
+                .unwrap_or(f32::MAX);
             candidate.dist <= dist_to_selected
         });
 
@@ -168,6 +171,8 @@ fn select_neighbors_heuristic(
 
 #[cfg(test)]
 mod tests {
+    use nodedb_types::vector_dtype::VectorStorageDtype;
+
     use crate::distance::DistanceMetric;
     use crate::hnsw::{HnswIndex, HnswParams};
 
@@ -229,6 +234,100 @@ mod tests {
             let query = idx.get_vector(target).unwrap().to_vec();
             let results = idx.search(&query, 1, 32).unwrap();
             assert_eq!(results[0].id, target, "node {target} not reachable");
+        }
+    }
+
+    /// F16/BF16 inserts score node pairs through the borrowed encoded bytes.
+    /// Every node must stay reachable by an exact query.
+    #[test]
+    fn narrow_dtype_inserts_reach_every_node() {
+        use crate::test_support::{seeded_index, seeded_vectors};
+
+        let vectors = seeded_vectors(120, 8, 0x2545_F491_4F6C_DD1D);
+        for dtype in [VectorStorageDtype::F16, VectorStorageDtype::BF16] {
+            for metric in [DistanceMetric::L2, DistanceMetric::Cosine] {
+                let idx = seeded_index(&vectors, metric, dtype);
+                for (id, v) in vectors.iter().enumerate() {
+                    // `ef` covers every node, so a miss means a node is unreachable.
+                    let hits = idx.search(v, 1, 128).unwrap();
+                    assert_eq!(
+                        hits.first().map(|h| h.id),
+                        Some(id as u32),
+                        "dtype={dtype:?} metric={metric:?}: exact query misses node {id}"
+                    );
+                }
+                for node in &idx.nodes {
+                    assert!(node.neighbors[0].len() <= idx.params.m0);
+                }
+            }
+        }
+    }
+
+    /// A graph-only restore with an attached backing must insert exactly like a
+    /// full restore. Restored nodes hold no local vector, so neighbor pruning
+    /// and the diversity heuristic read them through the backing. A new node
+    /// must gain incoming edges, or search can never reach it.
+    ///
+    /// `segment_backing` is gated off on wasm32, so the test is too.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn inserts_after_graph_only_restore_match_a_full_restore() {
+        use crate::test_support::{graph_only_restore_with_backing, seeded_index, seeded_vectors};
+
+        const DIM: usize = 8;
+        let base = seeded_vectors(200, DIM, 0x9E37_79B9_7F4A_7C15);
+        let extra = seeded_vectors(5, DIM, 0xD1B5_4A32_D192_ED03);
+
+        let src = seeded_index(&base, DistanceMetric::L2, VectorStorageDtype::F32);
+        let mut full = HnswIndex::from_checkpoint(&src.checkpoint_to_bytes().unwrap())
+            .unwrap()
+            .expect("full checkpoint must be recognized");
+        let mut graph_only = graph_only_restore_with_backing(&src, &base);
+
+        for v in &extra {
+            full.insert(v.clone()).unwrap();
+            graph_only.insert(v.clone()).unwrap();
+        }
+
+        let neighbors = graph_only.export_neighbors();
+        assert_eq!(
+            full.export_neighbors(),
+            neighbors,
+            "a graph-only restore must build the same graph as a full restore"
+        );
+
+        for (offset, v) in extra.iter().enumerate() {
+            let new_id = (base.len() + offset) as u32;
+            let hits = graph_only.search(v, 1, 64).unwrap();
+            assert_eq!(
+                hits.first().map(|h| h.id),
+                Some(new_id),
+                "exact query for inserted node {new_id} returns it, got {hits:?}"
+            );
+            assert!(
+                hits[0].distance < 1e-6,
+                "exact query for node {new_id} scores ~0, got {}",
+                hits[0].distance
+            );
+            assert!(
+                neighbors
+                    .iter()
+                    .any(|layers| layers.first().is_some_and(|l0| l0.contains(&new_id))),
+                "node {new_id} has no incoming layer-0 edge"
+            );
+        }
+
+        let m = graph_only.params().m;
+        let m0 = graph_only.params().m0;
+        for (id, layers) in neighbors.iter().enumerate() {
+            for (layer, list) in layers.iter().enumerate() {
+                let cap = if layer == 0 { m0 } else { m };
+                assert!(
+                    list.len() <= cap,
+                    "node {id} layer {layer} has {} neighbors, cap {cap}",
+                    list.len()
+                );
+            }
         }
     }
 

@@ -31,9 +31,8 @@ fn prefetch_t0(ptr: *const u8) {
 
 use roaring::RoaringBitmap;
 
-use crate::dtype::cast_from_f32;
 use crate::error::{VectorError, check_dim};
-use crate::hnsw::graph::{Candidate, HnswIndex, SearchResult};
+use crate::hnsw::graph::{Candidate, HnswIndex, Probe, SearchResult};
 
 /// Maximum beam width to prevent runaway search cost.
 const MAX_EF: usize = 8192;
@@ -129,19 +128,19 @@ impl HnswIndex {
             return Ok(Vec::new());
         };
 
-        let query_bytes = cast_from_f32(query, self.params.dtype);
+        let probe = self.probe(query);
 
         // Phase 1: Greedy descent from top layer to layer 1.
         let mut current_ep = ep;
         for layer in (1..=self.max_layer).rev() {
-            let results = search_layer(self, &query_bytes, current_ep, 1, layer, None, 0);
+            let results = search_layer(self, &probe, current_ep, 1, layer, None, 0);
             if let Some(nearest) = results.first() {
                 current_ep = nearest.id;
             }
         }
 
         // Phase 2: Beam search at layer 0.
-        let results = search_layer(self, &query_bytes, current_ep, ef, 0, filter, id_offset);
+        let results = search_layer(self, &probe, current_ep, ef, 0, filter, id_offset);
 
         Ok(results
             .into_iter()
@@ -167,19 +166,23 @@ pub fn decode_filter_bitmap(bytes: &[u8]) -> Result<RoaringBitmap, VectorError> 
 /// When `filter` is `Some`, only nodes present in the bitmap enter results,
 /// but all nodes are still traversed for graph connectivity.
 ///
+/// Distances use the build metric. A node without a vector is traversed at
+/// infinite distance and never enters the results.
+///
 /// Scratch buffers are drawn from `index.arena` (a `RefCell`-guarded
 /// `BeamSearchArena`).  The arena is reset at entry and its `Vec`/`HashSet`
 /// capacity grows to the high-water mark over successive calls, giving
 /// amortised zero-allocation steady state.
 pub(crate) fn search_layer(
     index: &HnswIndex,
-    query_bytes: &[u8],
+    probe: &Probe<'_>,
     entry_point: u32,
     ef: usize,
     layer: usize,
     filter: Option<&RoaringBitmap>,
     id_offset: u32,
 ) -> Vec<Candidate> {
+    let metric = index.params.metric;
     let mut arena = index.arena.borrow_mut();
 
     // Reset scratch buffers — retains Vec/HashSet capacity from prior calls.
@@ -187,9 +190,9 @@ pub(crate) fn search_layer(
 
     arena.visited.insert(entry_point);
 
-    let ep_dist = index.dist_to_node(query_bytes, entry_point);
+    let ep_dist = index.dist_to_node(probe, entry_point, metric);
     let ep_candidate = Candidate {
-        dist: ep_dist,
+        dist: ep_dist.unwrap_or(f32::INFINITY),
         id: entry_point,
     };
 
@@ -213,7 +216,7 @@ pub(crate) fn search_layer(
         }
     };
 
-    if passes_filter(entry_point) {
+    if ep_dist.is_some() && passes_filter(entry_point) {
         res_vec.push(ep_candidate);
     }
     let mut results = BinaryHeap::from(res_vec);
@@ -245,20 +248,20 @@ pub(crate) fn search_layer(
                 continue;
             }
 
-            let dist = index.dist_to_node(query_bytes, neighbor_id);
+            let scored = index.dist_to_node(probe, neighbor_id, metric);
             let neighbor = Candidate {
-                dist,
+                dist: scored.unwrap_or(f32::INFINITY),
                 id: neighbor_id,
             };
 
             let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.dist);
-            let should_explore = dist < worst_dist || results.len() < ef;
+            let should_explore = neighbor.dist < worst_dist || results.len() < ef;
 
             if should_explore {
                 candidates.push(Reverse(neighbor));
             }
 
-            if passes_filter(neighbor_id) {
+            if scored.is_some() && passes_filter(neighbor_id) {
                 results.push(neighbor);
                 if results.len() > ef {
                     results.pop();

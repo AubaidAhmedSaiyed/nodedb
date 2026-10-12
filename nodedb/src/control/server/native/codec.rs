@@ -120,7 +120,24 @@ pub fn decode_request(payload: &[u8], format: FrameFormat) -> crate::Result<Nati
 }
 
 /// Encode a response in the given format.
+///
+/// Every native frame is encoded here, so an error frame of the overload
+/// class (`57P03`) counts here once.
 pub fn encode_response(resp: &NativeResponse, format: FrameFormat) -> crate::Result<Vec<u8>> {
+    let bytes = encode_frame(resp, format)?;
+    if resp
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code == nodedb_types::error::sqlstate::SERVER_OVERLOAD)
+    {
+        crate::control::metrics::overload_responses()
+            .record(crate::control::metrics::OverloadProtocol::Native);
+    }
+    Ok(bytes)
+}
+
+/// Serialize `resp` in `format`.
+fn encode_frame(resp: &NativeResponse, format: FrameFormat) -> crate::Result<Vec<u8>> {
     match format {
         FrameFormat::Json => sonic_rs::to_vec(resp).map_err(|e| crate::Error::Serialization {
             format: "json".into(),
@@ -204,6 +221,35 @@ mod tests {
         let bytes = encode_response(&resp, FrameFormat::Json).unwrap();
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.contains("\"seq\":1"));
+    }
+
+    /// A `57P03` error frame counts once under `native`. Another error frame
+    /// does not count.
+    #[test]
+    fn an_overload_frame_counts_under_native() {
+        use crate::control::metrics::{OverloadProtocol, overload_responses};
+        let before = overload_responses().sent(OverloadProtocol::Native);
+        let refusal = crate::Error::DispatchCapacity {
+            scope: crate::DispatchCapacityScope::QueueFull {
+                core_id: 0,
+                capacity: 4,
+            },
+        };
+
+        let frame = crate::control::server::native::dispatch::error_to_native(1, &refusal);
+        encode_response(&frame, FrameFormat::MessagePack).expect("frame encodes");
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Native),
+            before + 1
+        );
+
+        let other =
+            crate::control::server::native::sqlstate_code::sqlstate_error(2, "XX000", "boom");
+        encode_response(&other, FrameFormat::Json).expect("frame encodes");
+        assert_eq!(
+            overload_responses().sent(OverloadProtocol::Native),
+            before + 1
+        );
     }
 
     #[test]

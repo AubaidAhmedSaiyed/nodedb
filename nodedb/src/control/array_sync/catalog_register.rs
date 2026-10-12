@@ -14,11 +14,11 @@ use nodedb_array::sync::SchemaDoc;
 use nodedb_array::sync::hlc::Hlc as SchemaHlc;
 use nodedb_array::sync::replica_id::ReplicaId;
 use nodedb_array::types::ArrayId;
-use nodedb_types::sync::wire::array::{ArrayRejectMsg, ArrayRejectReason, ArraySchemaSyncMsg};
+use nodedb_types::sync::wire::array::{ArrayRejectMsg, ArraySchemaSyncMsg};
 use tracing::warn;
 
 use super::inbound::OriginArrayInbound;
-use super::reject::build_reject;
+use super::reject::engine_reject;
 use crate::control::array_catalog::entry::ArrayCatalogEntry;
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::state::SharedState;
@@ -32,7 +32,7 @@ impl OriginArrayInbound {
         &self,
         msg: &ArraySchemaSyncMsg,
         remote_hlc: SchemaHlc,
-    ) -> Result<(), Option<ArrayRejectMsg>> {
+    ) -> Result<(), ArrayRejectMsg> {
         register_array_catalog_entry(
             self.shared(),
             self.tenant_id(),
@@ -44,12 +44,7 @@ impl OriginArrayInbound {
         .await
         .map_err(|e| {
             warn!(array = %msg.array, error = %e, "array_inbound: catalog registration failed");
-            Some(build_reject(
-                &msg.array,
-                remote_hlc,
-                ArrayRejectReason::EngineRejected,
-                format!("catalog registration error: {e}"),
-            ))
+            engine_reject(&msg.array, remote_hlc, "catalog registration error", &e)
         })
     }
 }

@@ -252,7 +252,9 @@ impl Scheduler {
         match error {
             crate::Error::DispatchCapacity { scope } => {
                 self.metrics.record_dispatch_deferred();
-                tracing::debug!(
+                // Trace per attempt: the intake gate logs once per stall
+                // window, as it closes for the deferred dispatch and reopens.
+                tracing::trace!(
                     vshard_id = self.vshard_id,
                     epoch = txn_id.epoch,
                     position = txn_id.position,

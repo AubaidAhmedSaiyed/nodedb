@@ -21,8 +21,8 @@ use super::state::HnswIndex;
 impl HnswIndex {
     /// Attach a [`crate::segment_backing::VectorSegmentBacking`] to this index.
     ///
-    /// After this succeeds, `dist_to_node` falls back to the backing whenever a
-    /// node's local vector storage is empty.  This is used by Lite's
+    /// After this succeeds, `dist_to_node` falls back to the backing whenever an
+    /// F32 node's local vector storage is empty.  This is used by Lite's
     /// graph-checkpoint-only restore path: the graph topology is loaded from the
     /// B+ tree blob, but vector data lives in a pagedb segment.
     ///

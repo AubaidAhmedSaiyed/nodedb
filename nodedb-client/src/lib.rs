@@ -14,9 +14,9 @@
 pub mod capabilities;
 pub mod traits;
 
-/// Shared row decoders used by both the trait default impls and the
-/// feature-gated clients. Feature-agnostic on purpose — one parser per
-/// row shape regardless of which transport delivered the row.
+/// Shared row decoders used by the trait default impls and the feature-gated
+/// clients. One parser per row shape, whichever transport delivered the row.
+/// A decoder used only by the clients compiles under their features.
 mod row_decode;
 
 /// Shared SQL escaping helpers (string-literal and identifier quoting).

@@ -253,12 +253,20 @@ mod tests {
     use nodedb_types::TenantId;
     use nodedb_types::id::DatabaseId;
 
+    use nodedb_physical::physical_plan::PhysicalPlan;
+    use nodedb_physical::physical_plan::meta::MetaOp;
+
+    use crate::bridge::dispatch::{BridgeResponse, CoreChannelDataSide};
+    use crate::bridge::envelope::{StageVote, Status};
     use crate::control::cluster::calvin::scheduler::driver::core::test_proposer::lead_data_group;
     use crate::control::cluster::calvin::scheduler::driver::core::test_support::{
         build_test_scheduler, build_test_scheduler_with_data_side, fill_tenant_inflight,
-        make_sequenced_txn, make_validate_only_txn, test_coll_vshard,
+        make_sequenced_txn, make_validate_only_txn, release_filler, staged_response,
+        test_coll_vshard,
     };
     use crate::control::cluster::calvin::scheduler::lock_manager::{AcquireOutcome, TxnId};
+    use crate::control::cluster::calvin::scheduler::metrics::intake_closure_reason;
+    use crate::types::RequestId;
 
     #[tokio::test]
     async fn drain_catch_up_is_noop_when_no_drop_recorded() {
@@ -685,5 +693,213 @@ mod tests {
             "the next drain replays the entry past the first window"
         );
         assert_eq!(armed(&scheduler), None, "the armed range is fully replayed");
+    }
+
+    /// One run-loop pass of the rebuild: re-send parked requests, then
+    /// replay the armed log range while the intake gate is open.
+    fn rebuild_pass(scheduler: &mut Scheduler) {
+        if scheduler.resends_deferred() {
+            scheduler.redispatch_deferred();
+        }
+        if scheduler.refresh_intake_gate() {
+            scheduler.drain_catch_up();
+        }
+        scheduler.refresh_intake_gate();
+    }
+
+    /// The first index armed for catch-up on `scheduler`'s vShard.
+    fn armed_index(scheduler: &Scheduler) -> Option<u64> {
+        scheduler
+            .sequencer_state_machine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peek_catch_up_from(scheduler.vshard_id)
+    }
+
+    /// Pop the next request off the Data Plane side. It must be a Calvin
+    /// request that `wanted` accepts. Returns its id.
+    fn pop_calvin_request(
+        data_side: &mut CoreChannelDataSide,
+        wanted: impl Fn(&MetaOp) -> bool,
+    ) -> RequestId {
+        let request = data_side
+            .request_rx
+            .try_pop()
+            .expect("a request reached the Data Plane");
+        match &request.inner.plan {
+            PhysicalPlan::Meta(op) if wanted(op) => request.inner.request_id,
+            other => panic!("unexpected request on the Data Plane: {other:?}"),
+        }
+    }
+
+    /// Answer `request_id` `Ok` on the Data Plane side, route the answer
+    /// back, and hand its completion to the scheduler.
+    async fn answer(
+        scheduler: &mut Scheduler,
+        data_side: &mut CoreChannelDataSide,
+        request_id: RequestId,
+        stage_vote: Option<StageVote>,
+    ) {
+        let mut response = staged_response(Status::Ok, stage_vote);
+        response.request_id = request_id;
+        data_side
+            .response_tx
+            .try_push(BridgeResponse { inner: response })
+            .expect("response ring has room");
+        assert!(scheduler.shared.poll_and_route_responses() >= 1);
+        let (txn_id, routed, response) =
+            tokio::time::timeout(Duration::from_secs(5), scheduler.completion_rx.recv())
+                .await
+                .expect("the completion arrives")
+                .expect("the completion channel is open");
+        assert_eq!(routed, request_id);
+        scheduler.handle_completion(txn_id, routed, response);
+    }
+
+    /// Drive the read-only staged txn `txn_id` from its stage request to
+    /// completion: the stage votes commit, the verdict commits, and the
+    /// slice drops.
+    async fn complete_staged(
+        scheduler: &mut Scheduler,
+        data_side: &mut CoreChannelDataSide,
+        txn_id: TxnId,
+    ) {
+        let stage = pop_calvin_request(data_side, |op| {
+            matches!(op, MetaOp::CalvinExecuteStatic { epoch, position, .. }
+                if *epoch == txn_id.epoch && *position == txn_id.position)
+        });
+        answer(scheduler, data_side, stage, Some(StageVote::Commit)).await;
+        scheduler.resume_on_verdict(txn_id, true);
+        let drop = pop_calvin_request(data_side, |op| {
+            matches!(op, MetaOp::CalvinDrop { epoch, position }
+                if *epoch == txn_id.epoch && *position == txn_id.position)
+        });
+        answer(scheduler, data_side, drop, None).await;
+    }
+
+    /// The rebuild re-applies two epochs while the txns' tenant holds its
+    /// whole in-flight cap. The first replayed stage defers: its txn stays
+    /// pending, nothing halts or completes, and catch-up stays armed behind
+    /// it. Rebuild passes while saturated refuse once per attempt and close
+    /// the intake gate once. Once capacity frees, both epochs apply and the
+    /// scheduler reports caught up.
+    #[tokio::test]
+    async fn rebuild_against_a_saturated_tenant_defers_then_catches_up() {
+        const SATURATED_PASSES: u64 = 32;
+        let registry = CalvinCompletionRegistry::new_detached();
+        let (mut scheduler, _dir, mut data_side) =
+            build_test_scheduler_with_data_side(test_coll_vshard(), registry);
+        lead_data_group(&mut scheduler);
+        scheduler.rebuild_target_epoch = 1;
+        let vshard = scheduler.vshard_id;
+        let shared = std::sync::Arc::clone(&scheduler.shared);
+        let (_idx0, idx1) = arm_two_dropped_stage_batches(&scheduler);
+        let fillers = fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
+        let tenant_scope = crate::DispatchCapacityScope::TenantInflight {
+            tenant_id: TenantId::new(1),
+            inflight: 0,
+            cap: 0,
+        };
+        let busy = || {
+            shared
+                .system_metrics
+                .as_ref()
+                .expect("the test state carries system metrics")
+                .dispatch_capacity
+                .refusals(&tenant_scope)
+        };
+        let busy_before = busy();
+        let answers = || {
+            crate::control::metrics::OverloadProtocol::ALL
+                .map(|protocol| crate::control::metrics::overload_responses().sent(protocol))
+        };
+        let answers_before = answers();
+        let first = TxnId::new(0, 0);
+        let second = TxnId::new(1, 0);
+
+        rebuild_pass(&mut scheduler);
+
+        assert!(
+            scheduler.has_deferred_for(first),
+            "the replayed stage defers"
+        );
+        assert!(scheduler.pending.contains_key(&first));
+        assert!(
+            !scheduler.pending.contains_key(&second) && !scheduler.blocked.contains_key(&second),
+            "the next epoch waits behind the closed gate"
+        );
+        assert_eq!(armed_index(&scheduler), Some(idx1));
+
+        for _ in 0..SATURATED_PASSES {
+            rebuild_pass(&mut scheduler);
+        }
+
+        let metrics = &scheduler.metrics;
+        assert!(
+            !scheduler.is_apply_halted(),
+            "a capacity refusal never halts"
+        );
+        assert_eq!(scheduler.deferred_dispatch_len(), 1);
+        assert_eq!(scheduler.pending.len(), 1);
+        assert!(!scheduler.applied.is_applied(0, 0));
+        assert_eq!(armed_index(&scheduler), Some(idx1));
+        assert_eq!(metrics.completed_count.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.executor_error_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.dispatch_deferred_count.load(Ordering::Relaxed),
+            1 + SATURATED_PASSES,
+            "each attempt refuses once"
+        );
+        assert_eq!(busy() - busy_before, 1 + SATURATED_PASSES);
+        assert_eq!(
+            answers(),
+            answers_before,
+            "a refusal the scheduler absorbs reaches no client"
+        );
+        assert_eq!(
+            metrics.intake_gate_closed_counts[intake_closure_reason::DEFERRED_DISPATCH]
+                .load(Ordering::Relaxed),
+            1,
+            "the stall closes the intake gate once"
+        );
+        assert!(!scheduler.is_caught_up());
+        assert_eq!(shared.calvin.caught_up.lagging(), vec![vshard]);
+
+        for filler in fillers {
+            release_filler(&shared, &mut data_side, filler);
+        }
+        rebuild_pass(&mut scheduler);
+
+        assert!(!scheduler.has_deferred_dispatch(), "the stage is re-sent");
+        assert_eq!(
+            armed_index(&scheduler),
+            None,
+            "the rebuild range is replayed"
+        );
+        assert!(
+            scheduler.blocked.contains_key(&second),
+            "the next epoch waits for the first one's locks"
+        );
+
+        complete_staged(&mut scheduler, &mut data_side, first).await;
+        complete_staged(&mut scheduler, &mut data_side, second).await;
+
+        assert!(scheduler.applied.is_applied(0, 0));
+        assert!(scheduler.applied.is_applied(1, 0));
+        assert!(scheduler.pending.is_empty());
+        assert!(!scheduler.is_apply_halted());
+        assert_eq!(
+            scheduler
+                .metrics
+                .executor_error_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(scheduler.metrics.completed_count.load(Ordering::Relaxed), 2);
+        assert!(scheduler.is_caught_up());
+        assert!(
+            shared.calvin.caught_up.lagging().is_empty(),
+            "the readiness gate opens"
+        );
     }
 }

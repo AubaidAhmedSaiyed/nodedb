@@ -158,11 +158,13 @@ fn create_sorted_index(fields: &TextFields, collection: &str) -> crate::Result<S
             }
         }
         Some(window) if window == "custom" => {
-            sql.push_str(&format!(
-                " WINDOW CUSTOM START {} END {}",
-                fields.window_start_ms.unwrap_or(0),
-                fields.window_end_ms.unwrap_or(0)
-            ));
+            let start_ms = fields
+                .window_start_ms
+                .ok_or_else(|| bad_request("missing 'window_start_ms'"))?;
+            let end_ms = fields
+                .window_end_ms
+                .ok_or_else(|| bad_request("missing 'window_end_ms'"))?;
+            sql.push_str(&format!(" WINDOW CUSTOM START {start_ms} END {end_ms}"));
             if let Some(column) = fields.window_timestamp_column.as_deref() {
                 sql.push_str(&format!(" ON {}", ident(column)?));
             }

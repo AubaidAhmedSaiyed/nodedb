@@ -213,12 +213,14 @@ pub struct TextFields {
     /// Top-K value for SortedIndexTopK.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k_count: Option<u32>,
-    /// Score min for SortedIndexRange (encoded bytes).
+    /// Inclusive lower score bound for `KvSortedIndexRange`, as a typed value
+    /// of the index's leading sort column. `None` or `Null` leaves it open.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub score_min: Option<Vec<u8>>,
-    /// Score max for SortedIndexRange (encoded bytes).
+    pub score_min: Option<crate::value::Value>,
+    /// Inclusive upper score bound for `KvSortedIndexRange`. Same rules as
+    /// `score_min`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub score_max: Option<Vec<u8>>,
+    pub score_max: Option<crate::value::Value>,
 
     // ── Document advanced ───────────────────────────────────
     /// Field-level updates: [(field_name, value_bytes), ...].

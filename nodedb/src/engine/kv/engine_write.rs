@@ -5,7 +5,10 @@
 use nodedb_types::Surrogate;
 
 use super::engine::KvEngine;
-use super::engine_helpers::{expiry_key, extract_all_field_values_from_msgpack, table_key};
+use super::engine_helpers::{
+    decode_document, document_field_values, expiry_key, extract_all_field_values_from_msgpack,
+    table_key,
+};
 use super::entry::NO_EXPIRY;
 
 /// Parameters for [`KvEngine::put`].
@@ -217,7 +220,11 @@ impl KvEngine {
                 .and_then(|t| t.get(key, now_ms))
                 .map(|v| v.to_vec())
                 .unwrap_or_default();
-            let new_fields = extract_all_field_values_from_msgpack(&new_value_bytes);
+            let new_document = decode_document(&new_value_bytes);
+            let new_fields = new_document
+                .as_ref()
+                .map(document_field_values)
+                .unwrap_or_default();
             let old_fields = old
                 .as_ref()
                 .map(|v| extract_all_field_values_from_msgpack(v));
@@ -237,7 +244,7 @@ impl KvEngine {
             }
 
             if has_sorted {
-                self.sorted_indexes.on_put(tkey, key, &new_fields);
+                self.sorted_indexes.on_put(tkey, key, new_document.as_ref());
             }
         }
 

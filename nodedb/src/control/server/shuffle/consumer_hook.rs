@@ -199,11 +199,9 @@ impl RegistryShuffleConsumer {
             Ok(mut d) => d.dispatch(request),
             Err(poisoned) => poisoned.into_inner().dispatch(request),
         };
-        if let Err(e) = dispatch_result {
-            return Err(TypedClusterError::Internal {
-                code: 0,
-                message: format!("shuffle consume dispatch failed: {e}"),
-            });
+        if let Err(error) = dispatch_result {
+            // A capacity refusal crosses as the retryable overload class.
+            return Err(execution_error_to_typed(error));
         }
 
         let max_result_bytes = self.state.tuning.network.max_query_result_bytes as usize;

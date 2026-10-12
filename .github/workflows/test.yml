@@ -56,6 +56,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --profile ci -- -D warnings
+      - name: Run clippy nodedb-client (no features)
+        run: cargo clippy -p nodedb-client --no-default-features --all-targets --profile ci -- -D warnings
+      - name: Run clippy nodedb-client (native only)
+        run: cargo clippy -p nodedb-client --no-default-features --features native --all-targets --profile ci -- -D warnings
+      - name: Run clippy nodedb-client (remote only)
+        run: cargo clippy -p nodedb-client --no-default-features --features remote --all-targets --profile ci -- -D warnings
       - name: Warm-storage ObjectStore gate
         run: bash scripts/ci/check_warm_storage_gate.sh
       - name: Format-path .expect() gate

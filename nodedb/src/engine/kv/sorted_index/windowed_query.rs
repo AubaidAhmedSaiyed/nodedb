@@ -3,7 +3,9 @@
 //! Windowed query helpers for sorted indexes.
 //!
 //! These functions handle time-windowed queries where only entries within
-//! a configurable time window are considered for rank/top_k/range/count.
+//! the current window are considered for rank/top_k/range/count. An entry is
+//! visible when the timestamp column of its sort key decodes to a timestamp
+//! inside the window bounds. An entry with no decodable timestamp is hidden.
 //!
 //! Performance: uses `for_each_in_order` with early termination instead of
 //! fetching all entries. windowed_top_k(10) on a 10M-entry tree is O(N) in
@@ -12,9 +14,10 @@
 
 use std::collections::HashMap;
 
-use super::key::SortKeyEncoder;
 use super::manager::SortedIndexDef;
+use super::timestamp::decode_column_timestamp;
 use super::tree::OrderStatTree;
+use super::window::WindowBounds;
 
 /// Internal state for a sorted index (definition + tree).
 pub(super) struct SortedIndexRef<'a> {
@@ -22,20 +25,25 @@ pub(super) struct SortedIndexRef<'a> {
     pub tree: &'a OrderStatTree,
 }
 
-/// Windowed rank: count entries with lower sort key that are in the current window.
+/// Windowed rank: count visible entries up to and including `primary_key`.
+///
+/// `None` when `primary_key` is absent or outside the window.
 pub(super) fn windowed_rank(
     idx: &SortedIndexRef<'_>,
     primary_key: &[u8],
     now_ms: u64,
 ) -> Option<u32> {
-    let window_start = idx.def.window.window_start(now_ms)?;
+    let bounds = idx.def.window.bounds(now_ms)?;
     let target_sort = idx.tree.get_sort_key(primary_key)?;
+    if !entry_in_window(idx.def, target_sort, &bounds) {
+        return None;
+    }
 
     let mut rank = 0u32;
     let mut found = false;
 
     idx.tree.for_each_in_order(|sort_key, pk| {
-        if !entry_in_window(idx, pk, window_start) {
+        if !entry_in_window(idx.def, sort_key, &bounds) {
             return true; // Skip, continue.
         }
         rank += 1;
@@ -53,15 +61,18 @@ pub(super) fn windowed_rank(
 ///
 /// Early termination: stops as soon as k windowed entries are found.
 pub(super) fn windowed_top_k(idx: &SortedIndexRef<'_>, k: u32, now_ms: u64) -> Vec<(u32, Vec<u8>)> {
-    let Some(window_start) = idx.def.window.window_start(now_ms) else {
+    let Some(bounds) = idx.def.window.bounds(now_ms) else {
         return Vec::new();
     };
+    if k == 0 {
+        return Vec::new();
+    }
 
     let mut result = Vec::with_capacity(k as usize);
     let mut rank = 0u32;
 
-    idx.tree.for_each_in_order(|_, pk| {
-        if !entry_in_window(idx, pk, window_start) {
+    idx.tree.for_each_in_order(|sort_key, pk| {
+        if !entry_in_window(idx.def, sort_key, &bounds) {
             return true; // Skip, continue.
         }
         rank += 1;
@@ -72,13 +83,14 @@ pub(super) fn windowed_top_k(idx: &SortedIndexRef<'_>, k: u32, now_ms: u64) -> V
     result
 }
 
-/// Windowed range: filter range results by window.
+/// Windowed range: keep the visible entries of `entries`, ranked among all
+/// visible entries.
 pub(super) fn windowed_range(
     idx: &SortedIndexRef<'_>,
     entries: &[(&[u8], &[u8])],
     now_ms: u64,
 ) -> Vec<(u32, Vec<u8>)> {
-    let Some(window_start) = idx.def.window.window_start(now_ms) else {
+    let Some(bounds) = idx.def.window.bounds(now_ms) else {
         return Vec::new();
     };
 
@@ -86,8 +98,8 @@ pub(super) fn windowed_range(
     let mut windowed_ranks: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut rank = 0u32;
 
-    idx.tree.for_each_in_order(|_, pk| {
-        if entry_in_window(idx, pk, window_start) {
+    idx.tree.for_each_in_order(|sort_key, pk| {
+        if entry_in_window(idx.def, sort_key, &bounds) {
             rank += 1;
             windowed_ranks.insert(pk.to_vec(), rank);
         }
@@ -105,13 +117,13 @@ pub(super) fn windowed_range(
 
 /// Windowed count: count entries in the current window.
 pub(super) fn windowed_count(idx: &SortedIndexRef<'_>, now_ms: u64) -> u32 {
-    let Some(window_start) = idx.def.window.window_start(now_ms) else {
+    let Some(bounds) = idx.def.window.bounds(now_ms) else {
         return 0;
     };
 
     let mut count = 0u32;
-    idx.tree.for_each_in_order(|_, pk| {
-        if entry_in_window(idx, pk, window_start) {
+    idx.tree.for_each_in_order(|sort_key, _| {
+        if entry_in_window(idx.def, sort_key, &bounds) {
             count += 1;
         }
         true
@@ -119,58 +131,13 @@ pub(super) fn windowed_count(idx: &SortedIndexRef<'_>, now_ms: u64) -> u32 {
     count
 }
 
-/// Check if an entry's timestamp is within the window.
+/// `true` when the timestamp column of `sort_key` lies inside `bounds`.
 ///
-/// Reads the timestamp from the sort key if the timestamp column is part of
-/// the composite sort key. For entries where the timestamp is NOT in the sort
-/// key, assumes the entry is in-window (documented limitation).
-fn entry_in_window(idx: &SortedIndexRef<'_>, primary_key: &[u8], window_start: u64) -> bool {
-    let Some(sort_key_bytes) = idx.tree.get_sort_key(primary_key) else {
-        return false;
-    };
-
-    // Find the timestamp column's position in the sort key.
-    let ts_col = &idx.def.window.timestamp_column;
-    let columns = idx.def.encoder.columns();
-    let mut offset = 0usize;
-
-    for col in columns {
-        // Read length prefix.
-        if offset + 4 > sort_key_bytes.len() {
-            return true; // Can't parse — assume in-window.
-        }
-        let len = u32::from_be_bytes(
-            sort_key_bytes[offset..offset + 4]
-                .try_into()
-                .unwrap_or([0; 4]),
-        ) as usize;
-        offset += 4;
-
-        if col.name == *ts_col {
-            if offset + len > sort_key_bytes.len() || len != 8 {
-                return true; // Can't parse — assume in-window.
-            }
-            let mut ts_bytes = [0u8; 8];
-            ts_bytes.copy_from_slice(&sort_key_bytes[offset..offset + len]);
-
-            // If DESC, undo the complement.
-            let ts_bytes = if col.direction == super::key::SortDirection::Desc {
-                let mut unflipped = [0u8; 8];
-                for (i, &b) in ts_bytes.iter().enumerate() {
-                    unflipped[i] = !b;
-                }
-                unflipped
-            } else {
-                ts_bytes
-            };
-
-            let ts_ms = SortKeyEncoder::decode_timestamp_ms(&ts_bytes);
-            return ts_ms >= window_start;
-        }
-
-        offset += len;
-    }
-
-    // Timestamp column not in sort key — can't filter, assume in-window.
-    true
+/// Registration rejects a windowed index whose timestamp column is not a sort
+/// column. A key without a decodable timestamp is outside every window.
+fn entry_in_window(def: &SortedIndexDef, sort_key: &[u8], bounds: &WindowBounds) -> bool {
+    def.encoder
+        .column_value(sort_key, &def.window.timestamp_column)
+        .and_then(|value| decode_column_timestamp(&value))
+        .is_some_and(|ts| bounds.contains(ts))
 }

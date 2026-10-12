@@ -16,7 +16,7 @@ use crate::control::wal_replication::ReplicatedEntry;
 use crate::types::{TraceId, VShardId};
 
 use super::inbound::OriginArrayInbound;
-use super::reject::build_reject;
+use super::reject::{build_reject, engine_reject};
 
 impl OriginArrayInbound {
     fn consume_array_write_authorization(
@@ -24,19 +24,19 @@ impl OriginArrayInbound {
         authorization: crate::control::server::shared::authorization::AuthorizedCollection,
         array: &str,
         hlc: Hlc,
-    ) -> Result<(), Option<ArrayRejectMsg>> {
+    ) -> Result<(), ArrayRejectMsg> {
         let (tenant_id, database_id, collection, permission) = authorization.into_scope();
         if tenant_id != self.tenant_id()
             || database_id != self.database_id()
             || collection != array
             || permission != crate::control::security::identity::Permission::Write
         {
-            return Err(Some(build_reject(
+            return Err(build_reject(
                 array,
                 hlc,
-                ArrayRejectReason::EngineRejected,
+                ArrayRejectReason::PermissionDenied,
                 "array authorization scope mismatch".to_string(),
-            )));
+            ));
         }
         Ok(())
     }
@@ -44,24 +44,25 @@ impl OriginArrayInbound {
     /// Propose a `ReplicatedEntry` to Raft and await its commit + apply.
     ///
     /// Returns `Ok(())` when the entry has been committed and executed by the
-    /// distributed applier. Returns a reject on proposal or timeout failure.
+    /// distributed applier. A failure maps to its reject reason through the
+    /// typed error.
     pub(super) async fn propose_and_await(
         &self,
         mut entry: ReplicatedEntry,
         array: &str,
         hlc: Hlc,
         authorization: crate::control::server::shared::authorization::AuthorizedCollection,
-    ) -> Result<(), Option<ArrayRejectMsg>> {
+    ) -> Result<(), ArrayRejectMsg> {
         self.consume_array_write_authorization(authorization, array, hlc)?;
         if entry.tenant_id != self.tenant_id().as_u64()
             || entry.database_id != self.database_id().as_u64()
         {
-            return Err(Some(build_reject(
+            return Err(build_reject(
                 array,
                 hlc,
-                ArrayRejectReason::EngineRejected,
+                ArrayRejectReason::PermissionDenied,
                 "array replicated entry scope mismatch".to_string(),
-            )));
+            ));
         }
         // Both proposers below take prebuilt bytes, so the floor is stamped
         // here: replicas hold the write until they applied the array's DDL.
@@ -74,12 +75,7 @@ impl OriginArrayInbound {
         let idempotency_key = entry.idempotency_key;
         let data = entry.encode().map_err(|e| {
             error!(array = %array, error = %e, "array_inbound: replicated entry encode failed");
-            Some(build_reject(
-                array,
-                hlc,
-                ArrayRejectReason::EngineRejected,
-                format!("replicated entry encode failed: {e}"),
-            ))
+            engine_reject(array, hlc, "replicated entry encode failed", &e)
         })?;
 
         // The async proposer forwards to the group leader and waits for the
@@ -87,14 +83,7 @@ impl OriginArrayInbound {
         let async_proposer = self
             .shared()
             .async_raft_proposer()
-            .map_err(|e| {
-                Some(build_reject(
-                    array,
-                    hlc,
-                    ArrayRejectReason::EngineRejected,
-                    format!("raft proposer not available: {e}"),
-                ))
-            })?
+            .map_err(|e| engine_reject(array, hlc, "raft proposer not available", &e))?
             .as_ref();
         let deadline =
             crate::control::server::shared::session::StatementDeadline::of_statement(self.shared())
@@ -103,12 +92,7 @@ impl OriginArrayInbound {
             Ok((_payload, _committed_version)) => Ok(()),
             Err(e) => {
                 warn!(array = %array, error = %e, "array_inbound: raft propose+apply failed");
-                Err(Some(build_reject(
-                    array,
-                    hlc,
-                    ArrayRejectReason::EngineRejected,
-                    format!("raft propose failed: {e}"),
-                )))
+                Err(engine_reject(array, hlc, "raft propose failed", &e))
             }
         }
     }
@@ -119,21 +103,23 @@ impl OriginArrayInbound {
     pub(super) async fn cell_surrogate(
         &self,
         op: &ArrayOp,
-    ) -> Result<Option<nodedb_types::Surrogate>, Option<ArrayRejectMsg>> {
+    ) -> Result<Option<nodedb_types::Surrogate>, ArrayRejectMsg> {
         use nodedb_array::sync::op::ArrayOpKind;
         if !matches!(op.kind, ArrayOpKind::Put) {
             return Ok(None);
         }
-        let reject = |detail: String| {
-            Some(build_reject(
-                &op.header.array,
-                op.header.hlc,
-                ArrayRejectReason::EngineRejected,
-                detail,
-            ))
+        let reject = |context: &str, error: &crate::Error| {
+            engine_reject(&op.header.array, op.header.hlc, context, error)
         };
-        let pk = zerompk::to_msgpack_vec(&op.coord)
-            .map_err(|e| reject(format!("array cell coord encode: {e}")))?;
+        let pk = zerompk::to_msgpack_vec(&op.coord).map_err(|e| {
+            reject(
+                "array cell coord encode",
+                &crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: e.to_string(),
+                },
+            )
+        })?;
         let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
             self.shared(),
             nodedb_types::CollectionKey::from_bare(self.database_id(), &op.header.array),
@@ -142,7 +128,7 @@ impl OriginArrayInbound {
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| reject(format!("array cell surrogate assign: {e}")))?;
+        .map_err(|e| reject("array cell surrogate assign", &e))?;
         Ok(Some(surrogate))
     }
 

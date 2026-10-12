@@ -339,7 +339,7 @@ fn lite_fts_index_frame_with_no_fields_roundtrips() {
 }
 
 #[test]
-fn all_11_message_types_valid() {
+fn core_message_types_keep_their_codes() {
     for (code, expected) in [
         (0x01u8, SyncMessageType::Handshake),
         (0x02, SyncMessageType::HandshakeAck),
@@ -357,7 +357,18 @@ fn all_11_message_types_valid() {
         assert_eq!(parsed, expected);
         assert_eq!(parsed as u8, code);
     }
-    assert!(SyncMessageType::from_u8(0x99).is_none());
+}
+
+/// Every byte either names a message type that round-trips to the same byte,
+/// or names none. `0x00` stays unassigned.
+#[test]
+fn every_code_round_trips_or_is_unknown() {
+    for code in 0..=u8::MAX {
+        if let Some(parsed) = SyncMessageType::from_u8(code) {
+            assert_eq!(parsed as u8, code, "code {code:#04x}");
+        }
+    }
+    assert!(SyncMessageType::from_u8(0x00).is_none());
 }
 
 /// Roundtrip the `VectorPrimaryConfig` through the same MessagePack channel

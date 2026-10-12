@@ -39,13 +39,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use nodedb_array::sync::apply::ApplyRejection;
 use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::op::ArrayOp;
 use nodedb_array::sync::op_codec;
 use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_types::sync::wire::array::{
-    ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg, ArrayRejectReason, ArraySchemaSyncMsg,
+    ArrayDeltaMsg, ArrayOpResultsMsg, ArrayRejectMsg, ArrayRejectReason, ArraySchemaSyncMsg,
 };
 use tracing::warn;
 
@@ -70,12 +69,11 @@ pub enum InboundOutcome {
     Applied,
     /// The op was already present; no state was changed (idempotent replay).
     Idempotent,
-    /// The op was rejected; the caller sends `ArrayRejectMsg` back.
-    Rejected(ApplyRejection),
     /// A snapshot chunk was buffered; more chunks are expected.
     SnapshotPartial { received: u32, total: u32 },
-    /// A snapshot was fully assembled and all contained ops applied.
-    SnapshotApplied { ops_applied: u64 },
+    /// A snapshot was fully assembled. Every contained op was attempted, and
+    /// the message holds one result per op, in snapshot order.
+    SnapshotApplied(ArrayOpResultsMsg),
     /// A schema CRDT snapshot was imported into the local registry.
     SchemaImported,
     /// An ack was recorded into the ack-vector (GC frontier tracking).
@@ -85,6 +83,24 @@ pub enum InboundOutcome {
 }
 
 // ─── Dispatcher ──────────────────────────────────────────────────────────────
+
+/// What [`OriginArrayInbound::apply_op`] did with an op it did not refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OpApplied {
+    /// The op committed and applied.
+    Applied,
+    /// The op's HLC was already present. Nothing changed.
+    Idempotent,
+}
+
+impl From<OpApplied> for InboundOutcome {
+    fn from(applied: OpApplied) -> Self {
+        match applied {
+            OpApplied::Applied => Self::Applied,
+            OpApplied::Idempotent => Self::Idempotent,
+        }
+    }
+}
 
 /// Dispatcher for inbound array CRDT wire messages from Lite peers.
 ///
@@ -144,10 +160,8 @@ impl OriginArrayInbound {
         array: &str,
         hlc: Hlc,
         permission: crate::control::security::identity::Permission,
-    ) -> Result<
-        crate::control::server::shared::authorization::AuthorizedCollection,
-        Option<ArrayRejectMsg>,
-    > {
+    ) -> Result<crate::control::server::shared::authorization::AuthorizedCollection, ArrayRejectMsg>
+    {
         let emitter =
             crate::control::security::audit::ArcAuditEmitter(Arc::clone(&self.shared.audit));
         crate::control::server::shared::authorization::authorize_collection_capability(
@@ -160,12 +174,12 @@ impl OriginArrayInbound {
             &emitter,
         )
         .map_err(|error| {
-            Some(build_reject(
+            build_reject(
                 array,
                 hlc,
-                ArrayRejectReason::EngineRejected,
+                ArrayRejectReason::PermissionDenied,
                 error.resource().to_string(),
-            ))
+            )
         })
     }
 
@@ -240,54 +254,31 @@ impl OriginArrayInbound {
     pub async fn handle_delta(
         &self,
         msg: &ArrayDeltaMsg,
-    ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
+    ) -> Result<InboundOutcome, ArrayRejectMsg> {
         let op = match op_codec::decode_op(&msg.op_payload) {
             Ok(op) => op,
             Err(e) => {
                 warn!(array = %msg.array, error = %e, "array_inbound: delta decode failed");
-                return Err(Some(build_reject(
+                return Err(build_reject(
                     &msg.array,
                     Hlc::ZERO,
                     ArrayRejectReason::ShapeInvalid,
                     format!("decode error: {e}"),
-                )));
+                ));
             }
         };
 
         let provenance = self.session_provenance(&msg.array, msg.seq);
-        self.apply_op(op, &msg.op_payload, provenance).await
+        self.apply_op(op, &msg.op_payload, provenance)
+            .await
+            .map(InboundOutcome::from)
     }
 
-    /// Handle a batch of delta messages from a Lite peer.
-    ///
-    /// Returns one outcome per op. If decoding fails for an op, that op
-    /// yields a reject; subsequent ops are still attempted.
-    pub async fn handle_delta_batch(
-        &self,
-        msg: &ArrayDeltaBatchMsg,
-    ) -> Vec<Result<InboundOutcome, Option<ArrayRejectMsg>>> {
-        let mut outcomes = Vec::with_capacity(msg.op_payloads.len());
-        for payload in &msg.op_payloads {
-            let outcome = match op_codec::decode_op(payload) {
-                Ok(op) => {
-                    // Batch carries no per-op seq; array dedups by HLC, so seq
-                    // is informational here. The epoch fence still applies.
-                    let provenance = self.session_provenance(&msg.array, 0);
-                    self.apply_op(op, payload, provenance).await
-                }
-                Err(e) => {
-                    warn!(array = %msg.array, error = %e, "array_inbound: batch decode failed");
-                    Err(Some(build_reject(
-                        &msg.array,
-                        Hlc::ZERO,
-                        ArrayRejectReason::ShapeInvalid,
-                        format!("batch decode error: {e}"),
-                    )))
-                }
-            };
-            outcomes.push(outcome);
-        }
-        outcomes
+    /// Server-authoritative provenance for one op of a delta batch.
+    pub(super) fn batch_provenance(&self, array: &str) -> Option<SyncProvenance> {
+        // A batch carries no per-op seq. Array dedups by HLC, so seq is
+        // informational here. The epoch fence still applies.
+        self.session_provenance(array, 0)
     }
 
     // ─── Schema ──────────────────────────────────────────────────────────────
@@ -300,7 +291,7 @@ impl OriginArrayInbound {
     pub async fn handle_schema(
         &self,
         msg: &ArraySchemaSyncMsg,
-    ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
+    ) -> Result<InboundOutcome, ArrayRejectMsg> {
         let hlc_arr: [u8; 18] = msg.schema_hlc_bytes;
         let remote_hlc = Hlc::from_bytes(&hlc_arr);
         let authorization = self.authorize_array(
@@ -344,15 +335,15 @@ impl OriginArrayInbound {
         op: ArrayOp,
         raw_op_bytes: &[u8],
         provenance: Option<SyncProvenance>,
-    ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
+    ) -> Result<OpApplied, ArrayRejectMsg> {
         // 1. Shape validation.
         if let Err(e) = op.validate_shape() {
-            return Err(Some(build_reject(
+            return Err(build_reject(
                 &op.header.array,
                 op.header.hlc,
                 ArrayRejectReason::ShapeInvalid,
                 format!("shape validation: {e}"),
-            )));
+            ));
         }
 
         let authorization = self.authorize_array(
@@ -368,15 +359,15 @@ impl OriginArrayInbound {
             &op.header.array,
         ) {
             None => {
-                return Err(Some(build_reject(
+                return Err(build_reject(
                     &op.header.array,
                     op.header.hlc,
                     ArrayRejectReason::ArrayUnknown,
                     format!("array '{}' not known to this replica", op.header.array),
-                )));
+                ));
             }
             Some(local_schema) if op.header.schema_hlc > local_schema => {
-                return Err(Some(build_reject(
+                return Err(build_reject(
                     &op.header.array,
                     op.header.hlc,
                     ArrayRejectReason::SchemaTooNew,
@@ -384,7 +375,7 @@ impl OriginArrayInbound {
                         "op schema_hlc {:?} > local {:?}; request schema sync",
                         op.header.schema_hlc, local_schema
                     ),
-                )));
+                ));
             }
             Some(_) => {}
         }
@@ -397,7 +388,7 @@ impl OriginArrayInbound {
             op.header.hlc,
         ) {
             let _authorized_scope = authorization.into_scope();
-            return Ok(InboundOutcome::Idempotent);
+            return Ok(OpApplied::Idempotent);
         }
 
         // 4. Propose through Raft. A put's cell surrogate is
@@ -434,7 +425,7 @@ impl OriginArrayInbound {
                 if let Some(observer) = &self.apply_observer {
                     observer.on_op_applied(&op);
                 }
-                Ok(InboundOutcome::Applied)
+                Ok(OpApplied::Applied)
             }
             Err(e) => Err(e),
         }

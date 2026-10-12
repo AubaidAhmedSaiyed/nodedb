@@ -37,6 +37,8 @@
 //! - `0x95` ArrayAck (client → server)
 //! - `0x96` ArrayReject (server → client)
 //! - `0x97` ArrayCatchupRequest (client → server)
+//! - `0x98` ArrayOpResults (server → client)
+//! - `0x99` ArrayAdvisoryRefused (server → client)
 //! - `0xA0` ColumnarInsert (client → server)
 //! - `0xA1` ColumnarInsertAck (server → client)
 //! - `0xA2` VectorInsert (client → server)
@@ -77,8 +79,10 @@ pub mod vector;
 pub use ack_result::{SyncAckResult, SyncOutcome};
 pub use ack_status::AckStatus;
 pub use array::{
-    ArrayAckMsg, ArrayCatchupRequestMsg, ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg,
-    ArrayRejectReason, ArraySchemaSyncMsg, ArraySnapshotChunkMsg, ArraySnapshotMsg,
+    ArrayAckMsg, ArrayAdvisoryKind, ArrayAdvisoryRefusedMsg, ArrayCatchupRequestMsg,
+    ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayOpOutcome, ArrayOpResult, ArrayOpResultsMsg,
+    ArrayRejectClass, ArrayRejectMsg, ArrayRejectReason, ArraySchemaSyncMsg, ArraySnapshotChunkMsg,
+    ArraySnapshotMsg,
 };
 pub use collection_schema::{CollectionDescriptor, CollectionSchemaSyncMsg};
 pub use columnar::{ColumnarInsertAckMsg, ColumnarInsertMsg};
