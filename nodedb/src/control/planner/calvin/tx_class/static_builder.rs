@@ -379,7 +379,8 @@ mod tests {
 
     /// A predicate read locks its whole collection `Shared`. A later row
     /// writer of that collection takes `Intent` on it, so it waits until the
-    /// reader releases. A point read locks only its row.
+    /// reader releases. A point read locks its row `Shared` and its
+    /// collection `IntentShared`.
     #[test]
     fn a_predicate_read_blocks_a_later_writer_until_released() {
         use crate::control::cluster::calvin::scheduler::LockMode;
@@ -414,11 +415,12 @@ mod tests {
             }),
             Some(&LockMode::Shared)
         );
-        assert!(
-            !reader_locks.contains_key(&LockKey::Collection {
+        assert_eq!(
+            reader_locks.get(&LockKey::Collection {
                 collection: std::sync::Arc::from("read_col"),
             }),
-            "a point read locks nothing collection-wide"
+            Some(&LockMode::IntentShared),
+            "a point read announces itself on its collection"
         );
 
         let writer = build_single_vshard_tx_class(

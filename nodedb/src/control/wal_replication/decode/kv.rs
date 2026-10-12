@@ -73,40 +73,6 @@ pub(super) fn delete(
     })
 }
 
-/// Reconstruct a KV predicate `UPDATE` plan. The predicate is re-scanned
-/// against this node's own committed state — see `delete` above for why the
-/// check slot is stamped rather than re-derived.
-pub(super) fn predicate_update(
-    collection: &str,
-    filters: &[u8],
-    updates: &[(String, Vec<u8>)],
-    returning: ReturningFields<'_>,
-) -> PhysicalPlan {
-    PhysicalPlan::Kv(KvOp::PredicateUpdate {
-        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
-        filters: filters.to_vec(),
-        updates: updates.to_vec(),
-        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
-        returning: returning.returning,
-        rls_filters: returning.rls_filters.to_vec(),
-    })
-}
-
-/// Reconstruct a KV predicate `DELETE` plan — see [`predicate_update`].
-pub(super) fn predicate_delete(
-    collection: &str,
-    filters: &[u8],
-    returning: ReturningFields<'_>,
-) -> PhysicalPlan {
-    PhysicalPlan::Kv(KvOp::PredicateDelete {
-        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
-        filters: filters.to_vec(),
-        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
-        returning: returning.returning,
-        rls_filters: returning.rls_filters.to_vec(),
-    })
-}
-
 pub(super) fn insert(
     collection: &str,
     key: &[u8],

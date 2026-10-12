@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use nodedb_cluster::distributed_array::ArrayLocalExecutor;
 use nodedb_cluster::distributed_array::handler::handle_array_shard_rpc;
 use nodedb_cluster::distributed_array::rpc::ShardRpcDispatch;
-use nodedb_cluster::error::Result as ClusterResult;
-use nodedb_cluster::rpc_codec::RaftRpc;
-use nodedb_cluster::wire::VShardEnvelope;
+use nodedb_cluster::error::{ClusterError, Result as ClusterResult};
+use nodedb_cluster::rpc_codec::{RaftRpc, remaining_budget_ms};
+use nodedb_cluster::wire::{VShardEnvelope, VShardMessageType};
 use nodedb_cluster::{NexarTransport, RoutingTable};
 
 use crate::control::cluster::array_cluster_helpers::array_resp_msg_type;
@@ -59,25 +59,59 @@ impl NexarArrayDispatch {
     }
 }
 
+/// The sends one shard call makes at most: the first, and one resend.
+const CALL_ATTEMPTS: usize = 2;
+
+/// The pause before a resend, so the metadata applier can heal a routing
+/// entry that named a stale or fake leader.
+const RESEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[async_trait]
 impl ShardRpcDispatch for NexarArrayDispatch {
+    /// Every send gets what is left of the `timeout_ms` budget. A live shard
+    /// can use all of it. A dead shard fails the send at the QUIC idle
+    /// timeout, and the resend reaches the shard's current leader.
     async fn call(&self, req: VShardEnvelope, timeout_ms: u64) -> ClusterResult<VShardEnvelope> {
-        match self.call_once(&req, timeout_ms).await {
-            Ok(resp) => Ok(resp),
-            Err(first_err) if is_transport_err(&first_err) => {
-                // Routing table may have pointed at a stale or fake leader.
-                // The metadata applier heals it asynchronously; wait briefly,
-                // re-read routing, and retry once.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                self.call_once(&req, timeout_ms).await
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let resend_safe = is_resend_safe(req.msg_type);
+        let mut attempts_left = CALL_ATTEMPTS;
+        loop {
+            match self.call_once(&req, remaining_budget_ms(deadline)).await {
+                Ok(resp) => return Ok(resp),
+                // A resend starts only while the budget has time left.
+                Err(e)
+                    if attempts_left > 1
+                        && remaining_budget_ms(deadline) > 0
+                        && may_resend(&e, resend_safe) =>
+                {
+                    // `call_once` re-reads routing, so the resend reaches the
+                    // shard's current leader.
+                    attempts_left -= 1;
+                    tokio::time::sleep(RESEND_PAUSE).await;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
     }
 }
 
-fn is_transport_err(e: &nodedb_cluster::error::ClusterError) -> bool {
-    matches!(e, nodedb_cluster::error::ClusterError::Transport { .. })
+/// Whether a second run of the request leaves the same state and answer. A
+/// slice, an aggregate and a surrogate bitmap only read the shard. A put or
+/// a delete can have applied when its answer was lost.
+fn is_resend_safe(msg_type: VShardMessageType) -> bool {
+    matches!(
+        msg_type,
+        VShardMessageType::ArrayShardSliceReq
+            | VShardMessageType::ArrayShardAggReq
+            | VShardMessageType::ArrayShardSurrogateBitmapReq
+    )
+}
+
+/// Whether a failed send can go again. A request that never reached the
+/// shard always can. A lost answer can only for a resend-safe request:
+/// any other one reports its unknown outcome.
+fn may_resend(e: &ClusterError, resend_safe: bool) -> bool {
+    e.is_unsent() || (resend_safe && e.is_lost_answer())
 }
 
 impl NexarArrayDispatch {
@@ -130,8 +164,8 @@ impl NexarArrayDispatch {
         // Wrap in RaftRpc and send. The remote node's handler decodes the
         // envelope bytes and dispatches to the appropriate shard handler.
         let rpc = RaftRpc::VShardEnvelope(envelope_bytes);
-        // The shard's budget bounds the reply wait, never the transport's fixed
-        // RPC timeout.
+        // The call's remaining budget bounds the reply wait, never the
+        // transport's fixed RPC timeout.
         let reply_wait = std::time::Duration::from_millis(timeout_ms);
         let resp_rpc = tokio::time::timeout(
             reply_wait,
@@ -139,16 +173,18 @@ impl NexarArrayDispatch {
                 .send_rpc_with_read_timeout(node_id, rpc, reply_wait),
         )
         .await
-        // The request can have reached the shard, so a timeout is never
-        // resent: `call` retries only a `Transport` error.
+        // The request can have reached the shard. The budget is spent, so
+        // `call` starts no resend.
         .map_err(|_| nodedb_cluster::error::ClusterError::ShardTimeout {
             vshard_id: req.vshard_id,
             elapsed_ms: timeout_ms,
         })??;
 
+        // The shard answered, so an answer this node cannot read is a codec
+        // error: a resend can run a put or a delete twice.
         match resp_rpc {
             RaftRpc::VShardEnvelope(bytes) => VShardEnvelope::from_bytes(&bytes).ok_or_else(|| {
-                nodedb_cluster::error::ClusterError::Transport {
+                nodedb_cluster::error::ClusterError::Codec {
                     detail: "array shard response: failed to decode VShardEnvelope".into(),
                 }
             }),
@@ -158,12 +194,72 @@ impl NexarArrayDispatch {
             RaftRpc::VShardRefusal(refusal) => {
                 Err(nodedb_cluster::error::ClusterError::from(refusal.error))
             }
-            other => Err(nodedb_cluster::error::ClusterError::Transport {
+            other => Err(nodedb_cluster::error::ClusterError::Codec {
                 detail: format!(
                     "array shard RPC: unexpected response type {:?}",
                     std::mem::discriminant(&other)
                 ),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timed_out() -> ClusterError {
+        ClusterError::ShardTimeout {
+            vshard_id: 3,
+            elapsed_ms: 1_000,
+        }
+    }
+
+    /// A slice, an aggregate and a surrogate bitmap only read the shard.
+    #[test]
+    fn only_array_reads_are_resend_safe() {
+        assert!(is_resend_safe(VShardMessageType::ArrayShardSliceReq));
+        assert!(is_resend_safe(VShardMessageType::ArrayShardAggReq));
+        assert!(is_resend_safe(
+            VShardMessageType::ArrayShardSurrogateBitmapReq
+        ));
+        assert!(!is_resend_safe(VShardMessageType::ArrayShardPutReq));
+        assert!(!is_resend_safe(VShardMessageType::ArrayShardDeleteReq));
+    }
+
+    /// A read whose answer was lost goes again.
+    #[test]
+    fn a_timed_out_read_resends() {
+        assert!(may_resend(&timed_out(), true));
+        let unanswered = ClusterError::Unanswered {
+            node_id: 2,
+            detail: "stream reset".into(),
+        };
+        assert!(may_resend(&unanswered, true));
+    }
+
+    /// A put or a delete whose answer was lost reports its unknown outcome.
+    #[test]
+    fn a_timed_out_write_is_never_resent() {
+        assert!(!may_resend(&timed_out(), false));
+    }
+
+    /// A request that never reached the shard goes again, read or write.
+    #[test]
+    fn an_unsent_request_resends() {
+        let unsent = ClusterError::Transport {
+            detail: "connect refused".into(),
+        };
+        assert!(may_resend(&unsent, false));
+        assert!(may_resend(&unsent, true));
+    }
+
+    /// An answer the shard gave never goes again.
+    #[test]
+    fn an_answer_is_never_resent() {
+        let unreadable = ClusterError::Codec {
+            detail: "array shard response: failed to decode VShardEnvelope".into(),
+        };
+        assert!(!may_resend(&unreadable, true));
     }
 }

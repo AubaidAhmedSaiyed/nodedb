@@ -51,7 +51,8 @@ async fn reissue_crdt_collection(
     })?
     .with_event_source(EventSource::Restore)
     .with_restore_id(target.restore_id);
-    let deadline = crate::control::wal_replication::statement_propose_deadline(state);
+    let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(state)
+        .tokio_instant();
     crate::control::wal_replication::propose_replicated_entry(state, proposer, entry, deadline)
         .await?;
     Ok(())

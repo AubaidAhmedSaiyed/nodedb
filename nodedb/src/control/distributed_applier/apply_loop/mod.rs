@@ -18,6 +18,9 @@
 //!   applies.
 //! - [`pipeline`]: every group's lane and the applies that run.
 //! - [`lane`]: one group's queued and started entries, settled in log order.
+//! - [`settle`]: settles every group's concluded entries and saves the
+//!   floors that moved.
+//! - [`panicked`]: an entry whose enqueue or apply panicked holds its group.
 //! - [`start`]: prepares one entry and routes it to its apply path.
 //! - [`cut_barrier`]: a backup cut's barrier: the group's cut floor, the
 //!   restore point's place, and a database backup's capture.
@@ -41,6 +44,8 @@
 //!   and records each applied proposal in the ledger.
 //! - [`snapshot_gate`]: skips an entry an installed snapshot covers, and
 //!   orders each write before a later snapshot restore.
+//! - [`held_entry`]: an entry this replica cannot apply as its peers do
+//!   holds its group's lane until a snapshot install covers it.
 //! - [`group_watch`]: per-group second-apply detection and backup cut floors.
 //! - [`bookkeeping`]: applied-floor persistence + Raft log compaction trigger.
 //! - [`helpers`]: shared response/result classification helpers.
@@ -61,12 +66,15 @@ mod context;
 mod cut_barrier;
 mod driver;
 mod group_watch;
+mod held_entry;
 mod helpers;
 mod lane;
 mod metadata_floor;
+mod panicked;
 mod pipeline;
 mod proposal_gate;
 mod redo_chunk;
+mod settle;
 mod snapshot_gate;
 mod start;
 mod surrogate_bind;

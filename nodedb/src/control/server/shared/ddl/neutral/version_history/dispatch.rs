@@ -10,8 +10,6 @@
 //! these, so they mint a capability instead: the plan that reaches storage is
 //! the plan authorization approved.
 
-use std::time::Duration;
-
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -21,6 +19,7 @@ use crate::control::server::shared::clone_write::{
 };
 use crate::control::server::shared::ddl::sync_dispatch::dispatch_authorized;
 use crate::control::server::shared::response_payload::payload_or_typed_error;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -64,7 +63,7 @@ pub(super) async fn dispatch_authorized_read(
     .await
     .map_err(gate_error)?;
 
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
+    let deadline = StatementDeadline::of_statement(state);
     match outcome {
         // The clone-read hook merged the target with its source and produced the
         // answer itself; the payload is flattened the same way the Data Plane's
@@ -76,7 +75,7 @@ pub(super) async fn dispatch_authorized_read(
             // No session reaches this handler: the read takes the strong
             // default (see `DmlTxnCtx::linearizable_reads`).
             let linearizable = true;
-            dispatch_authorized(state, checked, collection, timeout, linearizable)
+            dispatch_authorized(state, checked, collection, deadline, linearizable)
                 .await
                 .map_err(|e| DdlError::from_error_in_context("dispatch", &e))
         }

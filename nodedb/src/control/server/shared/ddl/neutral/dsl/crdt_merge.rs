@@ -2,13 +2,12 @@
 
 //! `CRDT MERGE INTO` DSL handler.
 
-use std::time::Duration;
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::{authorize_collection, authorize_task_set};
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -80,7 +79,7 @@ pub async fn crdt_merge(
             database_id,
             collection,
             plan: source_plan,
-            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            deadline: StatementDeadline::of_statement(state),
             // Admitted at this request's own transport entry; this handler
             // has no session or peer information of its own.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
@@ -165,7 +164,7 @@ pub async fn crdt_merge(
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
             authorized,
             collection: &qualified_collection,
-            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            deadline: StatementDeadline::of_statement(state),
             event_source: crate::event::EventSource::User,
             policy: &policy,
         },

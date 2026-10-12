@@ -51,11 +51,20 @@ impl MultiRaft {
     }
 
     /// Whether this node's replica of `group_id` is within `max_staleness`
-    /// of the leader. False for a group not hosted here.
-    pub fn within_staleness_bound(&self, group_id: u64, max_staleness: Duration) -> bool {
-        self.groups
-            .get(&group_id)
-            .is_some_and(|node| node.within_staleness_bound(max_staleness))
+    /// of the leader. `applied` is the highest index whose state reads see
+    /// here, the host's applied watermark, never Raft's hand-off index.
+    /// False for a group not hosted here, and for a replica that awaits a
+    /// snapshot install: its data diverged from the log.
+    pub fn within_staleness_bound(
+        &self,
+        group_id: u64,
+        max_staleness: Duration,
+        applied: u64,
+    ) -> bool {
+        self.groups.get(&group_id).is_some_and(|node| {
+            node.replica_state() != nodedb_raft::ReplicaState::AwaitingSnapshot
+                && node.within_staleness_bound(max_staleness, applied)
+        })
     }
 }
 

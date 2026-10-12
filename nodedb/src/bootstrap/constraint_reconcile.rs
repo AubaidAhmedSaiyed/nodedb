@@ -169,7 +169,9 @@ pub async fn reconcile_once(
             },
         );
 
-        let deadline = crate::control::wal_replication::statement_propose_deadline(shared);
+        let deadline =
+            crate::control::server::shared::session::StatementDeadline::of_statement(shared)
+                .tokio_instant();
         match propose_replicated_entry(shared, &proposer, entry, deadline).await {
             Ok(_) => {
                 // Record only on commit. A transient / NotLeader error

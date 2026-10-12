@@ -78,7 +78,9 @@ pub(crate) async fn assign_many_at_home(
             home.as_u32(),
             ReplicatedWrite::SurrogateBind { identities },
         );
-        let deadline = crate::control::wal_replication::statement_propose_deadline(state);
+        let deadline =
+            crate::control::server::shared::session::StatementDeadline::of_statement(state)
+                .tokio_instant();
         propose_replicated_entry(state, proposer, entry, deadline).await?;
     }
     pks.iter()

@@ -16,7 +16,7 @@ use common::cluster_harness::{TestCluster, TestClusterNode, wait_for};
 
 use std::time::Duration;
 
-use nodedb::control::gateway::retry::retry_not_leader;
+use nodedb::control::gateway::retry::{RetryPacing, retry_not_leader};
 use nodedb::types::VShardId;
 
 const CONVERGE: Duration = Duration::from_secs(30);
@@ -197,18 +197,24 @@ async fn an_outsider_follows_a_redirect_to_the_new_leader_and_ignores_a_stale_on
 
     // A stale redirect naming the old leader at the old term, through the
     // gateway's retry path, leaves the hint on the new leader.
-    let _ = retry_not_leader(Some(&**routing), |attempt| async move {
-        if attempt == 0 {
-            Err(nodedb::Error::NotLeader {
-                vshard_id: VShardId::new(vshard_id),
-                leader_node: old_leader,
-                leader_addr: String::new(),
-                leader_term: old_term,
-            })
-        } else {
-            Ok::<(), nodedb::Error>(())
-        }
-    })
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let _ = retry_not_leader(
+        Some(&**routing),
+        deadline,
+        RetryPacing::default(),
+        |attempt| async move {
+            if attempt.index == 0 {
+                Err(nodedb::Error::NotLeader {
+                    vshard_id: VShardId::new(vshard_id),
+                    leader_node: old_leader,
+                    leader_addr: String::new(),
+                    leader_term: old_term,
+                })
+            } else {
+                Ok::<(), nodedb::Error>(())
+            }
+        },
+    )
     .await;
     assert_eq!(
         hint(outsider, group_id),

@@ -4,8 +4,6 @@
 //! write-interception paths: presence probes on the target collection, and
 //! source-row/value fetches for copy-up.
 
-use std::time::Duration;
-
 use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate, TenantId};
 
 use crate::bridge::envelope::{Priority, Request, Response, Status};
@@ -269,15 +267,14 @@ pub(super) async fn dispatch_data_plane_raw(
             .request_id_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
-    let deadline_secs = state.tuning.network.default_deadline_secs;
-    let deadline_dur = Duration::from_secs(deadline_secs);
+    let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(state);
     let req = Request {
         request_id: req_id,
         tenant_id,
         vshard_id,
         database_id,
         plan,
-        deadline: std::time::Instant::now() + deadline_dur,
+        deadline: deadline.instant(),
         priority: Priority::Normal,
         trace_id: TraceId::ZERO,
         consistency: ReadConsistency::Strong,
@@ -300,7 +297,7 @@ pub(super) async fn dispatch_data_plane_raw(
         Ok(mut d) => d.dispatch(req)?,
         Err(p) => p.into_inner().dispatch(req)?,
     }
-    tokio::time::timeout(deadline_dur, rx.recv())
+    tokio::time::timeout_at(deadline.tokio_instant(), rx.recv())
         .await
         .map_err(|_| crate::Error::DeadlineExceeded { request_id: req_id })?
         .ok_or(crate::Error::Dispatch {

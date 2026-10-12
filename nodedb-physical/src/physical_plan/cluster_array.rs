@@ -30,9 +30,9 @@ use nodedb_types::SystemTimeScope;
 pub enum ClusterArrayOp {
     /// Fan-out a slice query across all target vShards and merge rows.
     ///
-    /// `slice_hilbert_ranges` — pre-computed `(lo, hi)` Hilbert-prefix
-    /// ranges that determine which shards to contact. An empty vec means
-    /// "scan all shards".
+    /// `slice_tile_keys` — pre-computed tile keys, at least one per routing
+    /// bucket the slice touches. They pick the shards to contact. An empty
+    /// vec scans every shard.
     ///
     /// `prefix_bits` — routing granularity from the array catalog entry.
     Slice {
@@ -43,8 +43,8 @@ pub enum ClusterArrayOp {
         attr_projection: Vec<u32>,
         /// Maximum rows returned. 0 = unlimited.
         limit: u32,
-        /// Pre-computed Hilbert-prefix ranges for shard selection.
-        slice_hilbert_ranges: Vec<(u64, u64)>,
+        /// Pre-computed tile keys for shard selection.
+        slice_tile_keys: Vec<u64>,
         /// Routing granularity from the array catalog entry.
         prefix_bits: u8,
         /// Bitemporal system-time scope for this slice fan-out.
@@ -68,8 +68,8 @@ pub enum ClusterArrayOp {
         reducer_msgpack: Vec<u8>,
         /// Dimension index to group by (-1 = no grouping).
         group_by_dim: i32,
-        /// Pre-computed Hilbert ranges for shard selection (empty = all).
-        slice_hilbert_ranges: Vec<(u64, u64)>,
+        /// Pre-computed tile keys for shard selection (empty = all).
+        slice_tile_keys: Vec<u64>,
         /// Routing granularity.
         prefix_bits: u8,
         /// Bitemporal system-time cutoff. `None` = live read.
@@ -78,16 +78,16 @@ pub enum ClusterArrayOp {
         valid_at_ms: Option<i64>,
     },
 
-    /// Fan-out a cell write batch, partitioned by Hilbert tile.
+    /// Fan-out a cell write batch, partitioned by routing bucket.
     ///
-    /// `cells` — list of `(hilbert_prefix, zerompk-encoded single-cell
-    /// bytes)`. The coordinator partitions these by prefix and sends each
-    /// shard's subset via `coord_put`.
+    /// `cells` — list of `(tile_key, zerompk-encoded single-cell bytes)`.
+    /// The coordinator partitions these by the tile key's vShard and sends
+    /// each shard's subset via `coord_put`.
     Put {
         array_id: ArrayId,
         /// zerompk-encoded `ArrayId` bytes for the wire request.
         array_id_msgpack: Vec<u8>,
-        /// Cells as `(hilbert_prefix, cell_msgpack)` pairs.
+        /// Cells as `(tile_key, cell_msgpack)` pairs.
         cells: Vec<(u64, Vec<u8>)>,
         /// WAL LSN allocated by the Control Plane for this batch.
         wal_lsn: u64,
@@ -95,14 +95,14 @@ pub enum ClusterArrayOp {
         prefix_bits: u8,
     },
 
-    /// Fan-out a coord delete batch, partitioned by Hilbert tile.
+    /// Fan-out a coord delete batch, partitioned by routing bucket.
     ///
-    /// `coords` — `(hilbert_prefix, zerompk-encoded single-coord bytes)`.
+    /// `coords` — `(tile_key, zerompk-encoded single-coord bytes)`.
     Delete {
         array_id: ArrayId,
         /// zerompk-encoded `ArrayId` bytes for the wire request.
         array_id_msgpack: Vec<u8>,
-        /// Coords as `(hilbert_prefix, coord_msgpack)` pairs.
+        /// Coords as `(tile_key, coord_msgpack)` pairs.
         coords: Vec<(u64, Vec<u8>)>,
         /// WAL LSN.
         wal_lsn: u64,

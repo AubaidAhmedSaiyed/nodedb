@@ -146,6 +146,8 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
         | crate::Error::GroupMarksUnavailable { .. }
         | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::MetadataGroupGone { .. }
+        | crate::Error::MetadataDdlSuperseded { .. }
         | crate::Error::AuthorizationStateBehind { .. }
         | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::ExecutionLimitExceeded { .. }
@@ -234,6 +236,7 @@ fn is_indeterminate(error: &crate::Error) -> bool {
         | crate::Error::GroupMarksUnavailable { .. }
         | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::MetadataDdlSuperseded { .. }
         | crate::Error::AuthorizationStateBehind { .. }
         | crate::Error::LinearizableReadRefused { .. }
         // Shed by a resource or rate gate: the class `53`.
@@ -248,7 +251,8 @@ fn is_indeterminate(error: &crate::Error) -> bool {
         },
         // The write committed: pushing the same bytes again applies it twice.
         crate::Error::CommittedResultUnavailable { .. }
-        | crate::Error::ProposalOutcomeUnknown { .. } => false,
+        | crate::Error::ProposalOutcomeUnknown { .. }
+        | crate::Error::MetadataGroupGone { .. } => false,
         // Refused on its merits, or a fault the same bytes reproduce.
         crate::Error::RejectedConstraint { .. }
         | crate::Error::TxnOverlayMemoryExceeded { .. }

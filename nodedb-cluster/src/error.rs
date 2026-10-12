@@ -271,7 +271,78 @@ pub enum ClusterError {
     },
 }
 
+/// What a failed send says about the request it carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFate {
+    /// The request never reached the peer whole. A resend cannot run it twice.
+    Unsent,
+    /// The request reached the peer and no answer came back. The peer can
+    /// have run it, so its outcome is unknown.
+    LostAnswer,
+    /// An answer, or a refusal the caller handles itself.
+    Answered,
+}
+
 impl ClusterError {
+    /// Whether the request never reached the peer whole.
+    ///
+    /// The peer ran nothing, so any request can be sent again.
+    pub fn is_unsent(&self) -> bool {
+        self.send_fate() == SendFate::Unsent
+    }
+
+    /// Whether the request reached the peer and its answer was lost.
+    ///
+    /// The peer can have run it. Only a resend-safe request goes again. Any
+    /// other request reports an unknown outcome.
+    pub fn is_lost_answer(&self) -> bool {
+        self.send_fate() == SendFate::LostAnswer
+    }
+
+    fn send_fate(&self) -> SendFate {
+        match self {
+            Self::Transport { .. } => SendFate::Unsent,
+            Self::ShardTimeout { .. } | Self::Unanswered { .. } => SendFate::LostAnswer,
+            Self::Raft(_)
+            | Self::VShardNotMapped { .. }
+            | Self::GroupNotFound { .. }
+            | Self::LearnerNotCaughtUp { .. }
+            | Self::MigrationInProgress { .. }
+            | Self::MigrationPauseBudgetExceeded { .. }
+            | Self::NodeUnreachable { .. }
+            | Self::GhostNotFound { .. }
+            | Self::StreamTerminal { .. }
+            | Self::Storage { .. }
+            | Self::DataPlane { .. }
+            | Self::Codec { .. }
+            | Self::UnsupportedWireVersion { .. }
+            | Self::CircuitOpen { .. }
+            | Self::JoinGroupDisappeared { .. }
+            | Self::JoinCommitTimeout { .. }
+            | Self::ReadIndexNotLeader { .. }
+            | Self::ReadIndexTimeout { .. }
+            | Self::Config { .. }
+            | Self::MigrationCheckpoint(_)
+            | Self::MigrationRecovery(_)
+            | Self::WrongOwner { .. }
+            | Self::Calvin(_)
+            | Self::SnapshotCrcMismatch { .. }
+            | Self::SnapshotOffsetRegression { .. }
+            | Self::PartialSnapshotCorrupt { .. }
+            | Self::PartialSnapshotCleanupFailed { .. }
+            | Self::SnapshotApplyFailed { .. }
+            | Self::Mirror(_)
+            | Self::BspBarrier(_)
+            | Self::VectorGather(_)
+            | Self::SpatialGather(_)
+            | Self::Bm25Gather(_)
+            | Self::TsGather(_)
+            | Self::ShufflePush(_)
+            | Self::RemoteUntyped { .. }
+            | Self::ShardExecution { .. } => SendFate::Answered,
+        }
+    }
+
     /// Whether the error means the link to the peer failed.
     ///
     /// A link failure counts against the peer's circuit breaker and ends a
@@ -285,6 +356,16 @@ impl ClusterError {
                 | Self::CircuitOpen { .. }
                 | Self::NodeUnreachable { .. }
         )
+    }
+}
+
+/// An array routing granularity out of range is a codec error: it arrives
+/// on a wire request or a catalog entry.
+impl From<nodedb_types::array_route::PrefixBitsOutOfRange> for ClusterError {
+    fn from(e: nodedb_types::array_route::PrefixBitsOutOfRange) -> Self {
+        ClusterError::Codec {
+            detail: e.to_string(),
+        }
     }
 }
 
@@ -315,5 +396,55 @@ mod tests {
             }
             .is_link_failure()
         );
+    }
+
+    #[test]
+    fn only_a_transport_error_is_unsent() {
+        let unsent = ClusterError::Transport {
+            detail: "connect refused".into(),
+        };
+        assert!(unsent.is_unsent());
+        assert!(!unsent.is_lost_answer());
+    }
+
+    #[test]
+    fn a_timeout_or_a_missing_answer_is_a_lost_answer() {
+        let lost = [
+            ClusterError::ShardTimeout {
+                vshard_id: 3,
+                elapsed_ms: 50,
+            },
+            ClusterError::Unanswered {
+                node_id: 2,
+                detail: "stream reset".into(),
+            },
+        ];
+        for error in &lost {
+            assert!(error.is_lost_answer(), "{error}");
+            assert!(!error.is_unsent(), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_answer_is_neither_unsent_nor_lost() {
+        let answered = [
+            ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
+                leader_hint: Some(2),
+                term: 3,
+            }),
+            ClusterError::CircuitOpen {
+                node_id: 1,
+                failures: 5,
+            },
+            ClusterError::NodeUnreachable { node_id: 1 },
+            ClusterError::RemoteUntyped {
+                detail: "refused".into(),
+            },
+            ClusterError::Calvin(CalvinError::AdmissionTimedOut),
+        ];
+        for error in &answered {
+            assert!(!error.is_unsent(), "{error}");
+            assert!(!error.is_lost_answer(), "{error}");
+        }
     }
 }

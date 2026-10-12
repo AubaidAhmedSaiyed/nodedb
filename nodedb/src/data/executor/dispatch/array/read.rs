@@ -14,7 +14,8 @@ use nodedb_array::query::slice::{Slice, slice_sparse, tile_overlaps_slice};
 use nodedb_array::segment::{MbrQueryPredicate, TilePayload};
 use nodedb_array::tile::sparse_tile::SparseTile;
 use nodedb_array::types::ArrayId;
-use nodedb_types::{ArrayCell, SurrogateBitmap, SystemTimeScope, Value};
+use nodedb_types::array_route::shard_bucket_admits;
+use nodedb_types::{ArrayCell, ShardBucket, SurrogateBitmap, SystemTimeScope, Value};
 
 /// Slice parameters bundled to avoid exceeding the 7-argument limit.
 pub(in crate::data::executor) struct SliceParams<'a> {
@@ -23,11 +24,10 @@ pub(in crate::data::executor) struct SliceParams<'a> {
     pub attr_projection: &'a [u32],
     pub limit: u32,
     pub cell_filter: Option<&'a SurrogateBitmap>,
-    /// Optional Hilbert-prefix range `[lo, hi]` for shard-level partitioning.
-    /// When set, only tiles whose Hilbert prefix falls within this range are
-    /// included. Used by the distributed shard handler to prevent duplicate
-    /// rows when all vShards share a single Data Plane.
-    pub hilbert_range: Option<(u64, u64)>,
+    /// Optional shard bucket. When set, only tiles whose key routes to this
+    /// bucket are included, so vShards that share one Data Plane return no
+    /// duplicate rows.
+    pub shard_bucket: Option<ShardBucket>,
     /// Bitemporal system-time scope.
     ///
     /// - `Current`: live read (effective cutoff `i64::MAX`).
@@ -59,7 +59,7 @@ impl CoreLoop {
             attr_projection,
             limit,
             cell_filter,
-            hilbert_range,
+            shard_bucket,
             system_time,
             valid_at_ms,
         } = p;
@@ -126,11 +126,9 @@ impl CoreLoop {
                     }
                 };
 
-                // Apply Hilbert-range and slice coord filters.
+                // Apply the shard bucket and slice coord filters.
                 versions.retain(|(hp, coord, _sys_ms, _payload)| {
-                    if let Some((lo, hi)) = hilbert_range
-                        && (*hp < lo || *hp > hi)
-                    {
+                    if !shard_bucket_admits(shard_bucket, *hp) {
                         return false;
                     }
                     // Check coord against slice predicate dim-by-dim.
@@ -235,9 +233,7 @@ impl CoreLoop {
 
                 let mut rows: Vec<Value> = Vec::new();
                 'outer: for (hp, sparse) in resolved_tiles {
-                    if let Some((lo, hi)) = hilbert_range
-                        && (hp < lo || hp > hi)
-                    {
+                    if !shard_bucket_admits(shard_bucket, hp) {
                         continue;
                     }
                     if !tile_overlaps_slice(&sparse.mbr.dim_mins, &sparse.mbr.dim_maxs, &slice) {
@@ -742,7 +738,7 @@ mod tests {
             attr_projection: vec![],
             limit: 0,
             cell_filter: None,
-            hilbert_range: None,
+            shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         });
@@ -794,7 +790,7 @@ mod tests {
             attr_projection: vec![],
             limit: 0,
             cell_filter: None,
-            hilbert_range: None,
+            shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::AllVersions,
             valid_at_ms: None,
         });
@@ -867,7 +863,7 @@ mod tests {
             attr_projection: vec![],
             limit: 0,
             cell_filter: Some(bm),
-            hilbert_range: None,
+            shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         });
@@ -886,5 +882,123 @@ mod tests {
         }
         // 10.0 + 30.0 = 40.0; 20.0 must have been excluded.
         assert!((total - 40.0).abs() < 1e-9, "total got {total}");
+    }
+
+    fn schema_full_range_2d(name: &str) -> ArraySchema {
+        let full = || Domain::new(DomainBound::Int64(i64::MIN), DomainBound::Int64(i64::MAX));
+        ArraySchemaBuilder::new(name)
+            .dim(DimSpec::new("x", DimType::Int64, full()))
+            .dim(DimSpec::new("y", DimType::Int64, full()))
+            .attr(AttrSpec::new("v", AttrType::Float64, true))
+            .tile_extents(vec![1, 1])
+            .build()
+            .unwrap()
+    }
+
+    fn slice_in_bucket(h: &mut Harness, aid: &ArrayId, bucket: Option<ShardBucket>) -> Vec<Value> {
+        let slice = ArraySlice::new(vec![None, None]);
+        let r = h.send(ArrayOp::Slice {
+            array_id: aid.clone(),
+            slice_msgpack: zerompk::to_msgpack_vec(&slice).unwrap(),
+            attr_projection: vec![],
+            limit: 0,
+            cell_filter: None,
+            shard_bucket: bucket,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        });
+        assert_eq!(r.status, Status::Ok, "slice failed: {r:?}");
+        decode_slice_rows(r.payload.as_ref())
+    }
+
+    fn row_coords(row: &Value) -> Vec<Value> {
+        match row {
+            Value::ArrayCell(ArrayCell { coords, .. }) => coords.clone(),
+            other => panic!("row not ArrayCell: {other:?}"),
+        }
+    }
+
+    /// Over every bucket, the shard filter returns each cell exactly once.
+    #[test]
+    fn shard_buckets_partition_the_cells_of_a_full_range_array() {
+        let mut h = Harness::new();
+        let s = schema_full_range_2d("t6_buckets");
+        let aid = ArrayId::new(TenantId::new(1), "t6_buckets");
+        h.open(&aid, &s, 0xB1);
+        let cells: Vec<ArrayPutCell> = (0..8)
+            .flat_map(|x| (0..8).map(move |y| cell(x, y, (x * 8 + y) as f64)))
+            .collect();
+        h.put(&aid, cells, 1);
+        h.flush(&aid);
+
+        let prefix_bits = 8u8;
+        let mut seen: Vec<String> = Vec::new();
+        let mut non_empty = 0usize;
+        for bucket in 0..(1u32 << prefix_bits) {
+            let rows = slice_in_bucket(
+                &mut h,
+                &aid,
+                Some(ShardBucket {
+                    bucket,
+                    prefix_bits,
+                }),
+            );
+            if !rows.is_empty() {
+                non_empty += 1;
+            }
+            seen.extend(rows.iter().map(|r| format!("{:?}", row_coords(r))));
+        }
+        assert_eq!(
+            seen.len(),
+            64,
+            "every cell is returned by exactly one bucket"
+        );
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 64, "no cell is returned by two buckets");
+        assert!(non_empty >= 32, "64 tiles land in only {non_empty} buckets");
+        assert_eq!(slice_in_bucket(&mut h, &aid, None).len(), 64);
+    }
+
+    /// Two tiles `2^bits` apart share one key, so they share one bucket, and
+    /// a read of that bucket returns both cells.
+    #[test]
+    fn tiles_that_share_a_key_route_together_and_both_cells_read_back() {
+        let mut h = Harness::new();
+        let s = schema_full_range_2d("t6_collide");
+        let aid = ArrayId::new(TenantId::new(1), "t6_collide");
+        h.open(&aid, &s, 0xB2);
+        let far = 1i64 << nodedb_array::coord::bits_per_dim(2);
+        let near_coord = [CoordValue::Int64(3), CoordValue::Int64(5)];
+        let far_coord = [CoordValue::Int64(3 + far), CoordValue::Int64(5)];
+        let key = nodedb_array::tile::cell_tile_prefix(&s, &near_coord).unwrap();
+        assert_eq!(
+            nodedb_array::tile::cell_tile_prefix(&s, &far_coord).unwrap(),
+            key,
+            "the fixture's two tiles share one key"
+        );
+        h.put(
+            &aid,
+            vec![cell_sur(3, 5, 1.0, 7), cell_sur(3 + far, 5, 2.0, 8)],
+            1,
+        );
+        h.flush(&aid);
+
+        let prefix_bits = 8u8;
+        let owner = ShardBucket {
+            bucket: nodedb_types::array_route::prefix_bucket(key, prefix_bits),
+            prefix_bits,
+        };
+        let rows = slice_in_bucket(&mut h, &aid, Some(owner));
+        assert_eq!(
+            rows.len(),
+            2,
+            "both cells of the shared key read back: {rows:?}"
+        );
+        let other = ShardBucket {
+            bucket: (owner.bucket + 1) % (1u32 << prefix_bits),
+            prefix_bits,
+        };
+        assert!(slice_in_bucket(&mut h, &aid, Some(other)).is_empty());
     }
 }

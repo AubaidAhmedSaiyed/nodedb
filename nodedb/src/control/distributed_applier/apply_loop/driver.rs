@@ -5,8 +5,10 @@
 //! and every started entry concluded.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
+use tokio::time::MissedTickBehavior;
 
 use crate::control::distributed_applier::applier::ApplyBatch;
 use crate::control::distributed_applier::proposal_ledger::{
@@ -55,7 +57,23 @@ pub async fn run_apply_loop(
         tracker: &tracker,
     };
     let mut pipeline = Pipeline::new(ctx, ledger);
+    drive(&mut pipeline, &mut apply_rx, &state).await;
+}
+
+/// Feed `pipeline` from `apply_rx` and its wakes until the channel closes and
+/// every started entry concluded.
+pub(super) async fn drive(
+    pipeline: &mut Pipeline<'_>,
+    apply_rx: &mut mpsc::Receiver<ApplyBatch>,
+    state: &SharedState,
+) {
     let mut install_released = state.raft_apply_gates.get().map(|g| g.subscribe_released());
+    // A held group whose snapshot debt did not persist gets no batches. The
+    // loop wakes on each Raft tick to write the debt again.
+    let mut debt_retry = tokio::time::interval(Duration::from_millis(
+        state.tuning.cluster_transport.raft_tick_interval_ms,
+    ));
+    debt_retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut accepting = true;
     loop {
         if !accepting && !pipeline.has_running() {
@@ -64,13 +82,15 @@ pub async fn run_apply_loop(
             return;
         }
         let running = pipeline.has_running();
-        let blocked = pipeline.install_blocked();
+        let blocked = pipeline.awaits_install();
+        let retry_debt = pipeline.retries_debt();
         tokio::select! {
             biased;
             Some(event) = pipeline.next_event(), if running => {
                 pipeline.handle(event);
             }
             () = wait_install_released(&mut install_released), if blocked => {}
+            _ = debt_retry.tick(), if retry_debt => {}
             batch = apply_rx.recv(), if accepting => match batch {
                 Some(batch) => {
                     pipeline.accept(batch);

@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Sync wait primitive used to block on a Raft group's local apply
-//! watermark.
+//! Async wait on a Raft group's local apply watermark.
 //!
-//! Uses `std::sync::Condvar` so it is safe to call from synchronous
-//! pgwire handler code without entering a tokio reactor. A `closed`
-//! flag distinguishes "still waiting for apply" from "the group is
-//! no longer hosted on this node" — a follower that gets removed via
-//! conf-change must wake outstanding waiters with a terminal status
-//! rather than time them out.
+//! A waiter parks as a task on a [`Notify`], so it holds no thread while it
+//! waits. A `closed` flag tells "still waiting for apply" apart from "the
+//! group is no longer hosted on this node": a removed group wakes its
+//! waiters with a terminal outcome instead of timing them out.
 
-use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::time::Instant;
 
-/// Outcome of [`AppliedIndexWatcher::wait_for`].
+use tokio::sync::Notify;
+
+/// Outcome of [`AppliedIndexWatcher::wait_for_async`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     /// The applied watermark reached the requested target.
@@ -35,7 +34,8 @@ impl WaitOutcome {
 #[derive(Debug, Default)]
 pub struct AppliedIndexWatcher {
     state: Mutex<State>,
-    cv: Condvar,
+    /// Woken on every watermark advance and on close.
+    changed: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -53,29 +53,36 @@ impl AppliedIndexWatcher {
         Self::default()
     }
 
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Advance the watermark. Idempotent: smaller indices are ignored.
     /// Bumps on a closed watcher are also ignored (the group is gone).
     pub fn bump(&self, applied_index: u64) {
-        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.closed {
-            return;
-        }
-        if applied_index > guard.applied {
-            guard.applied = applied_index;
-            self.cv.notify_all();
+        let advanced = {
+            let mut guard = self.state();
+            let advanced = !guard.closed && applied_index > guard.applied;
+            if advanced {
+                guard.applied = applied_index;
+            }
+            advanced
+        };
+        if advanced {
+            self.changed.notify_waiters();
         }
     }
 
     /// Read the current watermark without blocking.
     pub fn current(&self) -> u64 {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).applied
+        self.state().applied
     }
 
     /// Declare that the applier starts a batch ending at `last_index`. The
     /// applier calls it before the batch mutates any state a reader can see.
     /// Idempotent: smaller indices are ignored.
     pub fn begin_batch(&self, last_index: u64) {
-        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.state();
         guard.applying_through = guard.applying_through.max(last_index);
     }
 
@@ -84,51 +91,60 @@ impl AppliedIndexWatcher {
     ///
     /// A reader that sees an effect of the batch in progress gets a floor at
     /// or above the index of the entry that made it visible. A waiter for
-    /// that floor waits on [`Self::wait_for`], which the finished batch
+    /// that floor waits on [`Self::wait_for_async`], which the finished batch
     /// satisfies.
     pub fn floor(&self) -> u64 {
-        let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.state();
         guard.applied.max(guard.applying_through)
     }
 
     /// True once [`Self::close`] has been called.
     pub fn is_closed(&self) -> bool {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed
+        self.state().closed
     }
 
     /// Mark this watcher closed and wake every waiter with
     /// [`WaitOutcome::GroupGone`]. Idempotent.
     pub fn close(&self) {
-        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if !guard.closed {
+        let closed_now = {
+            let mut guard = self.state();
+            let closed_now = !guard.closed;
             guard.closed = true;
-            self.cv.notify_all();
+            closed_now
+        };
+        if closed_now {
+            self.changed.notify_waiters();
         }
     }
 
-    /// Block until the watermark reaches `target`, the timeout elapses,
-    /// or the watcher is closed.
-    pub fn wait_for(&self, target: u64, timeout: Duration) -> WaitOutcome {
-        let deadline = Instant::now() + timeout;
-        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+    /// The outcome of a wait for `target` as the state stands, `None` while
+    /// it is still pending.
+    fn settled(&self, target: u64) -> Option<WaitOutcome> {
+        let guard = self.state();
+        if guard.applied >= target {
+            Some(WaitOutcome::Reached)
+        } else if guard.closed {
+            Some(WaitOutcome::GroupGone)
+        } else {
+            None
+        }
+    }
+
+    /// Wait until the watermark reaches `target`, `deadline` passes, or the
+    /// watcher is closed. The waiting task holds no thread.
+    pub async fn wait_for_async(&self, target: u64, deadline: Instant) -> WaitOutcome {
+        let deadline = tokio::time::Instant::from_std(deadline);
         loop {
-            if guard.applied >= target {
-                return WaitOutcome::Reached;
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            // Registered before the state is read, so a bump between the
+            // read and the await still wakes this waiter.
+            notified.as_mut().enable();
+            if let Some(outcome) = self.settled(target) {
+                return outcome;
             }
-            if guard.closed {
-                return WaitOutcome::GroupGone;
-            }
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(r) if !r.is_zero() => r,
-                _ => return WaitOutcome::TimedOut,
-            };
-            let wait = self
-                .cv
-                .wait_timeout(guard, remaining)
-                .unwrap_or_else(|p| p.into_inner());
-            guard = wait.0;
-            if wait.1.timed_out() && guard.applied < target && !guard.closed {
-                return WaitOutcome::TimedOut;
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.settled(target).unwrap_or(WaitOutcome::TimedOut);
             }
         }
     }
@@ -138,47 +154,83 @@ impl AppliedIndexWatcher {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::thread;
+    use std::time::Duration;
 
-    #[test]
-    fn bump_notifies_waiter() {
+    fn after(duration: Duration) -> Instant {
+        Instant::now() + duration
+    }
+
+    #[tokio::test]
+    async fn a_bump_wakes_the_waiter() {
         let w = Arc::new(AppliedIndexWatcher::new());
-        let w2 = w.clone();
-        let h = thread::spawn(move || w2.wait_for(5, Duration::from_secs(2)));
-        thread::sleep(Duration::from_millis(20));
+        let waiter = {
+            let w = Arc::clone(&w);
+            tokio::spawn(async move { w.wait_for_async(5, after(Duration::from_secs(5))).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
         w.bump(3);
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
         w.bump(5);
-        assert_eq!(h.join().unwrap(), WaitOutcome::Reached);
+        let started = Instant::now();
+        assert_eq!(waiter.await.expect("join"), WaitOutcome::Reached);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
-    #[test]
-    fn times_out_if_never_bumped() {
+    #[tokio::test]
+    async fn the_wait_times_out_at_its_deadline() {
         let w = AppliedIndexWatcher::new();
-        assert_eq!(
-            w.wait_for(1, Duration::from_millis(30)),
-            WaitOutcome::TimedOut
-        );
+        let started = Instant::now();
+        let outcome = w.wait_for_async(1, after(Duration::from_millis(200))).await;
+        assert_eq!(outcome, WaitOutcome::TimedOut);
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
     }
 
-    #[test]
-    fn already_past_target_returns_immediately() {
+    #[tokio::test]
+    async fn a_passed_deadline_still_reports_a_reached_target() {
         let w = AppliedIndexWatcher::new();
         w.bump(10);
-        assert_eq!(
-            w.wait_for(5, Duration::from_millis(10)),
-            WaitOutcome::Reached
-        );
+        let outcome = w.wait_for_async(5, Instant::now()).await;
+        assert_eq!(outcome, WaitOutcome::Reached);
     }
 
-    #[test]
-    fn close_wakes_waiter_with_group_gone() {
+    #[tokio::test]
+    async fn close_wakes_the_waiter_with_group_gone() {
         let w = Arc::new(AppliedIndexWatcher::new());
-        let w2 = w.clone();
-        let h = thread::spawn(move || w2.wait_for(99, Duration::from_secs(2)));
-        thread::sleep(Duration::from_millis(20));
+        let waiter = {
+            let w = Arc::clone(&w);
+            tokio::spawn(async move { w.wait_for_async(99, after(Duration::from_secs(5))).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
         w.close();
-        assert_eq!(h.join().unwrap(), WaitOutcome::GroupGone);
+        assert_eq!(waiter.await.expect("join"), WaitOutcome::GroupGone);
+    }
+
+    /// A bump that races the start of a wait is never lost: every waiter
+    /// ends `Reached` well before its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bump_racing_the_wait_start_is_not_lost() {
+        for round in 1..=200u64 {
+            let w = Arc::new(AppliedIndexWatcher::new());
+            let waiter = {
+                let w = Arc::clone(&w);
+                tokio::spawn(async move {
+                    w.wait_for_async(round, after(Duration::from_secs(10)))
+                        .await
+                })
+            };
+            let bumper = {
+                let w = Arc::clone(&w);
+                tokio::spawn(async move { w.bump(round) })
+            };
+            bumper.await.expect("join bumper");
+            let outcome = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the waiter woke on the bump")
+                .expect("join waiter");
+            assert_eq!(outcome, WaitOutcome::Reached, "round {round}");
+        }
     }
 
     #[test]

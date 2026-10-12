@@ -27,13 +27,16 @@
 //! distinct `(epoch, position, vshard)` triples collide on the same
 //! synthetic `TxnId` and corrupt each other's staged overlay.
 
-use crate::types::TxnId;
+use crate::types::{TxnId, VShardId};
 
-const VSHARD_BITS: u32 = 10;
+const VSHARD_BITS: u32 = VShardId::BITS as u32;
 const POSITION_BITS: u32 = 20;
 const EPOCH_BITS: u32 = 33;
 
-const VSHARD_MAX: u32 = 1 << VSHARD_BITS;
+// The marker bit and the three fields fill the id exactly.
+const _: () = assert!(1 + EPOCH_BITS + POSITION_BITS + VSHARD_BITS == 64);
+
+const VSHARD_MAX: u32 = VShardId::COUNT;
 const POSITION_MAX: u32 = 1 << POSITION_BITS;
 const EPOCH_MAX: u64 = 1 << EPOCH_BITS;
 

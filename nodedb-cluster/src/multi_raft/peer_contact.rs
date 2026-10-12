@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use nodedb_raft::{NodeRole, StalenessVerdict};
+use nodedb_raft::NodeRole;
 
 use crate::multi_raft::core::MultiRaft;
 
@@ -43,7 +43,7 @@ impl MultiRaft {
     pub fn leader_contact_within(&self, group_id: u64, window: Duration) -> bool {
         self.groups
             .get(&group_id)
-            .is_some_and(|node| node.staleness_verdict(window) != StalenessVerdict::NoRecentContact)
+            .is_some_and(|node| node.leader_contact_within(window))
     }
 
     /// Response counts from every peer of `group_id`. `None` when the group

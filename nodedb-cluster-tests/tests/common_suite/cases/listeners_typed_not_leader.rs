@@ -29,7 +29,7 @@
 //! NotLeader") when the QUIC connection itself fails (e.g. sending to a node that
 //! doesn't exist). In that case the hinted leader in the error is the bad node_id
 //! itself, so the retry loop would update the routing table to the same bad node
-//! and exhaust all 3 attempts — the client sees `NotLeader`, not success.
+//! and retry until the statement deadline — the client sees `NotLeader`, not success.
 //!
 //! The retry-on-success path exists for a FUTURE scenario where Raft-aware
 //! execution on follower nodes explicitly returns `TypedClusterError::NotLeader`
@@ -492,7 +492,7 @@ async fn native_not_leader_gateway_error_mapping() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn not_leader_counter_increments_per_retry_attempt() {
-    use nodedb::control::gateway::retry::retry_not_leader;
+    use nodedb::control::gateway::retry::{RetryPacing, retry_not_leader};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     let counter = Arc::new(AtomicU64::new(0));
@@ -501,12 +501,13 @@ async fn not_leader_counter_increments_per_retry_attempt() {
     let counter_inner = Arc::clone(&counter);
     let call_count_inner = Arc::clone(&call_count);
 
-    let result = retry_not_leader(None, move |attempt| {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let result = retry_not_leader(None, deadline, RetryPacing::default(), move |attempt| {
         let c = Arc::clone(&call_count_inner);
         let rc = Arc::clone(&counter_inner);
         async move {
             let n = c.fetch_add(1, AtomicOrdering::SeqCst);
-            if attempt > 0 {
+            if attempt.index > 0 {
                 rc.fetch_add(1, AtomicOrdering::Relaxed);
             }
             if n < 2 {

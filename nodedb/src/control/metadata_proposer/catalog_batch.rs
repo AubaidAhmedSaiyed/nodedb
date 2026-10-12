@@ -13,7 +13,7 @@ use crate::error::Error;
 use super::catalog::{catalog_ddl_entry, propose_prepared};
 use super::ddl_prepare::{acquire_ddl_prepare_lease_async, lock_ddl_preparation_async};
 use super::handle::MetadataRaftHandle;
-use super::timeouts::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_PROPOSE_TIMEOUT};
+use super::timeouts::DEFAULT_DRAIN_TIMEOUT;
 
 /// What happened to the entries a batch plan built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +85,8 @@ pub async fn propose_catalog_batch_async(
                 group_id: METADATA_GROUP_ID,
                 through: log_index,
             }],
+            crate::control::server::shared::session::StatementDeadline::of_statement(shared)
+                .instant(),
         )
         .await?;
     }
@@ -113,14 +115,14 @@ async fn propose_replicated(
         for entry in &entries {
             wrapped.push(catalog_ddl_entry(entry)?);
         }
-        // The wait follows apply progress: a batch of slow purges keeps it
-        // alive, and only a stall of `DEFAULT_PROPOSE_TIMEOUT` ends it.
+        // A batch of slow purges applies for as long as the statement lets it.
         let log_index = propose_prepared(
             shared,
             handle,
             lease.token(),
             MetadataEntry::Batch { entries: wrapped },
-            DEFAULT_PROPOSE_TIMEOUT,
+            crate::control::server::shared::session::StatementDeadline::of_statement(shared)
+                .instant(),
         )
         .await?;
         Ok::<_, Error>(Some((log_index, entries)))

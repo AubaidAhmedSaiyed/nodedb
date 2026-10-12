@@ -19,6 +19,7 @@ use crate::control::cluster::metadata_applier::{MetadataApplyWedge, WedgeReport,
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::catalog::cut_floors::StoredBarrier;
 use crate::control::state::SharedState;
+use crate::types::CutFloor;
 
 /// One group's cut barrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,59 @@ pub fn persist_cut_floor(
         .credentials
         .catalog()
         .put_cut_floor(group_id, barrier, durable)
+}
+
+/// The durable cut floors of `group_id` at or below `through`, in index
+/// order, for a data-group snapshot to carry.
+pub fn group_cut_floors(
+    state: &SharedState,
+    group_id: u64,
+    through: u64,
+) -> crate::Result<Vec<CutFloor>> {
+    Ok(state
+        .credentials
+        .catalog()
+        .group_cut_floors(group_id)?
+        .into_iter()
+        .filter(|barrier| barrier.index <= through)
+        .map(|barrier| CutFloor {
+            index: barrier.index,
+            watermark: barrier.watermark,
+        })
+        .collect())
+}
+
+/// Durably record the cut floors `floors` a snapshot of `group_id` carried,
+/// and hand the group's rows to the apply loop. The receiver never applies
+/// the barriers the snapshot covers, yet every later entry records above them.
+pub fn install_cut_floors(
+    state: &SharedState,
+    group_id: u64,
+    floors: &[CutFloor],
+) -> crate::Result<()> {
+    if floors.is_empty() {
+        return Ok(());
+    }
+    let catalog = state.credentials.catalog();
+    let barriers: Vec<StoredBarrier> = floors
+        .iter()
+        .map(|floor| StoredBarrier {
+            index: floor.index,
+            watermark: floor.watermark,
+        })
+        .collect();
+    catalog.put_cut_floors(group_id, &barriers, state.pitr.durable_applied(group_id))?;
+    let rows: Vec<RecordedCut> = catalog
+        .group_cut_floors(group_id)?
+        .into_iter()
+        .map(|barrier| RecordedCut {
+            group_id,
+            barrier_index: barrier.index,
+            hlc: barrier.watermark,
+        })
+        .collect();
+    state.pitr.recorded_cuts().replace_group(group_id, &rows);
+    Ok(())
 }
 
 /// First wait between two attempts of a floor write.

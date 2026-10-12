@@ -96,17 +96,10 @@ impl TestCluster {
     /// the retry loop tries the next node on failure so the test
     /// doesn't have to discover the leader explicitly.
     ///
-    /// After the DDL is accepted, **blocks until every node's
-    /// metadata applier has caught up to the proposer's applied
-    /// index**. `propose_catalog_entry` already waits for the entry
-    /// to be applied on the proposing node before returning, but
-    /// followers apply asynchronously — without this barrier a
-    /// subsequent `wait_for("x visible on every node")` would race
-    /// the follower appliers and trip its timeout on the cold-start
-    /// attempt. Polling the watermark directly is O(applied_index)
-    /// and converges as soon as the followers drain their commit
-    /// queues, so it's both strictly more correct and strictly
-    /// faster than waiting on the visibility check itself.
+    /// After the DDL is accepted, blocks until every node applied the
+    /// metadata group through its commit index. Followers apply
+    /// asynchronously, so a later visibility check otherwise races their
+    /// appliers. Panics with every node's positions after 10 s.
     pub async fn exec_ddl_on_any_leader(&self, sql: &str) -> Result<usize, String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut last_err = String::new();
@@ -114,7 +107,8 @@ impl TestCluster {
             for (idx, node) in self.nodes.iter().enumerate() {
                 match node.exec(sql).await {
                     Ok(()) => {
-                        self.wait_for_applied_index_convergence(idx).await;
+                        self.wait_for_metadata_apply_convergence(Duration::from_secs(10))
+                            .await;
                         return Ok(idx);
                     }
                     Err(e) => last_err = e,
@@ -125,121 +119,6 @@ impl TestCluster {
         Err(format!(
             "no node accepted DDL within 10s; last error: {last_err}"
         ))
-    }
-
-    /// Block until every node's metadata applier has caught up to the
-    /// proposer's current applied index. Called after every successful
-    /// DDL by `exec_ddl_on_any_leader`.
-    async fn wait_for_applied_index_convergence(&self, proposer_idx: usize) {
-        let group_id = nodedb_cluster::METADATA_GROUP_ID;
-        let target = self.nodes[proposer_idx]
-            .shared
-            .applied_index_watcher(group_id)
-            .current();
-        if target == 0 {
-            return;
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let all_caught_up = self
-                .nodes
-                .iter()
-                .all(|n| n.shared.applied_index_watcher(group_id).current() >= target);
-            if all_caught_up {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                // Don't panic — the caller's own `wait_for` assertion
-                // will report the specific visibility failure with a
-                // better error than "convergence timed out".
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    /// Block until every node's per-group applied watermark has
-    /// caught up to the maximum observed across the cluster for that
-    /// group. This is the deterministic barrier for "every Raft
-    /// group has fully propagated" — replaces the SQL-polling
-    /// pattern (`wait_for_async("rows visible from node N", ...)`)
-    /// that races the follower applier under load.
-    ///
-    /// For every group registered on *any* node, the target is
-    /// `max(applied_index across all nodes)`. Each node then waits
-    /// for that group's local watcher to reach the target. New
-    /// groups that show up partway through (e.g. a vshard the test
-    /// has not written to yet) are handled by re-snapshotting on
-    /// every iteration of the outer poll, so the helper is
-    /// idempotent against late-bound group registration.
-    ///
-    /// Returns once every (node, group) pair has converged or the
-    /// deadline expires. On expiry, falls through silently — the
-    /// caller's own assertion will surface the specific row-level
-    /// failure with a more useful error than "convergence timed
-    /// out".
-    pub async fn wait_for_full_apply_convergence(&self, timeout: Duration) {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            // Targets: for each group_id seen on any node, take the
-            // max applied_index. Asymmetric group membership is
-            // expected — replication factor may be < node count, so
-            // not every group is hosted on every node.
-            let mut targets: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-            for node in &self.nodes {
-                for (gid, applied) in node.shared.group_watchers().snapshot() {
-                    let entry = targets.entry(gid).or_insert(0);
-                    if applied > *entry {
-                        *entry = applied;
-                    }
-                }
-            }
-
-            // Group membership is read from the routing table (the
-            // authoritative source) rather than inferred from the
-            // watcher registry. Inferring from the registry has a
-            // cold-start race: a follower that hosts group X but
-            // hasn't yet applied its first entry has no registry
-            // entry, would be treated as "not hosted", and the
-            // helper would return prematurely. Routing knows the
-            // members + learners list as soon as the conf-change
-            // commits.
-            let all_caught_up = {
-                let routing = self.nodes[0]
-                    .shared
-                    .cluster_routing
-                    .as_ref()
-                    .expect("cluster_routing")
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner());
-
-                self.nodes.iter().all(|node| {
-                    let nid = node.shared.node_id;
-                    let watcher = node.shared.group_watchers();
-                    targets.iter().all(|(&gid, &target)| {
-                        let hosts = routing
-                            .group_info(gid)
-                            .map(|info| info.members.contains(&nid) || info.learners.contains(&nid))
-                            .unwrap_or(false);
-                        if !hosts {
-                            return true;
-                        }
-                        watcher.get_or_create(gid).current() >= target
-                    })
-                })
-            };
-            if all_caught_up {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                // Falls through silently — the caller's own
-                // assertion will surface the specific row-level
-                // failure with a more useful error than
-                // "convergence timed out".
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
     }
 
     /// Cooperatively shut down every node. Reverse order so peers

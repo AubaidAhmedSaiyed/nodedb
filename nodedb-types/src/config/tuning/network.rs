@@ -170,12 +170,11 @@ pub struct ClusterTransportTuning {
     /// [`Self::election_timeout_min_ms`].
     #[serde(default)]
     pub election_timeout_max_ms: u64,
+    /// Timeout of one RPC round trip, and the QUIC idle timeout: a peer
+    /// silent this long is dead. Keep-alives go out at a fifth of it.
+    /// Startup refuses a value below 500 ms.
     #[serde(default = "default_rpc_timeout_secs")]
     pub rpc_timeout_secs: u64,
-    #[serde(default = "default_quic_keep_alive_secs")]
-    pub quic_keep_alive_secs: u64,
-    #[serde(default = "default_quic_idle_timeout_secs")]
-    pub quic_idle_timeout_secs: u64,
     #[serde(default = "default_quic_max_bi_streams")]
     pub quic_max_bi_streams: u32,
     #[serde(default = "default_quic_max_uni_streams")]
@@ -262,8 +261,6 @@ impl Default for ClusterTransportTuning {
             election_timeout_min_ms: 0,
             election_timeout_max_ms: 0,
             rpc_timeout_secs: default_rpc_timeout_secs(),
-            quic_keep_alive_secs: default_quic_keep_alive_secs(),
-            quic_idle_timeout_secs: default_quic_idle_timeout_secs(),
             quic_max_bi_streams: default_quic_max_bi_streams(),
             quic_max_uni_streams: default_quic_max_uni_streams(),
             quic_receive_window: default_quic_receive_window(),
@@ -308,12 +305,6 @@ fn default_election_timeout_max_secs() -> u64 {
 }
 fn default_rpc_timeout_secs() -> u64 {
     5
-}
-fn default_quic_keep_alive_secs() -> u64 {
-    5
-}
-fn default_quic_idle_timeout_secs() -> u64 {
-    30
 }
 fn default_quic_max_bi_streams() -> u32 {
     256

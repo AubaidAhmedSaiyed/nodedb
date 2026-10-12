@@ -15,9 +15,9 @@ use crate::wal::RedoStreamId;
 use nodedb_physical::physical_plan::document::MergeClauseOp;
 use nodedb_physical::physical_plan::{
     ColumnarInsertIntent, CrdtWriteVerb, KvCounterShape, UpdateValue, VectorDirectWriteIntent,
-    VectorResolvedMutation, VectorWriteTargets,
+    VectorResolvedMutation,
 };
-use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
+use nodedb_types::{PayloadIndexKind, Surrogate, VectorQuantization, VectorStorageDtype};
 
 #[derive(
     Debug,
@@ -874,36 +874,6 @@ pub enum ReplicatedWrite {
         response_payload: Vec<u8>,
     },
 
-    /// KV predicate `UPDATE` on a collection with NO write policy — the
-    /// predicate travels and every replica re-scans it against its own state.
-    /// A write-policy collection never reaches this shape.
-    KvPredicateUpdate {
-        collection: String,
-        /// Serialized `Vec<ScanFilter>`. Empty matches every row.
-        filters: Vec<u8>,
-        updates: Vec<(String, Vec<u8>)>,
-        /// See `ReplicatedWrite::PointPut::returning`.
-        #[serde(default)]
-        returning: Option<Vec<u8>>,
-        /// See `ReplicatedWrite::PointPut::rls_filters`.
-        #[serde(default)]
-        rls_filters: Vec<u8>,
-    },
-
-    /// KV predicate `DELETE` on a collection with NO write policy — see
-    /// [`ReplicatedWrite::KvPredicateUpdate`].
-    KvPredicateDelete {
-        collection: String,
-        /// Serialized `Vec<ScanFilter>`. Empty matches every row.
-        filters: Vec<u8>,
-        /// See `ReplicatedWrite::PointPut::returning`.
-        #[serde(default)]
-        returning: Option<Vec<u8>>,
-        /// See `ReplicatedWrite::PointPut::rls_filters`.
-        #[serde(default)]
-        rls_filters: Vec<u8>,
-    },
-
     /// Resolved form of a deferred document write (`PointUpdate`,
     /// `PointDelete`, `Upsert`, `BulkUpdate`, `BulkDelete`) on a write-policy
     /// collection: mutations and reply, already decided against the live
@@ -915,12 +885,12 @@ pub enum ReplicatedWrite {
         response_payload: Vec<u8>,
     },
 
-    /// Vector-primary `DELETE` on a collection with NO write policy — the
-    /// targets travel and every replica resolves them against its own state.
+    /// Vector-primary `DELETE` on a collection with NO write policy. It
+    /// names the rows it removes: a row predicate resolves on the proposer.
     VectorDirectDelete {
         collection: String,
         field: String,
-        targets: VectorWriteTargets,
+        rows: Vec<Surrogate>,
         /// See `ReplicatedWrite::PointPut::returning`.
         #[serde(default)]
         returning: Option<Vec<u8>>,
@@ -940,11 +910,11 @@ pub enum ReplicatedWrite {
     },
 
     /// Vector-primary `UPDATE` on a collection with NO write policy — see
-    /// [`ReplicatedWrite::VectorDirectDelete`].
+    /// [`ReplicatedWrite::VectorDirectDelete`]. The patch holds literals only.
     VectorDirectUpdate {
         collection: String,
         field: String,
-        targets: VectorWriteTargets,
+        rows: Vec<Surrogate>,
         new_vector: Option<Vec<f32>>,
         payload_patch: Vec<(String, UpdateValue)>,
         quantization: VectorQuantization,

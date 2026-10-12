@@ -19,7 +19,8 @@
 //!
 //! A `Full` answer comes from a live leader that holds the stream, so it
 //! keeps the stream alive. A stream with no answer from such a leader for
-//! the network deadline stops as lost.
+//! the stall window stops as lost. A stream also stops as lost at the
+//! statement's deadline: the statement no longer waits for its outcome.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -80,24 +81,37 @@ impl StreamEnd {
     }
 }
 
-/// Stream `stream` to `target`. `assigned` says the caller holds the
-/// header's assignment, so the leader has opened the stream.
+/// Stream `stream` to `target` until the statement's `deadline`.
+/// `assigned` says the caller holds the header's assignment, so the leader
+/// has opened the stream.
 pub(crate) async fn stream_parts(
     state: &SharedState,
     target: StreamTarget,
     stream: &PartStream,
     assigned: bool,
+    deadline: tokio::time::Instant,
 ) -> StreamEnd {
     if stream.parts.is_empty() {
         return StreamEnd::Done;
     }
-    let deadline = Duration::from_secs(state.tuning.network.default_deadline_secs.max(1));
+    let stall_window = stall_window(state);
     // no-determinism: coordinator-side liveness timer, never in the log.
-    let mut progress = StreamProgress::new(stream.parts.len(), assigned, deadline, Instant::now());
+    let mut progress = StreamProgress::new(
+        stream.parts.len(),
+        assigned,
+        stall_window,
+        deadline.into_std(),
+        Instant::now(),
+    );
     let mut backoff = FIRST_BACKOFF;
     loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return StreamEnd::Lost;
+        }
         let batch = batch_from(&stream.parts, progress.next);
-        let reply = match offer(state, target, stream.id, batch).await {
+        let read_timeout = stall_window.min(left);
+        let reply = match offer(state, target, stream.id, batch, read_timeout).await {
             Ok(reply) => reply,
             Err(error) => {
                 warn!(%error, "calvin part stream: offer failed; retrying");
@@ -136,6 +150,11 @@ enum Step {
     End(StreamEnd),
 }
 
+/// The longest a stream waits with no answer from a leader that holds it.
+fn stall_window(state: &SharedState) -> Duration {
+    Duration::from_secs(state.tuning.network.default_deadline_secs.max(1))
+}
+
 /// Where a stream stands, and when the leader last showed it alive.
 #[derive(Debug)]
 struct StreamProgress {
@@ -146,19 +165,28 @@ struct StreamProgress {
     taken_any: bool,
     /// Whether the caller holds the header's assignment.
     assigned: bool,
-    deadline: Duration,
+    stall_window: Duration,
+    /// The statement's deadline. The stream stops there.
+    ends_at: Instant,
     /// The last answer from a leader that holds the stream.
     last_alive: Instant,
 }
 
 impl StreamProgress {
-    fn new(total: usize, assigned: bool, deadline: Duration, now: Instant) -> Self {
+    fn new(
+        total: usize,
+        assigned: bool,
+        stall_window: Duration,
+        ends_at: Instant,
+        now: Instant,
+    ) -> Self {
         Self {
             total,
             next: 0,
             taken_any: false,
             assigned,
-            deadline,
+            stall_window,
+            ends_at,
             last_alive: now,
         }
     }
@@ -168,8 +196,9 @@ impl StreamProgress {
     /// An `Accepted` or `Full` answer comes from a leader that holds the
     /// stream, so it counts as liveness: a full queue drains as the leader
     /// proposes. Only an `Unknown` answer, or no answer, runs down the
-    /// deadline. A leader that stops proposing closes the stalled stream,
-    /// and its next answer is `Unknown`.
+    /// stall window. A leader that stops proposing closes the stalled
+    /// stream, and its next answer is `Unknown`. The statement's deadline
+    /// ends any stream that still owes parts.
     fn on_reply(&mut self, reply: &PartsOfferReply, now: Instant) -> Step {
         let owed = usize::try_from(reply.next_index).unwrap_or(usize::MAX);
         match reply.status {
@@ -196,7 +225,8 @@ impl StreamProgress {
         if reply.status == PartsOfferStatus::Accepted {
             return Step::Offer;
         }
-        if now.saturating_duration_since(self.last_alive) > self.deadline {
+        if now >= self.ends_at || now.saturating_duration_since(self.last_alive) > self.stall_window
+        {
             return Step::End(StreamEnd::Lost);
         }
         Step::Wait
@@ -231,6 +261,7 @@ async fn offer(
     target: StreamTarget,
     stream: PartStreamId,
     batch: Vec<StreamedPart>,
+    read_timeout: Duration,
 ) -> crate::Result<PartsOfferReply> {
     match target {
         StreamTarget::Local => {
@@ -246,7 +277,9 @@ async fn offer(
                 transport_error: false,
             })
         }
-        StreamTarget::Remote(leader) => offer_remote(state, leader, stream, batch).await,
+        StreamTarget::Remote(leader) => {
+            offer_remote(state, leader, stream, batch, read_timeout).await
+        }
     }
 }
 
@@ -255,6 +288,7 @@ async fn offer_remote(
     leader: u64,
     stream: PartStreamId,
     batch: Vec<StreamedPart>,
+    read_timeout: Duration,
 ) -> crate::Result<PartsOfferReply> {
     let transport = state
         .cluster_transport
@@ -270,7 +304,6 @@ async fn offer_remote(
         stream_seq: stream.seq,
         parts_bytes,
     });
-    let read_timeout = Duration::from_secs(state.tuning.network.default_deadline_secs.max(1));
     let reply = transport
         .send_rpc_with_read_timeout(leader, request, read_timeout)
         .await
@@ -338,15 +371,16 @@ mod tests {
         }
     }
 
-    /// A leader that holds the stream and answers `Full` past the deadline
-    /// keeps it alive: its queue drains as it proposes. Only no answer runs
-    /// the deadline down.
+    /// A leader that holds the stream and answers `Full` past the stall
+    /// window keeps it alive: its queue drains as it proposes. Only no answer
+    /// runs the stall window down.
     #[test]
-    fn full_answers_keep_a_stream_alive_past_the_deadline() {
-        let deadline = Duration::from_secs(1);
+    fn full_answers_keep_a_stream_alive_past_the_stall_window() {
+        let stall_window = Duration::from_secs(1);
         // no-determinism: test-only synthetic timeline.
         let start = Instant::now();
-        let mut progress = StreamProgress::new(4, true, deadline, start);
+        let ends_at = start + Duration::from_secs(3600);
+        let mut progress = StreamProgress::new(4, true, stall_window, ends_at, start);
         assert_eq!(
             progress.on_reply(&reply(PartsOfferStatus::Accepted, 1, false), start),
             Step::Offer
@@ -366,7 +400,7 @@ mod tests {
                 alive + Duration::from_millis(500)
             ),
             Step::Wait,
-            "one missed answer within the deadline waits"
+            "one missed answer within the stall window waits"
         );
         assert_eq!(
             progress.on_reply(
@@ -374,7 +408,29 @@ mod tests {
                 alive + Duration::from_secs(2)
             ),
             Step::End(StreamEnd::Lost),
-            "no answer for the deadline loses the stream"
+            "no answer for the stall window loses the stream"
+        );
+    }
+
+    /// A leader that keeps answering `Full` still loses the stream at the
+    /// statement's deadline: nobody waits for the outcome past it.
+    #[test]
+    fn the_statement_deadline_ends_a_live_stream() {
+        let stall_window = Duration::from_secs(10);
+        // no-determinism: test-only synthetic timeline.
+        let start = Instant::now();
+        let ends_at = start + Duration::from_secs(2);
+        let mut progress = StreamProgress::new(4, true, stall_window, ends_at, start);
+        assert_eq!(
+            progress.on_reply(
+                &reply(PartsOfferStatus::Full, 0, false),
+                start + Duration::from_secs(1)
+            ),
+            Step::Wait
+        );
+        assert_eq!(
+            progress.on_reply(&reply(PartsOfferStatus::Full, 0, false), ends_at),
+            Step::End(StreamEnd::Lost)
         );
     }
 }

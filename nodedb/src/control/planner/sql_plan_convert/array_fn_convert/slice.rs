@@ -10,6 +10,7 @@ use nodedb_array::types::ArrayId;
 use nodedb_array::types::domain::DomainBound;
 use nodedb_sql::temporal::TemporalScope;
 use nodedb_sql::types_array::ArraySliceAst;
+use nodedb_types::array_route::prefix_bucket;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::TenantId;
@@ -69,14 +70,14 @@ pub(crate) fn convert_slice(
         //
         // The coordinator fans out only to the shards that own a tile the
         // slice covers. An empty list fans out to every shard.
-        let slice_hilbert_ranges =
-            compute_slice_hilbert_ranges(&schema, &slice.dim_ranges, entry.prefix_bits);
+        let slice_tile_keys =
+            compute_slice_tile_keys(&schema, &slice.dim_ranges, entry.prefix_bits);
         PhysicalPlan::ClusterArray(ClusterArrayOp::Slice {
             array_id: aid,
             slice_msgpack,
             attr_projection: attr_indices,
             limit,
-            slice_hilbert_ranges,
+            slice_tile_keys,
             prefix_bits: entry.prefix_bits,
             system_time,
             valid_at_ms,
@@ -88,7 +89,7 @@ pub(crate) fn convert_slice(
             attr_projection: attr_indices,
             limit,
             cell_filter: None,
-            hilbert_range: None,
+            shard_bucket: None,
             system_time,
             valid_at_ms,
         })
@@ -108,8 +109,8 @@ pub(crate) fn convert_slice(
 /// tiles fans out to every shard.
 const MAX_FAN_OUT_TILES: u128 = 4096;
 
-/// The Hilbert ranges a slice's shard fan-out covers: one `(key, key)` pair
-/// per routing bucket, each holding the key of one tile in that bucket.
+/// The tile keys a slice's shard fan-out covers: one key per routing bucket
+/// (`prefix_bucket`), each the key of one tile in that bucket.
 ///
 /// Every tile whose cells can match the slice is enumerated, so every shard
 /// that holds such a cell, or will hold one a later write lands there, is
@@ -120,11 +121,11 @@ const MAX_FAN_OUT_TILES: u128 = 4096;
 /// Returns an empty vec, which fans out to every shard, when the slice
 /// covers more than [`MAX_FAN_OUT_TILES`] tiles, when the schema has no
 /// dimension, or when a tile key fails to encode.
-fn compute_slice_hilbert_ranges(
+fn compute_slice_tile_keys(
     schema: &ArraySchema,
     dim_ranges: &[Option<DimRange>],
     prefix_bits: u8,
-) -> Vec<(u64, u64)> {
+) -> Vec<u64> {
     if schema.dims.is_empty() || prefix_bits == 0 || prefix_bits > 16 {
         return Vec::new();
     }
@@ -145,19 +146,20 @@ fn compute_slice_hilbert_ranges(
         return Vec::new();
     }
 
-    let shift = 64 - u32::from(prefix_bits);
-    let mut buckets: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    let mut buckets: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
     let mut indices: Vec<u64> = spans.iter().map(|(lo, _)| *lo).collect();
     loop {
         let Ok(key) = tile_prefix(schema, &indices) else {
             return Vec::new();
         };
-        buckets.entry(key >> shift).or_insert(key);
+        buckets
+            .entry(prefix_bucket(key, prefix_bits))
+            .or_insert(key);
         // Advance the odometer over the per-dimension tile spans.
         let mut dim = 0;
         loop {
             if dim == indices.len() {
-                return buckets.into_values().map(|key| (key, key)).collect();
+                return buckets.into_values().collect();
             }
             if indices[dim] < spans[dim].1 {
                 indices[dim] += 1;
@@ -290,9 +292,9 @@ mod tests {
             Some(DimRange::new(DomainBound::Int64(0), DomainBound::Int64(2))),
             Some(DimRange::new(DomainBound::Int64(0), DomainBound::Int64(99))),
         ];
-        let ranges = compute_slice_hilbert_ranges(&schema, &box_ranges, 8);
-        assert!(!ranges.is_empty(), "a three-tile slice fans out by tile");
-        let fanned = nodedb_cluster::distributed_array::array_vshards_for_slice(&ranges, 8, 1024)
+        let keys = compute_slice_tile_keys(&schema, &box_ranges, 8);
+        assert!(!keys.is_empty(), "a three-tile slice fans out by tile");
+        let fanned = nodedb_cluster::distributed_array::array_vshards_for_slice(&keys, 8, 1024)
             .expect("fan-out");
         let mut owners = std::collections::BTreeSet::new();
         for chr in 0..=2 {
@@ -324,8 +326,8 @@ mod tests {
             .tile_extents(vec![1])
             .build()
             .expect("schema build");
-        assert!(compute_slice_hilbert_ranges(&wide, &[None], 8).is_empty());
-        assert!(!compute_slice_hilbert_ranges(&schema, &[None], 8).is_empty());
+        assert!(compute_slice_tile_keys(&wide, &[None], 8).is_empty());
+        assert!(!compute_slice_tile_keys(&schema, &[None], 8).is_empty());
     }
 
     #[test]

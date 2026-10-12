@@ -369,9 +369,9 @@ pub async fn run_commit(
                 // longer reach the overlay) cannot un-commit it, so it is
                 // surfaced at ERROR and the remaining vShards are still reaped
                 // rather than aborting a committed transaction. `drop_txn_overlay`
-                // already retries a transient remote failure a bounded number of
-                // times internally (see `retry_not_leader`); a drop that still
-                // fails after that budget strands a bounded, invisible (the
+                // already retries a transient remote failure until its cleanup
+                // deadline (see `retry_not_leader`); a drop that still fails
+                // after that budget strands a bounded, invisible (the
                 // `txn_id` is never reused) overlay on the unreachable former
                 // leader, cleared on that node's restart and visible meanwhile
                 // via `active_txn_overlays`.

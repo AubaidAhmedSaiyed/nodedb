@@ -13,8 +13,8 @@
 //! `TimeseriesIngest` opcode: a fresh column comes only from a raw ILP line
 //! (see `ts_native_ingest`). A parked apply holds every later entry of its
 //! group, so only A reaches the gates. B goes out once every replica's gate
-//! holds A, and C once every replica committed B, so the log orders them as
-//! sent:
+//! holds A, and C once every replica's log holds B's ingest committed, so the
+//! log orders them as sent:
 //!
 //! - A gives the new column `extra` a float.
 //! - B gives a new column `y` a float and names no `extra`.
@@ -40,12 +40,13 @@ use common::cluster_harness::{TestCluster, TestClusterNode, wait_for};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use nodedb::control::wal_replication::{ReplicatedEntry, ReplicatedWrite};
 use nodedb::event::cdc::consume::{ConsumeError, ConsumeParams, consume_local};
 use nodedb_test_support::fail_point::{FailAction, FailGuard};
 use nodedb_types::DatabaseId;
 
 use super::ts_native_ingest::{
-    ingest_native, ingest_until_accepted, native_session, rejection_warnings,
+    ingest_native_within, ingest_until_accepted, native_session, rejection_warnings,
 };
 
 const COLLECTION: &str = "ts_ring_drop";
@@ -116,6 +117,32 @@ fn group_commit_index(node: &TestClusterNode, group_id: u64) -> u64 {
         .into_iter()
         .find(|group| group.group_id == group_id)
         .map_or(0, |group| group.commit_index)
+}
+
+/// Whether `node`'s log for `group_id` holds a committed ingest into the
+/// collection above index `after`.
+///
+/// One ingest is in flight at a time, and every earlier one sits at or below
+/// `after`, so such an entry is the ingest just sent.
+fn committed_ingest_above(node: &TestClusterNode, group_id: u64, after: u64) -> bool {
+    let Some(multi_raft) = node.shared.multi_raft.get() else {
+        return false;
+    };
+    let mut multi_raft = multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(raft) = multi_raft.groups_mut().get(&group_id) else {
+        return false;
+    };
+    let collection = nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION);
+    (after + 1..=raft.commit_index())
+        .filter_map(|index| raft.log_entry_at(index))
+        .filter_map(|entry| ReplicatedEntry::from_bytes(&entry.data))
+        .any(|entry| {
+            matches!(
+                entry.write,
+                ReplicatedWrite::TimeseriesIngest { collection: ref written, .. }
+                    if written == collection.as_str()
+            )
+        })
 }
 
 /// The new values of the change events `node` serves.
@@ -199,8 +226,9 @@ async fn catch_up_after_an_apply_time_rejection_rebuilds_only_landed_rows() {
         format!("{COLLECTION} value=3.0,extra=\"text\" 4000000000"),
     ];
     // A parked apply holds every later entry of its group, so only A reaches
-    // the gates. B and C each go out once every replica committed the line
-    // before it.
+    // the gates. B and C each go out once every replica's log holds the line
+    // before it committed. Each statement waits without a bound while parked:
+    // its reply comes only after the release.
     let group_id = cluster.nodes[0]
         .group_id_for_collection(COLLECTION)
         .expect("the collection maps to a data group");
@@ -219,7 +247,7 @@ async fn catch_up_after_an_apply_time_rejection_rebuilds_only_landed_rows() {
             .collect();
         let mut session = native_session(node).await;
         sent.push(tokio::spawn(async move {
-            ingest_native(&mut session, 1, COLLECTION, &line).await
+            ingest_native_within(&mut session, 1, COLLECTION, &line, None).await
         }));
         if label == "A" {
             wait_for("every replica holds A's apply", CONVERGE, GATE_STEP, || {
@@ -236,7 +264,7 @@ async fn catch_up_after_an_apply_time_rejection_rebuilds_only_landed_rows() {
                         .nodes
                         .iter()
                         .zip(&committed_before)
-                        .all(|(node, before)| group_commit_index(node, group_id) > *before)
+                        .all(|(node, before)| committed_ingest_above(node, group_id, *before))
                 },
             )
             .await;
@@ -248,9 +276,20 @@ async fn catch_up_after_an_apply_time_rejection_rebuilds_only_landed_rows() {
     for gate in &gates {
         gate.release();
     }
+    // Every reply is due once the applies run, so the bound starts here.
+    let replied_by = tokio::time::Instant::now() + CONVERGE;
     let mut replies = Vec::new();
-    for statement in sent {
-        replies.push(statement.await.expect("statement task"));
+    for (label, statement) in ["A", "B", "C"].into_iter().zip(sent) {
+        let reply = tokio::time::timeout_at(replied_by, statement)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{label} got no reply within {CONVERGE:?} of the release; groups:\n{}",
+                    cluster.group_positions_report()
+                )
+            })
+            .expect("statement task");
+        replies.push(reply);
     }
 
     let deadline = Instant::now() + CONVERGE;

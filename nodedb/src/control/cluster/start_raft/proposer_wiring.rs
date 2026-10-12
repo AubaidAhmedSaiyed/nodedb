@@ -225,8 +225,8 @@ fn install_async_proposer(
     // Held weakly for the same cycle-breaking reason as `raft_proposer` above:
     // the proposer lives on `SharedState`.
     let state_for_proposer = Arc::downgrade(shared);
-    let async_submit: Arc<crate::control::wal_replication::AsyncRaftSubmit> =
-        Arc::new(move |vshard_id, idempotency_key, data, deadline| {
+    let async_submit: Arc<crate::control::wal_replication::AsyncRaftSubmit> = Arc::new(
+        move |vshard_id, idempotency_key, data, deadline| {
             let rl_weak = raft_loop_async.clone();
             let tk = tracker_for_proposer.clone();
             let state_weak = state_for_proposer.clone();
@@ -307,6 +307,7 @@ fn install_async_proposer(
                                 group_id,
                                 through: log_index,
                             }],
+                            crate::control::server::shared::session::StatementDeadline::of_statement(&state).instant(),
                         )
                         .await?;
                     }
@@ -320,7 +321,8 @@ fn install_async_proposer(
                     applied,
                 })
             })
-        });
+        },
+    );
     crate::control::vshard_admission::install_async_raft_proposer(shared, async_submit)
 }
 

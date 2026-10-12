@@ -123,6 +123,8 @@ pub(super) fn execution_error(context: &str, error: crate::Error) -> ClusterErro
         | crate::Error::GroupMarksUnavailable { .. }
         | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::MetadataGroupGone { .. }
+        | crate::Error::MetadataDdlSuperseded { .. }
         | crate::Error::AuthorizationStateBehind { .. }
         | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::ExecutionLimitExceeded { .. }

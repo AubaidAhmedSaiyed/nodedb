@@ -41,14 +41,15 @@ impl DomainContext for RaftEntryReapplied {
     }
 }
 
-/// The catalog refused a read or write of a vShard's stored dependent-read
-/// barrier log.
+/// The catalog refused a read or write of the stored dependent-read
+/// barrier logs.
 pub(in crate::diag) struct CalvinBarrierLogStoreFailed<'a> {
-    pub vshard_id: u32,
-    /// The txn's `(epoch, position)`. A removal of every row of the vShard
+    /// The vShard. A persist of every vShard's rows names none.
+    pub vshard_id: Option<u32>,
+    /// The txn's `(epoch, position)`. An operation on every row of a vShard
     /// names none.
     pub txn: Option<(u64, u32)>,
-    /// What the store did: `save`, `load` or `remove`.
+    /// What the store did: `save`, `load`, `remove`, `forget` or `persist`.
     pub op: &'static str,
     pub error_class: &'a str,
 }
@@ -59,11 +60,12 @@ impl DomainContext for CalvinBarrierLogStoreFailed<'_> {
     }
 
     fn grouping_key(&self) -> String {
-        // One report per vShard and operation: the txn changes per event.
-        format!(
-            "calvin_barrier_log_store_failed:{}:{}",
-            self.op, self.vshard_id
-        )
+        // One report per vShard and operation: the txn changes per event,
+        // and a retry loop repeats the same pair.
+        match self.vshard_id {
+            Some(vshard_id) => format!("calvin_barrier_log_store_failed:{}:{vshard_id}", self.op),
+            None => format!("calvin_barrier_log_store_failed:{}:all", self.op),
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -77,6 +79,15 @@ impl DomainContext for CalvinBarrierLogStoreFailed<'_> {
                 "the scheduler keeps the txn's barrier open and reads the row \
                        again on its next pass"
             }
+            "forget" => {
+                "the rows of a vShard this node left stay stored. Every scheduler \
+                       reconcile pass removes them again until one succeeds"
+            }
+            "persist" => {
+                "the saved barrier rows are not durable yet. No applied floor moves \
+                       this pass, so a restart delivers their entries again. The next \
+                       settle pass persists again"
+            }
             _ => {
                 "the row of a finished txn stays stored. The scheduler's next \
                   stall-tick sweep removes it"
@@ -88,6 +99,37 @@ impl DomainContext for CalvinBarrierLogStoreFailed<'_> {
             "op": self.op,
             "error_class": self.error_class,
             "effect": effect,
+            "operator_action": "check the system catalog's disk: free space, I/O errors, \
+                                and the redb file's permissions",
+        })
+    }
+}
+
+/// The catalog refused the forget of the stored Calvin state of vShards
+/// this node left: their applied positions and bases.
+pub(in crate::diag) struct CalvinLeftStateNotForgotten<'a> {
+    pub vshards: &'a [u32],
+    pub error_class: &'a str,
+}
+
+impl DomainContext for CalvinLeftStateNotForgotten<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.calvin_left_state_not_forgotten"
+    }
+
+    fn grouping_key(&self) -> String {
+        // One root cause: the catalog refuses the write. The vShards are the
+        // occurrence, and a retry loop repeats them.
+        "calvin_left_state_not_forgotten".to_string()
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "vshards": self.vshards,
+            "error_class": self.error_class,
+            "effect": "the applied positions and base of a vShard this node left stay \
+                       stored. Every scheduler reconcile pass forgets them again until one \
+                       succeeds",
             "operator_action": "check the system catalog's disk: free space, I/O errors, \
                                 and the redb file's permissions",
         })

@@ -22,25 +22,20 @@ pub struct ArrayShardSliceReq {
     /// Optional surrogate pre-filter bitmap bytes (zerompk encoding of `SurrogateBitmap`).
     /// Empty slice means no filter.
     pub cell_filter_msgpack: Vec<u8>,
-    /// Prefix bits used for Hilbert routing (1–16). 0 means no routing validation.
+    /// The array's routing granularity (1–16). 0 skips routing validation.
     ///
-    /// When non-zero the shard verifies that its `local_vshard_id` is covered
-    /// by the Hilbert ranges in `slice_hilbert_ranges` before executing the
-    /// scan. A mismatch returns `ClusterError::WrongOwner` so the coordinator
-    /// can retry against a refreshed routing table.
+    /// When non-zero the shard checks that some key in `slice_tile_keys`
+    /// routes to its `local_vshard_id`. A mismatch returns
+    /// `ClusterError::WrongOwner`, so the coordinator retries against a
+    /// refreshed routing table.
     pub prefix_bits: u8,
-    /// Inclusive Hilbert-prefix ranges `(lo, hi)` that this slice covers,
-    /// pre-computed by the coordinator from the slice predicate. Each entry
-    /// is encoded as two consecutive `u64` values (little-endian). Empty
-    /// means unbounded (no routing validation is performed).
-    pub slice_hilbert_ranges: Vec<(u64, u64)>,
-    /// Hilbert-prefix range `[lo, hi]` that this shard owns. The shard
-    /// applies this as a pre-filter so it only returns cells whose Hilbert
-    /// prefix falls within the range. `None` means unbounded (return all
-    /// matching cells). Used by the distributed shard handler to prevent
-    /// duplicate rows in single-node harnesses where all vShards share one
-    /// Data Plane.
-    pub shard_hilbert_range: Option<(u64, u64)>,
+    /// Tile keys covering the slice, at least one per bucket it touches,
+    /// computed by the planner. Empty means unbounded and skips validation.
+    pub slice_tile_keys: Vec<u64>,
+    /// The bucket this shard owns. The shard returns only cells whose tile
+    /// key falls in it, so vShards that share one Data Plane return no
+    /// duplicate rows. `None` returns every matching cell.
+    pub shard_bucket: Option<nodedb_types::ShardBucket>,
     /// Bitemporal system-time scope forwarded from `ArrayOp::Slice::system_time`.
     ///
     /// - `Current` = live read.
@@ -91,10 +86,9 @@ pub struct ArrayShardAggReq {
     pub group_by_dim: i32,
     /// Optional surrogate pre-filter; empty = all cells.
     pub cell_filter_msgpack: Vec<u8>,
-    /// Hilbert-prefix range `[lo, hi]` that this shard owns. The shard
-    /// applies this as a pre-filter so it only counts cells whose Hilbert
-    /// prefix falls within the range. `None` means unbounded (scan all).
-    pub shard_hilbert_range: Option<(u64, u64)>,
+    /// The bucket this shard owns. The shard counts only cells whose tile
+    /// key falls in it. `None` counts every cell.
+    pub shard_bucket: Option<nodedb_types::ShardBucket>,
     /// Bitemporal system-time cutoff forwarded from `ArrayOp::Aggregate::system_as_of`.
     /// `None` = live read.
     pub system_as_of: Option<i64>,
@@ -131,16 +125,15 @@ pub struct ArrayShardAggResp {
 ///
 /// `cells_msgpack` is a zerompk encoding of
 /// `Vec<nodedb::engine::array::wal::ArrayPutCell>`.
-/// All cells in this batch belong to the same Hilbert-prefix bucket.
+/// All cells in this batch route to the same bucket (`prefix_bucket` of the tile key).
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct ArrayShardPutReq {
     pub array_id_msgpack: Vec<u8>,
     pub cells_msgpack: Vec<u8>,
     pub wal_lsn: u64,
-    /// Hilbert prefix of any representative cell in this batch (used by
-    /// the shard handler to validate routing). Set to 0 when routing
-    /// metadata is unavailable (pre-routing clients).
-    pub representative_hilbert_prefix: u64,
+    /// Tile key of any cell in this batch. The shard handler routes it to
+    /// check that it owns the batch.
+    pub representative_tile_key: u64,
     /// Prefix bits used for routing (1–16). 0 means no validation.
     pub prefix_bits: u8,
 }
@@ -165,11 +158,10 @@ pub struct ArrayShardDeleteReq {
     pub array_id_msgpack: Vec<u8>,
     pub coords_msgpack: Vec<u8>,
     pub wal_lsn: u64,
-    /// Hilbert prefix of any representative coord in this batch. Used by the
-    /// shard handler to validate that it still owns the target Hilbert bucket.
-    /// Set to 0 when routing metadata is unavailable.
-    pub representative_hilbert_prefix: u64,
-    /// Prefix bits used for Hilbert routing (1–16). 0 means no validation.
+    /// Tile key of any coord in this batch. The shard handler routes it to
+    /// check that it still owns the batch's bucket.
+    pub representative_tile_key: u64,
+    /// Prefix bits used for routing (1–16). 0 means no validation.
     pub prefix_bits: u8,
 }
 

@@ -122,6 +122,8 @@ impl LocalPlanExecutor {
         ),
         TypedClusterError,
     > {
+        #[cfg(feature = "failpoints")]
+        crate::control::fail_gate::before_execute(self.state.node_id).await;
         let (deadline, database_id) = validate_request(&self.state, req)?;
         let plan = decode_plan(&self.state, database_id, req.tenant_id, &req.plan_bytes)?;
         // A backup's snapshot plan takes the backup's cut on this node first.

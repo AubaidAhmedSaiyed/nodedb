@@ -25,6 +25,7 @@ use nodedb_physical::physical_plan::CutCaptureRequest;
 
 use crate::control::state::SharedState;
 use crate::control::wal_replication::ReplicatedWrite;
+use crate::types::CoveredCutBarrier;
 
 /// The clock skew between two nodes a cut's window tolerates.
 const CLOCK_SKEW_MARGIN: Duration = Duration::from_secs(30);
@@ -91,6 +92,25 @@ impl OrderedCut {
             hlc: self.hlc,
             restore_point: self.restore_point,
             capture: self.capture.clone(),
+        }
+    }
+
+    /// This cut's barrier at `log_index`, as a data-group snapshot carries it.
+    pub fn covered_at(&self, log_index: u64) -> CoveredCutBarrier {
+        CoveredCutBarrier {
+            hlc: self.hlc,
+            restore_point: self.restore_point,
+            capture: self.capture.clone(),
+            log_index,
+        }
+    }
+
+    /// The cut a data-group snapshot's `barrier` names.
+    pub fn from_covered(barrier: &CoveredCutBarrier) -> Self {
+        Self {
+            hlc: barrier.hlc,
+            restore_point: barrier.restore_point,
+            capture: barrier.capture.clone(),
         }
     }
 }
@@ -163,6 +183,22 @@ mod tests {
         };
         assert_eq!(plain.key().capture, 0);
         assert_ne!(plain.key(), cut.key(), "the capture keeps two cuts apart");
+    }
+
+    #[test]
+    fn a_cut_round_trips_through_a_snapshot() {
+        let cut = OrderedCut {
+            hlc: 7,
+            restore_point: 3,
+            capture: Some(CutCaptureRequest {
+                request_id: 11,
+                database_id: 2,
+                tenants: vec![1],
+            }),
+        };
+        let covered = cut.covered_at(40);
+        assert_eq!(covered.log_index, 40);
+        assert_eq!(OrderedCut::from_covered(&covered), cut);
     }
 
     #[test]

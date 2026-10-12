@@ -50,6 +50,18 @@ impl SystemCatalog {
         barrier: StoredBarrier,
         durable_applied: u64,
     ) -> crate::Result<()> {
+        self.put_cut_floors(group_id, &[barrier], durable_applied)
+    }
+
+    /// Record every barrier of `barriers` group `group_id` holds, in one
+    /// write. The barriers at or below `durable_applied` fold as in
+    /// [`Self::put_cut_floor`].
+    pub fn put_cut_floors(
+        &self,
+        group_id: u64,
+        barriers: &[StoredBarrier],
+        durable_applied: u64,
+    ) -> crate::Result<()> {
         crate::fail_point_err!("cut_floor::before_persist", |detail: String| {
             crate::Error::Internal {
                 detail: format!("fail point: {detail}"),
@@ -70,8 +82,10 @@ impl SystemCatalog {
                 Some(bytes) => decode(bytes.value())?,
                 None => StoredFloors::default(),
             };
-            floors.barriers.retain(|held| held.index != barrier.index);
-            floors.barriers.push(barrier);
+            for barrier in barriers {
+                floors.barriers.retain(|held| held.index != barrier.index);
+                floors.barriers.push(*barrier);
+            }
             floors.barriers.sort_by_key(|held| held.index);
             let settled = floors
                 .barriers
@@ -103,6 +117,26 @@ impl SystemCatalog {
                 .map_err(|e| catalog_err("insert cut floors", e))?;
         }
         txn.commit().map_err(|e| catalog_err("cut floor commit", e))
+    }
+
+    /// Every recorded barrier of `group_id`, in index order.
+    pub fn group_cut_floors(&self, group_id: u64) -> crate::Result<Vec<StoredBarrier>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("cut floor read txn", e))?;
+        let table = match txn.open_table(CUT_FLOORS) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(catalog_err("open cut floors", e)),
+        };
+        match table
+            .get(group_id)
+            .map_err(|e| catalog_err("get cut floors", e))?
+        {
+            Some(bytes) => Ok(decode(bytes.value())?.barriers),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Every recorded barrier, as `(group_id, barrier)`.
@@ -168,6 +202,29 @@ mod tests {
                 (3, barrier(30, 300)),
                 (4, barrier(7, 70))
             ]
+        );
+    }
+
+    #[test]
+    fn a_group_takes_several_barriers_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SystemCatalog::open(&dir.path().join("system.redb")).unwrap();
+        assert!(catalog.group_cut_floors(3).unwrap().is_empty());
+        catalog.put_cut_floor(3, barrier(40, 400), 0).unwrap();
+        catalog
+            .put_cut_floors(3, &[barrier(20, 200), barrier(10, 100)], 0)
+            .unwrap();
+        catalog.put_cut_floor(4, barrier(7, 70), 0).unwrap();
+        assert_eq!(
+            catalog.group_cut_floors(3).unwrap(),
+            [barrier(10, 100), barrier(20, 200), barrier(40, 400)]
+        );
+
+        // Durable through 25 folds the two barriers below it.
+        catalog.put_cut_floors(3, &[barrier(10, 100)], 25).unwrap();
+        assert_eq!(
+            catalog.group_cut_floors(3).unwrap(),
+            [barrier(20, 200), barrier(40, 400)]
         );
     }
 }

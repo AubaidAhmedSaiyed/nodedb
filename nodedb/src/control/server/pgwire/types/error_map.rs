@@ -411,7 +411,8 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         // Class `XX` is never treated as transient, so no client re-proposes
         // a write that can have committed.
         crate::Error::CommittedResultUnavailable { .. }
-        | crate::Error::ProposalOutcomeUnknown { .. } => {
+        | crate::Error::ProposalOutcomeUnknown { .. }
+        | crate::Error::MetadataGroupGone { .. } => {
             ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string())
         }
         // Server-side faults and system defects. The client can act on none
@@ -419,6 +420,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::MaterializedSumResolutionMissing { .. }
         | crate::Error::RetryableLeaderChange { .. }
         | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::MetadataDdlSuperseded { .. }
         | crate::Error::Wal(_)
         | crate::Error::Dispatch { .. }
         | crate::Error::Storage { .. }

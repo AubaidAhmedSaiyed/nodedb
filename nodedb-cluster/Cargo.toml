@@ -19,8 +19,9 @@ default = []
 # `faultbox::init`; a no-op on wasm32 regardless. Off by default so the crate
 # stays dependency-light for embedders that report failures their own way.
 diagnostics = ["dep:faultbox"]
-# Arms the Raft fail gates cluster tests use. Off by default.
-failpoints = ["nodedb-raft/failpoints"]
+# Arms the Raft fail gates and the transport blackhole cluster tests use.
+# Off by default.
+failpoints = ["nodedb-raft/failpoints", "nodedb-types/failpoints"]
 
 [dependencies]
 # Workspace crates

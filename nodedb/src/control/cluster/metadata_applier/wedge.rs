@@ -132,6 +132,8 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::GroupMarksUnavailable { .. }
         | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::MetadataGroupGone { .. }
+        | crate::Error::MetadataDdlSuperseded { .. }
         | crate::Error::AuthorizationStateBehind { .. }
         | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::ExecutionLimitExceeded { .. }

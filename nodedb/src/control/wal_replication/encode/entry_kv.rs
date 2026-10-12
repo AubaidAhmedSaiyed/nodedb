@@ -13,8 +13,8 @@ use super::kv::{WirePut, WireReturning};
 use nodedb_physical::physical_plan::KvOp;
 
 /// Encode a `KvOp` write variant, `Ok(None)` when not a single-shard replicated
-/// write, or an error when it can't replicate safely. `PredicateUpdate`/
-/// `PredicateDelete` refuse on `rls_write_check.has_predicate()`.
+/// write, or an error when it can't replicate safely. `PredicateUpdate` /
+/// `PredicateDelete` always refuse: they resolve to a mutation list first.
 pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
     Ok(Some(match op {
         KvOp::Put {
@@ -304,43 +304,10 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             rls_write_check: _,
         } => kv::resolved_write(mutations, response_payload),
 
-        // With no write policy, each replica re-scans the predicate — deterministic
-        // replay. A restricting policy refuses; see `refuse_governed_predicate_dml`.
-        KvOp::PredicateUpdate {
-            collection,
-            filters,
-            updates,
-            rls_write_check,
-            returning,
-            rls_filters,
-        } => {
-            refuse_governed_predicate_dml(collection.as_str(), rls_write_check)?;
-            kv::predicate_update(
-                collection.as_str(),
-                filters,
-                updates,
-                WireReturning {
-                    returning,
-                    rls_filters,
-                },
-            )
-        }
-        KvOp::PredicateDelete {
-            collection,
-            filters,
-            rls_write_check,
-            returning,
-            rls_filters,
-        } => {
-            refuse_governed_predicate_dml(collection.as_str(), rls_write_check)?;
-            kv::predicate_delete(
-                collection.as_str(),
-                filters,
-                WireReturning {
-                    returning,
-                    rls_filters,
-                },
-            )
+        // A row set a replica scans for itself depends on its clock (TTL
+        // expiry), so a predicate write resolves to rows first.
+        KvOp::PredicateUpdate { collection, .. } | KvOp::PredicateDelete { collection, .. } => {
+            return Err(refuse_predicate_dml(collection.as_str()));
         }
 
         // Not a write — reads/scans/sorted-index queries. `ResolveWrite` mutates
@@ -364,19 +331,12 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
 /// Refuse a KV predicate UPDATE/DELETE on a governed collection: a follower has
 /// no writing identity to evaluate the predicate. Must resolve to
 /// `KvOp::ResolvedWrite` before proposing.
-fn refuse_governed_predicate_dml(
-    collection: &str,
-    rls_write_check: &nodedb_types::RlsWriteCheck,
-) -> crate::Result<()> {
-    if rls_write_check.has_predicate() {
-        return Err(crate::Error::PlanError {
-            detail: format!(
-                "kv predicate UPDATE/DELETE on '{collection}' cannot be replicated as a \
-                 predicate because it carries an RLS write policy: a follower has no writing \
-                 identity to evaluate the predicate against. It must be resolved to a concrete \
-                 mutation list before it is proposed."
-            ),
-        });
+fn refuse_predicate_dml(collection: &str) -> crate::Error {
+    crate::Error::Internal {
+        detail: format!(
+            "internal invariant break: a kv predicate UPDATE/DELETE on '{collection}' reached \
+             the Raft propose path unresolved; write_resolve resolves it to a mutation list \
+             first"
+        ),
     }
-    Ok(())
 }

@@ -233,6 +233,40 @@ mod tests {
         assert!(!scheduler.release_cut_holds(), "nothing left to end");
     }
 
+    /// A scheduler holding for a cut whose barrier a snapshot install carried
+    /// is woken by the install and releases its hold at once.
+    #[tokio::test]
+    async fn an_installed_barrier_ends_the_hold() {
+        use futures::FutureExt;
+
+        let (mut scheduler, _dir) = build_test_scheduler(test_coll_vshard());
+        let cut = fresh_cut(&scheduler);
+        scheduler.process_scheduler_input(marker(&cut));
+        assert!(scheduler.held_for_cut(0));
+        let group_id = scheduler
+            .data_group()
+            .expect("the fixture routes every vShard");
+        assert!(!scheduler.release_cut_holds());
+
+        let shared = Arc::clone(&scheduler.shared);
+        let woken = shared.calvin.cut_barriers.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        crate::control::cluster::calvin_snapshot::cut_barriers::install_cut_barriers(
+            &shared,
+            group_id,
+            &[cut.covered_at(12)],
+            &[],
+        )
+        .expect("the install records the barrier");
+        assert!(
+            woken.now_or_never().is_some(),
+            "the install wakes the run loop"
+        );
+        assert!(scheduler.release_cut_holds());
+        assert!(!scheduler.held_for_cut(0));
+    }
+
     /// A second copy of the marker keeps the first copy's place, and a copy
     /// of a cut whose barrier applied holds nothing for long.
     #[tokio::test]

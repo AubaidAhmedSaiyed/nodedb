@@ -7,14 +7,13 @@
 //! refused configuration as a successful statement. Index DDL routes its
 //! engine registration through here so the refusal always reaches the client.
 
-use std::time::Duration;
-
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan};
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
 use super::result::DdlError;
-use super::sync_dispatch::{SystemReason, SystemTask, dispatch_system};
+use super::sync_dispatch::{SystemReason, SystemTask, dispatch_system_by};
 
 /// Dispatch `plan` for `collection` and translate any Data-Plane refusal into
 /// a [`DdlError`] with `context` before its message.
@@ -29,8 +28,7 @@ pub(crate) async fn apply_in_engine(
     plan: PhysicalPlan,
     context: &str,
 ) -> Result<(), DdlError> {
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    dispatch_system(
+    dispatch_system_by(
         state,
         SystemTask::new(
             SystemReason::DdlApply,
@@ -38,7 +36,7 @@ pub(crate) async fn apply_in_engine(
             nodedb_types::CollectionKey::from_bare(database_id, collection),
             plan,
         ),
-        timeout,
+        StatementDeadline::of_statement(state),
     )
     .await
     .map(|_| ())
@@ -63,7 +61,6 @@ pub(crate) async fn refuse_materialized_vector_index(
     field_name: &str,
     context: &str,
 ) -> Result<(), DdlError> {
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     let plan = PhysicalPlan::Vector(nodedb_physical::physical_plan::VectorOp::QueryStats {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         field_name: field_name.to_string(),
@@ -76,7 +73,7 @@ pub(crate) async fn refuse_materialized_vector_index(
             nodedb_types::CollectionKey::from_bare(database_id, collection),
             plan,
         ),
-        timeout,
+        StatementDeadline::of_statement(state),
         crate::event::EventSource::User,
     )
     .await

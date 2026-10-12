@@ -52,16 +52,9 @@ pub(crate) async fn settled_cut(
     let watcher = shared.applied_index_watcher(group_id);
     let cut = cut_of(tracker.started_through(group_id), watcher.current());
     if watcher.current() < cut {
-        let waiting = std::sync::Arc::clone(&watcher);
-        let outcome =
-            tokio::task::spawn_blocking(move || waiting.wait_for(cut, CUT_SETTLE_TIMEOUT))
-                .await
-                .map_err(|e| Error::Internal {
-                    detail: format!(
-                        "snapshot build: group {group_id}: the settle wait for cut {cut} \
-                         did not finish: {e}"
-                    ),
-                })?;
+        let outcome = watcher
+            .wait_for_async(cut, std::time::Instant::now() + CUT_SETTLE_TIMEOUT)
+            .await;
         match outcome {
             WaitOutcome::Reached => {}
             WaitOutcome::TimedOut | WaitOutcome::GroupGone => {

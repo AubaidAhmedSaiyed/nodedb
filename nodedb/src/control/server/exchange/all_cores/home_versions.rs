@@ -22,7 +22,7 @@ use nodedb_physical::physical_plan::{
 };
 
 use crate::control::cluster::leased_read::{LeaseRefusal, confirm_leased_read};
-use crate::control::cluster::linearizable_read::statement_read_deadline;
+use crate::control::cluster::linearizable_read::StatementDeadline;
 use crate::control::server::exchange::owning_core::dispatch_single_owning_core;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
@@ -49,7 +49,7 @@ pub(super) async fn fan_home_versions(
     groups.sort_unstable();
     groups.dedup();
     let refusals: HashMap<u64, LeaseRefusal> =
-        confirm_leased_read(state, &groups, statement_read_deadline(state))
+        confirm_leased_read(state, &groups, StatementDeadline::of_statement(state))
             .await?
             .into_iter()
             .map(|refusal| (refusal.group_id, refusal))

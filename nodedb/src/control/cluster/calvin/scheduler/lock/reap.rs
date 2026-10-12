@@ -62,7 +62,8 @@ impl LockManager {
             keys.iter().all(|key| {
                 self.table
                     .get(key)
-                    .is_none_or(|e| !e.holders.contains(&owner) || e.mode == LockMode::Shared)
+                    .and_then(|e| e.mode_of(owner))
+                    .is_none_or(|mode| mode == LockMode::Shared)
             })
         });
         let waits_shared = self
@@ -128,7 +129,7 @@ mod tests {
         let promoted = lm.reap_expired_shared(50);
         assert!(promoted.is_empty());
         assert_eq!(lm.lock_count(), 1, "still within the lease, not reaped");
-        assert!(lm.table.get(&key("k")).unwrap().holders.contains(&r));
+        assert!(lm.table.get(&key("k")).unwrap().holds(r));
     }
 
     #[test]
@@ -144,7 +145,7 @@ mod tests {
             1,
             "a real txn's exclusive lock is never reaped"
         );
-        assert!(lm.table.get(&key("k")).unwrap().holders.contains(&t));
+        assert!(lm.table.get(&key("k")).unwrap().holds(t));
     }
 
     #[test]
@@ -164,7 +165,7 @@ mod tests {
             "mid-commit reservation is left alone"
         );
         assert_eq!(entry.holders.len(), 1);
-        assert_eq!(entry.holders[0], r);
+        assert_eq!(entry.holder_ids()[0], r);
     }
 
     #[test]
@@ -196,7 +197,7 @@ mod tests {
         let entry = lm.table.get(&key("k")).unwrap();
         assert_eq!(entry.mode, LockMode::Exclusive);
         assert_eq!(entry.holders.len(), 1);
-        assert_eq!(entry.holders[0], writer);
+        assert_eq!(entry.holder_ids()[0], writer);
     }
 
     #[test]

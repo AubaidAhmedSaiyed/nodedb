@@ -22,4 +22,6 @@ pub use snapshot::{
     ArrayCellsBlob, SurrogateBindEntry, TenantDataSnapshot, TsFlushedCollectionBlob,
     TsFlushedPartitionBlob,
 };
-pub use snapshot_calvin::{CutBarrierLog, GroupCalvinCut, VShardCalvinState};
+pub use snapshot_calvin::{
+    CoveredCutBarrier, CutBarrierLog, CutFloor, GroupCalvinCut, VShardCalvinState,
+};

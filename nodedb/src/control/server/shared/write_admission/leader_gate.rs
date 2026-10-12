@@ -280,8 +280,6 @@ fn entry_scope(write: &ReplicatedWrite, database_id: crate::types::DatabaseId) -
         | ReplicatedWrite::ColumnarTruncate { .. }
         | ReplicatedWrite::TimeseriesTruncate { .. }
         | ReplicatedWrite::KvResolvedWrite { .. }
-        | ReplicatedWrite::KvPredicateUpdate { .. }
-        | ReplicatedWrite::KvPredicateDelete { .. }
         | ReplicatedWrite::DocumentResolvedWrite { .. }
         | ReplicatedWrite::VectorDirectDelete { .. }
         | ReplicatedWrite::VectorDirectTruncate { .. }

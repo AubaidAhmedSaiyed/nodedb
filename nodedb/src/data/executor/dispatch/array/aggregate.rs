@@ -15,7 +15,8 @@ use nodedb_array::segment::TilePayload;
 use nodedb_array::types::ArrayId;
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
-use nodedb_types::SurrogateBitmap;
+use nodedb_types::array_route::shard_bucket_admits;
+use nodedb_types::{ShardBucket, SurrogateBitmap};
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -37,8 +38,8 @@ pub(in crate::data::executor) struct AggParams<'a> {
     pub group_by_dim_idx: i32,
     pub cell_filter: Option<&'a SurrogateBitmap>,
     pub return_partial: bool,
-    /// Optional Hilbert-prefix range `[lo, hi]` for shard-level partitioning.
-    pub hilbert_range: Option<(u64, u64)>,
+    /// Optional shard bucket. Only tiles whose key routes to it contribute.
+    pub shard_bucket: Option<ShardBucket>,
     /// Bitemporal system-time cutoff. `None` = live read.
     pub system_as_of: Option<i64>,
     /// Bitemporal valid-time point. `None` = no valid-time filter.
@@ -49,7 +50,7 @@ pub(in crate::data::executor) struct AggParams<'a> {
 struct AggTileScan<'a> {
     array_id: &'a ArrayId,
     schema: &'a ArraySchema,
-    hilbert_range: Option<(u64, u64)>,
+    shard_bucket: Option<ShardBucket>,
     system_as_of: Option<i64>,
     valid_at_ms: Option<i64>,
     /// The transaction whose staged cells merge into the scan, or `None`
@@ -78,13 +79,6 @@ struct AggEmit<'a> {
     emit_horizon: bool,
 }
 
-fn hilbert_prefix_in_range(hp: u64, range: Option<(u64, u64)>) -> bool {
-    match range {
-        Some((lo, hi)) => hp >= lo && hp <= hi,
-        None => true,
-    }
-}
-
 impl CoreLoop {
     pub(in crate::data::executor) fn dispatch_array_aggregate(
         &mut self,
@@ -98,7 +92,7 @@ impl CoreLoop {
             group_by_dim_idx,
             cell_filter,
             return_partial,
-            hilbert_range,
+            shard_bucket,
             system_as_of,
             valid_at_ms,
         } = p;
@@ -126,7 +120,7 @@ impl CoreLoop {
         // shard's result, for the finalizing single-node read and for the
         // distributed partial alike. Each shard's overlay holds only the
         // cells partitioned to that shard, and `collect_agg_tiles` applies
-        // the shard's `hilbert_range` to overlay tiles as to base tiles, so
+        // the shard's `shard_bucket` to overlay tiles as to base tiles, so
         // folding them into the shard's partial counts every staged cell
         // exactly once at the coordinator's merge. `AS OF SYSTEM TIME` is a
         // snapshot of committed history and skips the overlay.
@@ -138,7 +132,7 @@ impl CoreLoop {
         let (all_tiles, truncated_before_horizon) = match self.collect_agg_tiles(AggTileScan {
             array_id,
             schema: &schema,
-            hilbert_range,
+            shard_bucket,
             system_as_of,
             valid_at_ms,
             overlay_txn,
@@ -172,7 +166,7 @@ impl CoreLoop {
     /// double-count any cell overwritten across segments in a bitemporal array
     /// (e.g. v1 in one sealed segment, v2 in another). `system_as_of`/
     /// `valid_at_ms` narrow the cutoff for point-in-time queries; the same
-    /// `hilbert_range` shard filter applies in all cases.
+    /// `shard_bucket` filter applies in all cases.
     ///
     /// Returns an error *detail* string (wrapped into `ErrorCode::Internal` by
     /// the caller) rather than a `Response`, so it can borrow `&self` cleanly.
@@ -180,7 +174,7 @@ impl CoreLoop {
         let AggTileScan {
             array_id,
             schema,
-            hilbert_range,
+            shard_bucket,
             system_as_of,
             valid_at_ms,
             overlay_txn,
@@ -194,7 +188,7 @@ impl CoreLoop {
             .scan_tiles_at(cutoff, valid_at_ms)
             .map_err(|e| format!("array aggregate scan: {e}"))?;
         // Staged cells join the SAME tile set the base cells reduce through,
-        // ahead of the shard-range filter, so they fold into the same partial
+        // ahead of the shard bucket filter, so they fold into the same partial
         // accumulator under the same surrogate filter.
         self.merge_array_overlay_tiles(
             ArrayOverlayMergeParams {
@@ -208,7 +202,7 @@ impl CoreLoop {
         .map_err(|e| format!("array aggregate overlay merge: {e}"))?;
         let tiles = resolved_tiles
             .into_iter()
-            .filter(|(hp, _)| hilbert_prefix_in_range(*hp, hilbert_range))
+            .filter(|(hp, _)| shard_bucket_admits(shard_bucket, *hp))
             .map(|(_, tile)| TilePayload::Sparse(tile))
             .collect();
         Ok((tiles, truncated_before_horizon))
@@ -553,7 +547,7 @@ mod tests {
             group_by_dim: -1,
             cell_filter: None,
             return_partial: false,
-            hilbert_range: None,
+            shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
         });
@@ -587,7 +581,7 @@ mod tests {
             group_by_dim: -1,
             cell_filter: None,
             return_partial: true,
-            hilbert_range: None,
+            shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
         });
@@ -640,7 +634,7 @@ mod tests {
             group_by_dim: -1,
             cell_filter: None,
             return_partial: false,
-            hilbert_range: None,
+            shard_bucket: None,
             system_as_of: Some(150),
             valid_at_ms: None,
         });
@@ -672,7 +666,7 @@ mod tests {
             group_by_dim: -1,
             cell_filter: None,
             return_partial: false,
-            hilbert_range: None,
+            shard_bucket: None,
             system_as_of: Some(50),
             valid_at_ms: None,
         });
@@ -707,7 +701,7 @@ mod tests {
             group_by_dim: 0,
             cell_filter: None,
             return_partial: false,
-            hilbert_range: None,
+            shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
         });
@@ -761,7 +755,7 @@ mod tests {
             group_by_dim: -1,
             cell_filter: Some(bm),
             return_partial: false,
-            hilbert_range: None,
+            shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
         });

@@ -8,8 +8,6 @@
 //! lease holder too, so its own Event Plane lag closes the same way. A
 //! single-node cluster runs the same barrier against its one lease.
 
-use std::time::{Duration, Instant};
-
 use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use nodedb_cluster::{AuthBarrierOutcome, AuthBarrierRequest, GroupCoverage, RaftRpc};
 
@@ -22,7 +20,7 @@ use super::leadership::{metadata_leader, send_to_leader};
 ///
 /// `targets` name the change: per group, the index it committed at. The
 /// change itself is committed; an error means only that the barrier did not
-/// release within the request deadline.
+/// release by `deadline`, the caller's statement deadline.
 ///
 /// Latency: in a cluster, every authorization-bearing write waits about one
 /// renewal interval (the Raft heartbeat) before it is acknowledged. Each
@@ -35,15 +33,16 @@ use super::leadership::{metadata_leader, send_to_leader};
 pub async fn authorization_barrier(
     state: &SharedState,
     targets: Vec<GroupCoverage>,
+    deadline: std::time::Instant,
 ) -> crate::Result<()> {
-    let deadline_secs = state.tuning.network.default_deadline_secs;
-    let deadline = Instant::now() + Duration::from_secs(deadline_secs);
+    let remaining_until = || deadline.saturating_duration_since(std::time::Instant::now());
+    let budget_ms = remaining_until().as_millis();
     let timing = lease_timing(state)?;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = remaining_until();
         if remaining.is_zero() {
             return Err(committed_but_pending(format!(
-                "the barrier did not release within {deadline_secs}s"
+                "the barrier did not release within the statement deadline ({budget_ms} ms)"
             )));
         }
         let request = AuthBarrierRequest {
@@ -86,7 +85,7 @@ pub async fn authorization_barrier(
             // leader again. A new leader holds the barrier to its own floors.
             Some(AuthBarrierOutcome::NotLeader { .. })
             | Some(AuthBarrierOutcome::Timeout { .. })
-            | None => tokio::time::sleep(timing.renew_every).await,
+            | None => tokio::time::sleep(timing.renew_every.min(remaining_until())).await,
         }
     }
 }
@@ -96,8 +95,12 @@ pub async fn authorization_barrier(
 ///
 /// Its completion acks sit in the sequencer log, at or below the sequencer
 /// group's commit index now. A node covers that index only once its own
-/// replicas applied every acknowledged transaction below it.
-pub async fn calvin_write_barrier(state: &SharedState) -> crate::Result<()> {
+/// replicas applied every acknowledged transaction below it. The wait ends
+/// at `deadline`, the caller's statement deadline.
+pub async fn calvin_write_barrier(
+    state: &SharedState,
+    deadline: std::time::Instant,
+) -> crate::Result<()> {
     lease_timing(state)?;
     let commit_index = state
         .raft_status_fn
@@ -115,6 +118,7 @@ pub async fn calvin_write_barrier(state: &SharedState) -> crate::Result<()> {
             group_id: SEQUENCER_GROUP_ID,
             through: commit_index,
         }],
+        deadline,
     )
     .await
 }

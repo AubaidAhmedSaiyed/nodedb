@@ -178,6 +178,9 @@ impl NexarTransport {
     /// There is NO retry wrapper on the stream body — retry only applies to the
     /// eager pre-first-frame phase, which the caller (coordinator) owns. Once
     /// the first frame has been observed, any error is terminal.
+    ///
+    /// The request is written before the stream returns, so a link failure
+    /// while reading it is `ClusterError::Unanswered`: the peer can have run it.
     pub async fn send_rpc_stream(
         &self,
         target: u64,
@@ -211,7 +214,9 @@ impl NexarTransport {
             // server-side `accept_bi` stream is not reset early.
             let _send = send;
             loop {
-                let envelope = read_envelope(&mut recv).await?;
+                let envelope = read_envelope(&mut recv)
+                    .await
+                    .map_err(|e| written_stream_failure(target, e))?;
                 let (fields, inner_frame) =
                     auth_envelope::parse_envelope(&envelope, &auth.mac_key)?;
                 if fields.from_node_id != target {
@@ -359,6 +364,20 @@ impl NexarTransport {
         }
         rpc_codec::decode(inner_frame, &self.auth.epoch)
     }
+}
+
+/// The error of a failed read on a stream whose request is written.
+///
+/// A link failure leaves the outcome unknown, so it is `Unanswered`. A
+/// malformed frame keeps its own error.
+fn written_stream_failure(target: u64, error: ClusterError) -> ClusterError {
+    if let ClusterError::Transport { detail } = error {
+        return ClusterError::Unanswered {
+            node_id: target,
+            detail,
+        };
+    }
+    error
 }
 
 /// Map a terminal [`TypedClusterError`] carried by `ExecuteStreamEnd` into a

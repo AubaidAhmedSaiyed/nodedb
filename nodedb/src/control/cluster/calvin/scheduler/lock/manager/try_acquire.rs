@@ -60,7 +60,7 @@ mod tests {
         assert!(lm.try_acquire(b, BTreeMap::from([(coll(), LockMode::Intent)])));
         assert!(!lm.try_acquire(c, BTreeMap::from([(coll(), LockMode::Exclusive)])));
         let entry = lm.table.get(&coll()).unwrap();
-        assert_eq!(entry.holders.as_slice(), &[a, b]);
+        assert_eq!(entry.holder_ids(), vec![a, b]);
         assert!(entry.waiters.is_empty(), "a refused probe leaves no waiter");
     }
 }

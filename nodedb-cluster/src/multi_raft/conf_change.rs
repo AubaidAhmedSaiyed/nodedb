@@ -62,33 +62,15 @@ impl MultiRaft {
         group_id: u64,
         change: &ConfChange,
     ) -> Result<(u64, u64)> {
+        // Promoting a learner that has not caught up grows the voter set
+        // while it cannot ack, shrinking the effective quorum. Removing the
+        // last whole voter leaves no replica to lead and send a snapshot.
+        self.admit_conf_change(group_id, change)?;
         let (log_index, committed_immediately) = {
             let node = self
                 .groups
                 .get_mut(&group_id)
                 .ok_or(ClusterError::GroupNotFound { group_id })?;
-
-            // PromoteLearner safety gate (propose side): a learner must have
-            // caught up to the group's commit index BEFORE the promote entry
-            // enters the log. Promoting an un-caught-up learner grows the
-            // voter set while it cannot yet ack anything, shrinking the
-            // effective quorum (e.g. 3 voters + 1 stale learner -> no
-            // majority) and risking cluster unavailability. The check cannot
-            // live in `apply_conf_change` — at apply time the commit index
-            // has already advanced past the promote entry itself, so it
-            // would spuriously reject promotions that were valid when
-            // proposed.
-            if change.change_type == ConfChangeType::PromoteLearner
-                && node.role() == nodedb_raft::NodeRole::Leader
-                && node.match_index_for(change.node_id).unwrap_or(0) < node.commit_index()
-            {
-                return Err(ClusterError::LearnerNotCaughtUp {
-                    group_id,
-                    node_id: change.node_id,
-                    match_index: node.match_index_for(change.node_id).unwrap_or(0),
-                    commit_index: node.commit_index(),
-                });
-            }
 
             let data = change.to_entry_data()?;
             let log_index = node.propose(data)?;
@@ -376,7 +358,7 @@ mod tests {
             success: true,
             last_log_index: last,
             round: nodedb_raft::node::leader_lease::UNTRACKED_ROUND,
-            needs_snapshot: false,
+            replica: nodedb_raft::ReplicaState::Whole,
         };
         mr.handle_append_entries_response(0, 2, &resp).unwrap();
         assert_eq!(mr.match_index_for(0, 2), Some(last));

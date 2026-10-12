@@ -20,7 +20,6 @@ use crate::error::Error;
 use super::ddl_owner::{current_owner, reclaim_cause};
 use super::ddl_prepare::propose_metadata_and_wait_async;
 use super::handle::MetadataRaftHandle;
-use super::timeouts::DEFAULT_PROPOSE_TIMEOUT;
 
 /// How often the leader checks the lease owner.
 const RECLAIM_POLL: Duration = Duration::from_millis(250);
@@ -99,20 +98,10 @@ pub(crate) async fn reclaim_ddl_prepare_lease(
     token: u64,
 ) -> Result<(), Error> {
     if shared.pending_ddl.contains(token) {
-        propose_metadata_and_wait_async(
-            shared,
-            handle,
-            &MetadataEntry::DdlPendingCancel { token },
-            DEFAULT_PROPOSE_TIMEOUT,
-        )
-        .await?;
+        propose_metadata_and_wait_async(shared, handle, &MetadataEntry::DdlPendingCancel { token })
+            .await?;
     }
-    propose_metadata_and_wait_async(
-        shared,
-        handle,
-        &MetadataEntry::DdlPrepareRelease { token },
-        DEFAULT_PROPOSE_TIMEOUT,
-    )
-    .await
-    .map(|_| ())
+    propose_metadata_and_wait_async(shared, handle, &MetadataEntry::DdlPrepareRelease { token })
+        .await
+        .map(|_| ())
 }

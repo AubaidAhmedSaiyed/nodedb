@@ -11,14 +11,11 @@ use std::time::{Duration, Instant};
 
 use nodedb_cluster::{DescriptorId, DrainOwner, MetadataEntry};
 
-use crate::control::metadata_proposer::wait::wait_applied;
+use crate::control::metadata_proposer::wait::await_metadata_apply;
 use crate::control::state::SharedState;
 use crate::error::Error;
 
-use super::drain_propose::{
-    DRAIN_PROPOSE_TIMEOUT, POLL_INTERVAL, drain_applied_or_error, drain_start_entry,
-    drained_or_timed_out, encode_drain,
-};
+use super::drain_propose::{POLL_INTERVAL, drain_start_entry, drained_or_timed_out, encode_drain};
 
 /// Drain every lease on `id` at `version <= up_to_version` for a `Put*` DDL.
 ///
@@ -140,7 +137,8 @@ pub async fn end_drain_async(
     .await
 }
 
-/// Propose a drain variant and await its apply on this node.
+/// Propose a drain variant and await its apply on this node, until the
+/// statement deadline.
 async fn propose_drain_async(
     shared: &SharedState,
     entry: MetadataEntry,
@@ -150,12 +148,5 @@ async fn propose_drain_async(
     let log_index = handle
         .propose_async(encode_drain(&entry, operation)?)
         .await?;
-    let watcher = shared.applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID);
-    let outcome = wait_applied(
-        std::sync::Arc::clone(&watcher),
-        log_index,
-        DRAIN_PROPOSE_TIMEOUT,
-    )
-    .await?;
-    drain_applied_or_error(outcome, operation, log_index, watcher.current())
+    await_metadata_apply(shared, log_index).await.map(|_| ())
 }

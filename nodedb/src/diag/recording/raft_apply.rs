@@ -37,10 +37,11 @@ pub fn raft_entry_reapplied(group_id: u64, log_index: u64, highest_applied: u64)
     .emit();
 }
 
-/// Report a catalog error on a vShard's stored dependent-read barrier log.
-/// Called from the sites that read and write the rows. `op` names the operation: `save`, `load` or `remove`.
+/// Report a catalog error on the stored dependent-read barrier logs.
+/// Called from the sites that read and write the rows. `op` names the
+/// operation: `save`, `load`, `remove`, `forget` or `persist`.
 pub fn calvin_barrier_log_store_failed(
-    vshard_id: u32,
+    vshard_id: Option<u32>,
     txn: Option<(u64, u32)>,
     op: &'static str,
     err: &crate::Error,
@@ -55,6 +56,23 @@ pub fn calvin_barrier_log_store_failed(
     let _ = Capture::new(
         EventKind::Error,
         "calvin dependent-read barrier log store failed",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
+    .emit();
+}
+
+/// Report a catalog error that left the stored Calvin state of vShards this
+/// node left. Called from `calvin_snapshot::forget_left`.
+pub fn calvin_left_state_not_forgotten(vshards: &[u32], err: &crate::Error) {
+    let class = error_class(err);
+    let ctx = context::CalvinLeftStateNotForgotten {
+        vshards,
+        error_class: &class,
+    };
+    let _ = Capture::new(
+        EventKind::Error,
+        "calvin state of a left vShard was not forgotten",
     )
     .error_chain(error_chain_of(err))
     .domain(&ctx)

@@ -13,7 +13,7 @@ use crate::Error;
 use nodedb_physical::physical_plan::{PhysicalPlan, plan_contains_cluster_partitioned_leaf};
 
 use crate::control::cluster::linearizable_read::{
-    confirm_linearizable_read, groups_of_vshards, linearizable_read_deadline,
+    StatementDeadline, confirm_linearizable_read, groups_of_vshards,
 };
 use crate::control::server::graph_dispatch::graph_read_groups;
 use crate::control::server::shared::write_admission::plan_is_write;
@@ -52,7 +52,7 @@ pub(crate) async fn confirm_local_read(
     if read_groups.is_empty() {
         return Ok(());
     }
-    let deadline = linearizable_read_deadline(Duration::from_millis(deadline_ms));
+    let deadline = StatementDeadline::after(Duration::from_millis(deadline_ms));
     if plan_contains_cluster_partitioned_leaf(plan) {
         let groups = graph_read_groups(shared, database_id, plan)?;
         return confirm_linearizable_read(shared, &groups, deadline).await;

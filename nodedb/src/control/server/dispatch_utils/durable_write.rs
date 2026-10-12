@@ -215,7 +215,8 @@ async fn propose_if_replicable(
         return Ok(None);
     };
     let entry = entry.with_event_source(event_source);
-    let deadline = crate::control::wal_replication::statement_propose_deadline(shared);
+    let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(shared)
+        .tokio_instant();
     let (payload, write_versions) =
         propose_replicated_entry(shared, proposer, entry, deadline).await?;
     Ok(Some(replicated_write_response(

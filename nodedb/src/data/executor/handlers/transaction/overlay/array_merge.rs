@@ -9,8 +9,8 @@
 //!
 //! - base rows whose coordinate this transaction tombstoned OR re-put are
 //!   dropped (a staged put shadows the base cell, last-writer-wins);
-//! - staged puts are appended as synthetic tiles, one per Hilbert prefix, so
-//!   a shard `hilbert_range` filter, the slice window, the attribute
+//! - staged puts are appended as synthetic tiles, one per tile key, so
+//!   a `shard_bucket` filter, the slice window, the attribute
 //!   projection, the surrogate `cell_filter`, and the row cap all apply to
 //!   staged cells exactly as they apply to base cells.
 //!
@@ -130,8 +130,8 @@ fn merge_overlay(
         tiles.retain(|(_, tile)| tile.row_count() > 0);
     }
 
-    // Staged puts, grouped by the Hilbert prefix each would land in so a
-    // shard-range filter treats them like base tiles.
+    // Staged puts, grouped by the tile key each would land in so a shard
+    // bucket filter treats them like base tiles.
     let mut by_prefix: HashMap<u64, SparseTileBuilder<'_>> = HashMap::new();
     for (coord, put) in overlay.staged_cells(array_id) {
         if let Some(vt) = valid_at_ms

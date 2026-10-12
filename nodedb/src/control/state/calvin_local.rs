@@ -3,7 +3,7 @@
 //! This node's in-process Calvin state, shared between the per-vShard
 //! schedulers and the Control-Plane paths that read or fence against them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -102,6 +102,9 @@ pub struct CalvinLocalState {
     /// scheduler: read results and timeouts the data-group apply loop
     /// applied before the scheduler took them.
     pub read_results: CalvinReadResults,
+    /// vShards whose stored Calvin state waits for a forget. Each scheduler
+    /// reconcile forgets those this node does not host and drops the rest.
+    pub forget_pending: Mutex<BTreeSet<u32>>,
 }
 
 impl CalvinLocalState {
@@ -131,6 +134,7 @@ impl CalvinLocalState {
             caught_up: CaughtUpRegistry::default(),
             inboxes: CalvinInboxes::default(),
             read_results: CalvinReadResults::default(),
+            forget_pending: Mutex::new(BTreeSet::new()),
         }
     }
 }

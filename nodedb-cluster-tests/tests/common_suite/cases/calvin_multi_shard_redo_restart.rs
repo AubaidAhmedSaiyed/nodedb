@@ -44,6 +44,18 @@ fn sequencer_leader(node: &TestClusterNode) -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether `vshard_id`'s applied ledger on `node` holds an applied position.
+fn ledger_holds_a_position(node: &TestClusterNode, vshard_id: u32) -> bool {
+    node.shared
+        .calvin
+        .applied
+        .get(vshard_id)
+        .is_some_and(|ledger| {
+            ledger.max_applied_epoch()
+                != nodedb::control::cluster::calvin::scheduler::NOT_YET_APPLIED_EPOCH
+        })
+}
+
 /// Count of transactions the single-node sequencer has admitted to an epoch,
 /// or `0` if the sequencer metrics handle is not installed yet.
 fn admitted_total(node: &TestClusterNode) -> u64 {
@@ -206,6 +218,19 @@ async fn calvin_multi_shard_write_in_explicit_block_commits_and_survives_restart
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    // The txn applied on the KV collection's vShard, so this node holds
+    // stored Calvin state for it.
+    let kv_vshard = nodedb_types::CollectionKey::from_bare(nodedb::types::DatabaseId::DEFAULT, &kv)
+        .vshard()
+        .as_u32();
+    wait_for(
+        "the KV vShard's applied ledger holds the txn",
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || ledger_holds_a_position(&node, kv_vshard),
+    )
+    .await;
+
     // WAL-only restart: shut down cleanly (flushing the WAL, releasing every
     // redb handle) and reopen against the SAME directory — no vector
     // checkpoint, so the HNSW must be rebuilt purely from the committed
@@ -263,6 +288,35 @@ async fn calvin_multi_shard_write_in_explicit_block_commits_and_survives_restart
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    // Boot queued the stored Calvin state of every vShard for a forget
+    // check. Once the data groups replayed, the reconcile pass keeps the
+    // state of each vShard this node still replicates.
+    wait_for(
+        "boot recovery replays the data groups",
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        || node.shared.data_groups_replayed.load(Ordering::Acquire),
+    )
+    .await;
+    wait_for(
+        "the reconcile pass settles every vShard queued at boot",
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || {
+            node.shared
+                .calvin
+                .forget_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        },
+    )
+    .await;
+    assert!(
+        ledger_holds_a_position(&node, kv_vshard),
+        "a vShard this node replicates keeps its applied ledger across a restart"
+    );
 
     node.shutdown().await;
 }

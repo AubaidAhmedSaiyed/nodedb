@@ -63,8 +63,8 @@ impl CoreLoop {
                     collection,
                     key: &key,
                     value: new_value,
-                    // `execute_kv_predicate_update` writes with `ttl_ms: 0`, the
-                    // keyed field merge's behaviour. Preserved verbatim.
+                    // The keyed field merge writes with `ttl_ms: 0`, so the
+                    // resolved rewrite does too.
                     ttl_ms: 0,
                     expire_at_ms: 0,
                     precondition: body,

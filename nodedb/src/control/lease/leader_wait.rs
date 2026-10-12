@@ -10,9 +10,6 @@ use nodedb_cluster::{MetadataEntry, encode_entry};
 use crate::control::state::SharedState;
 use crate::error::Error;
 
-/// Same propose-and-wait timeout the catalog DDL path uses.
-pub(in crate::control) const PROPOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Backoff schedule for re-proposing while the metadata group elects a leader.
 ///
 /// Reads take a descriptor lease, so a lease proposal issued in the first
@@ -21,7 +18,7 @@ pub(in crate::control) const PROPOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// failed proposal, so it is waited out here rather than surfaced as a failed
 /// statement. Bounded at ~1.6s total: long enough for a single-node or healthy
 /// multi-node election, short enough that a genuinely leaderless group still
-/// fails well inside [`PROPOSE_TIMEOUT`].
+/// fails well inside the statement deadline.
 const LEADER_ELECTION_BACKOFF_MS: [u64; 7] = [10, 25, 50, 100, 200, 400, 800];
 
 /// Propose `raw`, waiting out an in-progress metadata election.
@@ -55,10 +52,10 @@ async fn propose_once_leader_is_elected(
 
 /// Encode `entry`, propose it through the metadata raft handle, and await
 /// the local applied watermark until the proposed log index applies or the
-/// timeout fires.
+/// statement deadline passes.
 ///
 /// Shared by the lease grant and release paths. `operation` is a short label
-/// for the encode-failure and timeout errors.
+/// for the encode-failure error.
 pub(in crate::control) async fn propose_and_wait(
     shared: &SharedState,
     entry: &MetadataEntry,
@@ -69,22 +66,5 @@ pub(in crate::control) async fn propose_and_wait(
         detail: format!("descriptor lease {operation} encode: {e}"),
     })?;
     let log_index = propose_once_leader_is_elected(handle.as_ref(), raw, operation).await?;
-
-    let watcher = shared.applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID);
-    let outcome = crate::control::metadata_proposer::wait::wait_applied(
-        std::sync::Arc::clone(&watcher),
-        log_index,
-        PROPOSE_TIMEOUT,
-    )
-    .await?;
-    if !outcome.is_reached() {
-        return Err(Error::Config {
-            detail: format!(
-                "descriptor lease {operation} did not apply within {PROPOSE_TIMEOUT:?} \
-                 (log index {log_index}, current: {}, outcome: {outcome:?})",
-                watcher.current()
-            ),
-        });
-    }
-    Ok(log_index)
+    crate::control::metadata_proposer::wait::await_metadata_apply(shared, log_index).await
 }

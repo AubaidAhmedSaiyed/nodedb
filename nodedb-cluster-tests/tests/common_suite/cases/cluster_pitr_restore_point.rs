@@ -44,11 +44,24 @@ async fn insert_rows(cluster: &TestCluster, prefix: &str) {
     for collection in COLLECTIONS {
         for i in 0..3 {
             let sql = format!("INSERT INTO {collection} (id, v) VALUES ('{prefix}-{i}', {i})");
-            cluster.nodes[0]
-                .exec(&sql)
-                .await
-                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            write_on(cluster, 0, collection, &sql).await;
         }
+    }
+}
+
+/// Run the write `sql` into `collection` on node `index`. On error, panic
+/// with the collection's group and every node's group positions, so the
+/// failing hop shows.
+async fn write_on(cluster: &TestCluster, index: usize, collection: &str, sql: &str) {
+    let node = &cluster.nodes[index];
+    if let Err(error) = node.exec(sql).await {
+        panic!(
+            "{sql} on node {}: {error}\n{collection} is in group {:?}\n\
+             groups (leader, commit, applied per node):\n{}",
+            node.node_id,
+            node.group_id_for_collection(collection),
+            cluster.group_positions_report()
+        );
     }
 }
 
@@ -104,10 +117,12 @@ async fn create_collection(cluster: &TestCluster, collection: &str) {
         "CREATE COLLECTION {collection} (id STRING PRIMARY KEY, v INT) \
          WITH (engine='document_strict')"
     );
-    cluster
-        .exec_ddl_on_any_leader(&sql)
-        .await
-        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    if let Err(error) = cluster.exec_ddl_on_any_leader(&sql).await {
+        panic!(
+            "{sql}: {error}\ngroups (leader, commit, applied per node):\n{}",
+            cluster.group_positions_report()
+        );
+    }
 }
 
 /// Wait until every node archived `point`, stop every node, restore each to
@@ -185,10 +200,13 @@ async fn a_cluster_restores_every_group_to_a_restore_point() {
         );
     }
 
-    cluster.nodes[1]
-        .exec("INSERT INTO pitr_a (id, v) VALUES ('after-restore', 9)")
-        .await
-        .unwrap_or_else(|e| panic!("a write after the restore: {e}"));
+    write_on(
+        &cluster,
+        1,
+        "pitr_a",
+        "INSERT INTO pitr_a (id, v) VALUES ('after-restore', 9)",
+    )
+    .await;
     cluster
         .wait_for_full_apply_convergence(Duration::from_secs(30))
         .await;
@@ -263,10 +281,7 @@ async fn a_ddl_after_the_watermark_is_absent_though_it_precedes_the_point() {
     create_collection(&cluster, "pitr_mid").await;
     for i in 0..3 {
         let sql = format!("INSERT INTO pitr_mid (id, v) VALUES ('mid-{i}', {i})");
-        cluster.nodes[0]
-            .exec(&sql)
-            .await
-            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        write_on(&cluster, 0, "pitr_mid", &sql).await;
     }
     assert!(
         !creator.is_finished(),

@@ -25,17 +25,10 @@ pub(super) async fn answer_applied_plan(
         return None;
     };
     let watcher = state.applied_index_watcher(METADATA_GROUP_ID);
-    let reached = match crate::control::metadata_proposer::wait::wait_applied(
-        watcher, *index, budget,
-    )
-    .await
-    {
-        Ok(outcome) => outcome.is_reached(),
-        Err(error) => {
-            tracing::warn!(index = *index, %error, "metadata-applied wait did not finish");
-            false
-        }
-    };
+    let reached = watcher
+        .wait_for_async(*index, std::time::Instant::now() + budget)
+        .await
+        .is_reached();
     Some(if reached {
         ExecuteResponse::ok(vec![Vec::new()], 0, Vec::new())
     } else {

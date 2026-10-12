@@ -6,12 +6,12 @@
 //! - `fan_out` — broadcast one request to all listed shards (slice, agg,
 //!   delete, surrogate scan).
 //! - `fan_out_partitioned` — send a different payload to each shard
-//!   (used by `coord_put` where cells are routed by Hilbert prefix).
+//!   (used by `coord_put` where cells are routed by tile key).
 //!
 //! Both functions dispatch concurrently via `FuturesUnordered`, apply a
 //! per-shard `tokio::time::timeout`, and wrap each call in the cluster
 //! `CircuitBreaker`. Any shard failure is propagated as `Err` — partial
-//! results are not silently dropped.
+//! results are not silently dropped. The error names the failing shard.
 
 use std::sync::Arc;
 
@@ -74,6 +74,28 @@ async fn call_with_wrong_owner_retry(
 
 use super::rpc::ShardRpcDispatch;
 
+/// A fan-out failure and the shard it names.
+#[derive(Debug, thiserror::Error)]
+#[error("array shard {vshard_id}: {error}")]
+pub struct ShardFailure {
+    /// The shard whose call failed.
+    pub vshard_id: u32,
+    /// Why it failed.
+    #[source]
+    pub error: ClusterError,
+}
+
+/// The error of an array coordinator call.
+#[derive(Debug, thiserror::Error)]
+pub enum ArrayCoordError {
+    /// A shard call failed. The failure names the shard.
+    #[error(transparent)]
+    Shard(#[from] ShardFailure),
+    /// The coordinator failed outside any shard call, such as an encode.
+    #[error(transparent)]
+    Coordinator(#[from] ClusterError),
+}
+
 /// Classify whether a shard error should count against the peer circuit breaker.
 ///
 /// `WrongOwner` is a transient routing/ownership-churn signal, not a peer-health
@@ -92,8 +114,9 @@ fn counts_against_breaker(err: &ClusterError) -> bool {
         ClusterError::DataPlane { .. }
         | ClusterError::ShardExecution { .. }
         | ClusterError::StreamTerminal { .. } => false,
-        // An unresponsive peer is exactly what the breaker exists to shed
-        // load from, so a shard timeout counts like any other liveness failure.
+        // The breaker counts peer liveness, not the send fate of
+        // `is_lost_answer`. An unresponsive peer is what the breaker sheds
+        // load from, so a lost answer counts like any other liveness failure.
         ClusterError::ShardTimeout { .. } | ClusterError::Unanswered { .. } => true,
         ClusterError::Raft(_)
         | ClusterError::VShardNotMapped { .. }
@@ -166,7 +189,7 @@ pub async fn fan_out(
     req_bytes: &[u8],
     dispatch: &Arc<dyn ShardRpcDispatch>,
     circuit_breaker: &CircuitBreaker,
-) -> Result<Vec<(u32, Vec<u8>)>> {
+) -> std::result::Result<Vec<(u32, Vec<u8>)>, ShardFailure> {
     if params.shard_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -176,11 +199,15 @@ pub async fn fan_out(
     let mut futs = futures::stream::FuturesUnordered::new();
 
     for &shard_id in &params.shard_ids {
+        let failed = |error| ShardFailure {
+            vshard_id: shard_id,
+            error,
+        };
         // Circuit-breaker gate: treat shard_id as the peer identifier.
-        let admission = circuit_breaker.check(shard_id as u64)?;
+        let admission = circuit_breaker.check(shard_id as u64).map_err(failed)?;
 
         let env = VShardEnvelope::new(
-            msg_type_from_opcode(opcode)?,
+            msg_type_from_opcode(opcode).map_err(failed)?,
             params.source_node,
             0, // target_node resolved by the dispatch impl
             shard_id,
@@ -209,7 +236,10 @@ pub async fn fan_out(
                 if counts_against_breaker(&e) {
                     circuit_breaker.record_failure(shard_id as u64, admission);
                 }
-                return Err(e);
+                return Err(ShardFailure {
+                    vshard_id: shard_id,
+                    error: e,
+                });
             }
         }
     }
@@ -227,7 +257,7 @@ pub async fn fan_out_partitioned(
     per_shard: &[(u32, Vec<u8>)],
     dispatch: &Arc<dyn ShardRpcDispatch>,
     circuit_breaker: &CircuitBreaker,
-) -> Result<Vec<(u32, Vec<u8>)>> {
+) -> std::result::Result<Vec<(u32, Vec<u8>)>, ShardFailure> {
     if per_shard.is_empty() {
         return Ok(Vec::new());
     }
@@ -235,10 +265,14 @@ pub async fn fan_out_partitioned(
     let mut futs = futures::stream::FuturesUnordered::new();
 
     for (shard_id, payload) in per_shard {
-        let admission = circuit_breaker.check(*shard_id as u64)?;
+        let failed = |error| ShardFailure {
+            vshard_id: *shard_id,
+            error,
+        };
+        let admission = circuit_breaker.check(*shard_id as u64).map_err(failed)?;
 
         let env = VShardEnvelope::new(
-            msg_type_from_opcode(opcode)?,
+            msg_type_from_opcode(opcode).map_err(failed)?,
             params.source_node,
             0,
             *shard_id,
@@ -267,7 +301,10 @@ pub async fn fan_out_partitioned(
                 if counts_against_breaker(&e) {
                     circuit_breaker.record_failure(shard_id as u64, admission);
                 }
-                return Err(e);
+                return Err(ShardFailure {
+                    vshard_id: shard_id,
+                    error: e,
+                });
             }
         }
     }
@@ -425,9 +462,47 @@ mod tests {
         .await
         .expect_err("fan_out should propagate shard failure");
         assert!(
-            matches!(err, ClusterError::Transport { .. }),
+            matches!(err.error, ClusterError::Transport { .. }),
             "expected Transport error, got {err:?}"
         );
+    }
+
+    /// A failing shard's id rides with its error, so the caller can name
+    /// the vShard that refused.
+    #[tokio::test]
+    async fn a_failure_names_the_failing_shard() {
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(FailDispatch);
+        let params = FanOutParams {
+            shard_ids: vec![17],
+            timeout_ms: 1000,
+            source_node: 1,
+        };
+        let err = fan_out(
+            &params,
+            super::super::opcodes::ARRAY_SHARD_SLICE_REQ,
+            b"",
+            &dispatch,
+            &cb(),
+        )
+        .await
+        .expect_err("a failing shard fails the fan-out");
+        assert_eq!(err.vshard_id, 17);
+        assert!(err.error.is_unsent(), "got {err:?}");
+
+        let per_shard = vec![(23u32, b"cells".to_vec())];
+        let err = fan_out_partitioned(
+            &FanOutPartitionedParams {
+                timeout_ms: 1000,
+                source_node: 1,
+            },
+            super::super::opcodes::ARRAY_SHARD_PUT_REQ,
+            &per_shard,
+            &dispatch,
+            &cb(),
+        )
+        .await
+        .expect_err("a failing shard fails the partitioned fan-out");
+        assert_eq!(err.vshard_id, 23);
     }
 
     #[tokio::test]
@@ -486,7 +561,7 @@ mod tests {
         .await
         .expect_err("open circuit should block fan_out");
         assert!(
-            matches!(err, ClusterError::CircuitOpen { .. }),
+            matches!(err.error, ClusterError::CircuitOpen { .. }),
             "expected CircuitOpen, got {err:?}"
         );
     }
@@ -579,7 +654,7 @@ mod tests {
         .expect_err("fan_out should propagate WrongOwner when both attempts fail");
 
         assert!(
-            matches!(err, ClusterError::WrongOwner { .. }),
+            matches!(err.error, ClusterError::WrongOwner { .. }),
             "expected WrongOwner, got {err:?}"
         );
         assert_eq!(
@@ -617,7 +692,7 @@ mod tests {
         .expect_err("fan_out should propagate WrongOwner");
 
         assert!(
-            matches!(err, ClusterError::WrongOwner { .. }),
+            matches!(err.error, ClusterError::WrongOwner { .. }),
             "expected WrongOwner, got {err:?}"
         );
         // WrongOwner is a routing signal, not a health failure: the breaker
@@ -653,7 +728,7 @@ mod tests {
         .await
         .expect_err("fan_out should surface a timeout once the shard call never resolves");
 
-        match err {
+        match err.error {
             ClusterError::ShardTimeout {
                 vshard_id,
                 elapsed_ms,

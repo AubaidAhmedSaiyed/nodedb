@@ -7,10 +7,11 @@
 //! The lock manager provides a deterministic, totally-ordered lock table over
 //! per-key entries keyed by
 //! [`LockKey`](crate::control::cluster::calvin::scheduler::lock::LockKey).
-//! Locks come in three modes (see
+//! Locks come in four modes (see
 //! [`LockMode`](crate::control::cluster::calvin::scheduler::lock::LockMode)):
-//! `Exclusive` (one holder), `Shared` (many readers), and `Intent` (many row
-//! writers of one collection). A transaction acquires one map of key to mode.
+//! `Exclusive` (one holder), `Shared` (many readers), `Intent` (many row
+//! writers of one collection), and `IntentShared` (many row readers of one
+//! collection). A transaction acquires one map of key to mode.
 //! Read reservations take one `Shared` key via [`LockManager::acquire_shared`].
 //!
 //! # Determinism

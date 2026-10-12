@@ -163,7 +163,7 @@ mod tests {
         );
         let entry = lm.table.get(&coll("c")).unwrap();
         assert_eq!(entry.mode, LockMode::Intent);
-        assert_eq!(entry.holders.as_slice(), &[t1, t2]);
+        assert_eq!(entry.holder_ids(), vec![t1, t2]);
     }
 
     #[test]
@@ -193,6 +193,85 @@ mod tests {
             );
             assert_eq!(lm.release(t1), vec![t2]);
         }
+    }
+
+    /// A row read: its row `Shared`, its collection `IntentShared`.
+    fn row_read(name: &str) -> BTreeMap<LockKey, LockMode> {
+        BTreeMap::from([
+            (key(name), LockMode::Shared),
+            (coll(name), LockMode::IntentShared),
+        ])
+    }
+
+    #[test]
+    fn a_row_reader_orders_against_a_collection_writer() {
+        // The reader holds first: the truncate waits for it.
+        let mut lm = LockManager::new();
+        let (reader, truncate) = (txn(1, 0), txn(1, 1));
+        assert_eq!(lm.acquire(reader, row_read("c")), AcquireOutcome::Ready);
+        assert_eq!(
+            lm.acquire(truncate, one(coll("c"), LockMode::Exclusive)),
+            AcquireOutcome::Blocked,
+            "a truncate waits for the row reads of its collection"
+        );
+        assert_eq!(lm.release(reader), vec![truncate]);
+
+        // The truncate holds first: the reader waits for it.
+        let mut lm = LockManager::new();
+        let (truncate, reader) = (txn(1, 0), txn(1, 1));
+        assert_eq!(
+            lm.acquire(truncate, one(coll("c"), LockMode::Exclusive)),
+            AcquireOutcome::Ready
+        );
+        assert_eq!(
+            lm.acquire(reader, row_read("c")),
+            AcquireOutcome::Blocked,
+            "a row read waits for the truncate sequenced before it"
+        );
+        assert_eq!(lm.release(truncate), vec![reader]);
+    }
+
+    #[test]
+    fn a_row_reader_shares_its_collection_with_row_writers_and_predicate_readers() {
+        let mut lm = LockManager::new();
+        let (reader, writer, scan) = (txn(1, 0), txn(1, 1), txn(1, 2));
+        assert_eq!(lm.acquire(reader, row_read("c")), AcquireOutcome::Ready);
+        assert_eq!(
+            lm.acquire(
+                writer,
+                BTreeMap::from([
+                    (coll("c"), LockMode::Intent),
+                    (key("d"), LockMode::Exclusive)
+                ])
+            ),
+            AcquireOutcome::Ready,
+            "a row writer joins a row reader"
+        );
+        assert_eq!(
+            lm.acquire(scan, one(coll("c"), LockMode::Shared)),
+            AcquireOutcome::Blocked,
+            "a predicate reader waits for the row writer"
+        );
+        // The writer leaves: the group drops to the reader's mode, which the
+        // predicate reader shares.
+        assert_eq!(lm.release(writer), vec![scan]);
+        let entry = lm.table.get(&coll("c")).unwrap();
+        assert_eq!(entry.mode, LockMode::Shared);
+        assert_eq!(entry.holder_ids(), vec![reader, scan]);
+    }
+
+    #[test]
+    fn a_row_read_and_a_row_write_of_one_collection_merge_to_intent() {
+        let mut lm = LockManager::new();
+        let (t, other) = (txn(1, 0), txn(1, 1));
+        let mut keys = row_read("c");
+        keys.insert(coll("c"), LockMode::IntentShared.merge(LockMode::Intent));
+        assert_eq!(keys.get(&coll("c")), Some(&LockMode::Intent));
+        assert_eq!(lm.acquire(t, keys), AcquireOutcome::Ready);
+        assert_eq!(
+            lm.acquire(other, one(coll("c"), LockMode::Intent)),
+            AcquireOutcome::Ready
+        );
     }
 
     #[test]
@@ -325,7 +404,7 @@ mod tests {
 
         let entry = lm.table.get(&key("k")).unwrap();
         assert_eq!(entry.mode, LockMode::Exclusive);
-        assert_eq!(entry.holders.as_slice(), &[t]);
+        assert_eq!(entry.holder_ids(), vec![t]);
     }
 
     #[test]
@@ -352,7 +431,7 @@ mod tests {
         for k in ["k1", "k2"] {
             let entry = lm.table.get(&key(k)).unwrap();
             assert_eq!(entry.mode, LockMode::Exclusive);
-            assert_eq!(entry.holders.as_slice(), &[t]);
+            assert_eq!(entry.holder_ids(), vec![t]);
         }
     }
 

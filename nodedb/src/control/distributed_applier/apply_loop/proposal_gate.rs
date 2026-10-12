@@ -34,16 +34,50 @@ pub(super) enum EntryOutcome {
         durable: bool,
         result: Option<AppliedOutcome>,
     },
+    /// This replica cannot apply the entry as its peers do. The entry holds
+    /// its group's lane until a snapshot install covers it.
+    Held { reason: HoldReason },
+}
+
+/// Why this replica holds a committed entry it cannot apply as its peers do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HoldReason {
+    /// The redo body is missing here: this replica dropped the chunk stream
+    /// the entry names.
+    BodyMissing,
+    /// The entry's bytes do not decode as the redo they name.
+    Malformed,
+    /// The entry's enqueue or apply panicked here, so its effect on this
+    /// replica is unknown.
+    ApplyPanicked,
+}
+
+impl HoldReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BodyMissing => "body_missing",
+            Self::Malformed => "malformed",
+            Self::ApplyPanicked => "apply_panicked",
+        }
+    }
 }
 
 impl EntryOutcome {
+    /// Why the entry holds its group's lane, when it does.
+    pub fn hold_reason(&self) -> Option<HoldReason> {
+        match self {
+            Self::Held { reason } => Some(*reason),
+            Self::Skipped | Self::Repeat | Self::Covered | Self::Applied { .. } => None,
+        }
+    }
+
     /// Whether the apply wrote the entry's rows. A refused or failed apply
     /// wrote none, so it raises no tenant write mark. A second copy writes
     /// nothing itself: its mark follows its first copy (see
     /// [`ProposalGate::prior_wrote_rows`]).
     pub fn wrote_rows(&self) -> bool {
         match self {
-            Self::Skipped | Self::Repeat | Self::Covered => false,
+            Self::Skipped | Self::Repeat | Self::Covered | Self::Held { .. } => false,
             Self::Applied {
                 result: Some(outcome),
                 ..
@@ -64,6 +98,16 @@ pub(super) enum PrefixStep {
     Neutral,
     /// Extends the prefix when `true`, breaks it when `false`.
     Record(bool),
+}
+
+/// How a concluded entry stands in its group's lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Settlement {
+    /// The entry settles in log order and moves the durable prefix by its
+    /// step.
+    Settles(PrefixStep),
+    /// The entry holds its group's lane until a snapshot install covers it.
+    Holds(HoldReason),
 }
 
 /// The outcome a waiter received, in the form the ledger keeps. A refusal is
@@ -147,6 +191,14 @@ impl ProposalGate {
         self.ledger.note(proposal_key, None);
     }
 
+    /// Note a proposal an installed snapshot holds: a later copy of it is a
+    /// duplicate here too.
+    pub fn note_covered(&mut self, proposal_key: u64) {
+        if proposal_key != 0 {
+            self.ledger.note(proposal_key, None);
+        }
+    }
+
     /// Note that a copy of `proposal_key` started and has not concluded.
     pub fn open(&mut self, proposal_key: u64) {
         if proposal_key != 0 {
@@ -156,7 +208,7 @@ impl ProposalGate {
 
     /// Conclude an entry of `proposal_key` with `outcome`: note a durable
     /// apply in the ledger, close the copy `open` noted when `opened`, and
-    /// return how the entry moves its group's prefix.
+    /// return how the entry stands in its group's lane.
     ///
     /// No separate marker is written: the entry's own records carry its key,
     /// durable in the same write as its effect.
@@ -165,7 +217,7 @@ impl ProposalGate {
         proposal_key: u64,
         opened: bool,
         outcome: EntryOutcome,
-    ) -> PrefixStep {
+    ) -> Settlement {
         if opened
             && proposal_key != 0
             && let Some(copies) = self.in_flight.get_mut(&proposal_key)
@@ -176,21 +228,21 @@ impl ProposalGate {
             }
         }
         match outcome {
-            EntryOutcome::Skipped => PrefixStep::Neutral,
-            EntryOutcome::Repeat => PrefixStep::Record(true),
+            EntryOutcome::Skipped => Settlement::Settles(PrefixStep::Neutral),
+            EntryOutcome::Repeat => Settlement::Settles(PrefixStep::Record(true)),
             EntryOutcome::Covered => {
-                // A later copy of the proposal is a duplicate here too.
-                if proposal_key != 0 {
-                    self.ledger.note(proposal_key, None);
-                }
-                PrefixStep::Record(true)
+                self.note_covered(proposal_key);
+                Settlement::Settles(PrefixStep::Record(true))
             }
             EntryOutcome::Applied { durable, result } => {
                 if durable {
                     self.ledger.note(proposal_key, result);
                 }
-                PrefixStep::Record(durable)
+                Settlement::Settles(PrefixStep::Record(durable))
             }
+            // No outcome is recorded: the install that releases the entry
+            // notes its proposal.
+            EntryOutcome::Held { reason } => Settlement::Holds(reason),
         }
     }
 }
@@ -216,7 +268,7 @@ mod tests {
                 result: Some(Ok(AppliedWrite::unversioned(Vec::new()))),
             },
         );
-        assert_eq!(step, PrefixStep::Record(true));
+        assert_eq!(step, Settlement::Settles(PrefixStep::Record(true)));
         assert!(!gate.in_flight(42));
         assert!(gate.skip_duplicate(&tracker, 1, 9, 42));
     }
@@ -234,7 +286,7 @@ mod tests {
                 result: None,
             },
         );
-        assert_eq!(step, PrefixStep::Record(false));
+        assert_eq!(step, Settlement::Settles(PrefixStep::Record(false)));
         assert!(!gate.in_flight(7));
         assert!(!gate.skip_duplicate(&tracker, 1, 9, 7));
     }
@@ -246,8 +298,28 @@ mod tests {
         let tracker = ProposeTracker::new();
         let mut gate = ProposalGate::new(ProposalLedger::new(PROPOSAL_LEDGER_CAPACITY));
         let step = gate.conclude(11, false, EntryOutcome::Covered);
-        assert_eq!(step, PrefixStep::Record(true));
+        assert_eq!(step, Settlement::Settles(PrefixStep::Record(true)));
         assert!(!EntryOutcome::Covered.wrote_rows());
         assert!(gate.skip_duplicate(&tracker, 1, 14, 11));
+    }
+
+    /// A held entry closes its in-flight copy and records no outcome, so a
+    /// later copy of its proposal is not skipped as applied.
+    #[test]
+    fn a_held_entry_holds_its_lane_and_records_no_outcome() {
+        let tracker = ProposeTracker::new();
+        let mut gate = ProposalGate::new(ProposalLedger::new(PROPOSAL_LEDGER_CAPACITY));
+        gate.open(9);
+        let held = EntryOutcome::Held {
+            reason: HoldReason::BodyMissing,
+        };
+        assert!(!held.wrote_rows());
+        let step = gate.conclude(9, true, held);
+        assert_eq!(step, Settlement::Holds(HoldReason::BodyMissing));
+        assert!(!gate.in_flight(9));
+        assert!(!gate.skip_duplicate(&tracker, 1, 12, 9));
+
+        gate.note_covered(9);
+        assert!(gate.skip_duplicate(&tracker, 1, 12, 9));
     }
 }

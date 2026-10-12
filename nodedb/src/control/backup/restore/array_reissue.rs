@@ -326,7 +326,8 @@ impl CellWrite<'_> {
             state,
             proposer,
             entry,
-            crate::control::wal_replication::statement_propose_deadline(state),
+            crate::control::server::shared::session::StatementDeadline::of_statement(state)
+                .tokio_instant(),
         )
         .await?;
         Ok(())

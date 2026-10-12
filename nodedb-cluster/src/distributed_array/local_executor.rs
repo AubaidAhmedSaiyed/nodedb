@@ -73,10 +73,9 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     /// `limit` — maximum rows to return per shard (0 = unlimited).
     /// `cell_filter_msgpack` — zerompk encoding of `SurrogateBitmap`; empty
     ///   means no filter.
-    /// `shard_hilbert_range` — optional `[lo, hi]` Hilbert-prefix range; when
-    ///   set only tiles whose prefix falls in this range are returned, preventing
-    ///   duplicate rows in single-node harnesses where all vShards share one
-    ///   Data Plane. `None` = no Hilbert filter.
+    /// `shard_bucket` — optional bucket filter. When set, only tiles whose
+    ///   key routes to this bucket are returned, so vShards that share one
+    ///   Data Plane return no duplicate rows. `None` = no filter.
     /// `txn_id` — the reading transaction's id; the executor stamps it on the
     ///   Data Plane request so the shard folds that transaction's staged
     ///   cells into the result. `None` = autocommit read.
@@ -116,8 +115,8 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     ///
     /// `req.cells_msgpack` is a zerompk encoding of
     /// `Vec<nodedb::engine::array::wal::ArrayPutCell>`. All cells belong to
-    /// the same Hilbert-prefix tile. The shard handler has already validated
-    /// that this shard owns the tile; the executor dispatches directly to the
+    /// the same routing bucket. The shard handler has already validated
+    /// that this shard owns the bucket; the executor dispatches directly to the
     /// Data Plane without further routing checks.
     ///
     /// Returns the applied LSN plus the real cell count the Data Plane

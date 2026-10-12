@@ -117,6 +117,20 @@ impl CutBarriers {
         self.group(key, group).and_then(|barrier| barrier.applied)
     }
 
+    /// Every tracked cut this node applied a barrier of in `group`, with the
+    /// barrier's log index, in cut key order.
+    pub(crate) fn applied_in_group(&self, group: u64) -> Vec<(OrderedCut, u64)> {
+        self.cuts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .filter_map(|tracked| {
+                let applied = tracked.groups.get(&group)?.applied?;
+                Some((tracked.cut.clone(), applied))
+            })
+            .collect()
+    }
+
     /// Note that this node proposed `key`'s barrier into `group` while it
     /// led the group.
     pub(crate) fn note_proposed(&self, key: CutKey, group: u64, proposed: Proposed) {
@@ -212,6 +226,21 @@ mod tests {
         assert_eq!(barriers.applied(key, 1), Some(40));
         assert_eq!(barriers.applied(key, 2), None, "a barrier binds its group");
         assert_eq!(barriers.cut(key), Some(cut(5)));
+    }
+
+    #[test]
+    fn a_group_lists_the_barriers_it_applied_in_key_order() {
+        let barriers = CutBarriers::new();
+        barriers.note_applied(&cut(9), 1, 60);
+        barriers.note_applied(&cut(5), 1, 40);
+        barriers.note_applied(&cut(7), 2, 50);
+        barriers.claim_driver(&cut(8));
+        assert_eq!(
+            barriers.applied_in_group(1),
+            [(cut(5), 40), (cut(9), 60)],
+            "only applied barriers of the group, by cut key"
+        );
+        assert_eq!(barriers.applied_in_group(3), []);
     }
 
     /// A lost proposal is forgotten only when it is the one recorded.

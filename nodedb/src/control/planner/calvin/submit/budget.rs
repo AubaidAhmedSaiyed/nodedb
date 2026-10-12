@@ -6,11 +6,7 @@
 //! leader works on it only as long as the statement waits. The budget is
 //! what is left of the statement's deadline, never the node default.
 
-use std::time::Duration;
-
 use crate::bridge::envelope::ErrorCode;
-use crate::control::state::SharedState;
-use crate::control::wal_replication::statement_propose_deadline;
 
 /// The milliseconds left to `deadline`, for a request about to go out.
 ///
@@ -23,19 +19,10 @@ pub(crate) fn budget_ms_until(deadline: tokio::time::Instant) -> crate::Result<u
     }
 }
 
-/// The milliseconds left on the running statement, or on the node default
-/// outside a statement.
-pub(crate) fn statement_budget_ms(state: &SharedState) -> crate::Result<u64> {
-    budget_ms_until(statement_propose_deadline(state))
-}
-
-/// [`statement_budget_ms`] as a wait bound for the local half of the request.
-pub(crate) fn statement_budget(state: &SharedState) -> crate::Result<Duration> {
-    statement_budget_ms(state).map(Duration::from_millis)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     use crate::control::server::shared::session::{conn_scope, deadline, statement_deadline};

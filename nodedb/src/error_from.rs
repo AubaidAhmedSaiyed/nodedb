@@ -435,6 +435,8 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::GroupMarksUnavailable { .. }
             | Error::BackupCaptureMoved { .. }
             | Error::MetadataLeaderUnavailable
+            | Error::MetadataGroupGone { .. }
+            | Error::MetadataDdlSuperseded { .. }
             | Error::AuthorizationStateBehind { .. }
             | Error::LinearizableReadRefused { .. }
             | Error::ExecutionLimitExceeded { .. }

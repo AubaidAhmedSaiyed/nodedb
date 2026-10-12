@@ -3,18 +3,16 @@
 //! The DDL preparation lease: the local lock and the replicated lease that
 //! serialize descriptor preparation across the cluster.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, WaitOutcome, encode_entry};
+use nodedb_cluster::{MetadataEntry, encode_entry};
 
 use crate::control::state::SharedState;
 use crate::error::Error;
 
 use super::handle::MetadataRaftHandle;
-use super::timeouts::DEFAULT_PROPOSE_TIMEOUT;
-use super::wait::wait_applied;
+use super::wait::await_metadata_apply;
 
 /// How long a proposer waits for the lease. It outlasts the leader's
 /// stuck-owner fallback, so a reclaim always frees the lease first.
@@ -47,37 +45,15 @@ fn encode_metadata(entry: &MetadataEntry) -> Result<Vec<u8>, Error> {
     })
 }
 
-/// The result of waiting `timeout` for log index `index` to apply.
-fn applied_or_error(
-    outcome: WaitOutcome,
-    index: u64,
-    timeout: Duration,
-    current: u64,
-) -> Result<u64, Error> {
-    match outcome {
-        WaitOutcome::Reached => Ok(index),
-        WaitOutcome::TimedOut => Err(Error::Config {
-            detail: format!(
-                "metadata propose timed out after {timeout:?} waiting for log index {index} \
-                 (current: {current})"
-            ),
-        }),
-        WaitOutcome::GroupGone => Err(Error::Config {
-            detail: "metadata group no longer hosted on this node".into(),
-        }),
-    }
-}
-
+/// Propose `entry` and wait until this node applied it, until the statement
+/// deadline. Returns its log index.
 pub(super) async fn propose_metadata_and_wait_async(
     shared: &SharedState,
     handle: &dyn MetadataRaftHandle,
     entry: &MetadataEntry,
-    timeout: Duration,
 ) -> Result<u64, Error> {
     let index = handle.propose_async(encode_metadata(entry)?).await?;
-    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
-    let outcome = wait_applied(Arc::clone(&watcher), index, timeout).await?;
-    applied_or_error(outcome, index, timeout, watcher.current())
+    await_metadata_apply(shared, index).await
 }
 
 /// What the acquire loop does next, from the current lease owner.
@@ -117,7 +93,6 @@ pub(crate) async fn release_ddl_prepare_token(
         shared,
         handle.as_ref(),
         &MetadataEntry::DdlPrepareRelease { token },
-        DEFAULT_PROPOSE_TIMEOUT,
     )
     .await
     .map(|_| ())
@@ -145,20 +120,29 @@ impl DdlPrepareLease<'_> {
         self.token
     }
 
-    /// Release the lease and wait until the release applied here. A failed
-    /// release is logged: the metadata leader reclaims the lease once
-    /// [`super::ddl_owner::DDL_PREPARE_LEASE`] passed.
+    /// Release the lease and wait until the release applied here, until the
+    /// statement deadline. A failed release is logged: the metadata leader
+    /// reclaims the lease once [`super::ddl_owner::DDL_PREPARE_LEASE`] passed.
     pub(crate) async fn release(mut self) {
         self.released = true;
-        if let Err(error) = propose_metadata_and_wait_async(
+        match propose_metadata_and_wait_async(
             self.shared,
             self.handle,
             &MetadataEntry::DdlPrepareRelease { token: self.token },
-            DEFAULT_PROPOSE_TIMEOUT,
         )
         .await
         {
-            tracing::error!(token = self.token, %error, "metadata DDL lease release failed");
+            Ok(_) => {}
+            // Proposed: it applies in log order, ahead of this node's next
+            // acquire.
+            Err(error @ Error::DeadlineExceeded { .. }) => tracing::warn!(
+                token = self.token,
+                %error,
+                "metadata DDL lease release did not apply here before the statement deadline"
+            ),
+            Err(error) => {
+                tracing::error!(token = self.token, %error, "metadata DDL lease release failed");
+            }
         }
     }
 }
@@ -189,7 +173,6 @@ pub(crate) async fn acquire_ddl_prepare_lease_async<'a>(
                 token,
                 node_id: shared.node_id,
             },
-            DEFAULT_PROPOSE_TIMEOUT,
         )
         .await?;
 
@@ -220,6 +203,8 @@ pub(crate) async fn lock_ddl_preparation_async(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn owner(shared: &SharedState) -> Option<u64> {

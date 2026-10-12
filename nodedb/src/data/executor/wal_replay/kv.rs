@@ -238,20 +238,6 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_predicate_update (delta): re-resolves the row set against
-                // current state and re-runs the same merge.
-                if let Some(applied) = self.try_replay_kv_predicate_update(
-                    &record.payload,
-                    tenant_id,
-                    database_id,
-                    now_ms,
-                    record_lsn,
-                    tombstones,
-                ) {
-                    puts += applied;
-                    continue;
-                }
-
                 // A KV put-family record of no current shape: refused, never
                 // replayed without its surrogate. Any other `Put` payload
                 // belongs to another engine's replay pass.
@@ -336,25 +322,11 @@ impl CoreLoop {
                         }]);
                     }
                     self.kv_engine.truncate(database_id, tenant_id, &collection);
-                    self.note_replay_write(database_id, tenant_id, &collection, None, record_lsn);
+                    self.note_replay_wipe(database_id, tenant_id, &collection, record_lsn);
                     deletes += 1;
                     continue;
                 }
                 if self.applying_committed_redo() {
-                    continue;
-                }
-
-                // kv_predicate_delete (delta): re-resolves the row set
-                // against current state.
-                if let Some(removed) = self.try_replay_kv_predicate_delete(
-                    &record.payload,
-                    tenant_id,
-                    database_id,
-                    now_ms,
-                    record_lsn,
-                    tombstones,
-                ) {
-                    deletes += removed;
                     continue;
                 }
 

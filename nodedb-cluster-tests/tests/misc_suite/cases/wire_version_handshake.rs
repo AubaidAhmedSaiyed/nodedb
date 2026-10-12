@@ -37,7 +37,7 @@ impl RaftRpcHandler for EchoHandler {
                     success: true,
                     last_log_index: req.prev_log_index,
                     round: req.round,
-                    needs_snapshot: false,
+                    replica: nodedb_raft::ReplicaState::Whole,
                 }))
             }
             other => Err(ClusterError::Transport {

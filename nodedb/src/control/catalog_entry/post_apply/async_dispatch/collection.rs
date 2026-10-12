@@ -186,7 +186,10 @@ pub(crate) async fn reclaim_collection_storage(
     //    performance, requirement.
     let hold =
         (!drain_already_held).then(|| shared.quiesce.begin_drain(database_id, tenant_id, name));
-    wait_drained_reporting_progress(shared, database_id, tenant_id, name).await;
+    shared
+        .quiesce
+        .wait_until_drained(database_id, tenant_id, name)
+        .await;
 
     // 4. Reclaim on local Data Plane. RESULT-CHECKED: the redb +
     //    versioned engine purge is correctness-critical (the catalog
@@ -278,41 +281,6 @@ pub(crate) async fn reclaim_collection_storage(
                 "catalog_entry: UnregisterCollection reclaimed on local Data Plane"
             );
             Ok(())
-        }
-    }
-}
-
-/// How often a quiesce drain checks for closed scans.
-const DRAIN_PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Wait until every open scan of the collection closes. Each closed scan
-/// counts as apply progress, so a proposer waiting on this purge keeps
-/// waiting while scans close and times out only when none does.
-///
-/// A draining collection admits no new scan, so the open count only falls.
-async fn wait_drained_reporting_progress(
-    shared: &SharedState,
-    database_id: u64,
-    tenant_id: u64,
-    name: &str,
-) {
-    let drained = shared
-        .quiesce
-        .wait_until_drained(database_id, tenant_id, name);
-    tokio::pin!(drained);
-    let mut open = shared.quiesce.open_scans(database_id, tenant_id, name);
-    loop {
-        tokio::select! {
-            () = &mut drained => return,
-            () = tokio::time::sleep(DRAIN_PROGRESS_TICK) => {
-                let now = shared.quiesce.open_scans(database_id, tenant_id, name);
-                if now < open {
-                    shared
-                        .metadata_apply_progress
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
-                }
-                open = now;
-            }
         }
     }
 }

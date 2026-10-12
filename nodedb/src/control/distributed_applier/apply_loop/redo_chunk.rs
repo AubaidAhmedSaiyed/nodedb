@@ -12,8 +12,8 @@
 //!
 //! A group whose replica here owes a snapshot install is the exception (see
 //! `chunks::owed`). This node dropped streams of it that the other replicas
-//! still hold. A refusal there can be this replica's alone, so it holds the
-//! group's durable floor until the snapshot installs.
+//! still hold. A refusal there can be this replica's alone: the entry's body
+//! is missing here. It holds the group's lane until the snapshot installs.
 
 use crate::control::array_sync::raft_apply::AppliedPosition;
 use crate::control::distributed_applier::propose_tracker::{AppliedWrite, ProposeTracker};
@@ -28,7 +28,7 @@ use crate::wal::manager::RedoChunkPlacement;
 
 use super::calvin_redo::{ClaimOutcome, claim_chunked};
 use super::context::{ApplyContext, FinishedApply};
-use super::proposal_gate::{EntryOutcome, ledger_outcome};
+use super::proposal_gate::{EntryOutcome, HoldReason, ledger_outcome};
 use super::start::Prepared;
 use super::transaction_redo::{
     RedoApply, conclude_held, conclude_held_claimed, conclude_installed_copy, enqueue_payload,
@@ -65,6 +65,8 @@ pub(super) fn prepare_stream_entry<'a>(
                 bytes,
             };
             Prepared::Exclusive(Box::pin(async move {
+                #[cfg(feature = "failpoints")]
+                crate::control::fail_gate::before_chunk_apply(ctx.state.node_id, index).await;
                 let applied = ctx.state.redo_chunks.apply_chunk(chunk).await;
                 // The chunk's records are durable here, its entry not yet
                 // concluded.
@@ -86,6 +88,7 @@ pub(super) fn prepare_stream_entry<'a>(
         other => conclude_held(
             ctx,
             pos,
+            HoldReason::Malformed,
             crate::Error::Internal {
                 detail: format!("redo stream apply called with another write: {other:?}"),
             },
@@ -139,13 +142,13 @@ fn concluded(
     outcome
 }
 
-/// Hold a chunk entry this replica cannot decide as the other replicas do.
-/// No ledger outcome records it, so a re-delivery applies it again.
+/// Hold a chunk entry whose stream this replica dropped: the other
+/// replicas decide it from a stream it lacks. No ledger outcome records it,
+/// so a re-delivery applies it again.
 fn held(tracker: &ProposeTracker, pos: AppliedPosition, error: crate::Error) -> EntryOutcome {
     tracker.complete(pos.group_id, pos.log_index, pos.applied_key, Err(error));
-    EntryOutcome::Applied {
-        durable: false,
-        result: None,
+    EntryOutcome::Held {
+        reason: HoldReason::BodyMissing,
     }
 }
 
@@ -217,7 +220,9 @@ pub(super) fn prepare_chunked_final<'a>(
         // Another copy of the position installed, or installs now: this
         // copy's stream drops.
         ClaimOutcome::Refused => return conclude_installed_copy(ctx, pos, taken),
-        ClaimOutcome::Malformed(error) => return conclude_held(ctx, pos, error, taken),
+        ClaimOutcome::Malformed(error) => {
+            return conclude_held(ctx, pos, HoldReason::Malformed, error, taken);
+        }
     };
     // Every chunk is durable and the final entry committed; nothing of the
     // final entry applied yet.
@@ -235,9 +240,10 @@ pub(super) fn prepare_chunked_final<'a>(
         Ok(bytes) => bytes,
         Err(refusal) if ctx.state.redo_chunks.owes_snapshot(pos.group_id) => {
             let error = stream_lost_here(pos, chunked.stream, LostEntry::Final, &refusal);
+            let reason = HoldReason::BodyMissing;
             return match calvin {
-                Some(claim) => conclude_held_claimed(ctx, pos, error, taken, claim),
-                None => conclude_held(ctx, pos, error, taken),
+                Some(claim) => conclude_held_claimed(ctx, pos, reason, error, taken, claim),
+                None => conclude_held(ctx, pos, reason, error, taken),
             };
         }
         Err(refusal) => {
@@ -276,10 +282,13 @@ pub(super) fn prepare_chunked_final<'a>(
                 calvin,
             },
         )),
-        Err(error) => match calvin {
-            Some(claim) => conclude_held_claimed(ctx, pos, error, taken, claim),
-            None => conclude_held(ctx, pos, error, taken),
-        },
+        Err(error) => {
+            let reason = HoldReason::Malformed;
+            match calvin {
+                Some(claim) => conclude_held_claimed(ctx, pos, reason, error, taken, claim),
+                None => conclude_held(ctx, pos, reason, error, taken),
+            }
+        }
     }
 }
 
@@ -368,9 +377,8 @@ mod tests {
     fn holds(outcome: &EntryOutcome) -> bool {
         matches!(
             outcome,
-            EntryOutcome::Applied {
-                durable: false,
-                result: None
+            EntryOutcome::Held {
+                reason: HoldReason::BodyMissing
             }
         )
     }
@@ -378,7 +386,7 @@ mod tests {
     /// This node applied a stream's first chunk, left the group, and
     /// mounted it again on the group's old log. The next chunk and the
     /// final entry refuse here while every other replica installs the
-    /// redo. Each holds the group's durable floor instead of passing.
+    /// redo. Each holds the group's lane instead of passing.
     #[tokio::test]
     async fn a_final_entry_of_a_stream_this_replica_dropped_holds_the_apply() {
         let dir = tempfile::tempdir().expect("tempdir");

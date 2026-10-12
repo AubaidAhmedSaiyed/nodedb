@@ -120,6 +120,7 @@ pub(super) fn validate_domain(config: &ServerConfig) -> crate::Result<()> {
     }
 
     validate_calvin(config)?;
+    validate_rpc_timeout(config)?;
 
     if let Some(cluster) = config.cluster.as_ref() {
         positive_u64(
@@ -145,6 +146,21 @@ pub(super) fn validate_domain(config: &ServerConfig) -> crate::Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+/// Checks the RPC timeout against its floor. It is also the QUIC idle
+/// timeout, so a shorter one drops live peers.
+fn validate_rpc_timeout(config: &ServerConfig) -> crate::Result<()> {
+    let floor = nodedb_cluster::transport::liveness::MIN_RPC_TIMEOUT;
+    let secs = config.tuning.cluster_transport.rpc_timeout_secs;
+    if std::time::Duration::from_secs(secs) < floor {
+        return Err(reject(
+            "tuning.cluster_transport.rpc_timeout_secs",
+            secs,
+            &format!("a timeout of at least {} ms", floor.as_millis()),
+        ));
+    }
     Ok(())
 }
 

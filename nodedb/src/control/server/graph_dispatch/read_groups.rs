@@ -26,8 +26,7 @@ use nodedb_types::{CollectionKey, QualifiedCollection};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::cluster::linearizable_read::{
-    confirm_linearizable_read, groups_hosted_here, hosted_groups_of_vshards,
-    statement_read_deadline,
+    StatementDeadline, confirm_linearizable_read, groups_hosted_here, hosted_groups_of_vshards,
 };
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, VShardId};
@@ -94,7 +93,7 @@ pub async fn confirm_graph_read(
     plan: &PhysicalPlan,
 ) -> crate::Result<()> {
     let groups = graph_read_groups(state, database_id, plan)?;
-    confirm_linearizable_read(state, &groups, statement_read_deadline(state)).await
+    confirm_linearizable_read(state, &groups, StatementDeadline::of_statement(state)).await
 }
 
 fn keyed_groups<'a>(

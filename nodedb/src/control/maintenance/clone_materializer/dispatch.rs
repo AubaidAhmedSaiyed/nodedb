@@ -7,13 +7,13 @@
 //! runtime.
 
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
 
 use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::{ErrorCode, Priority, Request, Response};
 use crate::control::gateway::core::QueryContext;
 use crate::control::server::dispatch_utils::{OwnedRead, OwnedReadScope, route_owned_read};
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::server::shared::write_admission::plan_is_write;
 use crate::control::state::SharedState;
 use crate::types::{ReadConsistency, RequestId, TraceId, TxnId, VShardId};
@@ -157,15 +157,14 @@ pub(crate) async fn dispatch_on_this_node(
     txn_id: Option<TxnId>,
 ) -> crate::Result<Response> {
     let req_id = RequestId::new(state.request_id_counter.fetch_add(1, Ordering::Relaxed));
-    let deadline_secs = state.tuning.network.default_deadline_secs;
-    let deadline_dur = Duration::from_secs(deadline_secs);
+    let deadline = StatementDeadline::of_statement(state);
     let req = Request {
         request_id: req_id,
         tenant_id,
         vshard_id,
         database_id,
         plan,
-        deadline: Instant::now() + deadline_dur,
+        deadline: deadline.instant(),
         priority: Priority::Normal,
         trace_id: TraceId::ZERO,
         consistency: ReadConsistency::Strong,
@@ -188,7 +187,7 @@ pub(crate) async fn dispatch_on_this_node(
         Ok(mut d) => d.dispatch(req)?,
         Err(p) => p.into_inner().dispatch(req)?,
     }
-    tokio::time::timeout(deadline_dur, rx.recv())
+    tokio::time::timeout_at(deadline.tokio_instant(), rx.recv())
         .await
         .map_err(|_| crate::Error::DeadlineExceeded { request_id: req_id })?
         .ok_or(crate::Error::Dispatch {

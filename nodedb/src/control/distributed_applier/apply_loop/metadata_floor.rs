@@ -85,17 +85,11 @@ async fn await_metadata_floor(state: &SharedState, held: HeldEntry) -> crate::Re
         metadata_applied = watcher.current(),
         "a replicated write holds its group's lane for this node's metadata apply"
     );
+    let floor = held.metadata_floor;
     loop {
-        let waiting = Arc::clone(&watcher);
-        let floor = held.metadata_floor;
-        let outcome = tokio::task::spawn_blocking(move || waiting.wait_for(floor, WAIT_SLICE))
-            .await
-            .map_err(|e| crate::Error::Internal {
-                detail: format!(
-                    "raft group {} entry {}: the metadata catch-up wait did not finish: {e}",
-                    held.group_id, held.log_index
-                ),
-            })?;
+        let outcome = watcher
+            .wait_for_async(floor, std::time::Instant::now() + WAIT_SLICE)
+            .await;
         match outcome {
             WaitOutcome::Reached => return Ok(()),
             WaitOutcome::TimedOut => tracing::warn!(

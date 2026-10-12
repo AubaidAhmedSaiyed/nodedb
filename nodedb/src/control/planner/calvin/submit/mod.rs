@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Calvin submit-and-await primitive and sequencer-leader routing (Cv1).
+//! Calvin submit-and-await primitive and sequencer-leader routing.
 //!
 //! NodeDB's Calvin cross-shard write path only completes when the transaction is
 //! submitted on the SEQUENCER-GROUP leader:
@@ -38,8 +38,9 @@ pub mod parts;
 pub mod routed;
 pub mod stream;
 pub mod unique_claims;
+pub mod wait;
 
 pub(crate) use assign::submit_local_assign;
 pub use assign::{RoutedAssignment, submit_calvin_routed_assign};
-pub use local::{submit_and_await_calvin, submit_and_await_calvin_with_timeout};
+pub use local::{submit_and_await_calvin, submit_and_await_calvin_until};
 pub use routed::{submit_calvin_routed, submit_calvin_routed_write};

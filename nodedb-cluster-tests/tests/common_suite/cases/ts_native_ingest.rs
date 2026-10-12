@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use nodedb_test_support::native_harness::{do_handshake, send_request};
+use nodedb_test_support::native_harness::{RESPONSE_BOUND, do_handshake, send_request_within};
 use nodedb_types::protocol::opcodes::ResponseStatus;
 use nodedb_types::protocol::text_fields::TextFields;
 use nodedb_types::protocol::{HelloFrame, NativeResponse, OpCode};
@@ -33,14 +33,28 @@ pub(super) async fn native_session(node: &TestClusterNode) -> TcpStream {
 }
 
 /// Ingest the raw ILP `lines` into `collection` through the native
-/// `TimeseriesIngest` opcode.
+/// `TimeseriesIngest` opcode, waiting at most [`RESPONSE_BOUND`] for the
+/// response.
 pub(super) async fn ingest_native(
     stream: &mut TcpStream,
     seq: u64,
     collection: &str,
     lines: &str,
 ) -> NativeResponse {
-    send_request(
+    ingest_native_within(stream, seq, collection, lines, Some(RESPONSE_BOUND)).await
+}
+
+/// [`ingest_native`] waiting at most `bound` for the response, or without
+/// limit when `bound` is `None`. A test that parks the apply on purpose
+/// bounds the wait itself.
+pub(super) async fn ingest_native_within(
+    stream: &mut TcpStream,
+    seq: u64,
+    collection: &str,
+    lines: &str,
+    bound: Option<Duration>,
+) -> NativeResponse {
+    send_request_within(
         stream,
         seq,
         OpCode::TimeseriesIngest,
@@ -50,6 +64,7 @@ pub(super) async fn ingest_native(
             format: Some("ilp".to_string()),
             ..Default::default()
         },
+        bound,
     )
     .await
 }

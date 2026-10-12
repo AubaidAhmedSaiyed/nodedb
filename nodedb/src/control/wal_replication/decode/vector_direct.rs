@@ -4,11 +4,9 @@
 //! `PhysicalPlan::Vector`.
 //!
 //! Every surrogate is rebuilt verbatim from the record; `entry.rs` binds the
-//! insert family to its primary key afterwards. `DELETE` / `UPDATE` carry
-//! their targets verbatim: a point-targeted write names the leader's
-//! surrogates, which every replica bound when the rows were inserted; a
-//! predicate-targeted write re-resolves the predicate against the replica's
-//! own sidecar rows, exactly as `KvPredicateDelete` does.
+//! insert family to its primary key afterwards. `DELETE` / `UPDATE` name the
+//! leader's surrogates, which every replica bound when the rows were
+//! inserted. A row predicate resolves on the proposer, never here.
 
 use nodedb_physical::physical_plan::{
     ReturningSpec, UpdateValue, VectorDirectWriteIntent, VectorOp, VectorResolvedMutation,
@@ -22,14 +20,14 @@ use crate::bridge::envelope::PhysicalPlan;
 pub(super) fn direct_delete(
     collection: &str,
     field: &str,
-    targets: &VectorWriteTargets,
+    rows: &[Surrogate],
     returning: Option<ReturningSpec>,
     rls_filters: &[u8],
 ) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::DirectDelete {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field: field.to_owned(),
-        targets: targets.clone(),
+        targets: VectorWriteTargets::Surrogates(rows.to_vec()),
         returning,
         rls_filters: rls_filters.to_vec(),
         // A write-policy collection never reaches this shape: the leader
@@ -56,7 +54,7 @@ pub(super) fn direct_truncate(
 pub(super) struct DirectUpdateFields<'a> {
     pub(super) collection: &'a str,
     pub(super) field: &'a str,
-    pub(super) targets: &'a VectorWriteTargets,
+    pub(super) rows: &'a [Surrogate],
     pub(super) new_vector: &'a Option<Vec<f32>>,
     pub(super) payload_patch: &'a [(String, UpdateValue)],
     pub(super) quantization: nodedb_types::VectorQuantization,
@@ -71,7 +69,7 @@ pub(super) fn direct_update(f: DirectUpdateFields<'_>) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::DirectUpdate {
         collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
         field: f.field.to_owned(),
-        targets: f.targets.clone(),
+        targets: VectorWriteTargets::Surrogates(f.rows.to_vec()),
         new_vector: f.new_vector.clone(),
         payload_patch: f.payload_patch.to_vec(),
         quantization: f.quantization,

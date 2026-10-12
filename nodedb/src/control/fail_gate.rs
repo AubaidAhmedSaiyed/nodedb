@@ -61,6 +61,20 @@ pub(crate) async fn before_dispatch(node_id: u64, plan: &PhysicalPlan, wal_lsn: 
     }
 }
 
+/// The execute gate of node `node_id`, `exec::before_execute`: a received
+/// `ExecuteRequest` or `ExecuteStreamRequest` parks here before it is checked
+/// or run. Armed with `wait_file(<path>)`, one node takes a request and
+/// never answers. Armed with `sleep(<millis>)`, it runs the request late.
+pub(crate) async fn before_execute(node_id: u64) {
+    let scope = FailScope::Node(node_id);
+    let name = "exec::before_execute";
+    if let Some(FailAction::Sleep(pause)) = lookup(scope, name) {
+        tokio::time::sleep(pause).await;
+        return;
+    }
+    wait(scope, name).await;
+}
+
 /// The Calvin submit gate of node `node_id`: after a transaction's collection
 /// incarnations are stamped and before the sequencer admits it. Named per
 /// collection, `calvin::after_stamp::<collection>`. A test parks a
@@ -205,4 +219,40 @@ pub(crate) fn holds_metadata_apply(node_id: u64) -> bool {
         FailScope::Node(node_id),
         crate::control::cluster::metadata_applier::METADATA_APPLY_HOLD_POINT,
     )
+}
+
+/// The redo chunk gate of node `node_id`: a committed `RedoChunk` entry
+/// parks here before its chunk applies. Named per chunk index,
+/// `redo_chunk::before_apply::<index>`. The chunk's entry applies with
+/// nothing else of its group in flight, so every later entry of the group
+/// waits behind it.
+pub(crate) async fn before_chunk_apply(node_id: u64, index: u32) {
+    wait(
+        FailScope::Node(node_id),
+        &format!("redo_chunk::before_apply::{index}"),
+    )
+    .await;
+}
+
+/// The data-group snapshot build gate of node `node_id`: a leader's build
+/// of a snapshot of `group_id` parks here before it reads any state. Named
+/// `snapshot::before_build::<group_id>`. No snapshot of the group leaves
+/// the node while it is parked.
+pub(crate) async fn before_snapshot_build(node_id: u64, group_id: u64) {
+    wait(
+        FailScope::Node(node_id),
+        &format!("snapshot::before_build::{group_id}"),
+    )
+    .await;
+}
+
+/// The catalog DDL apply gate of node `node_id`: a `CatalogDdl` entry that
+/// puts collection `collection` pauses here before it applies. Named
+/// `catalog_ddl::before_apply::<collection>`, armed with `sleep(<millis>)`.
+/// The pause awaits a Tokio timer, as a slow apply awaits its effects.
+pub(crate) async fn before_catalog_ddl_apply(node_id: u64, collection: &str) {
+    let name = format!("catalog_ddl::before_apply::{collection}");
+    if let Some(FailAction::Sleep(pause)) = lookup(FailScope::Node(node_id), &name) {
+        tokio::time::sleep(pause).await;
+    }
 }

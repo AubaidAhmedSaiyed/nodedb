@@ -2,53 +2,77 @@
 
 //! Waits on the metadata group's applied index.
 //!
-//! The applied-index watcher parks its caller on a condition variable. Each
-//! park runs on the blocking pool, so no runtime flavor loses a worker to it.
+//! A metadata entry proposed for a statement waits for its apply here until
+//! the statement's deadline. Past the deadline the entry is proposed but its
+//! outcome here is unknown, so the wait ends with `Error::DeadlineExceeded`.
+//! A slow apply is not a wedge: `/healthz` reports a wedged metadata apply.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::time::Instant;
 
-use nodedb_cluster::{AppliedIndexWatcher, WaitOutcome};
+use nodedb_cluster::{AppliedIndexWatcher, METADATA_GROUP_ID, WaitOutcome};
 
+use crate::control::server::shared::session::StatementDeadline;
+use crate::control::state::SharedState;
 use crate::error::Error;
+use crate::types::RequestId;
 
-/// Wait until `watcher` reaches `index` or `timeout` passes, on the blocking
-/// pool.
-pub(crate) async fn wait_applied(
-    watcher: Arc<AppliedIndexWatcher>,
-    index: u64,
-    timeout: Duration,
-) -> Result<WaitOutcome, Error> {
-    tokio::task::spawn_blocking(move || watcher.wait_for(index, timeout))
-        .await
-        .map_err(|error| Error::Config {
-            detail: format!("metadata apply wait for log index {index} did not finish: {error}"),
-        })
+/// Wait until `watcher` reaches `log_index`, the index of a metadata entry
+/// this node proposed, or `deadline` passes. Returns `log_index`.
+pub(crate) async fn await_applied(
+    watcher: &AppliedIndexWatcher,
+    log_index: u64,
+    deadline: Instant,
+) -> Result<u64, Error> {
+    let outcome = watcher.wait_for_async(log_index, deadline).await;
+    applied_or_error(outcome, log_index, watcher.current())
 }
 
-/// Wait until `watcher` reaches `log_index`, for as long as the apply moves.
-/// Each window parks on the blocking pool.
-///
-/// Each window of `stall` that ends with neither the applied index nor
-/// `progress()` changed ends the wait with `TimedOut`. Any change inside a
-/// window opens another one, so a slow apply that keeps moving never times
-/// out, and a stuck one times out after one quiet window.
-pub(super) async fn wait_tracking_progress_async(
-    watcher: Arc<AppliedIndexWatcher>,
+/// Wait until this node applied the metadata entry it proposed at
+/// `log_index`, until the statement deadline. Returns `log_index`.
+pub(crate) async fn await_metadata_apply(
+    shared: &SharedState,
     log_index: u64,
-    stall: Duration,
-    mut progress: impl FnMut() -> u64,
-) -> Result<WaitOutcome, Error> {
-    let mut seen = (watcher.current(), progress());
-    loop {
-        let outcome = wait_applied(Arc::clone(&watcher), log_index, stall).await?;
-        if !matches!(outcome, WaitOutcome::TimedOut) {
-            return Ok(outcome);
+) -> Result<u64, Error> {
+    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
+    let deadline = StatementDeadline::of_statement(shared).instant();
+    await_applied(&watcher, log_index, deadline).await
+}
+
+/// The verdict on a proposed metadata entry from its apply wait. `applied`
+/// is the watermark when the wait ended.
+fn applied_or_error(outcome: WaitOutcome, log_index: u64, applied: u64) -> Result<u64, Error> {
+    match outcome {
+        WaitOutcome::Reached => Ok(log_index),
+        WaitOutcome::TimedOut => {
+            tracing::warn!(
+                log_index,
+                applied,
+                "a proposed metadata entry did not apply here before the statement deadline; \
+                 its outcome is unknown"
+            );
+            Err(Error::DeadlineExceeded {
+                request_id: RequestId::new(0),
+            })
         }
-        let now = (watcher.current(), progress());
-        if now == seen {
-            return Ok(outcome);
-        }
-        seen = now;
+        WaitOutcome::GroupGone => Err(Error::MetadataGroupGone { log_index }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A metadata group that left this node ends the wait with its own error.
+    #[tokio::test]
+    async fn a_gone_group_ends_the_wait_with_a_typed_error() {
+        let watcher = AppliedIndexWatcher::new();
+        watcher.close();
+        let result = await_applied(&watcher, 5, Instant::now() + Duration::from_secs(5)).await;
+        assert!(
+            matches!(result, Err(Error::MetadataGroupGone { log_index: 5 })),
+            "{result:?}"
+        );
     }
 }

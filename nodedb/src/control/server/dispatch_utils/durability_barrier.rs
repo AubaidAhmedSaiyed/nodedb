@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::shared::write_admission::plan_is_write;
-use nodedb_physical::physical_plan::{GraphOp, MetaOp};
+use nodedb_physical::physical_plan::{GraphOp, KvOp, MetaOp};
 
 /// Count of writes acknowledged with no durable redo record despite belonging
 /// to an engine whose every write-class op mints one on this path.
@@ -63,7 +63,9 @@ pub fn writes_acked_without_durability() -> u64 {
 /// * `ClusterArray` — a coordinator-side routing wrapper: each owning shard's
 ///   apply mints the redo for the cells it actually holds;
 /// * an empty `EdgePutBatch` / `EdgeDeleteBatch`, which has no edge to make
-///   durable and appends nothing on purpose.
+///   durable and appends nothing on purpose;
+/// * a KV `ResolvedWrite` with no mutation, such as a predicate UPDATE /
+///   DELETE that matched no row. It appends one record per mutation, so none.
 ///
 /// Exchange / gather plans never reach the barrier at all: they are resolved
 /// into a merged response before `submit_write` is entered.
@@ -75,6 +77,7 @@ pub(super) fn funnel_minted_redo_engine(plan: &PhysicalPlan) -> Option<&'static 
     // `PhysicalPlan` variant must be classified here by name rather than
     // silently inheriting "no durability expected".
     match plan {
+        PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) if mutations.is_empty() => None,
         PhysicalPlan::Kv(_) => Some("kv"),
         PhysicalPlan::Vector(_) => Some("vector"),
         PhysicalPlan::Columnar(_) => Some("columnar"),
@@ -172,6 +175,19 @@ mod tests {
             calvin: None,
         });
         assert_eq!(funnel_minted_redo_engine(&plan), Some("transaction"));
+    }
+
+    /// A resolved write with no mutation appends no record, so its
+    /// acknowledgement waits on nothing. A predicate write that matched no
+    /// row resolves to it.
+    #[test]
+    fn an_empty_kv_resolved_write_is_not_held_to_the_barrier() {
+        let empty = PhysicalPlan::Kv(KvOp::ResolvedWrite {
+            mutations: Vec::new(),
+            response_payload: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
+        });
+        assert_eq!(funnel_minted_redo_engine(&empty), None);
     }
 
     /// A read carries no durability obligation at all.

@@ -16,7 +16,7 @@ use crate::error::{RaftError, Result};
 use crate::log::RaftLog;
 use crate::message::{AppendEntriesRequest, LogEntry, PreVoteRequest, TimeoutNowRequest};
 use crate::state::{
-    HardState, LeaderState, LeadershipTransfer, NodeRole, PreVoteRound, VolatileState,
+    HardState, LeaderState, LeadershipTransfer, NodeRole, PreVoteRound, ReplicaState, VolatileState,
 };
 use crate::storage::LogStorage;
 
@@ -134,10 +134,12 @@ pub struct RaftNode<S: LogStorage> {
     /// An outside bound on compaction: the log never discards an entry above
     /// it. An archiver that must copy entries before they go raises it.
     pub(super) compaction_ceiling: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    /// Whether this follower holds no state it can resume the log from. It
-    /// then refuses every `AppendEntries` with `needs_snapshot`, and its
-    /// leader sends a snapshot instead. The driver sets and clears it.
-    pub(super) snapshot_required: bool,
+    /// Whether this replica holds the state it can resume the log from. One
+    /// that wants a snapshot refuses every `AppendEntries`, reporting this
+    /// state, and its leader sends a snapshot instead. One whose
+    /// data diverged also never campaigns. The driver sets and clears it
+    /// (see [`super::snapshot_debt`]).
+    pub(super) replica: ReplicaState,
     /// The highest `replicated_floor` a leader sent this node, or this
     /// node's own as leader. See [`Self::replicated_floor`].
     pub(super) replicated_floor: u64,
@@ -189,21 +191,10 @@ impl<S: LogStorage> RaftNode<S> {
             lease: LeaseState::new(),
             boot_vote_fence: now + config.election_timeout_max,
             compaction_ceiling: None,
-            snapshot_required: false,
+            replica: ReplicaState::Whole,
             replicated_floor: 0,
             config,
         }
-    }
-
-    /// Require a snapshot before this follower takes log entries again, or
-    /// lift the requirement. See [`Self::snapshot_required`].
-    pub fn set_snapshot_required(&mut self, required: bool) {
-        self.snapshot_required = required;
-    }
-
-    /// Whether this follower refuses log entries until a snapshot installs.
-    pub fn snapshot_required(&self) -> bool {
-        self.snapshot_required
     }
 
     /// Restore state from persistent storage. Must be called before ticking.

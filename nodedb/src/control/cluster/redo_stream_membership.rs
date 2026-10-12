@@ -8,13 +8,14 @@
 //!   install before it applies here again. A remount resumes its old log,
 //!   which can still name a dropped stream.
 //! - A mounted group that owes a snapshot refuses log entries until one
-//!   installs, and its leadership here moves to a replica that can lead.
-//!   This covers a group that mounted again, and a group whose apply here
-//!   held an entry of a dropped stream.
+//!   installs. Its replica here steps down from leadership and never
+//!   campaigns. This covers a group that mounted again, and a group whose
+//!   apply here holds an entry.
 
 use std::sync::Mutex;
 
 use nodedb_cluster::multi_raft::MultiRaft;
+use nodedb_raft::ReplicaState;
 
 use crate::control::state::SharedState;
 
@@ -56,8 +57,9 @@ fn drop_unmounted(shared: &SharedState, multi_raft: &Mutex<MultiRaft>) {
     }
 }
 
-/// Make every mounted group that owes a snapshot refuse log entries, and
-/// move a leadership of it this node holds: a leader takes no snapshot.
+/// Make every mounted group that owes a snapshot refuse log entries. The
+/// requirement steps down a leadership of it this node holds: a leader
+/// takes no snapshot.
 ///
 /// The debt is read under the `MultiRaft` lock. An install settles the debt
 /// before it refreshes the group's requirement under the same lock, so this
@@ -72,20 +74,12 @@ fn require_owed_snapshots(shared: &SharedState, multi_raft: &Mutex<MultiRaft>) {
         if !multi_raft.contains_group(group_id) || !shared.redo_chunks.owes_snapshot(group_id) {
             continue;
         }
-        if !multi_raft.snapshot_required(group_id) {
-            multi_raft.set_snapshot_required(group_id, true);
+        if multi_raft.replica_state(group_id) != Some(ReplicaState::AwaitingSnapshot) {
+            multi_raft.require_snapshot(group_id, ReplicaState::AwaitingSnapshot);
             tracing::warn!(
                 group_id,
                 "redo chunks: the group's replica here owes a snapshot install; it refuses \
-                 log entries until one installs"
-            );
-        }
-        if let Some(target) = multi_raft.hand_off_leadership(group_id) {
-            tracing::info!(
-                group_id,
-                target,
-                "redo chunks: the group's replica here owes a snapshot install; its \
-                 leadership moves to a replica that can lead"
+                 log entries and leads nothing until one installs"
             );
         }
     }

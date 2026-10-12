@@ -13,7 +13,7 @@
 
 use nodedb_array::types::ArrayId;
 use nodedb_types::sync::wire::SyncProvenance;
-use nodedb_types::{SurrogateBitmap, SystemTimeScope};
+use nodedb_types::{ShardBucket, SurrogateBitmap, SystemTimeScope};
 
 /// Reducer for [`ArrayOp::Aggregate`]. Numeric `c_enum` keeps the
 /// wire encoding to a single byte.
@@ -81,7 +81,7 @@ pub enum ArrayOp {
         array_id: ArrayId,
         schema_msgpack: Vec<u8>,
         schema_hash: u64,
-        /// Hilbert-prefix bits for vShard routing. Immutable post-create.
+        /// Routing bucket bits for vShard routing. Immutable post-create.
         prefix_bits: u8,
         /// Array audit retention selected by CREATE ARRAY. This stays on the
         /// authorized task so planning remains read-only.
@@ -150,12 +150,10 @@ pub enum ArrayOp {
         /// Only cells whose surrogate is present in this bitmap are included.
         /// `None` = no restriction.
         cell_filter: Option<SurrogateBitmap>,
-        /// Optional Hilbert-prefix range `[lo, hi]`. When set, only cells
-        /// whose Hilbert prefix falls within this range are included.
-        /// Used by distributed shard slice to prevent duplicate rows in
-        /// single-node harnesses where all vShards share one Data Plane.
-        /// `None` = no Hilbert filter (all cells included).
-        hilbert_range: Option<(u64, u64)>,
+        /// Optional shard bucket. When set, only cells whose tile key routes
+        /// to this bucket are included, so vShards that share one Data
+        /// Plane return no duplicate rows. `None` includes every cell.
+        shard_bucket: Option<ShardBucket>,
         /// Bitemporal system-time scope.
         ///
         /// - `Current`: live read (returns the latest committed state).
@@ -193,12 +191,10 @@ pub enum ArrayOp {
         /// merge partials across shards before finalizing.
         /// Single-node SQL callers always pass `false`.
         return_partial: bool,
-        /// Optional Hilbert-prefix range `[lo, hi]`. When set, only cells
-        /// whose Hilbert prefix falls within this range are included.
-        /// Used by distributed shard agg to prevent double-counting in
-        /// single-node harnesses where all vShards share one Data Plane.
-        /// `None` = no Hilbert filter (all cells included).
-        hilbert_range: Option<(u64, u64)>,
+        /// Optional shard bucket. When set, only cells whose tile key routes
+        /// to this bucket contribute, so vShards that share one Data Plane
+        /// count no cell twice. `None` includes every cell.
+        shard_bucket: Option<ShardBucket>,
         /// Bitemporal system-time cutoff. When `Some(t)`, only tile versions
         /// with `system_from_ms <= t` contribute to the aggregate. `None` =
         /// live read.
@@ -309,7 +305,7 @@ mod tests {
             group_by_dim: -1,
             cell_filter: None,
             return_partial: false,
-            hilbert_range: None,
+            shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
         };
@@ -327,7 +323,7 @@ mod tests {
             attr_projection: vec![],
             limit: 0,
             cell_filter: None,
-            hilbert_range: None,
+            shard_bucket: None,
             system_time: SystemTimeScope::AllVersions,
             valid_at_ms: None,
         };
@@ -355,7 +351,7 @@ mod tests {
             attr_projection: vec![],
             limit: 10,
             cell_filter: None,
-            hilbert_range: None,
+            shard_bucket: None,
             system_time: SystemTimeScope::AsOf(1_700_000_000_000),
             valid_at_ms: Some(1_600_000_000_000),
         };

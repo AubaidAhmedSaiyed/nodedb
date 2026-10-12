@@ -79,7 +79,7 @@ impl Scheduler {
                          on the next pass"
                     );
                     crate::diag::calvin_barrier_log_store_failed(
-                        self.vshard_id,
+                        Some(self.vshard_id),
                         Some((txn_id.epoch, txn_id.position)),
                         "load",
                         &e,
@@ -253,7 +253,7 @@ impl Scheduler {
                 "calvin: the barrier rows of finished txns were not removed; retrying on \
                  the next stall tick"
             );
-            crate::diag::calvin_barrier_log_store_failed(self.vshard_id, None, "remove", &e);
+            crate::diag::calvin_barrier_log_store_failed(Some(self.vshard_id), None, "remove", &e);
         }
     }
 
@@ -281,7 +281,7 @@ impl Scheduler {
                 "calvin: the barrier row of a finished txn was not removed"
             );
             crate::diag::calvin_barrier_log_store_failed(
-                self.vshard_id,
+                Some(self.vshard_id),
                 Some((txn_id.epoch, txn_id.position)),
                 "remove",
                 &e,

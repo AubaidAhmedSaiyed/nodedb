@@ -52,8 +52,9 @@ pub fn to_replicated_entry(
         PhysicalPlan::Document(op) => entry_document::document_write(op),
         // Fallible: a governed predicate DML refuses rather than encode it bare.
         PhysicalPlan::Kv(op) => entry_kv::kv_write(op)?,
+        // Fallible: a row predicate or a patch expression refuses the write.
+        PhysicalPlan::Vector(op) => vector::encode(op)?,
         // Exhaustive over their op enums — see their module docs.
-        PhysicalPlan::Vector(op) => vector::encode(op),
         PhysicalPlan::Crdt(op) => crdt::encode(op),
         PhysicalPlan::Graph(op) => entry_graph::graph_write(op),
         // Fallible for the same reason as the Kv arm above.

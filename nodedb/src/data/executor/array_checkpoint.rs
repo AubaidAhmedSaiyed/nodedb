@@ -337,7 +337,7 @@ mod tests {
                 attr_projection: vec![],
                 limit: 0,
                 cell_filter: None,
-                hilbert_range: None,
+                shard_bucket: None,
                 system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
             });

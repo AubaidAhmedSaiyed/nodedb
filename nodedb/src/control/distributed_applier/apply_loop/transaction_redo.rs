@@ -38,7 +38,7 @@ use crate::types::{DatabaseId, TenantId, VShardId};
 use super::calvin_redo::{CalvinClaim, ClaimOutcome, claim_inline};
 use super::context::{ApplyContext, EnqueueFuture, FinishedApply, Started, StartedEntry};
 use super::helpers::committed_response_result;
-use super::proposal_gate::{EntryOutcome, ledger_outcome};
+use super::proposal_gate::{EntryOutcome, HoldReason, ledger_outcome};
 use super::start::Prepared;
 
 /// Prepare one committed `TransactionRedo` entry. Its enqueue appends the
@@ -57,7 +57,7 @@ pub(super) fn prepare_transaction_redo_entry<'a>(
 ) -> Prepared<'a> {
     let decoded = match decode_transaction_redo(&entry.write) {
         Ok(decoded) => decoded,
-        Err(error) => return conclude_held(ctx, pos, error, None),
+        Err(error) => return conclude_held(ctx, pos, HoldReason::Malformed, error, None),
     };
     let target = RedoTarget {
         tenant_id: TenantId::new(entry.tenant_id),
@@ -75,7 +75,9 @@ pub(super) fn prepare_transaction_redo_entry<'a>(
                 ClaimOutcome::NotCalvin => None,
                 ClaimOutcome::Claimed(claim) => Some(claim),
                 ClaimOutcome::Refused => return conclude_installed_copy(ctx, pos, None),
-                ClaimOutcome::Malformed(error) => return conclude_held(ctx, pos, error, None),
+                ClaimOutcome::Malformed(error) => {
+                    return conclude_held(ctx, pos, HoldReason::Malformed, error, None);
+                }
             };
             Prepared::Enqueue(enqueue_payload(
                 ctx,
@@ -129,15 +131,16 @@ pub(super) struct RedoApply {
 
 /// Conclude an entry this replica cannot apply as the other replicas do:
 /// its own bytes are malformed, or its stream here is not the one the log
-/// built. It holds the floor rather than skipping a committed transaction.
-/// A taken stream stays on disk for it.
+/// built. It holds its group's lane rather than skipping a committed
+/// transaction. A taken stream stays on disk for it.
 pub(super) fn conclude_held<'a>(
     ctx: ApplyContext<'a>,
     pos: AppliedPosition,
+    reason: HoldReason,
     error: crate::Error,
     stream: Option<OpenStream>,
 ) -> Prepared<'a> {
-    Prepared::Concluded(held_outcome(ctx, pos, error, stream))
+    Prepared::Concluded(held_outcome(ctx, pos, reason, error, stream))
 }
 
 /// [`conclude_held`] for an entry that claimed a Calvin position: the claim
@@ -145,12 +148,13 @@ pub(super) fn conclude_held<'a>(
 pub(super) fn conclude_held_claimed<'a>(
     ctx: ApplyContext<'a>,
     pos: AppliedPosition,
+    reason: HoldReason,
     error: crate::Error,
     stream: Option<OpenStream>,
     claim: CalvinClaim,
 ) -> Prepared<'a> {
     let event = claim.not_applied(error.to_string());
-    let outcome = held_outcome(ctx, pos, error, stream);
+    let outcome = held_outcome(ctx, pos, reason, error, stream);
     report_then_conclude(ctx, pos, claim, event, outcome)
 }
 
@@ -175,19 +179,32 @@ pub(super) fn report_then_conclude<'a>(
 }
 
 /// Resolve the waiter of an entry this replica holds, and settle its
-/// stream.
+/// stream. A malformed entry is reported here, where it is detected. A
+/// missing body is reported where its stream refused.
 fn held_outcome(
     ctx: ApplyContext<'_>,
     pos: AppliedPosition,
+    reason: HoldReason,
     error: crate::Error,
     stream: Option<OpenStream>,
 ) -> EntryOutcome {
+    match reason {
+        HoldReason::Malformed => {
+            tracing::error!(
+                group_id = pos.group_id,
+                log_index = pos.log_index,
+                %error,
+                "committed redo entry does not decode on this replica; the group's apply holds \
+                 at it until a snapshot of the group installs"
+            );
+            crate::diag::redo_entry_malformed(pos.group_id, pos.log_index, &error);
+        }
+        // Each is reported at the site that detects it.
+        HoldReason::BodyMissing | HoldReason::ApplyPanicked => {}
+    }
     ctx.tracker
         .complete(pos.group_id, pos.log_index, pos.applied_key, Err(error));
-    let outcome = EntryOutcome::Applied {
-        durable: false,
-        result: None,
-    };
+    let outcome = EntryOutcome::Held { reason };
     settle_stream(ctx, stream, &outcome);
     outcome
 }
@@ -199,7 +216,10 @@ fn settle_stream(ctx: ApplyContext<'_>, stream: Option<OpenStream>, outcome: &En
     let Some(stream) = stream else {
         return;
     };
-    if matches!(outcome, EntryOutcome::Applied { durable: false, .. }) {
+    if matches!(
+        outcome,
+        EntryOutcome::Held { .. } | EntryOutcome::Applied { durable: false, .. }
+    ) {
         ctx.state.redo_chunks.park(stream);
     }
 }

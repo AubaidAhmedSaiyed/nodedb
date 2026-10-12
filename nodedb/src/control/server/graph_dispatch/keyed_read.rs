@@ -107,7 +107,9 @@ pub async fn read_on_vshard(
                 tenant_id,
                 database_id,
                 trace_id: TraceId::ZERO,
-                deadline_ms: crate::control::gateway::dispatcher::statement_deadline_ms(state),
+                deadline_ms:
+                    crate::control::server::shared::session::StatementDeadline::of_statement(state)
+                        .hop_budget_ms(),
                 version_set: &version_set,
                 txn_id,
                 linearizable,

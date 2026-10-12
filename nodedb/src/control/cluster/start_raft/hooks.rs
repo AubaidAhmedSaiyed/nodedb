@@ -119,7 +119,11 @@ pub(super) async fn build_hooks(
     // at or below a group's durable applied floor is never delivered again,
     // so its row is what a barrier reads from now on. A boot completion of a
     // snapshot install below replaces its group's rows.
-    crate::control::cluster::calvin::scheduler::barrier_store::restore_at_boot(shared)?;
+    let holding =
+        crate::control::cluster::calvin::scheduler::barrier_store::restore_at_boot(shared)?;
+    // The first reconcile pass after the data groups replay forgets the
+    // stored Calvin state of each vShard this node no longer replicates.
+    crate::control::cluster::left_vshard_forget::seed_at_boot(shared, holding);
 
     // Per-group snapshot builder for the SEND path: on the leader, build the
     // real serialized engine state for a lagging follower's group vshards

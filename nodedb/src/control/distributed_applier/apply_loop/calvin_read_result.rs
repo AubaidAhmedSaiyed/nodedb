@@ -13,9 +13,11 @@
 //!
 //! The entry counts as durably applied once its row holds the event. Boot
 //! resumes Raft delivery above the group's durable applied floor, so the
-//! row is what a barrier reads after a restart. A row write that fails
-//! leaves the event in memory alone, and the entry breaks the applied
-//! prefix: a restart delivers it again.
+//! row is what a barrier reads after a restart. The row is visible at once
+//! and durable before the floor that covers it: the settle pass persists
+//! every saved row before it saves a floor. A row write that fails leaves
+//! the event in memory alone, and the entry breaks the applied prefix: a
+//! restart delivers it again.
 
 use crate::control::array_sync::raft_apply::AppliedPosition;
 use crate::control::cluster::calvin::BarrierEvent;
@@ -253,7 +255,7 @@ fn drop_finished(ctx: ApplyContext<'_>, vshard_id: u32, txn: TxnId) {
             "calvin: the barrier row of a finished txn was not removed"
         );
         crate::diag::calvin_barrier_log_store_failed(
-            vshard_id,
+            Some(vshard_id),
             Some((txn.epoch, txn.position)),
             "remove",
             &e,
@@ -262,7 +264,8 @@ fn drop_finished(ctx: ApplyContext<'_>, vshard_id: u32, txn: TxnId) {
 }
 
 /// Save `event` in the row of `txn` on `vshard_id`, then hand it to the
-/// vShard's buffer. Returns whether the row holds it.
+/// vShard's buffer. Returns whether the row holds it. The settle pass
+/// persists the row before a floor covers its entry.
 ///
 /// A txn with an event its row lacks skips the row: the row stays a prefix
 /// of the txn's events, so a restart that delivers the missing entry again
@@ -282,7 +285,7 @@ fn save_and_buffer(ctx: ApplyContext<'_>, vshard_id: u32, txn: TxnId, event: Bar
                     "calvin: the barrier event's row write failed; the event stays in memory"
                 );
                 crate::diag::calvin_barrier_log_store_failed(
-                    vshard_id,
+                    Some(vshard_id),
                     Some((txn.epoch, txn.position)),
                     "save",
                     &e,

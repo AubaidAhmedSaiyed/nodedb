@@ -47,9 +47,10 @@ const CRASH_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the Calvin sequencer may take to elect its leader after a boot.
 const CALVIN_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The error a COMMIT returns once its completion deadline passes with no
-/// acknowledgement. The redo record stays appended and the install stays held.
-const COMMIT_DEADLINE: &str = "timed out waiting for Calvin transaction completion";
+/// The error a COMMIT returns once its statement deadline passes with no
+/// acknowledgement: an unknown outcome. The redo record stays appended and
+/// the install stays held.
+const COMMIT_DEADLINE: &str = "57014: request req:0 exceeded deadline";
 
 const LOG_DIRECTIVES: &str = "warn,nodedb::data::executor::kv_checkpoint=info";
 

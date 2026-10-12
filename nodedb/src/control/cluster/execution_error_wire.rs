@@ -133,6 +133,8 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::GroupMarksUnavailable { .. }
         | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
+        | crate::Error::MetadataGroupGone { .. }
+        | crate::Error::MetadataDdlSuperseded { .. }
         | crate::Error::AuthorizationStateBehind { .. }
         | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::ExecutionLimitExceeded { .. }

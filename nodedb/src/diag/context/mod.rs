@@ -14,6 +14,7 @@ mod crdt_dead_letter_store;
 mod cut_barrier;
 mod data_plane;
 mod event_image;
+mod held_entry;
 mod index_rebuild;
 mod ingest;
 mod lease;
@@ -43,6 +44,7 @@ pub(in crate::diag) use data_plane::{
     CalvinApplyHalted, CalvinCompletionTimeout, CoreFailStopped, DataPlaneResponseLost,
 };
 pub(in crate::diag) use event_image::{StrictRowImageUnrendered, TimeseriesRowImageUndecodable};
+pub(in crate::diag) use held_entry::{ApplyPanicked, HeldEntryDebtNotRecorded, RedoEntryMalformed};
 pub(in crate::diag) use index_rebuild::IndexRebuildNotInstalled;
 pub(in crate::diag) use ingest::IlpAcceptedLinesDropped;
 pub use ingest::IlpFlushOutcome;
@@ -53,7 +55,9 @@ pub(in crate::diag) use quota::{
     QuotaRowNotInstalled, QuotaRowWriteFailed, QuotaScopePurgeIncomplete, QuotaScopeReplayAborted,
     ScopeQuotaNotInstalled,
 };
-pub(in crate::diag) use raft_apply::{CalvinBarrierLogStoreFailed, RaftEntryReapplied};
+pub(in crate::diag) use raft_apply::{
+    CalvinBarrierLogStoreFailed, CalvinLeftStateNotForgotten, RaftEntryReapplied,
+};
 pub(in crate::diag) use recovery::{ReplayRecordUnapplied, WalArchivalFailedTruncationHeld};
 pub(in crate::diag) use redo_stream::{
     RedoAbandonGivenUp, RedoSnapshotDebtNotRecorded, RedoStreamLostHere,

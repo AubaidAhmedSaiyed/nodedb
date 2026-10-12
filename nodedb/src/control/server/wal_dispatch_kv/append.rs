@@ -10,10 +10,9 @@ use super::encode::{
     KvIncrRecord, KvRegisterSortedIndexFields, KvTransferFields, encode_kv_batch_put,
     encode_kv_cas, encode_kv_delete, encode_kv_drop_index, encode_kv_drop_sorted_index,
     encode_kv_expire, encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float,
-    encode_kv_insert_on_conflict_update, encode_kv_persist, encode_kv_predicate_delete,
-    encode_kv_predicate_update, encode_kv_put, encode_kv_register_index,
-    encode_kv_register_sorted_index, encode_kv_rewrite, encode_kv_transfer,
-    encode_kv_transfer_item, encode_kv_truncate,
+    encode_kv_insert_on_conflict_update, encode_kv_persist, encode_kv_put,
+    encode_kv_register_index, encode_kv_register_sorted_index, encode_kv_rewrite,
+    encode_kv_transfer, encode_kv_transfer_item, encode_kv_truncate,
 };
 
 /// Outcome of [`wal_append_kv_op`]: the allocated WAL LSN and, for a TTL-bearing
@@ -314,29 +313,16 @@ pub fn wal_append_kv_op(
             let entry = encode_kv_truncate(collection.as_str())?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
-        // The predicate is the durable record; replay re-executes it via the live handler.
-        KvOp::PredicateUpdate {
-            collection,
-            filters,
-            updates,
-            // Per-request authorization input, not part of the durable image.
-            rls_write_check: _,
-            // Per-request reply projection, not part of the durable image.
-            returning: _,
-            rls_filters: _,
-        } => {
-            let entry = encode_kv_predicate_update(collection.as_str(), filters, updates)?;
-            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
-        }
-        KvOp::PredicateDelete {
-            collection,
-            filters,
-            rls_write_check: _,
-            returning: _,
-            rls_filters: _,
-        } => {
-            let entry = encode_kv_predicate_delete(collection.as_str(), filters)?;
-            Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
+        // A row set replay scans for itself depends on its clock (TTL expiry),
+        // so a predicate write resolves to a mutation list first.
+        KvOp::PredicateUpdate { collection, .. } | KvOp::PredicateDelete { collection, .. } => {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "internal invariant break: a kv predicate UPDATE/DELETE on '{}' reached \
+                     the WAL unresolved; write_resolve resolves it to a mutation list first",
+                    collection.as_str()
+                ),
+            });
         }
         KvOp::Transfer {
             collection,

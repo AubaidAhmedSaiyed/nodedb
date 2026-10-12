@@ -8,7 +8,7 @@
 //! gated by the per-collection checkpoint watermark like the direct upsert:
 //! a restored checkpoint already holds every write at or below it.
 
-use nodedb_physical::physical_plan::VectorOp;
+use nodedb_physical::physical_plan::{VectorOp, VectorWriteTargets};
 
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::server::wal_dispatch::{
@@ -31,7 +31,7 @@ impl CoreLoop {
         tombstones: &nodedb_wal::TombstoneSet,
     ) -> bool {
         let tombstones = tombstones.for_database(database_id);
-        let Ok((collection, field, targets)) =
+        let Ok((collection, field, rows)) =
             zerompk::from_msgpack::<VectorDirectDeleteRecord>(payload)
         else {
             self.replay_record_unapplied(
@@ -45,6 +45,9 @@ impl CoreLoop {
         if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
             return false;
         }
+        // The record names the rows the delete removed. A row whose sidecar
+        // delete was durable before a crash still has its restored node.
+        let targets = VectorWriteTargets::Surrogates(rows);
         let index_key = CoreLoop::vector_index_key(database_id, tenant_id, &collection, &field);
         if self.vector_replay_skips(record_lsn) {
             return false;
@@ -192,7 +195,7 @@ impl CoreLoop {
         let Ok((
             collection,
             field,
-            targets,
+            rows,
             new_vector,
             payload_patch,
             quantization,
@@ -211,6 +214,7 @@ impl CoreLoop {
         if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
             return false;
         }
+        let targets = VectorWriteTargets::Surrogates(rows);
         let index_key = CoreLoop::vector_index_key(database_id, tenant_id, &collection, &field);
         if self.vector_replay_skips(record_lsn) {
             return false;
@@ -281,5 +285,39 @@ impl CoreLoop {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::{StorageKey, Surrogate};
+
+    use crate::control::server::wal_dispatch::encode_vector_direct_delete_payload;
+    use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::handlers::vector_direct_test_rows::{
+        COLLECTION, FIELD, TID, has_node, has_sidecar, seed,
+    };
+    use crate::types::DatabaseId;
+
+    /// A crash after the sidecar delete was durable leaves the restored node
+    /// with no sidecar. Replay of the delete record still removes the node.
+    #[test]
+    fn replay_removes_a_node_whose_sidecar_delete_was_durable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let row = Surrogate::new(7);
+        seed(&mut core, row);
+        let db = DatabaseId::DEFAULT.as_u64();
+        core.sparse
+            .delete(db, TID, COLLECTION, &StorageKey::for_surrogate(row))
+            .expect("durable sidecar delete");
+        assert!(has_node(&core, row) && !has_sidecar(&core, row));
+
+        let payload =
+            encode_vector_direct_delete_payload(COLLECTION, FIELD, &[row]).expect("encode");
+        let applied =
+            core.replay_direct_delete(&payload, TID, db, 100, &nodedb_wal::TombstoneSet::new());
+        assert!(applied, "the replayed delete applies");
+        assert!(!has_node(&core, row), "replay removes the node");
     }
 }

@@ -42,7 +42,8 @@ pub(super) async fn propose_resolved(
             ),
         })?;
 
-    let deadline = crate::control::wal_replication::statement_propose_deadline(state);
+    let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(state)
+        .tokio_instant();
     match propose_replicated_entry(state, proposer, entry, deadline).await {
         Ok((payload, write_versions)) => {
             let request_id =

@@ -472,7 +472,7 @@ mod tests {
             success: true,
             last_log_index: 5,
             round: 3,
-            needs_snapshot: false,
+            replica: nodedb_raft::ReplicaState::Whole,
         });
         let encoded = encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default()).unwrap();
         let header: [u8; HEADER_SIZE] = encoded[..HEADER_SIZE].try_into().unwrap();

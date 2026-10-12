@@ -43,8 +43,8 @@ pub use explain::calvin_explain_preamble;
 pub use predicate::predicate_class_for_filters;
 pub use retry_loop::{DependentOutcome, DependentRetryArgs, run_dependent_with_retry};
 pub use submit::{
-    RoutedAssignment, submit_and_await_calvin, submit_and_await_calvin_with_timeout,
-    submit_calvin_routed, submit_calvin_routed_assign, submit_calvin_routed_write,
+    RoutedAssignment, submit_and_await_calvin, submit_and_await_calvin_until, submit_calvin_routed,
+    submit_calvin_routed_assign, submit_calvin_routed_write,
 };
 pub use tx_class::{
     PassiveReads, build_predicted_tx_class, build_read_dependent_tx_class,

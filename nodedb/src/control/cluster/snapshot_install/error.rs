@@ -18,6 +18,8 @@ pub enum SettleStep {
     CalvinState,
     /// Replacing the group's open chunked redo streams.
     RedoStreams,
+    /// Recording the group's backup cut floors and barriers.
+    CutBarriers,
 }
 
 impl std::fmt::Display for SettleStep {
@@ -29,6 +31,7 @@ impl std::fmt::Display for SettleStep {
             Self::EventLane => "event lane install",
             Self::CalvinState => "Calvin state install",
             Self::RedoStreams => "redo stream install",
+            Self::CutBarriers => "cut barrier install",
         })
     }
 }

@@ -18,6 +18,7 @@ use nodedb_cluster::calvin::SequencerEntry;
 
 use crate::Error;
 use crate::control::cluster::calvin::scheduler::barrier_store;
+use crate::control::cluster::calvin_snapshot::cut_barriers::capture_cut_barriers;
 use crate::control::security::catalog::calvin_base::CalvinBase;
 use crate::control::state::SharedState;
 use crate::types::{GroupCalvinCut, VShardCalvinState};
@@ -103,18 +104,22 @@ pub async fn await_calvin_cut(
     }
 }
 
-/// The group's Calvin cut through `through`: the applied positions of every
-/// group vShard here, and the stored barrier logs of their unfinished txns.
-/// The caller holds the group's apply gate exclusive, so no Calvin install
-/// of these vShards runs and no barrier entry of the group applies.
+/// The group's Calvin cut through `through`, for a snapshot through the
+/// group's log index `cut_index`: the applied positions of every group
+/// vShard here, the stored barrier logs of their unfinished txns, and the
+/// group's backup cut barriers and floors. The caller holds the group's
+/// apply gate exclusive, so no Calvin install of these vShards runs and no
+/// entry of the group applies.
 ///
-/// Fails when the barrier logs cannot be read whole (see
+/// Fails when the barrier logs or cut floors cannot be read whole (see
 /// [`barrier_store::capture_group`]). The build retries on the next
 /// heartbeat.
 pub fn capture_calvin_cut(
     shared: &SharedState,
+    group_id: u64,
     group_vshards: &HashSet<u32>,
     through: u64,
+    cut_index: u64,
 ) -> Result<GroupCalvinCut, Error> {
     let ledgers = &shared.calvin.applied;
     let ids: BTreeSet<u32> = group_vshards.iter().copied().collect();
@@ -130,9 +135,12 @@ pub fn capture_calvin_cut(
         })
         .collect();
     let barrier_logs = barrier_store::capture_group(shared, &ids)?;
+    let (cut_barriers, cut_floors) = capture_cut_barriers(shared, group_id, cut_index)?;
     Ok(GroupCalvinCut {
         through,
         vshards,
         barrier_logs,
+        cut_barriers,
+        cut_floors,
     })
 }

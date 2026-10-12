@@ -8,6 +8,7 @@ use nodedb_cluster::ClusterError;
 use nodedb_raft::RaftError;
 
 use crate::error::Error;
+use crate::types::RequestId;
 
 /// Type-erased handle for proposing to the metadata raft group.
 ///
@@ -95,31 +96,41 @@ impl MetadataRaftHandle for RaftLoopProposerHandle {
 }
 
 /// The error a metadata proposal returns for a cluster error.
+///
+/// A group with no leader to take the proposal proposed nothing, so the
+/// caller can re-propose: [`Error::MetadataLeaderUnavailable`]. A forward
+/// with no answer can have been proposed, so its outcome is unknown:
+/// [`Error::DeadlineExceeded`]. A typed verdict keeps its class.
 fn metadata_propose_error(error: ClusterError) -> Error {
     match error {
-        // An election in progress is transient, not a failure of this
-        // proposal. Keep it typed rather than flattening it into a generic
-        // config error, so callers can wait the election out instead of
-        // failing the statement — a node that has recently restarted answers
-        // every metadata proposal this way for a moment.
-        ClusterError::Raft(RaftError::NotLeader {
-            leader_hint: None, ..
-        }) => Error::MetadataLeaderUnavailable,
+        // An election, a transfer in flight, or a leader that stepped down.
+        // Nothing was proposed.
+        ClusterError::Raft(
+            RaftError::NotLeader { .. } | RaftError::LeadershipTransferInProgress,
+        ) => Error::MetadataLeaderUnavailable,
+        // A forward that never reached the leader whole proposed nothing.
+        error if error.is_unsent() => Error::MetadataLeaderUnavailable,
+        // The forward is not resend-safe and got no answer. The leader can
+        // have appended the entry, so the outcome is unknown.
+        error if error.is_lost_answer() => {
+            tracing::warn!(
+                %error,
+                "metadata proposal forward got no answer from the leader"
+            );
+            Error::DeadlineExceeded {
+                request_id: RequestId::new(0),
+            }
+        }
         // A typed verdict keeps its class.
         ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
         ClusterError::ShardExecution { error, .. } | ClusterError::StreamTerminal { error, .. } => {
             Error::from(*error)
         }
         other @ (ClusterError::Raft(
-            RaftError::NotLeader {
-                leader_hint: Some(_),
-                ..
-            }
-            | RaftError::LogCompacted { .. }
+            RaftError::LogCompacted { .. }
             | RaftError::CompactionAheadOfApplied { .. }
             | RaftError::ProposalRejected { .. }
             | RaftError::InvalidTransferTarget { .. }
-            | RaftError::LeadershipTransferInProgress
             | RaftError::GroupNotFound { .. }
             | RaftError::Transport { .. }
             | RaftError::Storage { .. }
@@ -134,9 +145,6 @@ fn metadata_propose_error(error: ClusterError) -> Error {
         | ClusterError::MigrationPauseBudgetExceeded { .. }
         | ClusterError::NodeUnreachable { .. }
         | ClusterError::GhostNotFound { .. }
-        | ClusterError::Transport { .. }
-        | ClusterError::ShardTimeout { .. }
-        | ClusterError::Unanswered { .. }
         | ClusterError::Storage { .. }
         | ClusterError::Codec { .. }
         | ClusterError::UnsupportedWireVersion { .. }
@@ -162,8 +170,54 @@ fn metadata_propose_error(error: ClusterError) -> Error {
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
         | ClusterError::ShufflePush(_)
-        | ClusterError::RemoteUntyped { .. }) => Error::Config {
+        | ClusterError::RemoteUntyped { .. }
+        // The guards above take these three. They stay named for exhaustiveness.
+        | ClusterError::Transport { .. }
+        | ClusterError::ShardTimeout { .. }
+        | ClusterError::Unanswered { .. }) => Error::Config {
             detail: format!("metadata propose: {other}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A forward with no answer can have appended the entry. It is an
+    /// unknown outcome, never a config error and never retried.
+    #[test]
+    fn a_lost_metadata_answer_is_an_unknown_outcome() {
+        let unanswered = metadata_propose_error(ClusterError::Unanswered {
+            node_id: 2,
+            detail: "connection lost".into(),
+        });
+        assert!(matches!(unanswered, Error::DeadlineExceeded { .. }));
+
+        let timed_out = metadata_propose_error(ClusterError::ShardTimeout {
+            vshard_id: 0,
+            elapsed_ms: 50,
+        });
+        assert!(matches!(timed_out, Error::DeadlineExceeded { .. }));
+    }
+
+    /// A forward that never went out proposed nothing. The caller waits for
+    /// a leader and re-proposes.
+    #[test]
+    fn an_unsent_metadata_forward_waits_for_a_leader() {
+        let unsent = metadata_propose_error(ClusterError::Transport {
+            detail: "connect to node 2 refused".into(),
+        });
+        assert!(matches!(unsent, Error::MetadataLeaderUnavailable));
+
+        let stale = metadata_propose_error(ClusterError::Raft(RaftError::NotLeader {
+            leader_hint: Some(2),
+            term: 3,
+        }));
+        assert!(matches!(stale, Error::MetadataLeaderUnavailable));
+
+        let moving =
+            metadata_propose_error(ClusterError::Raft(RaftError::LeadershipTransferInProgress));
+        assert!(matches!(moving, Error::MetadataLeaderUnavailable));
     }
 }

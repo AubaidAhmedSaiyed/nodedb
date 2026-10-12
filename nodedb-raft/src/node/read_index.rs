@@ -190,7 +190,7 @@ mod tests {
                 success,
                 last_log_index: node.last_log_index(),
                 round: node.lease.next_round - 1,
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
     }
@@ -268,7 +268,7 @@ mod tests {
                 success: false,
                 last_log_index: 0,
                 round: 0,
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
 

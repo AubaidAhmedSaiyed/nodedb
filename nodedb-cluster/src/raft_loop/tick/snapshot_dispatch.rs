@@ -326,7 +326,7 @@ async fn send_snapshot(
                                 success: false,
                                 last_log_index: 0,
                                 round: nodedb_raft::node::leader_lease::UNTRACKED_ROUND,
-                                needs_snapshot: false,
+                                replica: nodedb_raft::ReplicaState::Whole,
                             },
                         ) {
                             tracing::error!(group_id, peer, resp_term, error = %e, "apply higher term from install_snapshot response");

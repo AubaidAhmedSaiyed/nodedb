@@ -2,7 +2,7 @@
 
 //! The arrays of a `MOVE TENANT`.
 //!
-//! A cell routes to its vShard by Hilbert prefix alone, so moving an array to
+//! A cell routes to its vShard by tile key alone, so moving an array to
 //! another database moves no cell to another vShard. Only the catalog key,
 //! the surrogate bindings, and each core's store directory carry the
 //! database. The cutover rekeys all three with a `DeleteArray` at the source

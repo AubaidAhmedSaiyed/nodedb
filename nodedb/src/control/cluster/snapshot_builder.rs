@@ -304,6 +304,8 @@ impl nodedb_cluster::SnapshotBuilder for DataPlaneSnapshotBuilder {
         last_included_index: u64,
         _last_included_term: u64,
     ) -> Result<nodedb_cluster::BuiltGroupSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(feature = "failpoints")]
+        crate::control::fail_gate::before_snapshot_build(self.shared.node_id, group_id).await;
         // No routing table or an empty group ships nothing: the sender falls
         // back to the stub chunk, at the index asked for.
         let nothing = nodedb_cluster::BuiltGroupSnapshot {
@@ -358,8 +360,14 @@ impl nodedb_cluster::SnapshotBuilder for DataPlaneSnapshotBuilder {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         // Read under the fence: the storage captured below holds exactly the
         // Calvin positions this names.
-        let calvin_cut = capture_calvin_cut(&self.shared, &group_vshards, calvin_through)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let calvin_cut = capture_calvin_cut(
+            &self.shared,
+            group_id,
+            &group_vshards,
+            calvin_through,
+            cut_index,
+        )
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         // Enumerate tenants and their databases from the system catalog — the
         // same source the backup orchestrator's catalog sections use. Every

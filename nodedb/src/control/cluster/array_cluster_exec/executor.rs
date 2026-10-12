@@ -17,7 +17,7 @@ use nodedb_cluster::routing::VSHARD_COUNT;
 use nodedb_cluster::{NexarTransport, RoutingTable};
 
 use crate::control::cluster::array_cluster_helpers::{
-    cluster_err, encode_err, finalize_agg_partials,
+    cluster_err, coord_err, encode_err, finalize_agg_partials,
 };
 use crate::control::server::shared::session::pending_shard_reads::{ShardObservation, ShardReads};
 use crate::control::server::shared::session::read_set::EngineTag;
@@ -48,7 +48,7 @@ struct SliceArgs<'a> {
     slice_msgpack: &'a [u8],
     attr_projection: &'a [u32],
     limit: u32,
-    slice_hilbert_ranges: &'a [(u64, u64)],
+    slice_tile_keys: &'a [u64],
     prefix_bits: u8,
     system_time: nodedb_types::SystemTimeScope,
     valid_at_ms: Option<i64>,
@@ -60,7 +60,7 @@ struct AggArgs<'a> {
     attr_idx: u32,
     reducer_msgpack: &'a [u8],
     group_by_dim: i32,
-    slice_hilbert_ranges: &'a [(u64, u64)],
+    slice_tile_keys: &'a [u64],
     prefix_bits: u8,
     system_as_of: Option<i64>,
     valid_at_ms: Option<i64>,
@@ -114,7 +114,7 @@ impl ClusterArrayExecutor {
                 slice_msgpack,
                 attr_projection,
                 limit,
-                slice_hilbert_ranges,
+                slice_tile_keys,
                 prefix_bits,
                 system_time,
                 valid_at_ms,
@@ -124,7 +124,7 @@ impl ClusterArrayExecutor {
                     slice_msgpack,
                     attr_projection,
                     limit: *limit,
-                    slice_hilbert_ranges,
+                    slice_tile_keys,
                     prefix_bits: *prefix_bits,
                     system_time: *system_time,
                     valid_at_ms: *valid_at_ms,
@@ -138,7 +138,7 @@ impl ClusterArrayExecutor {
                 attr_idx,
                 reducer_msgpack,
                 group_by_dim,
-                slice_hilbert_ranges,
+                slice_tile_keys,
                 prefix_bits,
                 system_as_of,
                 valid_at_ms,
@@ -148,7 +148,7 @@ impl ClusterArrayExecutor {
                     attr_idx: *attr_idx,
                     reducer_msgpack,
                     group_by_dim: *group_by_dim,
-                    slice_hilbert_ranges,
+                    slice_tile_keys,
                     prefix_bits: *prefix_bits,
                     system_as_of: *system_as_of,
                     valid_at_ms: *valid_at_ms,
@@ -187,7 +187,7 @@ impl ClusterArrayExecutor {
             slice_msgpack,
             attr_projection,
             limit,
-            slice_hilbert_ranges,
+            slice_tile_keys,
             prefix_bits,
             system_time,
             valid_at_ms,
@@ -196,7 +196,7 @@ impl ClusterArrayExecutor {
         let coordinator = ArrayCoordinator::for_slice(
             self.source_node,
             ARRAY_RPC_TIMEOUT_MS,
-            slice_hilbert_ranges,
+            slice_tile_keys,
             prefix_bits,
             self.total_shards,
             Arc::clone(&self.dispatch),
@@ -211,13 +211,11 @@ impl ClusterArrayExecutor {
             attr_projection: attr_projection.to_vec(),
             limit,
             cell_filter_msgpack: vec![],
-            // prefix_bits, slice_hilbert_ranges, and shard_hilbert_range are
-            // stamped per-shard by coord_slice from ArrayCoordParams, which was
-            // populated by for_slice above. Initialise to defaults here;
-            // coord_slice overwrites them before serialising the request envelope.
+            // coord_slice stamps prefix_bits, slice_tile_keys and shard_bucket
+            // per shard from the ArrayCoordParams that for_slice built.
             prefix_bits: 0,
-            slice_hilbert_ranges: vec![],
-            shard_hilbert_range: None,
+            slice_tile_keys: vec![],
+            shard_bucket: None,
             system_time,
             valid_at_ms,
             txn_id: txn_id.map(TxnId::as_u64),
@@ -225,7 +223,7 @@ impl ClusterArrayExecutor {
         let result = coordinator
             .coord_slice(req, limit, system_time)
             .await
-            .map_err(cluster_err)?;
+            .map_err(coord_err)?;
         note_array_reads(array_id, &result.read_versions);
 
         // Encode rows into the structured `ArraySliceResponse` — identical to
@@ -265,7 +263,7 @@ impl ClusterArrayExecutor {
             attr_idx,
             reducer_msgpack,
             group_by_dim,
-            slice_hilbert_ranges,
+            slice_tile_keys,
             prefix_bits,
             system_as_of,
             valid_at_ms,
@@ -274,7 +272,7 @@ impl ClusterArrayExecutor {
         let coordinator = ArrayCoordinator::for_slice(
             self.source_node,
             ARRAY_RPC_TIMEOUT_MS,
-            slice_hilbert_ranges,
+            slice_tile_keys,
             prefix_bits,
             self.total_shards,
             Arc::clone(&self.dispatch),
@@ -289,12 +287,12 @@ impl ClusterArrayExecutor {
             reducer_msgpack: reducer_msgpack.to_vec(),
             group_by_dim,
             cell_filter_msgpack: vec![],
-            shard_hilbert_range: None,
+            shard_bucket: None,
             system_as_of,
             valid_at_ms,
             txn_id: txn_id.map(TxnId::as_u64),
         };
-        let agg = coordinator.coord_agg(req).await.map_err(cluster_err)?;
+        let agg = coordinator.coord_agg(req).await.map_err(coord_err)?;
         note_array_reads(array_id, &agg.read_versions);
 
         // Decode the reducer so we know which field to finalize.
@@ -342,7 +340,7 @@ impl ClusterArrayExecutor {
             &self.circuit_breaker,
         )
         .await
-        .map_err(cluster_err)?;
+        .map_err(coord_err)?;
 
         // Sum each shard's real `affected` count — never `cells.len()`, which
         // counts cells named in the request, not cells the Data Plane
@@ -373,7 +371,7 @@ impl ClusterArrayExecutor {
             &self.circuit_breaker,
         )
         .await
-        .map_err(cluster_err)?;
+        .map_err(coord_err)?;
 
         // Sum each shard's real `affected` count — never `coords.len()`,
         // which counts coordinates named, not coordinates that existed and

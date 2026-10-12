@@ -298,6 +298,8 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::CommittedResultUnavailable { .. }
             | crate::Error::ProposalOutcomeUnknown { .. }
             | crate::Error::MetadataLeaderUnavailable
+            | crate::Error::MetadataGroupGone { .. }
+            | crate::Error::MetadataDdlSuperseded { .. }
             | crate::Error::Wal(_)
             | crate::Error::Dispatch { .. }
             | crate::Error::Storage { .. }

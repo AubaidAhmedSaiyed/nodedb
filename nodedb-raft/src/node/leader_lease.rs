@@ -305,7 +305,7 @@ mod tests {
                 success: true,
                 last_log_index,
                 round,
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
     }
@@ -422,7 +422,7 @@ mod tests {
                 success: false,
                 last_log_index: 0,
                 round: stale,
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
         assert_eq!(node.role(), NodeRole::Follower);

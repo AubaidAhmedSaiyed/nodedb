@@ -229,6 +229,11 @@ impl CoreLoop {
                     declared_primary_key,
                     *storage_key,
                 );
+                // The removed rows' index values record no version, so the
+                // first removal records a wipe that bounds every index read.
+                if truncated == 0 {
+                    self.note_task_collection_wipe(task, tid, collection);
+                }
                 // Record the removal's version against the row's surrogate
                 // and collection, as a point delete does.
                 self.note_surrogate_write(task, tid, collection, surrogate.as_u32());

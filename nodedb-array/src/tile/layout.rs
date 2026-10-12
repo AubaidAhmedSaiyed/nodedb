@@ -83,19 +83,21 @@ pub fn tile_id_for_cell(
 /// The space-filling-curve key of the tile at `tile_indices`.
 ///
 /// The memtable, the segment index, the transaction overlay and retention
-/// group cells by this key, and a cluster routes a tile by its top bits.
-/// Every cell inside a group stays addressed by its full coordinate: a
-/// lookup matches the coordinate within the group
+/// group cells by this key. A cluster routes a tile by the top bits of
+/// `fmix64(key)` (`nodedb_types::array_route::prefix_bucket`), not by the
+/// key's own top bits. Every cell inside a group stays addressed by its
+/// full coordinate: a lookup matches the coordinate within the group
 /// (`TileBuffer::get_cell_bytes`, `extract_cell_bytes`), and a tile's MBR
 /// is built from the cells it holds. Two tiles that share a key therefore
-/// share one group and lose no cell.
+/// share one group and one route, and lose no cell.
 ///
 /// A dimension whose tile count fits its share of the key bits scales each
 /// index over that count to the full bit width. Its tiles keep distinct,
-/// ordered keys that spread over the top bits. A dimension with more tiles
-/// than its bits can number, such as one with the default full-range
-/// domain, keeps the low bits of the index instead. Nearby tiles then keep
-/// distinct keys, and tiles `2^bits` apart share one.
+/// ordered keys. A dimension with more tiles than its bits can number, such
+/// as one with the default full-range domain, keeps the low bits of the
+/// index instead. Nearby tiles then keep distinct keys, and tiles `2^bits`
+/// apart share one. Such keys can share their top bits, and the routing mix
+/// still spreads them over buckets.
 pub fn tile_prefix(schema: &ArraySchema, tile_indices: &[u64]) -> ArrayResult<u64> {
     if tile_indices.len() != schema.arity() {
         return Err(ArrayError::CoordArityMismatch {
@@ -178,6 +180,7 @@ mod tests {
     use crate::schema::attr_spec::{AttrSpec, AttrType};
     use crate::schema::dim_spec::DimSpec;
     use crate::types::domain::Domain;
+    use nodedb_types::array_route::prefix_bucket;
 
     fn schema() -> ArraySchema {
         ArraySchemaBuilder::new("g")
@@ -221,20 +224,63 @@ mod tests {
     }
 
     #[test]
-    fn tile_keys_spread_over_the_top_bits() {
+    fn tile_keys_spread_over_routing_buckets() {
         let s = schema();
-        let tops: std::collections::BTreeSet<u64> = (0..10)
+        let buckets: std::collections::BTreeSet<u32> = (0..10)
             .flat_map(|x| (0..10).map(move |y| (x * 10, y * 10)))
             .map(|(x, y)| {
-                tile_id_for_cell(&s, &[CoordValue::Int64(x), CoordValue::Int64(y)], 0)
+                let key = tile_id_for_cell(&s, &[CoordValue::Int64(x), CoordValue::Int64(y)], 0)
                     .unwrap()
-                    .hilbert_prefix
-                    >> 56
+                    .hilbert_prefix;
+                prefix_bucket(key, 8)
             })
             .collect();
+        // 100 tiles over 256 buckets: well over half of them distinct.
         assert!(
-            tops.len() > 1,
-            "the tiles of one array route to more than one bucket: {tops:?}"
+            buckets.len() >= 60,
+            "the tiles of one array route to {} buckets",
+            buckets.len()
+        );
+    }
+
+    fn full_range_2d() -> ArraySchema {
+        ArraySchemaBuilder::new("open")
+            .dim(DimSpec::new(
+                "x",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(i64::MIN), DomainBound::Int64(i64::MAX)),
+            ))
+            .dim(DimSpec::new(
+                "y",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(i64::MIN), DomainBound::Int64(i64::MAX)),
+            ))
+            .attr(AttrSpec::new("v", AttrType::Int64, false))
+            .tile_extents(vec![1, 1])
+            .build()
+            .unwrap()
+    }
+
+    /// The tiles of coordinates 0..64 x 0..64 in a full-range 2-D array
+    /// share their key's top bits, yet spread over the routing buckets.
+    #[test]
+    fn full_range_tiles_near_zero_spread_over_routing_buckets() {
+        let s = full_range_2d();
+        let keys: Vec<u64> = (0..64)
+            .flat_map(|x| (0..64).map(move |y| (x, y)))
+            .map(|(x, y)| {
+                cell_tile_prefix(&s, &[CoordValue::Int64(x), CoordValue::Int64(y)]).unwrap()
+            })
+            .collect();
+        let distinct: std::collections::BTreeSet<u64> = keys.iter().copied().collect();
+        assert_eq!(distinct.len(), 4096, "every tile keeps a distinct key");
+        let buckets: std::collections::BTreeSet<u32> =
+            keys.iter().map(|&k| prefix_bucket(k, 8)).collect();
+        // 4096 distinct keys over 256 buckets reach at least 7/8 of them.
+        assert!(
+            buckets.len() >= 224,
+            "4096 tiles route to only {} of 256 buckets",
+            buckets.len()
         );
     }
 

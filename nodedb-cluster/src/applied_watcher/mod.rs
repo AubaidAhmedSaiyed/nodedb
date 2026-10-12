@@ -9,18 +9,15 @@
 //! checks) can wait on the apply watermark of *their* group rather
 //! than only the metadata group.
 //!
-//! Bump points (single source of truth for "applied on this node"):
+//! Bump points:
 //!
-//! 1. [`crate::raft_loop::tick`] after the per-group apply phase
-//!    — covers regular committed-entry application for every locally
-//!    mounted group, including the metadata group.
-//! 2. [`crate::raft_loop::handle_rpc`] after `handle_install_snapshot`
-//!    — covers the snapshot-install path where `last_applied` jumps
-//!    to `last_included_index` without going through the apply loop.
-//!
-//! Both bump points read the canonical applied index from the Raft
-//! node itself rather than mirroring it from a side channel, so the
-//! watcher cannot drift from Raft's own state.
+//! 1. The metadata lane, once a metadata entry applied.
+//! 2. The tick loop, for the Calvin sequencer group, which the host applies
+//!    inline.
+//! 3. The host apply loop, for data groups, once an entry's apply concluded
+//!    and every earlier entry of the group settled.
+//! 4. A snapshot install, for every group whose state it restored.
+//! 5. A group mount, seeded with the durable applied index.
 
 pub mod registry;
 pub mod watcher;

@@ -89,9 +89,10 @@ pub struct AppendEntriesResponse {
     pub last_log_index: u64,
     /// `round` of the request this answers.
     pub round: u64,
-    /// Set on a rejection from a follower that holds no state it can resume
-    /// the log from. The leader sends it a snapshot instead of entries.
-    pub needs_snapshot: bool,
+    /// What the follower needs before it takes entries. A rejection from a
+    /// follower that wants a snapshot gets one instead of entries. The
+    /// leader records it per peer: a peer whose data diverged cannot lead.
+    pub replica: crate::state::ReplicaState,
 }
 
 /// RequestVote RPC (Raft paper Figure 2).

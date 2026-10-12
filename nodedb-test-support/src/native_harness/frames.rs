@@ -132,11 +132,29 @@ pub async fn read_frame(stream: &mut TcpStream) -> Option<Vec<u8>> {
 /// must send one JSON frame before calling this. Shared by [`send_sql`] and
 /// any test driving a direct-op opcode (`PointGet`, `RangeScan`,
 /// `VectorSearch`, `KvBatchPut`, ...) directly rather than through SQL text.
+///
+/// Waits at most [`RESPONSE_BOUND`] for the response.
 pub async fn send_request(
     stream: &mut TcpStream,
     seq: u64,
     op: OpCode,
     fields: TextFields,
+) -> NativeResponse {
+    send_request_within(stream, seq, op, fields, Some(RESPONSE_BOUND)).await
+}
+
+/// How long [`send_request`] waits for a response.
+pub const RESPONSE_BOUND: Duration = Duration::from_secs(5);
+
+/// [`send_request`] waiting at most `bound` for the response, or without
+/// limit when `bound` is `None`. A caller that parks the server on purpose
+/// bounds the wait itself.
+pub async fn send_request_within(
+    stream: &mut TcpStream,
+    seq: u64,
+    op: OpCode,
+    fields: TextFields,
+    bound: Option<Duration>,
 ) -> NativeResponse {
     let req = NativeRequest {
         op,
@@ -146,14 +164,18 @@ pub async fn send_request(
     let json_bytes = sonic_rs::to_vec(&req).expect("json encode");
     write_frame(stream, &json_bytes).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = bound.map(|bound| tokio::time::Instant::now() + bound);
     let mut accumulated: Option<NativeResponse> = None;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let response_payload = tokio::time::timeout(remaining, read_frame(stream))
-            .await
-            .expect("timeout waiting for response")
-            .expect("response frame");
+        let response_payload = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, read_frame(stream))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("no response to request seq {seq} ({op:?}) within {bound:?}")
+                }),
+            None => read_frame(stream).await,
+        }
+        .expect("response frame");
         let response: NativeResponse =
             sonic_rs::from_slice(&response_payload).expect("json decode NativeResponse");
         if response.seq == seq {

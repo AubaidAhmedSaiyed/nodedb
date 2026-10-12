@@ -40,8 +40,10 @@ pub trait RaftReadGate: Send + Sync {
     ) -> Result<u64, ReadIndexRefusal>;
 
     /// Whether this node's replica of `group_id` is within `max_staleness` of
-    /// the leader. Local state only — no quorum round, so this does not block.
-    fn within_staleness_bound(&self, group_id: u64, max_staleness: Duration) -> bool;
+    /// the leader, with reads here seeing state through `applied`: the
+    /// group's host applied watermark. Local state only — no quorum round, so
+    /// this does not block.
+    fn within_staleness_bound(&self, group_id: u64, max_staleness: Duration, applied: u64) -> bool;
 
     /// Whether this node leads `group_id` under a leader lease that is valid
     /// now. Local state only, so this does not block.
@@ -173,11 +175,11 @@ impl RaftReadGate for MultiRaftReadGate {
             .map_err(refusal_of)
     }
 
-    fn within_staleness_bound(&self, group_id: u64, max_staleness: Duration) -> bool {
+    fn within_staleness_bound(&self, group_id: u64, max_staleness: Duration, applied: u64) -> bool {
         self.multi_raft
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .within_staleness_bound(group_id, max_staleness)
+            .within_staleness_bound(group_id, max_staleness, applied)
     }
 
     fn holds_leader_lease(&self, group_id: u64) -> bool {

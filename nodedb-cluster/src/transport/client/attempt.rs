@@ -24,6 +24,11 @@
 //! A live peer acknowledges the request within its ACK delay. A read that
 //! times out on a connection that received datagrams meanwhile is a slow
 //! handler, and the connection stays pooled.
+//!
+//! A peer silent for the RPC timeout is dead or cut off: its connection hit
+//! the QUIC idle timeout, or a dial got no answer. The call ends at once with
+//! no resend to that peer, so the caller can try another node. A written
+//! request then ends as `ClusterError::Unanswered`.
 
 use std::time::Duration;
 
@@ -59,15 +64,18 @@ struct LinkFailure {
     /// Whether the whole request was written before the failure. The peer
     /// can have run a written request.
     written: bool,
+    /// The peer sent nothing for the RPC timeout. No resend goes to it.
+    silent: bool,
 }
 
 impl LinkFailure {
-    /// A failure before the request went out that leaves the pool as it is.
-    fn keep_connection(error: ClusterError) -> Self {
+    /// A dial the peer never answered.
+    fn from_dial(failed: super::pool::DialError) -> Self {
         Self {
-            error: Box::new(error),
+            error: Box::new(failed.error),
             condemned: None,
             written: false,
+            silent: failed.silent,
         }
     }
 
@@ -85,9 +93,15 @@ impl LinkFailure {
 /// `Ok` holds the error kept while the next attempt goes out. `Err` ends the
 /// call. A written request that is not [`RaftRpc::resend_safe`] can have run
 /// on the peer. It is never resent and ends as `ClusterError::Unanswered`.
+///
+/// A silent peer gets no resend: a written request ends as `Unanswered`, an
+/// unsent one with its own error.
 fn resend_verdict(failure: LinkFailure, target: u64, resend_safe: bool) -> Result<ClusterError> {
-    if failure.written && !resend_safe {
+    if failure.written && (failure.silent || !resend_safe) {
         return Err(failure.into_unanswered(target));
+    }
+    if failure.silent {
+        return Err(*failure.error);
     }
     if RetryPolicy::is_retryable(&failure.error) {
         Ok(*failure.error)
@@ -234,15 +248,16 @@ impl NexarTransport {
         read_timeout: Duration,
     ) -> std::result::Result<Result<RaftRpc>, LinkFailure> {
         let conn = self
-            .get_or_connect(target)
+            .connect_peer(target)
             .await
-            .map_err(LinkFailure::keep_connection)?;
+            .map_err(LinkFailure::from_dial)?;
         let stable_id = conn.stable_id();
         if let Err(error) = self.verify_connection_target(&conn, target) {
             return Err(LinkFailure {
                 error: Box::new(error),
                 condemned: Some(stable_id),
                 written: false,
+                silent: false,
             });
         }
         let received_before = received_datagrams(&conn);
@@ -255,11 +270,13 @@ impl NexarTransport {
                     StreamFailure::Unanswered(error) => (error, false, true),
                 };
                 let heard = received_datagrams(&conn) > received_before;
-                let broken = condemns_connection(timed_out, conn.close_reason().is_some(), heard);
+                let close_reason = conn.close_reason();
+                let broken = condemns_connection(timed_out, close_reason.is_some(), heard);
                 LinkFailure {
                     error: Box::new(error),
                     condemned: broken.then_some(stable_id),
                     written,
+                    silent: matches!(close_reason, Some(quinn::ConnectionError::TimedOut)),
                 }
             })
     }
@@ -349,7 +366,13 @@ fn received_datagrams(conn: &quinn::Connection) -> u64 {
 mod tests {
     use nodedb_raft::message::RequestVoteRequest;
 
-    use super::super::transport::tests::{STALL, STALLED_GROUP, serve_echo};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::super::transport::tests::{
+        SLOW, SLOW_GROUP, STALL, STALLED_GROUP, serve_echo, serve_echo_with_rpc_timeout,
+    };
     use super::*;
     use crate::rpc_codec::{FrameRefusal, PongResponse, RequestRefusal};
 
@@ -399,6 +422,106 @@ mod tests {
         assert_eq!(client.circuit_breaker().failure_count(1), 1);
     }
 
+    /// RPC timeout, and so QUIC idle timeout, of the liveness tests.
+    const LIVENESS_RPC_TIMEOUT: Duration = Duration::from_millis(300);
+
+    fn vote(group_id: u64) -> RaftRpc {
+        RaftRpc::RequestVoteRequest(RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+            group_id,
+            transfer: false,
+        })
+    }
+
+    /// A handler slower than the idle timeout on a live peer gets the whole
+    /// read timeout: keep-alives hold the connection open.
+    #[tokio::test]
+    async fn a_stalled_handler_on_a_live_peer_answers_past_the_idle_timeout() {
+        let (_server, client, _shutdown) = serve_echo_with_rpc_timeout(LIVENESS_RPC_TIMEOUT).await;
+        client.warm_peer(1).await.expect("warm");
+        let pooled = client.peer_connection_stable_id(1).expect("pooled");
+        assert!(SLOW > LIVENESS_RPC_TIMEOUT * 3);
+
+        let reply = client
+            .send_rpc_with_read_timeout(1, vote(SLOW_GROUP), Duration::from_secs(2))
+            .await
+            .expect("a live peer answers");
+
+        assert!(
+            matches!(reply, RaftRpc::RequestVoteResponse(_)),
+            "{reply:?}"
+        );
+        assert_eq!(client.peer_connection_stable_id(1), Some(pooled));
+        assert_eq!(client.circuit_breaker().failure_count(1), 0);
+    }
+
+    /// A UDP relay between a client and a server that drops every datagram
+    /// once `cut` is set.
+    async fn relay(server: SocketAddr, cut: Arc<AtomicBool>) -> SocketAddr {
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind relay"),
+        );
+        let addr = socket.local_addr().expect("relay address");
+        tokio::spawn(async move {
+            let mut client: Option<SocketAddr> = None;
+            let mut buf = vec![0u8; 65_536];
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                if cut.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let to = if from == server {
+                    match client {
+                        Some(client) => client,
+                        None => continue,
+                    }
+                } else {
+                    client = Some(from);
+                    server
+                };
+                let _ = socket.send_to(&buf[..len], to).await;
+            }
+        });
+        addr
+    }
+
+    /// A peer cut off mid-read fails a long read at the idle timeout. The
+    /// read is not resent to it, and its connection leaves the pool.
+    #[tokio::test]
+    async fn a_silent_peer_fails_a_long_read_within_the_idle_timeout() {
+        let (server, client, _shutdown) = serve_echo_with_rpc_timeout(LIVENESS_RPC_TIMEOUT).await;
+        let cut = Arc::new(AtomicBool::new(false));
+        client.register_peer(1, relay(server.local_addr(), Arc::clone(&cut)).await);
+        client.warm_peer(1).await.expect("warm through the relay");
+        assert!(client.peer_connection_stable_id(1).is_some());
+
+        cut.store(true, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        let err = client
+            .send_rpc_with_read_timeout(1, vote(STALLED_GROUP), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, ClusterError::Unanswered { node_id: 1, .. }),
+            "{err:?}"
+        );
+        let slack = Duration::from_millis(700);
+        assert!(
+            elapsed < LIVENESS_RPC_TIMEOUT + slack,
+            "failed after {elapsed:?}, idle timeout {LIVENESS_RPC_TIMEOUT:?}"
+        );
+        assert!(
+            !client.peers.read().unwrap().contains_key(&1),
+            "the dead connection is evicted"
+        );
+    }
+
     fn lost(written: bool) -> LinkFailure {
         LinkFailure {
             error: Box::new(ClusterError::Transport {
@@ -406,6 +529,7 @@ mod tests {
             }),
             condemned: None,
             written,
+            silent: false,
         }
     }
 
@@ -439,6 +563,34 @@ mod tests {
         ));
     }
 
+    fn silent(written: bool) -> LinkFailure {
+        LinkFailure {
+            silent: true,
+            ..lost(written)
+        }
+    }
+
+    /// A silent peer is dead or cut off. A written read is not resent to it
+    /// and ends unanswered, so the caller can try another node.
+    #[test]
+    fn a_written_request_to_a_silent_peer_ends_unanswered() {
+        for resend_safe in [false, true] {
+            match resend_verdict(silent(true), 2, resend_safe) {
+                Err(ClusterError::Unanswered { node_id: 2, .. }) => {}
+                other => panic!("expected Unanswered, got {other:?}"),
+            }
+        }
+    }
+
+    /// A request a silent peer never got ends with its own error, unsent.
+    #[test]
+    fn an_unsent_request_to_a_silent_peer_is_not_resent() {
+        assert!(matches!(
+            resend_verdict(silent(false), 2, true),
+            Err(ClusterError::Transport { .. })
+        ));
+    }
+
     #[test]
     fn a_typed_refusal_is_a_final_answer() {
         let refusal = RaftRpc::RequestRefused(RequestRefusal::from(ClusterError::GroupNotFound {
@@ -463,10 +615,10 @@ mod tests {
 
     #[test]
     fn only_the_outer_error_is_a_link_failure() {
-        let link = LinkFailure::keep_connection(ClusterError::Transport {
-            detail: "connection lost".into(),
-        });
-        assert!(matches!(classify(1, Err(link)), Attempt::LinkFailed(_)));
+        assert!(matches!(
+            classify(1, Err(lost(false))),
+            Attempt::LinkFailed(_)
+        ));
 
         let unreadable = ClusterError::Codec {
             detail: "bad crc".into(),

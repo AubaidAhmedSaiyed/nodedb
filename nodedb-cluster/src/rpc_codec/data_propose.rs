@@ -291,6 +291,7 @@ mod tests {
             std::time::Duration::from_millis(u64::MAX) + REPLY_MARGIN
         );
     }
+
     use crate::rpc_codec::{decode, encode};
 
     fn roundtrip(target: ProposeTarget) -> DataProposeRequest {

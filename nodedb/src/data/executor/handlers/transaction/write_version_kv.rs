@@ -88,11 +88,13 @@ impl CoreLoop {
                     );
                 }
             }
-            // Whole-collection mutations: key set is every row or predicate-
-            // resolved at apply time, so only the collection floor applies.
-            KvOp::Truncate { collection, .. }
-            | KvOp::PredicateUpdate { collection, .. }
-            | KvOp::PredicateDelete { collection, .. } => {
+            // Every row leaves: a wipe bounds every row read of the collection.
+            KvOp::Truncate { collection, .. } => {
+                self.note_collection_wipe(db, tenant, collection.as_str(), stamp);
+            }
+            // Predicate-resolved at apply time, so only the collection floor
+            // applies.
+            KvOp::PredicateUpdate { collection, .. } | KvOp::PredicateDelete { collection, .. } => {
                 self.note_write(db, tenant, collection.as_str(), None, stamp);
             }
             // Read-only: nothing written, no version to record.

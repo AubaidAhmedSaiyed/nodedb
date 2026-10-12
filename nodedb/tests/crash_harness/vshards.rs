@@ -41,8 +41,8 @@ pub fn single_node_data_group(name: &str) -> u32 {
 /// `INT64` dimension `[lo..hi]` array in.
 ///
 /// An array cell write routes by its tile, never by the array's name. The
-/// tile's key picks a bucket from its top `prefix_bits` bits, and the bucket
-/// owns vShard `bucket * (1024 >> prefix_bits)`. At the default of 8 bits
+/// tile's key picks a bucket from the top `prefix_bits` bits of
+/// `fmix64(key)`, and the bucket owns vShard `bucket * (1024 >> prefix_bits)`. At the default of 8 bits
 /// every array vShard is a multiple of 4, so every cell of every array
 /// applies in data group 1. Only `prefix_bits` of 9 or more spreads cells
 /// over more than one group. `tile_extent` must match the array's

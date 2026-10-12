@@ -9,6 +9,7 @@ use std::time::Duration;
 use nodedb_types::config::tuning::ClusterTransportTuning;
 
 use crate::error::{ClusterError, Result};
+use crate::transport::liveness::raft_transport_config;
 use crate::transport::peer_identity_store::PeerIdentityStore;
 use crate::transport::pinned_verifier::{PinnedClientVerifier, PinnedServerVerifier};
 
@@ -42,30 +43,6 @@ pub const SNI_HOSTNAME: &str = "nodedb";
 /// constructing `NexarTransport::with_tuning()` with a custom `ClusterTransportTuning`.
 pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Transport config tuned for Raft RPCs in a datacenter.
-///
-/// All values are read from `tuning`. Pass `&ClusterTransportTuning::default()`
-/// to get the same behaviour as the previous hardcoded defaults.
-pub fn raft_transport_config(tuning: &ClusterTransportTuning) -> quinn::TransportConfig {
-    let mut config = quinn::TransportConfig::default();
-    // Raft RPCs use bidi streams: one per request-response pair.
-    config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(tuning.quic_max_bi_streams));
-    // Also allow uni streams for future migration/snapshot streaming.
-    config.max_concurrent_uni_streams(quinn::VarInt::from_u32(tuning.quic_max_uni_streams));
-    // Datacenter tuning: generous windows, low RTT estimate.
-    config.receive_window(quinn::VarInt::from_u32(tuning.quic_receive_window));
-    config.send_window(u64::from(tuning.quic_send_window));
-    config.stream_receive_window(quinn::VarInt::from_u32(tuning.quic_stream_receive_window));
-    config.initial_rtt(Duration::from_micros(100));
-    config.keep_alive_interval(Some(Duration::from_secs(tuning.quic_keep_alive_secs)));
-    config.max_idle_timeout(Some(
-        Duration::from_secs(tuning.quic_idle_timeout_secs)
-            .try_into()
-            .expect("idle timeout fits IdleTimeout"),
-    ));
-    config
-}
-
 /// Build a QUIC server config with self-signed TLS (unauthenticated).
 ///
 /// **Crate-private** — reachable only via
@@ -75,6 +52,7 @@ pub fn raft_transport_config(tuning: &ClusterTransportTuning) -> quinn::Transpor
 /// Production clusters use the mTLS variant.
 pub(crate) fn make_raft_server_config(
     tuning: &ClusterTransportTuning,
+    rpc_timeout: Duration,
 ) -> Result<quinn::ServerConfig> {
     ensure_rustls_crypto_provider();
     let (cert, key) = nexar::transport::tls::generate_self_signed_cert().map_err(|e| {
@@ -103,7 +81,7 @@ pub(crate) fn make_raft_server_config(
         })?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    server_config.transport_config(Arc::new(raft_transport_config(tuning)));
+    server_config.transport_config(Arc::new(raft_transport_config(tuning, rpc_timeout)?));
     Ok(server_config)
 }
 
@@ -116,6 +94,7 @@ pub(crate) fn make_raft_server_config(
 /// Production clusters use the mTLS variant.
 pub(crate) fn make_raft_client_config(
     tuning: &ClusterTransportTuning,
+    rpc_timeout: Duration,
 ) -> Result<quinn::ClientConfig> {
     ensure_rustls_crypto_provider();
     let provider = rustls::crypto::ring::default_provider();
@@ -136,7 +115,7 @@ pub(crate) fn make_raft_client_config(
         })?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
-    client_config.transport_config(Arc::new(raft_transport_config(tuning)));
+    client_config.transport_config(Arc::new(raft_transport_config(tuning, rpc_timeout)?));
     Ok(client_config)
 }
 
@@ -188,6 +167,7 @@ pub struct TlsCredentials {
 pub fn make_raft_server_config_mtls(
     creds: &TlsCredentials,
     tuning: &ClusterTransportTuning,
+    rpc_timeout: Duration,
     identity_store: Arc<dyn PeerIdentityStore>,
 ) -> Result<quinn::ServerConfig> {
     ensure_rustls_crypto_provider();
@@ -247,7 +227,7 @@ pub fn make_raft_server_config_mtls(
         })?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    server_config.transport_config(Arc::new(raft_transport_config(tuning)));
+    server_config.transport_config(Arc::new(raft_transport_config(tuning, rpc_timeout)?));
     Ok(server_config)
 }
 
@@ -261,6 +241,7 @@ pub fn make_raft_server_config_mtls(
 pub fn make_raft_client_config_mtls(
     creds: &TlsCredentials,
     tuning: &ClusterTransportTuning,
+    rpc_timeout: Duration,
     identity_store: Arc<dyn PeerIdentityStore>,
 ) -> Result<quinn::ClientConfig> {
     ensure_rustls_crypto_provider();
@@ -320,7 +301,7 @@ pub fn make_raft_client_config_mtls(
         })?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
-    client_config.transport_config(Arc::new(raft_transport_config(tuning)));
+    client_config.transport_config(Arc::new(raft_transport_config(tuning, rpc_timeout)?));
     Ok(client_config)
 }
 

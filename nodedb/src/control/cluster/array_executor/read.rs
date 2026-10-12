@@ -48,7 +48,7 @@ impl DataPlaneArrayExecutor {
             attr_projection: req.attr_projection.clone(),
             limit: req.limit,
             cell_filter,
-            hilbert_range: req.shard_hilbert_range,
+            shard_bucket: req.shard_bucket,
             system_time: req.system_time,
             valid_at_ms: req.valid_at_ms,
         });
@@ -119,7 +119,7 @@ impl DataPlaneArrayExecutor {
             group_by_dim: req.group_by_dim,
             cell_filter,
             return_partial: true,
-            hilbert_range: req.shard_hilbert_range,
+            shard_bucket: req.shard_bucket,
             system_as_of: req.system_as_of,
             valid_at_ms: req.valid_at_ms,
         });

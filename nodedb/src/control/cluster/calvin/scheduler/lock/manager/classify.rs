@@ -18,7 +18,8 @@ pub(super) enum KeyState {
     /// No entry: the requester can take the key.
     Free,
     /// The requester already holds the key in a mode that covers the request,
-    /// or holds it alone and can raise its mode in place.
+    /// or can raise its mode in place because every other holder is
+    /// compatible with the raised mode.
     Held,
     /// Other holders hold the key in a compatible mode and nobody waits: the
     /// requester can join them.
@@ -34,8 +35,9 @@ impl LockManager {
         let Some(entry) = self.table.get(key) else {
             return KeyState::Free;
         };
-        if entry.holders.contains(&txn) {
-            if entry.mode.merge(mode) == entry.mode || entry.held_solely_by(txn) {
+        if let Some(own) = entry.mode_of(txn) {
+            let raised = own.merge(mode);
+            if raised == own || entry.others_compatible(txn, raised) {
                 return KeyState::Held;
             }
             return KeyState::Conflict;
@@ -58,22 +60,14 @@ impl LockManager {
                     key.clone(),
                     LockEntry {
                         mode,
-                        holders: smallvec![txn],
+                        holders: smallvec![(txn, mode)],
                         waiters: VecDeque::new(),
                     },
                 );
             }
-            Some(entry) => {
-                if entry.holders.contains(&txn) {
-                    // A sole holder raises its mode in place. A co-holder only
-                    // reaches here when its mode already covers the request.
-                    if entry.held_solely_by(txn) {
-                        entry.mode = entry.mode.merge(mode);
-                    }
-                } else {
-                    entry.holders.push(txn);
-                }
-            }
+            // A holder raises its own mode in place. Classification admitted
+            // the raised mode against every other holder.
+            Some(entry) => entry.hold(txn, mode),
         }
     }
 
@@ -89,11 +83,12 @@ impl LockManager {
         if entry.has_waiter(txn) {
             return;
         }
-        let wanted = if entry.holders.contains(&txn) {
-            entry.holders.retain(|h| *h != txn);
-            entry.mode.merge(mode)
-        } else {
-            mode
+        let wanted = match entry.mode_of(txn) {
+            Some(own) => {
+                entry.drop_holder(txn);
+                own.merge(mode)
+            }
+            None => mode,
         };
         entry.waiters.push_back((txn, wanted));
     }

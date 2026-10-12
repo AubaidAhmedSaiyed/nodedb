@@ -275,14 +275,8 @@ impl MetadataCommitApplier {
         entries: &[MetadataEntry],
         raft_index: u64,
     ) -> Result<(), crate::Error> {
-        let shared = self.shared.get().and_then(std::sync::Weak::upgrade);
         for sub in entries {
             self.apply_host_side_effects(sub, raft_index).await?;
-            if let Some(shared) = &shared {
-                shared
-                    .metadata_apply_progress
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
         }
         Ok(())
     }

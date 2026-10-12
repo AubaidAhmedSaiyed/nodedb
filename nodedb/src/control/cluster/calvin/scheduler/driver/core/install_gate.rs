@@ -44,7 +44,8 @@ impl InstallGate {
 impl Scheduler {
     /// Record that this replica's Calvin state of the vShard has a hole, and
     /// make its data-group replica refuse log entries until a snapshot
-    /// brings the state back.
+    /// brings the state back. The group's data is whole here, so the
+    /// replica keeps campaigning and leading.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn lose_calvin_base(&self) {
         if let Err(error) = self
             .shared
@@ -60,10 +61,11 @@ impl Scheduler {
         }
         match group_of_vshard(&self.shared, self.vshard_id) {
             Ok(group_id) => {
-                self.multi_raft
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .set_snapshot_required(group_id, true);
+                let mut multi_raft = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+                crate::control::cluster::calvin_snapshot::require_calvin_snapshot(
+                    &mut multi_raft,
+                    group_id,
+                );
             }
             Err(error) => tracing::error!(
                 vshard_id = self.vshard_id,

@@ -89,15 +89,84 @@ pub fn statement_deadline(default_deadline_secs: u64) -> Instant {
 }
 
 /// Milliseconds left on the current statement, for the remote-hop
-/// `ExecuteRequest.deadline_remaining_ms` field.
-///
-/// Saturates at 1: a hop dispatched with `0` is refused up front by the
-/// receiver's deadline check, which will report a deadline the local half has
-/// not actually reached yet.
+/// `ExecuteRequest.deadline_remaining_ms` field. See [`hop_budget_ms`].
 pub fn statement_deadline_ms(default_deadline_secs: u64) -> u64 {
-    let remaining =
-        statement_deadline(default_deadline_secs).saturating_duration_since(Instant::now());
-    (remaining.as_millis() as u64).max(1)
+    hop_budget_ms(statement_deadline(default_deadline_secs))
+}
+
+/// The budget a remote hop carries for `deadline`: the milliseconds left now,
+/// at least 1.
+///
+/// A receiver refuses a hop sent with `0` before it checks anything else. It
+/// reports a deadline the local half has not reached yet.
+pub fn hop_budget_ms(deadline: Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+/// The deadline of the statement running on this task, as a value.
+///
+/// The one place a caller with `SharedState` reads the statement deadline:
+/// the installed deadline, or now plus `tuning.network.default_deadline_secs`
+/// outside a statement. Waits, retry loops and proposals that share the
+/// statement's budget all take it from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StatementDeadline(Instant);
+
+impl StatementDeadline {
+    /// The running statement's deadline, or the node default outside one.
+    pub fn of_statement(state: &crate::control::state::SharedState) -> Self {
+        Self::with_default(state.tuning.network.default_deadline_secs)
+    }
+
+    /// The running statement's deadline, or `default_deadline_secs` from now
+    /// outside one.
+    pub fn with_default(default_deadline_secs: u64) -> Self {
+        Self(statement_deadline(default_deadline_secs))
+    }
+
+    /// A deadline at `instant`.
+    pub fn at(instant: Instant) -> Self {
+        Self(instant)
+    }
+
+    /// A deadline `budget` from now.
+    pub fn after(budget: Duration) -> Self {
+        Self(Instant::now() + budget)
+    }
+
+    /// The deadline as a std instant.
+    pub fn instant(self) -> Instant {
+        self.0
+    }
+
+    /// The deadline as a Tokio instant, for `tokio::time` waits.
+    pub fn tokio_instant(self) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.0)
+    }
+
+    /// The milliseconds a remote hop carries for this deadline. See
+    /// [`hop_budget_ms`].
+    pub fn hop_budget_ms(self) -> u64 {
+        hop_budget_ms(self.0)
+    }
+
+    /// Time left until the deadline, zero once it passed.
+    pub fn remaining(self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
+}
+
+/// Install a fresh node-default deadline for cleanup work, such as an overlay
+/// drop.
+///
+/// Cleanup often runs after its statement ran out of time. Under that dead
+/// deadline every request it sends is refused before it runs. Dropping the
+/// guard restores the statement's deadline.
+pub fn enter_cleanup(default_deadline_secs: u64) -> StatementScope {
+    enter(None, default_deadline_secs)
 }
 
 fn store(deadline: Option<Instant>) {
@@ -175,6 +244,33 @@ mod tests {
                 Some(outer_deadline),
                 "a nested statement must not leave its budget behind"
             );
+        })
+        .await;
+    }
+
+    #[test]
+    fn a_spent_deadline_still_sends_a_one_millisecond_hop() {
+        assert_eq!(hop_budget_ms(Instant::now()), 1);
+        let live = hop_budget_ms(Instant::now() + Duration::from_secs(10));
+        assert!(live > 9_000 && live <= 10_000, "budget {live} ms");
+    }
+
+    /// Cleanup after a timed-out statement runs on the node default, and the
+    /// statement's deadline returns once cleanup ends.
+    #[tokio::test]
+    async fn cleanup_gets_a_fresh_deadline_after_its_statement_timed_out() {
+        conn_scope::scoped(async {
+            let _statement = enter(Some(Duration::from_millis(1)), 30);
+            let dead = current().expect("the statement installs a deadline");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(dead <= Instant::now());
+            {
+                let _cleanup = enter_cleanup(30);
+                let fresh = statement_deadline(30);
+                assert!(fresh >= Instant::now() + Duration::from_secs(29));
+                assert!(statement_deadline_ms(30) > 29_000);
+            }
+            assert_eq!(current(), Some(dead));
         })
         .await;
     }

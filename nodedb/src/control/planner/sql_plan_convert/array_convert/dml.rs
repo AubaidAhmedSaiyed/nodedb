@@ -86,9 +86,9 @@ pub(in super::super) fn convert_insert_array(
             let surrogate = ctx.surrogate_for_pk(ctx.collection_key(name), &pk_bytes)?;
             // A cell routes by its tile's key, the key a slice's shard
             // fan-out and each shard's tile filter use.
-            let hilbert =
+            let tile_key =
                 cell_tile_prefix(&schema, &coord).map_err(|e| crate::Error::PlanError {
-                    detail: format!("INSERT INTO ARRAY {name}: Hilbert prefix: {e}"),
+                    detail: format!("INSERT INTO ARRAY {name}: tile key: {e}"),
                 })?;
             let cell = ArrayPutCell {
                 coord,
@@ -103,7 +103,7 @@ pub(in super::super) fn convert_insert_array(
                     format: "msgpack".into(),
                     detail: format!("array put cell encode: {e}"),
                 })?;
-            partitioned.push((hilbert, cell_bytes));
+            partitioned.push((tile_key, cell_bytes));
         }
         let array_id_msgpack =
             zerompk::to_msgpack_vec(&aid).map_err(|e| crate::Error::Serialization {
@@ -212,9 +212,9 @@ pub(in super::super) fn convert_delete_array(
         let mut partitioned: Vec<(u64, Vec<u8>)> = Vec::with_capacity(coords.len());
         for row in coords {
             let typed = coerce_coords(row, &schema)?;
-            let hilbert =
+            let tile_key =
                 cell_tile_prefix(&schema, &typed).map_err(|e| crate::Error::PlanError {
-                    detail: format!("DELETE FROM ARRAY {name}: Hilbert prefix: {e}"),
+                    detail: format!("DELETE FROM ARRAY {name}: tile key: {e}"),
                 })?;
             let cell = ArrayDeleteCell {
                 coord: typed,
@@ -226,7 +226,7 @@ pub(in super::super) fn convert_delete_array(
                     format: "msgpack".into(),
                     detail: format!("array delete cell encode: {e}"),
                 })?;
-            partitioned.push((hilbert, cell_bytes));
+            partitioned.push((tile_key, cell_bytes));
         }
         let array_id_msgpack =
             zerompk::to_msgpack_vec(&aid).map_err(|e| crate::Error::Serialization {

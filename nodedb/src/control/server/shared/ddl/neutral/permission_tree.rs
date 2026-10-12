@@ -150,7 +150,12 @@ async fn source_group_barrier(state: &SharedState, sources: &[TreeKey]) -> crate
         .await?;
         targets.push(nodedb_cluster::GroupCoverage { group_id, through });
     }
-    crate::control::security::auth_lease::authorization_barrier(state, targets).await
+    crate::control::security::auth_lease::authorization_barrier(
+        state,
+        targets,
+        crate::control::server::shared::session::StatementDeadline::of_statement(state).instant(),
+    )
+    .await
 }
 
 /// ALTER COLLECTION <name> DROP PERMISSION_TREE

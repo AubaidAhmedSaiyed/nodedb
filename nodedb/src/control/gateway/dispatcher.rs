@@ -227,18 +227,6 @@ pub(crate) async fn dispatch_route_stream(
     }
 }
 
-/// Milliseconds left on the running statement, for a remote hop's
-/// `ExecuteRequest.deadline_remaining_ms`.
-///
-/// The session's `statement_timeout` when one is installed on this connection,
-/// else the node's configured default. A forwarded route must stop when the
-/// statement that spawned it does, not on a budget of its own.
-pub fn statement_deadline_ms(shared: &SharedState) -> u64 {
-    crate::control::server::shared::session::statement_deadline_ms(
-        shared.tuning.network.default_deadline_secs,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

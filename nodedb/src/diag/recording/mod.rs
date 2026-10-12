@@ -15,6 +15,7 @@ mod crdt;
 mod cut_barrier;
 mod data_plane;
 mod event_image;
+mod held_entry;
 mod index_rebuild;
 mod ingest;
 mod lease;
@@ -44,6 +45,7 @@ pub use data_plane::{
     data_plane_response_lost, data_plane_responses_lost,
 };
 pub use event_image::{strict_row_image_unrendered, timeseries_row_image_undecodable};
+pub use held_entry::{apply_panicked, held_entry_debt_not_recorded, redo_entry_malformed};
 pub use index_rebuild::{IndexRebuildTarget, index_rebuild_not_installed};
 pub use ingest::{ilp_invalid_utf8_drop, ilp_line_read_drop};
 pub use lease::descriptor_lease_not_renewed;
@@ -53,7 +55,8 @@ pub use quota::{
     quota_scope_replay_aborted, scope_quota_not_installed,
 };
 pub use raft_apply::{
-    calvin_barrier_log_store_failed, raft_entries_reapplied, raft_entry_reapplied,
+    calvin_barrier_log_store_failed, calvin_left_state_not_forgotten, raft_entries_reapplied,
+    raft_entry_reapplied,
 };
 pub use recovery::{
     batch_insert_without_surrogates, fts_index_update_failed, orphaned_index_entry_after_delete,

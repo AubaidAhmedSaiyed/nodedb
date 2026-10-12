@@ -206,7 +206,7 @@ mod tests {
                 success: true,
                 last_log_index: node.last_log_index(),
                 round,
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
     }
@@ -226,7 +226,7 @@ mod tests {
                 success: false,
                 last_log_index: 0,
                 round: latest_round(&node),
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
 
@@ -257,7 +257,7 @@ mod tests {
                 success: true,
                 last_log_index: 1,
                 round: latest_round(&node),
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
 
@@ -296,7 +296,7 @@ mod tests {
                 success: true,
                 last_log_index: node.last_log_index(),
                 round: latest_round(&node),
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
 
@@ -380,7 +380,7 @@ mod tests {
                 success: true,
                 last_log_index: node.last_log_index(),
                 round: latest_round(&node),
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
         node.tick();
@@ -468,7 +468,7 @@ mod tests {
                 success: false,
                 last_log_index: 0,
                 round: stale,
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
         assert_eq!(node.role(), NodeRole::Follower);
@@ -520,7 +520,7 @@ mod tests {
                 success: true,
                 last_log_index: node.last_log_index(),
                 round: latest_round(&node),
-                needs_snapshot: false,
+                replica: crate::state::ReplicaState::Whole,
             },
         );
 

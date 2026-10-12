@@ -66,7 +66,7 @@ impl CoreLoop {
     /// Stage a KV predicate `UPDATE` at statement time: resolve the current
     /// BASE ∪ OVERLAY matching set, merge the SET-list into each match, and
     /// record the post-image as a staged `Put`. Replies `{"affected": N}`,
-    /// the same shape `execute_kv_predicate_update` reports in autocommit.
+    /// the same shape the autocommit resolve reports.
     pub(in crate::data::executor) fn stage_kv_predicate_update(
         &mut self,
         params: StageKvPredicateUpdateParams<'_>,
@@ -204,6 +204,8 @@ impl CoreLoop {
         let filters: Vec<ScanFilter> =
             decode_scan_filters(filter_bytes, "kv predicate dml filters")
                 .map_err(|e| self.response_error(task, e))?;
+        // Deterministic: Calvin staging pins the epoch anchor every replica
+        // shares, and session staging runs on the leader alone.
         let mut rows = self
             .kv_predicate_matches(did, tid, collection, filter_bytes, self.kv_read_now_ms())
             .map_err(|e| self.response_error(task, e))?;

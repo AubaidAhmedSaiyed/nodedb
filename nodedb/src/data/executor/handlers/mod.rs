@@ -99,6 +99,8 @@ pub mod vector_direct_delete;
 pub mod vector_direct_resolve;
 pub mod vector_direct_row;
 pub mod vector_direct_targets;
+#[cfg(test)]
+pub mod vector_direct_test_rows;
 pub mod vector_direct_truncate;
 pub mod vector_direct_update;
 pub mod vector_index_drop;

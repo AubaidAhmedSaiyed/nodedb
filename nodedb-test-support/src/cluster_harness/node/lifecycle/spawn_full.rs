@@ -200,6 +200,16 @@ impl TestClusterNode {
         // cloned. Before `EventPlane::spawn` below: the Event Plane starts the
         // cross-shard drain only when its sender is wired.
         if let Some(state) = Arc::get_mut(&mut shared) {
+            // No stream is open yet: the store with the test's bounds
+            // replaces the default one before any entry applies.
+            if let Some(limits) = config.redo_chunk_limits {
+                state.redo_chunks = Arc::new(
+                    nodedb::control::wal_replication::transaction_redo::RedoChunkStore::new(
+                        Arc::clone(&wal),
+                        limits,
+                    ),
+                );
+            }
             // Consumer offsets, job history, MV state and the array-sync
             // stores live in the data directory in the production layout. A
             // restart reopens them there, since no metadata entry below the
@@ -325,6 +335,12 @@ impl TestClusterNode {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
+
+        // The data-group recovery production boot runs, in the background:
+        // the harness starts nodes one at a time, and a group elects only
+        // once its peers run. It sets `data_groups_replayed`, which gates
+        // the forget of a departed vShard's Calvin state.
+        nodedb::bootstrap::data_group_recovery::spawn_data_group_recovery(&shared);
 
         // CRDT constraint reconcile loop (leader-gated). The production server
         // spawns this from `spawn_background_loops`, which the harness does not

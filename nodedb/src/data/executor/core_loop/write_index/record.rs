@@ -94,6 +94,61 @@ impl CoreLoop {
         }
     }
 
+    /// Record a committed write that removed every row of `collection`: a
+    /// TRUNCATE. Every point and index read of the collection older than the
+    /// write then fails validation.
+    ///
+    /// In the install pass of a committed-redo apply the version waits in the
+    /// apply scope, exactly like [`Self::note_write`].
+    pub(in crate::data::executor) fn note_collection_wipe(
+        &mut self,
+        db: DatabaseId,
+        tenant: TenantId,
+        collection: &str,
+        stamp: WriteStamp,
+    ) {
+        if let Some(scope) = self.redo_apply.scope.as_mut() {
+            scope.defer_collection_wipe(db, tenant, collection, stamp);
+            return;
+        }
+        self.publish_collection_wipe(db, tenant, collection, stamp);
+    }
+
+    /// Record a wipe version and advance the core watermark monotonically.
+    pub(in crate::data::executor) fn publish_collection_wipe(
+        &mut self,
+        db: DatabaseId,
+        tenant: TenantId,
+        collection: &str,
+        stamp: WriteStamp,
+    ) {
+        self.floors.applied_prefix.note_applied(stamp.lsn);
+        let version = self.write_version_of(stamp);
+        self.write_index
+            .note_wipe(db, tenant, stamp.vshard, collection, version);
+        if stamp.lsn > self.watermark {
+            self.watermark = stamp.lsn;
+        }
+    }
+
+    /// Record a committed whole-collection removal, if `task` carries a WAL
+    /// record. See [`Self::note_collection_wipe`].
+    pub(in crate::data::executor) fn note_task_collection_wipe(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+    ) {
+        if let Some(stamp) = self.task_write_stamp(task) {
+            self.note_collection_wipe(
+                task.request.database_id,
+                TenantId::new(tid),
+                collection,
+                stamp,
+            );
+        }
+    }
+
     /// Record a committed write's collection version only (no per-key
     /// entry), if `task` carries a WAL record. Shared by the columnar-family
     /// write handlers (columnar / timeseries / array / spatial / FTS) whose
@@ -155,11 +210,39 @@ impl CoreLoop {
         key: Option<KeyRepr>,
         record_lsn: u64,
     ) {
-        if record_lsn == 0 {
-            return;
-        }
         let db = DatabaseId::new(database_id);
-        let stamp = match self.write_index.record_stamps.get(record_lsn) {
+        if let Some(stamp) = self.replay_stamp(db, collection, record_lsn) {
+            self.note_write(db, TenantId::new(tenant_id), collection, key, stamp);
+        }
+    }
+
+    /// Record a whole-collection removal a replay arm applied from the WAL
+    /// record at `record_lsn`, stamped like [`Self::note_replay_write`].
+    pub(in crate::data::executor) fn note_replay_wipe(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        record_lsn: u64,
+    ) {
+        let db = DatabaseId::new(database_id);
+        if let Some(stamp) = self.replay_stamp(db, collection, record_lsn) {
+            self.note_collection_wipe(db, TenantId::new(tenant_id), collection, stamp);
+        }
+    }
+
+    /// The stamp of a write a replay arm applied from the WAL record at
+    /// `record_lsn`. `None` when `record_lsn == 0` (no durable record).
+    fn replay_stamp(
+        &self,
+        db: DatabaseId,
+        collection: &str,
+        record_lsn: u64,
+    ) -> Option<WriteStamp> {
+        if record_lsn == 0 {
+            return None;
+        }
+        Some(match self.write_index.record_stamps.get(record_lsn) {
             Some(stamp) => stamp,
             None => WriteStamp {
                 // A name without its database's qualifier is a bare name.
@@ -169,8 +252,7 @@ impl CoreLoop {
                 lsn: Lsn::new(record_lsn),
                 entry: None,
             },
-        };
-        self.note_write(db, TenantId::new(tenant_id), collection, key, stamp);
+        })
     }
 
     /// Run horizon GC on the per-core version index. Invoked from the periodic
@@ -409,6 +491,103 @@ mod tests {
             Some(local(42))
         );
         assert_eq!(core.watermark, Lsn::new(42));
+    }
+
+    #[test]
+    fn a_kv_truncate_invalidates_a_point_read_of_a_removed_key() {
+        let (mut core, _, _, _dir) = make_core();
+        let resp = core.execute_kv_put(
+            &wal_task(42),
+            KvWriteParams {
+                did: DatabaseId::DEFAULT.as_u64(),
+                tid: 1,
+                collection: "kv",
+                key: b"k1".as_slice(),
+                value: b"v1".as_slice(),
+                ttl_ms: 0,
+                surrogate: Surrogate::new(3),
+                returning: None,
+                rls_filters: &[],
+            },
+        );
+        assert_eq!(resp.status, Status::Ok);
+        let read = core.write_index.latest(vshard0());
+        let point =
+            nodedb_types::calvin::ReadKeyIdent::Point(KeyRepr::KvKey(Box::from(b"k1".as_slice())));
+        let current = |core: &CoreLoop| {
+            core.write_index.read_is_valid(
+                DatabaseId::DEFAULT,
+                TenantId::new(1),
+                vshard0(),
+                "kv",
+                &point,
+                read,
+            )
+        };
+        assert!(current(&core), "the read saw the put");
+
+        let resp = core.execute_kv_truncate(&wal_task(50), DatabaseId::DEFAULT.as_u64(), 1, "kv");
+        assert_eq!(resp.status, Status::Ok);
+        assert!(
+            !current(&core),
+            "the truncate removed k1 after the read observed it"
+        );
+        assert_eq!(core.watermark, Lsn::new(50));
+    }
+
+    #[test]
+    fn a_document_truncate_invalidates_an_index_read_of_a_removed_row() {
+        let (mut core, _, _, _dir) = make_core();
+        let put = wal_task(42);
+        let resp = point_put(&mut core, &put, "docs", "d1", 3, "open");
+        assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+        // The index value the put of an indexed collection records.
+        let stamp = core.task_write_stamp(&put).expect("a WAL task has a stamp");
+        core.note_index_write_values(
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            "docs",
+            &[("a".to_string(), "open".to_string())],
+            stamp,
+        );
+        let read = core.write_index.latest(vshard0());
+        let index_eq = nodedb_types::calvin::ReadKeyIdent::IndexEq {
+            field: "a".to_string(),
+            value: "open".to_string(),
+        };
+        let point = nodedb_types::calvin::ReadKeyIdent::Point(KeyRepr::Surrogate(3));
+        let current = |core: &CoreLoop, key: &nodedb_types::calvin::ReadKeyIdent| {
+            core.write_index.read_is_valid(
+                DatabaseId::DEFAULT,
+                TenantId::new(1),
+                vshard0(),
+                "docs",
+                key,
+                read,
+            )
+        };
+        assert!(current(&core, &index_eq), "the index read saw the put");
+        assert!(current(&core, &point), "the point read saw the put");
+
+        let resp = core.execute_truncate(
+            &wal_task(50),
+            1,
+            crate::data::executor::handlers::truncate::TruncateParams {
+                collection: "docs",
+                resolved_sum_targets: &[],
+                declared_primary_key: None,
+            },
+        );
+        assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+        assert!(
+            !current(&core, &index_eq),
+            "the truncate removed the indexed row after the read observed it"
+        );
+        assert!(
+            !current(&core, &point),
+            "the truncate removed d1 after the read observed it"
+        );
+        assert_eq!(core.watermark, Lsn::new(50));
     }
 
     #[test]

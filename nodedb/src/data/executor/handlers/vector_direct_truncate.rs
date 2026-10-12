@@ -41,22 +41,32 @@ impl CoreLoop {
                 Err(e) => return self.response_error(task, e),
             };
 
-        let mut truncated = 0usize;
-        for surrogate in &surrogates {
-            match self.remove_vector_direct_row(&index_key, tid, collection, *surrogate) {
-                Ok(Some(_)) => truncated += 1,
-                // A sidecar row with no node bound to it: drop the row so the
-                // collection reads back empty.
-                Ok(None) => {
-                    let key = StorageKey::for_surrogate(*surrogate);
-                    if let Err(e) = self.sparse.delete(database_id, tid, collection, &key) {
-                        return self.response_error(task, ErrorCode::from(e));
+        for (at, surrogate) in surrogates.iter().enumerate() {
+            let outcome =
+                match self.remove_vector_direct_row(&index_key, tid, collection, *surrogate) {
+                    Ok(Some(_)) => Ok(()),
+                    // A sidecar row with no node bound to it: drop the row so the
+                    // collection reads back empty.
+                    Ok(None) => {
+                        let key = StorageKey::for_surrogate(*surrogate);
+                        let deleted = self
+                            .sparse
+                            .delete(database_id, tid, collection, &key)
+                            .map(|_| ())
+                            .map_err(ErrorCode::from);
+                        if deleted.is_ok() {
+                            self.doc_cache
+                                .invalidate(database_id, tid, collection, &key);
+                        }
+                        deleted
                     }
-                    self.doc_cache
-                        .invalidate(database_id, tid, collection, &key);
-                    truncated += 1;
-                }
-                Err(e) => return self.response_error(task, e),
+                    Err(e) => Err(e),
+                };
+            if let Err(e) = outcome {
+                // The failed row stays whole. The rows before it are removed.
+                let removed = &surrogates[..at];
+                self.finish_vector_direct_write(task, &index_key, tid, collection, removed);
+                return self.response_error(task, e);
             }
         }
 
@@ -68,6 +78,7 @@ impl CoreLoop {
         self.finish_vector_direct_write(task, &index_key, tid, collection, &surrogates);
         self.invalidate_aggregate_cache_for_collection(database_id, tid, collection);
 
+        let truncated = surrogates.len();
         debug!(core = self.core_id, %collection, truncated, "vector direct truncate complete");
         self.truncate_response(task, truncated)
     }

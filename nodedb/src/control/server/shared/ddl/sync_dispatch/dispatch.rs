@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response};
 use crate::control::server::shared::clone_write::CloneCheckedTask;
 use crate::control::server::shared::response_payload::payload_or_typed_error;
-use crate::control::server::shared::session::statement_deadline;
+use crate::control::server::shared::session::{StatementDeadline, statement_deadline};
 use crate::control::server::shared::write_admission::plan_is_write;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
@@ -23,13 +23,25 @@ use super::system_task::SystemTask;
 /// own [`crate::bridge::envelope::ErrorCode`]. Each protocol renders that code
 /// through its SQLSTATE or status table. Only a refusal with no code is
 /// `crate::Error::Internal`.
+///
+/// `timeout` bounds work the server starts on its own. Work inside a statement
+/// passes the statement's deadline to [`dispatch_system_by`].
 pub(crate) async fn dispatch_system(
     state: &SharedState,
     task: SystemTask<'_>,
     timeout: Duration,
 ) -> crate::Result<Vec<u8>> {
+    dispatch_system_by(state, task, StatementDeadline::after(timeout)).await
+}
+
+/// [`dispatch_system`] bounded by `deadline`.
+pub(crate) async fn dispatch_system_by(
+    state: &SharedState,
+    task: SystemTask<'_>,
+    deadline: StatementDeadline,
+) -> crate::Result<Vec<u8>> {
     let event_source = task.reason.event_source();
-    let resp = dispatch_system_response_with_source(state, task, timeout, event_source).await?;
+    let resp = dispatch_system_response_with_source(state, task, deadline, event_source).await?;
 
     // A system task never advances the tenant's observed write-HLC. Its
     // `SystemReason` states that no client asked for the work, and RESTORE's
@@ -49,7 +61,7 @@ pub(crate) async fn dispatch_system(
 pub(crate) async fn dispatch_system_response_with_source(
     state: &SharedState,
     task: SystemTask<'_>,
-    timeout: Duration,
+    deadline: StatementDeadline,
     event_source: crate::event::EventSource,
 ) -> crate::Result<Response> {
     let vshard_id = task.collection.vshard();
@@ -65,7 +77,7 @@ pub(crate) async fn dispatch_system_response_with_source(
             database_id: task.collection.database_id(),
             vshard_id,
             plan: task.plan,
-            timeout,
+            deadline,
             event_source,
         },
     )
@@ -94,7 +106,7 @@ pub(crate) async fn dispatch_authorized(
     state: &SharedState,
     checked: CloneCheckedTask,
     collection: &str,
-    timeout: Duration,
+    deadline: StatementDeadline,
     linearizable: bool,
 ) -> crate::Result<Vec<u8>> {
     // The write lease lives until the dispatch returns its outcome.
@@ -143,7 +155,7 @@ pub(crate) async fn dispatch_authorized(
             database_id: task.database_id,
             vshard_id,
             plan,
-            timeout,
+            deadline,
             event_source: crate::event::EventSource::User,
         },
     )
@@ -158,7 +170,8 @@ struct PlanDispatch {
     database_id: DatabaseId,
     vshard_id: VShardId,
     plan: PhysicalPlan,
-    timeout: Duration,
+    /// The caller's own bound, never past the running statement's deadline.
+    deadline: StatementDeadline,
     event_source: crate::event::EventSource,
 }
 
@@ -169,17 +182,17 @@ async fn dispatch_plan(state: &SharedState, dispatch: PlanDispatch) -> crate::Re
         database_id,
         vshard_id,
         plan,
-        timeout,
+        deadline: cap,
         event_source,
     } = dispatch;
     let request_id = state.next_request_id();
 
     // Whichever comes first: the running statement's deadline, or the caller's
-    // own timeout. A DDL statement a session bounded with `statement_timeout`
+    // own bound. A DDL statement a session bounded with `statement_timeout`
     // stops with the statement; a background caller with no statement scope
-    // keeps exactly the timeout it asked for.
-    let deadline = statement_deadline(state.tuning.network.default_deadline_secs)
-        .min(Instant::now() + timeout);
+    // keeps exactly the bound it asked for.
+    let deadline =
+        statement_deadline(state.tuning.network.default_deadline_secs).min(cap.instant());
 
     let request = Request {
         request_id,

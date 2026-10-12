@@ -22,11 +22,20 @@
 //! A data group whose chunked redo streams this node dropped when it left
 //! the group requires a snapshot too, until one installs (see
 //! `wal_replication::transaction_redo::chunks::owed`).
+//!
+//! The two needs differ in kind:
+//! - A missing Calvin base leaves the group's data whole. The replica wants
+//!   a snapshot ([`ReplicaState::WantsSnapshot`]) and may still lead, so a
+//!   group whose every replica lost the base keeps a leader, and Calvin
+//!   stays stopped there.
+//! - A snapshot debt means this replica's data diverged from the log. It
+//!   awaits a snapshot ([`ReplicaState::AwaitingSnapshot`]) and never leads.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, RwLock};
 
 use nodedb_cluster::multi_raft::MultiRaft;
+use nodedb_raft::ReplicaState;
 
 use crate::control::security::catalog::calvin_base::CalvinBase;
 use crate::control::state::SharedState;
@@ -50,7 +59,7 @@ pub fn install_snapshot_requirement(
     let weak = Arc::downgrade(shared);
     multi_raft.set_snapshot_requirement(Arc::new(move |group_id, sequencer_first| {
         let Some(shared) = weak.upgrade() else {
-            return false;
+            return ReplicaState::Whole;
         };
         let vshards = routing
             .read()
@@ -58,7 +67,13 @@ pub fn install_snapshot_requirement(
             .vshards_for_group(group_id);
         // Evaluated first and always: it registers the vShards as waiting.
         let reaches = shared.calvin.bases.group_reaches(&vshards, sequencer_first);
-        !reaches || shared.redo_chunks.owes_snapshot(group_id)
+        if shared.redo_chunks.owes_snapshot(group_id) {
+            ReplicaState::AwaitingSnapshot
+        } else if reaches {
+            ReplicaState::Whole
+        } else {
+            ReplicaState::WantsSnapshot
+        }
     }));
     Ok(())
 }
@@ -95,11 +110,11 @@ pub fn may_start(
     }
     if let Some(group_id) = group_id {
         let mut multi_raft = multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-        multi_raft.set_snapshot_required(group_id, true);
+        require_calvin_snapshot(&mut multi_raft, group_id);
         // Without a scheduler here the vShard casts no vote, so a leader here
-        // blocks every Calvin transaction on it. A replica whose state is
-        // whole takes the leadership. When none qualifies, the transactions
-        // end at their deadline with an error.
+        // blocks every Calvin transaction on it. A replica whose Calvin state
+        // is whole takes the leadership. When none qualifies, the
+        // transactions end at their deadline with an error.
         let sole_replica = multi_raft
             .group_membership(group_id)
             .is_some_and(|m| m.voters.len() + m.learners.len() <= 1);
@@ -134,6 +149,13 @@ pub fn may_start(
     false
 }
 
+/// Make this node's replica of `group_id` refuse log entries until a
+/// snapshot brings its Calvin state back. Its data is whole, so it keeps
+/// campaigning and leading.
+pub fn require_calvin_snapshot(multi_raft: &mut MultiRaft, group_id: u64) {
+    multi_raft.require_snapshot(group_id, ReplicaState::WantsSnapshot);
+}
+
 /// Record that the schedulers of `vshards`, each `(vshard_id, from)`,
 /// started from bases that reach the sequencer log and caught up from
 /// index `from`. They keep them whole from here.
@@ -166,9 +188,11 @@ pub fn rebased(shared: &SharedState, served: &[u32]) -> Vec<u32> {
 /// Forget the Calvin state of `vshards`: this node left their groups. A
 /// later return catches up from nothing, so neither their bases nor their
 /// applied positions can survive.
-pub fn forget_left(shared: &SharedState, vshards: &[u32]) {
+///
+/// On an error the stored state stays, and the caller retries the forget.
+pub fn forget_left(shared: &SharedState, vshards: &[u32]) -> crate::Result<()> {
     if vshards.is_empty() {
-        return;
+        return Ok(());
     }
     let catalog = shared.credentials.catalog();
     let resets: Vec<crate::control::security::catalog::calvin_applied::StoredCalvinApplied> =
@@ -189,13 +213,15 @@ pub fn forget_left(shared: &SharedState, vshards: &[u32]) {
     let forgotten = catalog
         .replace_calvin_applied(&resets)
         .and_then(|()| shared.calvin.bases.forget(catalog, vshards));
-    if let Err(error) = forgotten {
+    if let Err(error) = &forgotten {
         tracing::error!(
             ?vshards,
             %error,
             "calvin: the left vShards' Calvin state was not forgotten"
         );
+        crate::diag::calvin_left_state_not_forgotten(vshards, error);
     }
+    forgotten
 }
 
 /// Keep the sequencer log range only for vShards of the data groups this

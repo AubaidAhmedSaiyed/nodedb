@@ -37,9 +37,9 @@ use std::collections::BTreeMap;
 use futures::future::join_all;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan};
-use crate::control::gateway::dispatcher::statement_deadline_ms;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::server::exchange::execute_plan_all_local_cores;
+use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_graph::{AlgoParams, GraphAlgorithm};
@@ -76,7 +76,7 @@ pub async fn scatter_to_graph_owners(
     let targets = enumerate_shards(state)?.targets;
     let shared_arc = gateway_shared(state)?;
     let version_set = GatewayVersionSet::from_pairs(Vec::new());
-    let deadline_ms = statement_deadline_ms(state);
+    let deadline_ms = StatementDeadline::of_statement(state).hop_budget_ms();
     let legs = targets.into_iter().map(|target| {
         let plan = plan.clone();
         let shared_arc = shared_arc.clone();
@@ -123,7 +123,7 @@ pub async fn run_graph_algo(
     system_as_of_ms: Option<i64>,
     linearizable: bool,
 ) -> crate::Result<Payload> {
-    let deadline_ms = statement_deadline_ms(state);
+    let deadline_ms = StatementDeadline::of_statement(state).hop_budget_ms();
     // A current-state BSP run pins its own read cut from a Calvin cut marker
     // (`run_cut`). A historical run gathers the edges live at its system time.
     if state.cluster_routing.is_some() && system_as_of_ms.is_none() {
