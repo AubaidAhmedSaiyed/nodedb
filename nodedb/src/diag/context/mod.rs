@@ -6,6 +6,7 @@
 //! A grouping key excludes per-occurrence values, so a retry loop files one
 //! report with a rising count instead of one per attempt.
 
+mod array_sync;
 mod catalog;
 mod columnar;
 mod continuous_agg;
@@ -28,6 +29,7 @@ mod vector;
 mod vector_build;
 mod write_path;
 
+pub(in crate::diag) use array_sync::ArraySnapshotBufferPoisoned;
 pub(in crate::diag) use catalog::{
     CatalogApplyOrphanRow, CollectionPurgeRowMissing, ConsumerGroupOffsetsRetained,
     MetadataApplyWedged, SynonymGroupNotApplied,

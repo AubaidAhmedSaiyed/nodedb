@@ -8,6 +8,7 @@
 //! and returns `None` when unrecorded, so the result is deliberately
 //! discarded.
 
+mod array_sync;
 mod catalog;
 mod columnar;
 mod continuous_agg;
@@ -29,6 +30,7 @@ mod shared;
 mod vector;
 mod vector_build;
 
+pub use array_sync::array_snapshot_buffer_poisoned;
 pub use catalog::{
     catalog_apply_orphan_row, collection_purge_row_missing, consumer_group_offsets_retained,
     metadata_apply_wedged, synonym_group_not_applied,

@@ -7,6 +7,7 @@ pub mod catchup;
 pub mod gc_task;
 pub mod inbound;
 pub mod inbound_advisory;
+pub mod inbound_batch;
 pub mod inbound_propose;
 pub mod op_log;
 pub mod outbound;

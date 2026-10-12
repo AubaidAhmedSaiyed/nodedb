@@ -95,6 +95,12 @@ pub enum SyncMessageType {
     ArrayReject = 0x96,
     /// Array catchup request (client → server, 0x97).
     ArrayCatchupRequest = 0x97,
+    /// Per-op array results (server → client, 0x98). Answers an
+    /// `ArrayDeltaBatch` or a completed inbound snapshot.
+    ArrayOpResults = 0x98,
+    /// Refusal of an `ArrayAck` or `ArrayCatchupRequest` (server → client,
+    /// 0x99). Names no local op.
+    ArrayAdvisoryRefused = 0x99,
     /// Columnar batch insert (client → server, 0xA0).
     ColumnarInsert = 0xA0,
     /// Columnar insert acknowledgment (server → client, 0xA1).
@@ -165,6 +171,8 @@ impl SyncMessageType {
             0x95 => Some(Self::ArrayAck),
             0x96 => Some(Self::ArrayReject),
             0x97 => Some(Self::ArrayCatchupRequest),
+            0x98 => Some(Self::ArrayOpResults),
+            0x99 => Some(Self::ArrayAdvisoryRefused),
             0xA0 => Some(Self::ColumnarInsert),
             0xA1 => Some(Self::ColumnarInsertAck),
             0xA2 => Some(Self::VectorInsert),
@@ -393,11 +401,12 @@ mod tests {
     fn message_type_roundtrip() {
         for v in [
             0x01, 0x02, 0x10, 0x11, 0x12, 0x14, 0x20, 0x21, 0x22, 0x23, 0x30, 0x40, 0x41, 0x50,
-            0x52, 0x60, 0x61, 0x70, 0x80, 0x81, 0x82, 0xFF,
+            0x52, 0x60, 0x61, 0x70, 0x80, 0x81, 0x82, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96,
+            0x97, 0x98, 0x99, 0xFF,
         ] {
             let mt = SyncMessageType::from_u8(v).unwrap();
             assert_eq!(mt as u8, v);
         }
-        assert!(SyncMessageType::from_u8(0x99).is_none());
+        assert!(SyncMessageType::from_u8(0x9A).is_none());
     }
 }

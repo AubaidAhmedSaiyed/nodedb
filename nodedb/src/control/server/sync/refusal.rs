@@ -411,6 +411,12 @@ fn is_indeterminate_code(code: &ErrorCode) -> bool {
     }
 }
 
+/// Whether the same frame is expected to land once `error`'s condition
+/// clears. Every sync path that reports a failed dispatch asks this.
+pub(crate) fn is_retryable_dispatch_error(error: &crate::Error) -> bool {
+    retryable_refusal_reason(error).is_some() || is_indeterminate(error)
+}
+
 /// The [`AckStatus`] an engine ack must carry when its dispatch failed.
 ///
 /// A dispatch can fail because the write was refused on its merits (terminal —
@@ -424,7 +430,7 @@ fn is_indeterminate_code(code: &ErrorCode) -> bool {
 /// `next_seq` is the sequence the sender resumes from — its own seq for
 /// this batch, since nothing applied.
 pub(super) fn ack_status_for_dispatch_error(error: &crate::Error, next_seq: u64) -> AckStatus {
-    if retryable_refusal_reason(error).is_some() || is_indeterminate(error) {
+    if is_retryable_dispatch_error(error) {
         return AckStatus::Gap { expected: next_seq };
     }
     AckStatus::Rejected {
