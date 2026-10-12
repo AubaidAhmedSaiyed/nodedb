@@ -14,4 +14,5 @@ pub use limits::MAX_LAYER_CAP;
 
 pub use index::HnswIndex;
 pub use nodedb_types::hnsw::HnswParams;
+pub(crate) use types::Probe;
 pub use types::{Candidate, Node, NodeStorage, SearchResult, Xorshift64};

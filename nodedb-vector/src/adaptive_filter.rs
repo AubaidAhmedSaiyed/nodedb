@@ -96,16 +96,14 @@ pub fn adaptive_search(
         }
         FilterStrategy::BruteForceMatching => {
             let metric = index.params().metric;
+            let probe = index.probe(query);
+            // A node without a vector has no distance and is not a hit.
             let mut results: Vec<SearchResult> = bitmap
                 .iter()
+                .filter(|&id| !index.is_deleted(id))
                 .filter_map(|id| {
-                    if id as usize >= index.len() || index.is_deleted(id) {
-                        return None;
-                    }
-                    Some(SearchResult {
-                        id,
-                        distance: index.dist_to_node_f32(query, id, metric),
-                    })
+                    let distance = index.dist_to_node(&probe, id, metric)?;
+                    Some(SearchResult { id, distance })
                 })
                 .collect();
 
@@ -238,6 +236,104 @@ mod tests {
                 ),
                 "{result:?}"
             );
+        }
+    }
+
+    const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// Thresholds that force pre-filter, post-filter, and brute force in turn.
+    const FORCED: [FilterThresholds; 3] = [
+        FilterThresholds {
+            high_selectivity: 2.0,
+            extreme_selectivity: 2.0,
+        },
+        FilterThresholds {
+            high_selectivity: -1.0,
+            extreme_selectivity: 2.0,
+        },
+        BRUTE_FORCE,
+    ];
+
+    const BRUTE_FORCE: FilterThresholds = FilterThresholds {
+        high_selectivity: -1.0,
+        extreme_selectivity: -1.0,
+    };
+
+    fn every_tenth(n: u32) -> RoaringBitmap {
+        (0..n).step_by(10).collect()
+    }
+
+    /// Brute force over a graph-only restore reads node vectors through the
+    /// backing and ranks exactly like the source index.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn brute_force_after_graph_only_restore_matches_the_source_index() {
+        use crate::test_support::{graph_only_restore_with_backing, seeded_index, seeded_vectors};
+        use nodedb_types::vector_dtype::VectorStorageDtype;
+
+        let vectors = seeded_vectors(300, 8, SEED);
+        let src = seeded_index(&vectors, DistanceMetric::L2, VectorStorageDtype::F32);
+        let restored = graph_only_restore_with_backing(&src, &vectors);
+        let bitmap = every_tenth(300);
+
+        let expected = adaptive_search(&src, &vectors[7], 5, 64, &bitmap, &BRUTE_FORCE).unwrap();
+        let got = adaptive_search(&restored, &vectors[7], 5, 64, &bitmap, &BRUTE_FORCE).unwrap();
+        assert_eq!(expected.len(), 5);
+        let pairs = |r: &[SearchResult]| -> Vec<(u32, f32)> {
+            r.iter().map(|h| (h.id, h.distance)).collect()
+        };
+        assert_eq!(pairs(got.as_slice()), pairs(expected.as_slice()));
+    }
+
+    /// A graph-only restore searched before `with_backing` has no vectors. No
+    /// strategy may return its nodes, at infinite distance or otherwise.
+    #[test]
+    fn no_strategy_returns_a_node_without_a_vector() {
+        use crate::test_support::{graph_only_restore, seeded_index, seeded_vectors};
+        use nodedb_types::vector_dtype::VectorStorageDtype;
+
+        let vectors = seeded_vectors(300, 8, SEED);
+        let src = seeded_index(&vectors, DistanceMetric::L2, VectorStorageDtype::F32);
+        let idx = graph_only_restore(&src);
+        let bitmap = every_tenth(300);
+        for thresholds in &FORCED {
+            let results = adaptive_search(&idx, &vectors[7], 5, 64, &bitmap, thresholds).unwrap();
+            assert!(results.is_empty(), "got {results:?}");
+        }
+    }
+
+    /// Brute force on an F16/BF16 index scores the encoded vectors under the
+    /// build metric.
+    #[test]
+    fn brute_force_on_narrow_dtypes_matches_decoded_distances() {
+        use crate::distance::distance;
+        use crate::test_support::{seeded_index, seeded_vectors};
+        use nodedb_types::vector_dtype::VectorStorageDtype;
+
+        let vectors = seeded_vectors(300, 8, SEED);
+        let bitmap = every_tenth(300);
+        for dtype in [VectorStorageDtype::F16, VectorStorageDtype::BF16] {
+            let idx = seeded_index(&vectors, DistanceMetric::Cosine, dtype);
+            let encoded_query = crate::dtype::cast_from_f32(&vectors[7], dtype);
+            let query = crate::dtype::cast_to_f32(&encoded_query, dtype, 8).unwrap();
+            let mut reference: Vec<(u32, f32)> = bitmap
+                .iter()
+                .map(|id| {
+                    let node = idx.materialize_vector(id).unwrap();
+                    (id, distance(&query, &node, DistanceMetric::Cosine))
+                })
+                .collect();
+            reference.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+            let got = adaptive_search(&idx, &vectors[7], 5, 64, &bitmap, &BRUTE_FORCE).unwrap();
+            assert_eq!(got.len(), 5, "dtype={dtype:?}");
+            for (hit, (id, d)) in got.iter().zip(&reference) {
+                assert_eq!(hit.id, *id, "dtype={dtype:?}: got {got:?}");
+                assert!(
+                    (hit.distance - d).abs() < 1e-4,
+                    "dtype={dtype:?}: {hit:?} vs {d}"
+                );
+            }
         }
     }
 }

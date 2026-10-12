@@ -9,13 +9,13 @@
 //!
 //! See `selectivity.rs` for heuristic boundary definitions.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::HashSet;
 
 use roaring::RoaringBitmap;
 
 use crate::error::{VectorError, check_dim};
-use crate::hnsw::graph::{Candidate, HnswIndex};
+use crate::hnsw::graph::{Candidate, HnswIndex, Probe};
+use crate::navix::beam::Beam;
 use crate::navix::selectivity::{NavixHeuristic, local_selectivity_at, pick_heuristic};
 
 /// A k-NN result returned by `navix_search`.
@@ -60,6 +60,7 @@ impl Default for NavixSearchOptions {
 /// candidate IDs must be present in `options.allowed`.
 ///
 /// Returns an empty Vec when the index is empty or `options.allowed` is empty.
+/// A node without a vector is never returned.
 ///
 /// # Errors
 ///
@@ -75,6 +76,7 @@ pub fn navix_search(
     if index.is_empty() || options.allowed.is_empty() || options.k == 0 {
         return Ok(Vec::new());
     }
+    let probe = index.probe(query);
 
     let total = index.len();
     let global_sel = options.allowed.len() as f64 / total as f64;
@@ -82,7 +84,7 @@ pub fn navix_search(
     if global_sel < options.brute_force_threshold {
         return Ok(brute_force_on_allowed(
             index,
-            query,
+            &probe,
             options.k,
             &options.allowed,
             metric,
@@ -97,7 +99,7 @@ pub fn navix_search(
     // standard HNSW — we just want the best entry point for layer 0).
     let mut current_ep = ep;
     for layer in (1..=index.max_layer()).rev() {
-        let results = unfiltered_search_layer(index, query, current_ep, 1, layer, metric);
+        let results = unfiltered_search_layer(index, &probe, current_ep, 1, layer, metric);
         if let Some(nearest) = results.first() {
             current_ep = nearest.id;
         }
@@ -105,7 +107,7 @@ pub fn navix_search(
 
     // Phase 2: adaptive-local filtered beam search at layer 0.
     let ef = options.ef_search.max(options.k);
-    let results = navix_search_layer_0(index, query, current_ep, ef, &options.allowed, metric);
+    let results = navix_search_layer_0(index, &probe, current_ep, ef, &options.allowed, metric);
 
     Ok(results
         .into_iter()
@@ -123,21 +125,18 @@ pub fn navix_search(
 /// selectivity drops below the configured threshold.
 fn brute_force_on_allowed(
     index: &HnswIndex,
-    query: &[f32],
+    probe: &Probe<'_>,
     k: usize,
     allowed: &RoaringBitmap,
     metric: nodedb_types::vector_distance::DistanceMetric,
 ) -> Vec<SearchResult> {
+    // A node without a vector has no distance and is not a hit.
     let mut results: Vec<SearchResult> = allowed
         .iter()
+        .filter(|&id| !index.is_deleted(id))
         .filter_map(|id| {
-            if id as usize >= index.len() || index.is_deleted(id) {
-                return None;
-            }
-            Some(SearchResult {
-                id,
-                distance: index.dist_to_node_f32(query, id, metric),
-            })
+            let distance = index.dist_to_node(probe, id, metric)?;
+            Some(SearchResult { id, distance })
         })
         .collect();
 
@@ -157,11 +156,16 @@ fn brute_force_on_allowed(
     results
 }
 
+/// Whether node `id` may enter the results of a filtered search.
+fn admitted(index: &HnswIndex, allowed: &RoaringBitmap, id: u32) -> bool {
+    !index.is_deleted(id) && allowed.contains(id)
+}
+
 /// Standard unfiltered single-layer beam search used for Phase-1 greedy
 /// descent (layers 1..max_layer).
 fn unfiltered_search_layer(
     index: &HnswIndex,
-    query: &[f32],
+    probe: &Probe<'_>,
     entry_point: u32,
     ef: usize,
     layer: usize,
@@ -170,50 +174,27 @@ fn unfiltered_search_layer(
     let mut visited: HashSet<u32> = HashSet::new();
     visited.insert(entry_point);
 
-    let ep_dist = dist(index, query, entry_point, metric);
-    let ep_cand = Candidate {
-        dist: ep_dist,
-        id: entry_point,
-    };
+    let mut beam = Beam::new(ef);
+    beam.offer(
+        entry_point,
+        index.dist_to_node(probe, entry_point, metric),
+        !index.is_deleted(entry_point),
+    );
 
-    let mut candidates: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
-    candidates.push(Reverse(ep_cand));
-
-    let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
-    if !index.is_deleted(entry_point) {
-        results.push(ep_cand);
-    }
-
-    while let Some(Reverse(current)) = candidates.pop() {
-        if let Some(worst) = results.peek()
-            && current.dist > worst.dist
-            && results.len() >= ef
-        {
-            break;
-        }
-
+    while let Some(current) = beam.pop_frontier() {
         for &nb in index.neighbors_at(current.id, layer) {
             if !visited.insert(nb) {
                 continue;
             }
-            let d = dist(index, query, nb, metric);
-            let nb_cand = Candidate { dist: d, id: nb };
-            let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.dist);
-            if d < worst_dist || results.len() < ef {
-                candidates.push(Reverse(nb_cand));
-            }
-            if !index.is_deleted(nb) {
-                results.push(nb_cand);
-                if results.len() > ef {
-                    results.pop();
-                }
-            }
+            beam.offer(
+                nb,
+                index.dist_to_node(probe, nb, metric),
+                !index.is_deleted(nb),
+            );
         }
     }
 
-    let mut v: Vec<Candidate> = results.into_vec();
-    v.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
-    v
+    beam.into_sorted()
 }
 
 /// NaviX adaptive-local filtered beam search at layer 0.
@@ -224,7 +205,7 @@ fn unfiltered_search_layer(
 /// - **Blind**: skip 1-hop scoring; sample 2-hop of all 1-hop neighbors.
 fn navix_search_layer_0(
     index: &HnswIndex,
-    query: &[f32],
+    probe: &Probe<'_>,
     entry_point: u32,
     ef: usize,
     allowed: &RoaringBitmap,
@@ -233,124 +214,66 @@ fn navix_search_layer_0(
     let mut visited: HashSet<u32> = HashSet::new();
     visited.insert(entry_point);
 
-    let ep_dist = dist(index, query, entry_point, metric);
-    let ep_cand = Candidate {
-        dist: ep_dist,
-        id: entry_point,
-    };
-
-    let mut candidates: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
-    candidates.push(Reverse(ep_cand));
-
-    let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
-
     // Entry point enters results only if it is allowed.
-    if !index.is_deleted(entry_point) && allowed.contains(entry_point) {
-        results.push(ep_cand);
-    }
+    let mut beam = Beam::new(ef);
+    beam.offer(
+        entry_point,
+        index.dist_to_node(probe, entry_point, metric),
+        admitted(index, allowed, entry_point),
+    );
 
-    while let Some(Reverse(current)) = candidates.pop() {
-        if let Some(worst) = results.peek()
-            && current.dist > worst.dist
-            && results.len() >= ef
-        {
-            break;
-        }
-
+    while let Some(current) = beam.pop_frontier() {
         let neighbors_1hop = index.neighbors_at(current.id, 0);
-        let local_sel = local_selectivity_at(neighbors_1hop, allowed);
-        let heuristic = pick_heuristic(local_sel);
-
-        match heuristic {
-            NavixHeuristic::Standard => {
-                expand_standard(ExpandArgs {
-                    index,
-                    query,
-                    neighbors_1hop,
-                    allowed,
-                    ef,
-                    metric,
-                    visited: &mut visited,
-                    candidates: &mut candidates,
-                    results: &mut results,
-                });
-            }
-            NavixHeuristic::Directed => {
-                expand_directed(ExpandArgs {
-                    index,
-                    query,
-                    neighbors_1hop,
-                    allowed,
-                    ef,
-                    metric,
-                    visited: &mut visited,
-                    candidates: &mut candidates,
-                    results: &mut results,
-                });
-            }
-            NavixHeuristic::Blind => {
-                expand_blind(ExpandArgs {
-                    index,
-                    query,
-                    neighbors_1hop,
-                    allowed,
-                    ef,
-                    metric,
-                    visited: &mut visited,
-                    candidates: &mut candidates,
-                    results: &mut results,
-                });
-            }
+        let args = ExpandArgs {
+            index,
+            probe,
+            neighbors_1hop,
+            allowed,
+            metric,
+            visited: &mut visited,
+            beam: &mut beam,
+        };
+        match pick_heuristic(local_selectivity_at(neighbors_1hop, allowed)) {
+            NavixHeuristic::Standard => expand_standard(args),
+            NavixHeuristic::Directed => expand_directed(args),
+            NavixHeuristic::Blind => expand_blind(args),
         }
     }
 
-    let mut v: Vec<Candidate> = results.into_vec();
-    v.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
-    v
+    beam.into_sorted()
 }
 
 /// Shared beam-search state bundled for the per-heuristic `expand_*` helpers.
 struct ExpandArgs<'a> {
     index: &'a HnswIndex,
-    query: &'a [f32],
+    probe: &'a Probe<'a>,
     neighbors_1hop: &'a [u32],
     allowed: &'a RoaringBitmap,
-    ef: usize,
     metric: nodedb_types::vector_distance::DistanceMetric,
     visited: &'a mut HashSet<u32>,
-    candidates: &'a mut BinaryHeap<Reverse<Candidate>>,
-    results: &'a mut BinaryHeap<Candidate>,
+    beam: &'a mut Beam,
 }
 
 /// Standard expansion: score every allowed 1-hop neighbor and add to heaps.
 fn expand_standard(args: ExpandArgs<'_>) {
     let ExpandArgs {
         index,
-        query,
+        probe,
         neighbors_1hop,
         allowed,
-        ef,
         metric,
         visited,
-        candidates,
-        results,
+        beam,
     } = args;
     for &nb in neighbors_1hop {
         if !visited.insert(nb) {
             continue;
         }
-        let d = dist(index, query, nb, metric);
-        let nb_cand = Candidate { dist: d, id: nb };
-        let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.dist);
-        if d < worst_dist || results.len() < ef {
-            candidates.push(Reverse(nb_cand));
-        }
-        if !index.is_deleted(nb) && allowed.contains(nb) {
-            results.push(nb_cand);
-            if results.len() > ef {
-                results.pop();
-            }
-        }
+        beam.offer(
+            nb,
+            index.dist_to_node(probe, nb, metric),
+            admitted(index, allowed, nb),
+        );
     }
 }
 
@@ -359,40 +282,29 @@ fn expand_standard(args: ExpandArgs<'_>) {
 fn expand_directed(args: ExpandArgs<'_>) {
     let ExpandArgs {
         index,
-        query,
+        probe,
         neighbors_1hop,
         allowed,
-        ef,
         metric,
         visited,
-        candidates,
-        results,
+        beam,
     } = args;
-    // Score 1-hop; track the best allowed neighbor.
+    // Score 1-hop; track the best allowed neighbor that has a distance.
     let mut best_allowed: Option<(u32, f32)> = None;
 
     for &nb in neighbors_1hop {
-        let already_visited = !visited.insert(nb);
-        if already_visited {
+        if !visited.insert(nb) {
             continue;
         }
-        let d = dist(index, query, nb, metric);
-        let nb_cand = Candidate { dist: d, id: nb };
-
-        let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.dist);
-        if d < worst_dist || results.len() < ef {
-            candidates.push(Reverse(nb_cand));
+        let d = index.dist_to_node(probe, nb, metric);
+        let admit = admitted(index, allowed, nb);
+        if admit
+            && let Some(d) = d
+            && best_allowed.is_none_or(|(_, bd)| d < bd)
+        {
+            best_allowed = Some((nb, d));
         }
-
-        if !index.is_deleted(nb) && allowed.contains(nb) {
-            if best_allowed.is_none_or(|(_, bd)| d < bd) {
-                best_allowed = Some((nb, d));
-            }
-            results.push(nb_cand);
-            if results.len() > ef {
-                results.pop();
-            }
-        }
+        beam.offer(nb, d, admit);
     }
 
     // Expand 2-hop of the single best allowed neighbor.
@@ -401,18 +313,11 @@ fn expand_directed(args: ExpandArgs<'_>) {
             if !visited.insert(nb2) {
                 continue;
             }
-            let d = dist(index, query, nb2, metric);
-            let nb2_cand = Candidate { dist: d, id: nb2 };
-            let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.dist);
-            if d < worst_dist || results.len() < ef {
-                candidates.push(Reverse(nb2_cand));
-            }
-            if !index.is_deleted(nb2) && allowed.contains(nb2) {
-                results.push(nb2_cand);
-                if results.len() > ef {
-                    results.pop();
-                }
-            }
+            beam.offer(
+                nb2,
+                index.dist_to_node(probe, nb2, metric),
+                admitted(index, allowed, nb2),
+            );
         }
     }
 }
@@ -422,14 +327,12 @@ fn expand_directed(args: ExpandArgs<'_>) {
 fn expand_blind(args: ExpandArgs<'_>) {
     let ExpandArgs {
         index,
-        query,
+        probe,
         neighbors_1hop,
         allowed,
-        ef,
         metric,
         visited,
-        candidates,
-        results,
+        beam,
     } = args;
     for &nb1 in neighbors_1hop {
         // Mark 1-hop as visited so we do not double-score them later,
@@ -437,38 +340,12 @@ fn expand_blind(args: ExpandArgs<'_>) {
         visited.insert(nb1);
 
         for &nb2 in index.neighbors_at(nb1, 0) {
-            if !visited.insert(nb2) {
+            if !visited.insert(nb2) || !admitted(index, allowed, nb2) {
                 continue;
             }
-            if index.is_deleted(nb2) {
-                continue;
-            }
-            if !allowed.contains(nb2) {
-                continue;
-            }
-            let d = dist(index, query, nb2, metric);
-            let nb2_cand = Candidate { dist: d, id: nb2 };
-            let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.dist);
-            if d < worst_dist || results.len() < ef {
-                candidates.push(Reverse(nb2_cand));
-            }
-            results.push(nb2_cand);
-            if results.len() > ef {
-                results.pop();
-            }
+            beam.offer(nb2, index.dist_to_node(probe, nb2, metric), true);
         }
     }
-}
-
-/// Inline helper: distance from query to a stored node using the given metric.
-#[inline]
-fn dist(
-    index: &HnswIndex,
-    query: &[f32],
-    node_id: u32,
-    metric: nodedb_types::vector_distance::DistanceMetric,
-) -> f32 {
-    index.dist_to_node_f32(query, node_id, metric)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -677,5 +554,126 @@ mod tests {
             ),
             "{result:?}"
         );
+    }
+
+    const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+    /// Global selectivity is always below this, so the search brute-forces.
+    const BRUTE_FORCE: f64 = 2.0;
+    /// Global selectivity is never below this, so the search walks the graph.
+    const GRAPH: f64 = 0.0;
+
+    /// Allowed sets dense and sparse enough to reach every NaviX heuristic.
+    fn allowed_sets() -> Vec<RoaringBitmap> {
+        [2usize, 3, 50]
+            .into_iter()
+            .map(|step| (0..300u32).step_by(step).collect())
+            .collect()
+    }
+
+    fn options(allowed: RoaringBitmap, brute_force_threshold: f64) -> NavixSearchOptions {
+        NavixSearchOptions {
+            k: 5,
+            ef_search: 64,
+            allowed,
+            brute_force_threshold,
+        }
+    }
+
+    fn pairs(results: &[SearchResult]) -> Vec<(u32, f32)> {
+        results.iter().map(|r| (r.id, r.distance)).collect()
+    }
+
+    /// After a graph-only restore with a backing, brute force and graph
+    /// traversal rank exactly like the source index, under the build metric
+    /// and under a different caller metric.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn graph_only_restore_with_backing_matches_the_source_index() {
+        use crate::test_support::{graph_only_restore_with_backing, seeded_index, seeded_vectors};
+        use nodedb_types::vector_dtype::VectorStorageDtype;
+
+        let vectors = seeded_vectors(300, 8, SEED);
+        let src = seeded_index(&vectors, DistanceMetric::L2, VectorStorageDtype::F32);
+        let restored = graph_only_restore_with_backing(&src, &vectors);
+        let mut graph_hits = 0;
+        for metric in [DistanceMetric::L2, DistanceMetric::Cosine] {
+            for (threshold, brute) in [(BRUTE_FORCE, true), (GRAPH, false)] {
+                for allowed in allowed_sets() {
+                    let opts = options(allowed, threshold);
+                    let expected = navix_search(&src, &vectors[7], &opts, metric).unwrap();
+                    let got = navix_search(&restored, &vectors[7], &opts, metric).unwrap();
+                    assert!(!brute || expected.len() == 5, "{metric:?}: {expected:?}");
+                    assert_eq!(pairs(&got), pairs(&expected), "{metric:?} brute={brute}");
+                    if !brute {
+                        graph_hits += got.len();
+                    }
+                }
+            }
+        }
+        assert!(graph_hits > 0, "graph traversal must return hits");
+    }
+
+    /// A graph-only restore searched before `with_backing` has no vectors.
+    /// Neither brute force nor graph traversal may return its nodes.
+    #[test]
+    fn graph_only_restore_without_backing_returns_no_hits() {
+        use crate::test_support::{graph_only_restore, seeded_index, seeded_vectors};
+        use nodedb_types::vector_dtype::VectorStorageDtype;
+
+        let vectors = seeded_vectors(300, 8, SEED);
+        let src = seeded_index(&vectors, DistanceMetric::L2, VectorStorageDtype::F32);
+        let idx = graph_only_restore(&src);
+        for threshold in [BRUTE_FORCE, GRAPH] {
+            for allowed in allowed_sets() {
+                let opts = options(allowed, threshold);
+                let res = navix_search(&idx, &vectors[7], &opts, DistanceMetric::L2).unwrap();
+                assert!(res.is_empty(), "threshold={threshold}: got {res:?}");
+            }
+        }
+    }
+
+    /// Every dtype scores hits under the caller metric, not the build metric.
+    /// Brute force returns the exact top-k under that metric.
+    #[test]
+    fn caller_metric_overrides_the_build_metric_for_every_dtype() {
+        use crate::test_support::{seeded_index, seeded_vectors};
+        use nodedb_types::vector_dtype::VectorStorageDtype;
+
+        let vectors = seeded_vectors(300, 8, SEED);
+        let allowed: RoaringBitmap = (0..300u32).step_by(3).collect();
+        for dtype in [
+            VectorStorageDtype::F32,
+            VectorStorageDtype::F16,
+            VectorStorageDtype::BF16,
+        ] {
+            let idx = seeded_index(&vectors, DistanceMetric::L2, dtype);
+            let encoded = crate::dtype::cast_from_f32(&vectors[7], dtype);
+            let query = crate::dtype::cast_to_f32(&encoded, dtype, 8).unwrap();
+            let cosine_to = |id: u32| {
+                let node = idx.materialize_vector(id).unwrap();
+                distance(&query, &node, DistanceMetric::Cosine)
+            };
+            let mut reference: Vec<(u32, f32)> =
+                allowed.iter().map(|id| (id, cosine_to(id))).collect();
+            reference.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+            for (threshold, brute) in [(BRUTE_FORCE, true), (GRAPH, false)] {
+                let opts = options(allowed.clone(), threshold);
+                let res = navix_search(&idx, &vectors[7], &opts, DistanceMetric::Cosine).unwrap();
+                assert_eq!(res.len(), 5, "dtype={dtype:?} brute={brute}");
+                for hit in &res {
+                    let want = cosine_to(hit.id);
+                    assert!(
+                        (hit.distance - want).abs() < 1e-4,
+                        "dtype={dtype:?} brute={brute}: {hit:?} vs cosine {want}"
+                    );
+                }
+                if brute {
+                    let ids: Vec<u32> = res.iter().map(|r| r.id).collect();
+                    let want: Vec<u32> = reference.iter().take(5).map(|r| r.0).collect();
+                    assert_eq!(ids, want, "dtype={dtype:?}");
+                }
+            }
+        }
     }
 }

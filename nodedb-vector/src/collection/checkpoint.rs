@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use crate::collection::payload_index::PayloadIndexSetSnapshot;
 use crate::collection::segment::{BuildingSegment, DEFAULT_SEAL_THRESHOLD, SealedSegment};
 use crate::collection::tier::StorageTier;
-use crate::distance::DistanceMetric;
 use crate::error::VectorError;
 use crate::flat::FlatIndex;
 use crate::hnsw::{HnswIndex, HnswParams};
@@ -296,17 +295,7 @@ impl VectorCollection {
                 });
             }
         };
-        let metric = match snap.params_metric {
-            0 => DistanceMetric::L2,
-            1 => DistanceMetric::Cosine,
-            2 => DistanceMetric::InnerProduct,
-            3 => DistanceMetric::Manhattan,
-            4 => DistanceMetric::Chebyshev,
-            5 => DistanceMetric::Hamming,
-            6 => DistanceMetric::Jaccard,
-            7 => DistanceMetric::Pearson,
-            _ => DistanceMetric::Cosine,
-        };
+        let metric = crate::hnsw::checkpoint::metric_from_code(snap.params_metric)?;
         let params = HnswParams {
             m: snap.params_m,
             m0: snap.params_m0,

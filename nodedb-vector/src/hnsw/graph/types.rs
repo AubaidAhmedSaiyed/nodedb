@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::borrow::Cow;
+
 use nodedb_types::vector_dtype::VectorStorageDtype;
 
 /// Result of a k-NN search.
@@ -55,6 +57,17 @@ impl NodeStorage {
             NodeStorage::Bytes { .. } => None,
         }
     }
+}
+
+/// A vector scored against index nodes, in the form the index dtype compares.
+///
+/// Build one per operation with `HnswIndex::probe` or `HnswIndex::node_probe`.
+/// Scoring it against many nodes then copies nothing.
+pub(crate) enum Probe<'a> {
+    /// f32 values, compared directly against f32 node vectors.
+    F32(&'a [f32]),
+    /// Bytes in the index dtype, compared with the typed kernels.
+    Encoded(Cow<'a, [u8]>),
 }
 
 /// A node in the HNSW graph.

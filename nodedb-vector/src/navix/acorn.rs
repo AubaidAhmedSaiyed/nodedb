@@ -11,13 +11,13 @@
 
 #[cfg(feature = "acorn-baseline")]
 mod inner {
-    use std::cmp::Reverse;
-    use std::collections::{BinaryHeap, HashSet};
+    use std::collections::HashSet;
 
     use roaring::RoaringBitmap;
 
     use crate::error::{VectorError, check_dim};
-    use crate::hnsw::graph::{Candidate, HnswIndex};
+    use crate::hnsw::graph::{Candidate, HnswIndex, Probe};
+    use crate::navix::beam::Beam;
     use crate::navix::traversal::SearchResult;
 
     /// Options for an ACORN-1 search (same shape as `NavixSearchOptions`).
@@ -44,7 +44,8 @@ mod inner {
     ///
     /// Uses static 2-hop expansion: when a 1-hop neighbor is not in `allowed`,
     /// expand to its 2-hop neighbors unconditionally. A query without the
-    /// index dimension fails with [`VectorError::DimensionMismatch`].
+    /// index dimension fails with [`VectorError::DimensionMismatch`]. A node
+    /// without a vector is never returned.
     pub fn acorn_search(
         index: &HnswIndex,
         query: &[f32],
@@ -55,6 +56,7 @@ mod inner {
         if index.is_empty() || options.allowed.is_empty() || options.k == 0 {
             return Ok(Vec::new());
         }
+        let probe = index.probe(query);
 
         let total = index.len();
         let global_sel = options.allowed.len() as f64 / total as f64;
@@ -62,7 +64,7 @@ mod inner {
         if global_sel < options.brute_force_threshold {
             return Ok(brute_force_on_allowed(
                 index,
-                query,
+                &probe,
                 options.k,
                 &options.allowed,
                 metric,
@@ -76,15 +78,12 @@ mod inner {
         // Phase 1: greedy descent (unfiltered) to find best layer-0 entry.
         let mut current_ep = ep;
         for layer in (1..=index.max_layer()).rev() {
-            let results = greedy_descent_layer(index, query, current_ep, layer, metric);
-            if let Some(nearest) = results.first() {
-                current_ep = nearest.id;
-            }
+            current_ep = greedy_descent_layer(index, &probe, current_ep, layer, metric).id;
         }
 
         // Phase 2: ACORN-1 filtered beam search at layer 0.
         let ef = options.ef_search.max(options.k);
-        let results = acorn_search_layer_0(index, query, current_ep, ef, &options.allowed, metric);
+        let results = acorn_search_layer_0(index, &probe, current_ep, ef, &options.allowed, metric);
 
         Ok(results
             .into_iter()
@@ -97,15 +96,19 @@ mod inner {
     }
 
     /// Minimal greedy single-layer descent used for Phase-1 layer navigation.
+    ///
+    /// A node without a vector is never chosen over the entry point.
     fn greedy_descent_layer(
         index: &HnswIndex,
-        query: &[f32],
+        probe: &Probe<'_>,
         entry_point: u32,
         layer: usize,
         metric: nodedb_types::vector_distance::DistanceMetric,
-    ) -> Vec<Candidate> {
+    ) -> Candidate {
         let mut current = entry_point;
-        let mut current_dist = node_dist(index, query, current, metric);
+        let mut current_dist = index
+            .dist_to_node(probe, current, metric)
+            .unwrap_or(f32::INFINITY);
 
         loop {
             let mut improved = false;
@@ -113,8 +116,9 @@ mod inner {
                 if index.is_deleted(nb) {
                     continue;
                 }
-                let d = node_dist(index, query, nb, metric);
-                if d < current_dist {
+                if let Some(d) = index.dist_to_node(probe, nb, metric)
+                    && d < current_dist
+                {
                     current_dist = d;
                     current = nb;
                     improved = true;
@@ -124,10 +128,10 @@ mod inner {
                 break;
             }
         }
-        vec![Candidate {
+        Candidate {
             dist: current_dist,
             id: current,
-        }]
+        }
     }
 
     /// ACORN-1 layer-0 beam search.
@@ -136,101 +140,60 @@ mod inner {
     /// neighbors and score those (the "static 2-hop" rule).
     fn acorn_search_layer_0(
         index: &HnswIndex,
-        query: &[f32],
+        probe: &Probe<'_>,
         entry_point: u32,
         ef: usize,
         allowed: &RoaringBitmap,
         metric: nodedb_types::vector_distance::DistanceMetric,
     ) -> Vec<Candidate> {
+        let admitted = |id: u32| !index.is_deleted(id) && allowed.contains(id);
         let mut visited: HashSet<u32> = HashSet::new();
         visited.insert(entry_point);
 
-        let ep_dist = node_dist(index, query, entry_point, metric);
-        let ep_cand = Candidate {
-            dist: ep_dist,
-            id: entry_point,
-        };
+        let mut beam = Beam::new(ef);
+        beam.offer(
+            entry_point,
+            index.dist_to_node(probe, entry_point, metric),
+            admitted(entry_point),
+        );
 
-        let mut candidates: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
-        candidates.push(Reverse(ep_cand));
-
-        let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
-        if !index.is_deleted(entry_point) && allowed.contains(entry_point) {
-            results.push(ep_cand);
-        }
-
-        while let Some(Reverse(current)) = candidates.pop() {
-            if let Some(worst) = results.peek()
-                && current.dist > worst.dist
-                && results.len() >= ef
-            {
-                break;
-            }
-
+        while let Some(current) = beam.pop_frontier() {
             for &nb in index.neighbors_at(current.id, 0) {
                 if !visited.insert(nb) {
                     continue;
                 }
-
-                let d = node_dist(index, query, nb, metric);
-                let nb_cand = Candidate { dist: d, id: nb };
-                let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.dist);
-
-                if d < worst_dist || results.len() < ef {
-                    candidates.push(Reverse(nb_cand));
+                let admit = admitted(nb);
+                beam.offer(nb, index.dist_to_node(probe, nb, metric), admit);
+                if admit {
+                    continue;
                 }
-
-                if !index.is_deleted(nb) && allowed.contains(nb) {
-                    // 1-hop neighbor passes filter — add to results.
-                    results.push(nb_cand);
-                    if results.len() > ef {
-                        results.pop();
+                // 1-hop neighbor does not pass filter — static 2-hop expansion.
+                for &nb2 in index.neighbors_at(nb, 0) {
+                    if !visited.insert(nb2) {
+                        continue;
                     }
-                } else {
-                    // 1-hop neighbor does not pass filter — static 2-hop expansion.
-                    for &nb2 in index.neighbors_at(nb, 0) {
-                        if !visited.insert(nb2) {
-                            continue;
-                        }
-                        let d2 = node_dist(index, query, nb2, metric);
-                        let nb2_cand = Candidate { dist: d2, id: nb2 };
-                        let worst_dist2 = results.peek().map_or(f32::INFINITY, |w| w.dist);
-                        if d2 < worst_dist2 || results.len() < ef {
-                            candidates.push(Reverse(nb2_cand));
-                        }
-                        if !index.is_deleted(nb2) && allowed.contains(nb2) {
-                            results.push(nb2_cand);
-                            if results.len() > ef {
-                                results.pop();
-                            }
-                        }
-                    }
+                    beam.offer(nb2, index.dist_to_node(probe, nb2, metric), admitted(nb2));
                 }
             }
         }
 
-        let mut v: Vec<Candidate> = results.into_vec();
-        v.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
-        v
+        beam.into_sorted()
     }
 
     fn brute_force_on_allowed(
         index: &HnswIndex,
-        query: &[f32],
+        probe: &Probe<'_>,
         k: usize,
         allowed: &RoaringBitmap,
         metric: nodedb_types::vector_distance::DistanceMetric,
     ) -> Vec<SearchResult> {
+        // A node without a vector has no distance and is not a hit.
         let mut results: Vec<SearchResult> = allowed
             .iter()
+            .filter(|&id| !index.is_deleted(id))
             .filter_map(|id| {
-                if id as usize >= index.len() || index.is_deleted(id) {
-                    return None;
-                }
-                Some(SearchResult {
-                    id,
-                    distance: index.dist_to_node_f32(query, id, metric),
-                })
+                let distance = index.dist_to_node(probe, id, metric)?;
+                Some(SearchResult { id, distance })
             })
             .collect();
 
@@ -248,16 +211,6 @@ mod inner {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results
-    }
-
-    #[inline]
-    fn node_dist(
-        index: &HnswIndex,
-        query: &[f32],
-        node_id: u32,
-        metric: nodedb_types::vector_distance::DistanceMetric,
-    ) -> f32 {
-        index.dist_to_node_f32(query, node_id, metric)
     }
 
     #[cfg(test)]
@@ -351,6 +304,65 @@ mod inner {
             assert!(res.len() <= 1);
             if let Some(r) = res.first() {
                 assert_eq!(r.id, 7);
+            }
+        }
+
+        const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+        /// Options that brute-force (`true`) or walk the graph (`false`).
+        fn options(allowed: RoaringBitmap, brute: bool) -> AcornSearchOptions {
+            AcornSearchOptions {
+                k: 5,
+                ef_search: 64,
+                allowed,
+                brute_force_threshold: if brute { 2.0 } else { 0.0 },
+            }
+        }
+
+        fn pairs(results: &[SearchResult]) -> Vec<(u32, f32)> {
+            results.iter().map(|r| (r.id, r.distance)).collect()
+        }
+
+        /// After a graph-only restore with a backing, both ACORN paths rank
+        /// exactly like the source index, under a caller metric too.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn acorn_after_graph_only_restore_matches_the_source_index() {
+            use crate::test_support::{
+                graph_only_restore_with_backing, seeded_index, seeded_vectors,
+            };
+            use nodedb_types::vector_dtype::VectorStorageDtype;
+
+            let vectors = seeded_vectors(300, 8, SEED);
+            let src = seeded_index(&vectors, DistanceMetric::L2, VectorStorageDtype::F32);
+            let restored = graph_only_restore_with_backing(&src, &vectors);
+            let allowed: RoaringBitmap = (0..300u32).step_by(3).collect();
+            for metric in [DistanceMetric::L2, DistanceMetric::Cosine] {
+                for brute in [true, false] {
+                    let opts = options(allowed.clone(), brute);
+                    let expected = acorn_search(&src, &vectors[7], &opts, metric).unwrap();
+                    let got = acorn_search(&restored, &vectors[7], &opts, metric).unwrap();
+                    assert_eq!(expected.len(), 5, "{metric:?} brute={brute}");
+                    assert_eq!(pairs(&got), pairs(&expected), "{metric:?} brute={brute}");
+                }
+            }
+        }
+
+        /// A graph-only restore searched before `with_backing` has no vectors.
+        /// Neither ACORN path may return its nodes.
+        #[test]
+        fn acorn_without_backing_returns_no_hits() {
+            use crate::test_support::{graph_only_restore, seeded_index, seeded_vectors};
+            use nodedb_types::vector_dtype::VectorStorageDtype;
+
+            let vectors = seeded_vectors(300, 8, SEED);
+            let src = seeded_index(&vectors, DistanceMetric::L2, VectorStorageDtype::F32);
+            let idx = graph_only_restore(&src);
+            let allowed: RoaringBitmap = (0..300u32).step_by(3).collect();
+            for brute in [true, false] {
+                let opts = options(allowed.clone(), brute);
+                let res = acorn_search(&idx, &vectors[7], &opts, DistanceMetric::L2).unwrap();
+                assert!(res.is_empty(), "brute={brute}: got {res:?}");
             }
         }
     }
