@@ -416,7 +416,7 @@ mod tests {
         put_scored(&mut e, "players", "p3", 20);
         e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
 
-        let bound = |v: i64| SortKeyEncoder::encode_i64(v).to_vec();
+        let bound = |v: i64| crate::engine::kv::sorted_index::value::encode_int(v);
 
         let mid = e.sorted_index_range(SortedIndexRangeParams {
             database_id: 0,
@@ -558,5 +558,98 @@ mod tests {
             None,
             "the sorted index itself must be gone, as the secondary indexes are"
         );
+    }
+
+    fn put_doc(e: &mut KvEngine, key: &str, doc: serde_json::Value) {
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "players",
+            key: key.as_bytes(),
+            value: &nodedb_types::json_to_msgpack(&doc).expect("encode row"),
+            ttl_ms: 0,
+            now_ms: now(),
+            surrogate: row_surrogate(key.as_bytes()),
+        })
+        .expect("a bound row writes");
+    }
+
+    /// Integer and float scores written through `put` rank by numeric value.
+    #[test]
+    fn written_integer_and_float_scores_rank_numerically() {
+        let mut e = make_engine();
+        let n = now();
+        e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+
+        put_doc(&mut e, "ten_half", serde_json::json!({ "score": 10.5 }));
+        put_doc(&mut e, "eleven", serde_json::json!({ "score": 11 }));
+        put_doc(&mut e, "ten", serde_json::json!({ "score": 10 }));
+
+        assert_eq!(
+            ranked_keys(e.sorted_index_top_k(0, 1, "lb", 10, n)),
+            vec!["eleven", "ten_half", "ten"]
+        );
+    }
+
+    /// A write that drops the sort column takes the row out of the index.
+    #[test]
+    fn a_write_without_the_sort_column_leaves_the_index() {
+        let mut e = make_engine();
+        let n = now();
+        e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+
+        put_doc(&mut e, "p1", serde_json::json!({ "score": 10 }));
+        assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p1", n), Some(1));
+
+        put_doc(&mut e, "p1", serde_json::json!({ "name": "no score" }));
+        assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p1", n), None);
+        assert_eq!(e.sorted_index_count(0, 1, "lb", n), Some(0));
+    }
+
+    /// A windowed index maintained by `put` ranks only rows inside the window.
+    #[test]
+    fn windowed_index_maintained_by_put_ranks_inside_the_window() {
+        let mut e = make_engine();
+        let n = now();
+        let mut def = leaderboard_def("players", "lb");
+        def.encoder = SortKeyEncoder::new(vec![
+            SortColumn {
+                name: "score".into(),
+                direction: SortDirection::Desc,
+            },
+            SortColumn {
+                name: "ts".into(),
+                direction: SortDirection::Asc,
+            },
+        ]);
+        def.window = WindowConfig::custom("ts", n - 1_000, n + 1_000);
+        e.register_sorted_index(0, 1, "players", def);
+
+        put_doc(
+            &mut e,
+            "early",
+            serde_json::json!({ "score": 99, "ts": n - 1_001 }),
+        );
+        put_doc(
+            &mut e,
+            "int_ts",
+            serde_json::json!({ "score": 11, "ts": n }),
+        );
+        put_doc(
+            &mut e,
+            "float_ts",
+            serde_json::json!({ "score": 10.5, "ts": n as f64 + 0.5 }),
+        );
+        put_doc(
+            &mut e,
+            "late",
+            serde_json::json!({ "score": 50, "ts": n + 1_000 }),
+        );
+
+        assert_eq!(e.sorted_index_count(0, 1, "lb", n), Some(2));
+        assert_eq!(e.sorted_index_rank(0, 1, "lb", b"int_ts", n), Some(1));
+        assert_eq!(e.sorted_index_rank(0, 1, "lb", b"float_ts", n), Some(2));
+        assert_eq!(e.sorted_index_rank(0, 1, "lb", b"early", n), None);
+        assert_eq!(e.sorted_index_rank(0, 1, "lb", b"late", n), None);
     }
 }

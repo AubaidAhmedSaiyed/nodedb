@@ -142,29 +142,32 @@ impl SortedIndexManager {
         true
     }
 
-    /// Called on every KV PUT. Updates all sorted indexes on this collection.
+    /// Called on every KV PUT. Re-keys `primary_key` in every sorted index on
+    /// this collection.
     ///
-    /// `field_values` is a map of field_name → field_value_bytes extracted from
-    /// the MessagePack value.
+    /// `document` is the stored value decoded from MessagePack, `None` when it
+    /// does not decode. A value without a sort column leaves the index.
     pub fn on_put(
         &mut self,
         table_key: u64,
         primary_key: &[u8],
-        field_values: &[(String, Vec<u8>)],
+        document: Option<&serde_json::Value>,
     ) {
         let Some(idx_keys) = self.collection_indexes.get(&table_key) else {
             return;
         };
 
-        // Clone keys to avoid borrow conflict with self.indexes.
-        let idx_keys: Vec<String> = idx_keys.iter().cloned().collect();
-        for idx_key in &idx_keys {
+        for idx_key in idx_keys {
             let Some(idx) = self.indexes.get_mut(idx_key) else {
                 continue;
             };
-
-            if let Some(sort_key) = build_sort_key_from_fields(&idx.def, field_values) {
-                idx.tree.insert(sort_key, primary_key.to_vec());
+            match document.and_then(|doc| idx.def.encoder.key_for_document(doc)) {
+                Some(sort_key) => {
+                    idx.tree.insert(sort_key, primary_key.to_vec());
+                }
+                None => {
+                    idx.tree.remove(primary_key);
+                }
             }
         }
     }
@@ -303,29 +306,6 @@ pub(super) fn index_key(database_id: u64, tenant_id: u64, index_name: &str) -> S
     format!("{database_id}:{tenant_id}:{index_name}")
 }
 
-/// Build a sort key from pre-extracted field name/value pairs.
-fn build_sort_key_from_fields(
-    def: &SortedIndexDef,
-    field_values: &[(String, Vec<u8>)],
-) -> Option<Vec<u8>> {
-    let mut values: Vec<Vec<u8>> = Vec::with_capacity(def.encoder.column_count());
-
-    for col in def.encoder.columns() {
-        let val_bytes = field_values
-            .iter()
-            .find(|(name, _)| name == &col.name)
-            .map(|(_, v)| v.clone())?;
-
-        // The field value bytes from extract_all_field_values_from_msgpack are
-        // already encoded as sortable bytes (integers as big-endian u64 with
-        // sign-bit flip, strings as UTF-8). Use them directly.
-        values.push(val_bytes);
-    }
-
-    let refs: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
-    Some(def.encoder.encode(&refs))
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::key::{SortColumn, SortDirection};
@@ -352,6 +332,10 @@ mod tests {
         }))
         .unwrap();
         (pk, value)
+    }
+
+    fn scored(score: i64) -> serde_json::Value {
+        serde_json::json!({ "score": score })
     }
 
     #[test]
@@ -411,11 +395,8 @@ mod tests {
         let tbl_key = super::super::super::engine_helpers::table_key(0, 1, "scores");
 
         // Simulate PUTs.
-        let score_bytes = SortKeyEncoder::encode_i64(100).to_vec();
-        mgr.on_put(tbl_key, b"alice", &[("score".into(), score_bytes)]);
-
-        let score_bytes = SortKeyEncoder::encode_i64(200).to_vec();
-        mgr.on_put(tbl_key, b"bob", &[("score".into(), score_bytes)]);
+        mgr.on_put(tbl_key, b"alice", Some(&scored(100)));
+        mgr.on_put(tbl_key, b"bob", Some(&scored(200)));
 
         assert_eq!(mgr.count(0, 1, "lb", 0), Some(2));
         // DESC: bob(200) = rank 1, alice(100) = rank 2
@@ -510,8 +491,7 @@ mod tests {
         assert_eq!(mgr.rank(0, 1, "lb", b"alice", 0), Some(3));
 
         // And it is still maintained on write — one insert, not two trees.
-        let bytes = SortKeyEncoder::encode_i64(400).to_vec();
-        mgr.on_put(tbl_key, b"dave", &[("score".into(), bytes)]);
+        mgr.on_put(tbl_key, b"dave", Some(&scored(400)));
         assert_eq!(mgr.rank(0, 1, "lb", b"dave", 0), Some(1));
         assert_eq!(mgr.count(0, 1, "lb", 0), Some(4));
     }
@@ -565,8 +545,7 @@ mod tests {
         assert_eq!(mgr.count(0, 1, "lb", 0), Some(1));
 
         // A write to the collection the index no longer covers must not reach it.
-        let bytes = SortKeyEncoder::encode_i64(999).to_vec();
-        mgr.on_put(old_key, b"ghost", &[("score".into(), bytes)]);
+        mgr.on_put(old_key, b"ghost", Some(&scored(999)));
         assert_eq!(
             mgr.rank(0, 1, "lb", b"ghost", 0),
             None,

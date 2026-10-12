@@ -267,10 +267,14 @@ impl<'a> zerompk::FromMessagePack<'a> for TextFields {
                     out.top_k_count = Some(reader.read_u32()?);
                 }
                 FID_SCORE_MIN => {
-                    out.score_min = Some(reader.read_binary()?.into_owned());
+                    out.score_min = Some(<crate::value::Value as zerompk::FromMessagePack>::read(
+                        reader,
+                    )?);
                 }
                 FID_SCORE_MAX => {
-                    out.score_max = Some(reader.read_binary()?.into_owned());
+                    out.score_max = Some(<crate::value::Value as zerompk::FromMessagePack>::read(
+                        reader,
+                    )?);
                 }
                 FID_UPDATES => {
                     out.updates = Some(Vec::<(String, Vec<u8>)>::read(reader)?);
@@ -508,8 +512,6 @@ mod tests {
             cursor: Some(payload.clone()),
             expected: Some(payload.clone()),
             new_value: Some(payload.clone()),
-            score_min: Some(payload.clone()),
-            score_max: Some(payload.clone()),
             filters: Some(payload.clone()),
             ..Default::default()
         };
@@ -523,9 +525,25 @@ mod tests {
         assert_eq!(decoded.cursor.as_deref(), Some(payload.as_slice()));
         assert_eq!(decoded.expected.as_deref(), Some(payload.as_slice()));
         assert_eq!(decoded.new_value.as_deref(), Some(payload.as_slice()));
-        assert_eq!(decoded.score_min.as_deref(), Some(payload.as_slice()));
-        assert_eq!(decoded.score_max.as_deref(), Some(payload.as_slice()));
         assert_eq!(decoded.filters.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn score_bounds_roundtrip_as_typed_values() {
+        use crate::value::Value;
+        for (min, max) in [
+            (Value::Integer(11), Value::Float(10.5)),
+            (Value::String("gold".into()), Value::Null),
+        ] {
+            let tf = TextFields {
+                score_min: Some(min.clone()),
+                score_max: Some(max.clone()),
+                ..Default::default()
+            };
+            let decoded = roundtrip(&tf);
+            assert_eq!(decoded.score_min, Some(min));
+            assert_eq!(decoded.score_max, Some(max));
+        }
     }
 
     #[test]

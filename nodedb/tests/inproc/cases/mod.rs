@@ -178,6 +178,7 @@ mod siem_export;
 mod snapshot_round_trip;
 mod snapshot_round_trip_crdt;
 mod snapshot_round_trip_stale_state;
+mod sorted_index_mixed_numbers;
 mod sorted_index_rows;
 mod sql_custom_types;
 mod sql_ddl_owner_persistence;

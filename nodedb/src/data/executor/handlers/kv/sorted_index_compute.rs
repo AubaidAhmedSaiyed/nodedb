@@ -28,7 +28,7 @@ pub(in crate::data::executor) struct BuildSortedIndexDefParams<'a> {
 
 /// Build a [`SortedIndexDef`] from the raw `RegisterSortedIndex` fields,
 /// validating that a windowed index's timestamp column is included in its
-/// sort columns. Returns `Err` on that validation failure; never panics.
+/// sort columns. That failure is a permanent client error; never panics.
 pub(in crate::data::executor) fn build_sorted_index_def(
     params: BuildSortedIndexDefParams<'_>,
 ) -> Result<SortedIndexDef, ErrorCode> {
@@ -70,10 +70,9 @@ pub(in crate::data::executor) fn build_sorted_index_def(
         let ts_col = &window.timestamp_column;
         let has_ts = encoder.columns().iter().any(|c| c.name == *ts_col);
         if !has_ts {
-            return Err(ErrorCode::Internal {
-                detail: format!(
-                    "WINDOW timestamp column '{}' must be included in sort columns",
-                    ts_col
+            return Err(ErrorCode::RejectedPrevalidation {
+                reason: format!(
+                    "WINDOW timestamp column '{ts_col}' must be one of the sort columns"
                 ),
             });
         }
@@ -126,10 +125,10 @@ mod tests {
         })
         .expect_err("must reject missing timestamp column");
         match err {
-            ErrorCode::Internal { detail } => {
-                assert!(detail.contains("updated_at"));
+            ErrorCode::RejectedPrevalidation { reason } => {
+                assert!(reason.contains("updated_at"));
             }
-            other => panic!("expected Internal error, got {other:?}"),
+            other => panic!("expected RejectedPrevalidation, got {other:?}"),
         }
     }
 

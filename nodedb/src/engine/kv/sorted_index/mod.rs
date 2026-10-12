@@ -4,8 +4,10 @@ pub mod checkpoint;
 pub mod index;
 pub mod key;
 pub mod manager;
+pub mod number;
 pub mod timestamp;
 pub mod tree;
+pub mod value;
 pub mod window;
 mod windowed_query;
 

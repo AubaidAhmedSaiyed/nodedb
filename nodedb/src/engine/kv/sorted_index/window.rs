@@ -128,7 +128,6 @@ impl WindowBounds {
     pub fn contains(&self, ts: ColumnTimestamp) -> bool {
         match ts {
             ColumnTimestamp::Millis(ms) => {
-                let ms = i128::from(ms);
                 ms >= i128::from(self.start_ms)
                     && self.end_ms.is_none_or(|end| ms < i128::from(end))
             }
@@ -285,7 +284,7 @@ mod tests {
         // Before or after the window: a range that admits nothing.
         for now_ms in [500, 2000, 2500] {
             let outside = config.bounds(now_ms).expect("custom window has bounds");
-            for ts in [0, 999, 1000, 1999, 2000, i64::MAX] {
+            for ts in [0, 999, 1000, 1999, 2000, i128::from(u64::MAX)] {
                 assert!(!outside.contains(ColumnTimestamp::Millis(ts)));
             }
             assert!(!outside.contains(ColumnTimestamp::FractionalMillis(f64::INFINITY)));
@@ -315,7 +314,7 @@ mod tests {
             start_ms: 1000,
             end_ms: None,
         };
-        assert!(bounds.contains(ColumnTimestamp::Millis(i64::MAX)));
+        assert!(bounds.contains(ColumnTimestamp::Millis(i128::from(u64::MAX))));
         assert!(bounds.contains(ColumnTimestamp::FractionalMillis(1e300)));
         assert!(!bounds.contains(ColumnTimestamp::Millis(999)));
     }

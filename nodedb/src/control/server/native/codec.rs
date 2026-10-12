@@ -243,7 +243,8 @@ mod tests {
             before + 1
         );
 
-        let other = NativeResponse::error(2, "XX000", "boom");
+        let other =
+            crate::control::server::native::sqlstate_code::sqlstate_error(2, "XX000", "boom");
         encode_response(&other, FrameFormat::Json).expect("frame encodes");
         assert_eq!(
             overload_responses().sent(OverloadProtocol::Native),

@@ -18,7 +18,7 @@
 use nodedb_physical::physical_plan::SortedIndexRead;
 use nodedb_types::protocol::{NativeResponse, OpCode, TextFields};
 
-use crate::control::server::shared::ddl::neutral::kv_sorted_index::run_read;
+use crate::control::server::shared::ddl::neutral::kv_sorted_index::{encode_score_bound, run_read};
 use crate::control::server::shared::session::DmlTxnCtx;
 
 use super::response::data_plane_response_to_native;
@@ -73,8 +73,8 @@ fn sorted_read(op: OpCode, fields: &TextFields) -> crate::Result<(String, Sorted
             k: fields.top_k_count.unwrap_or(10),
         },
         OpCode::KvSortedIndexRange => SortedIndexRead::Range {
-            score_min: fields.score_min.clone(),
-            score_max: fields.score_max.clone(),
+            score_min: fields.score_min.clone().and_then(encode_score_bound),
+            score_max: fields.score_max.clone().and_then(encode_score_bound),
         },
         OpCode::KvSortedIndexCount => SortedIndexRead::Count,
         OpCode::KvSortedIndexScore => SortedIndexRead::Score {
@@ -125,5 +125,44 @@ mod tests {
         };
         assert!(sorted_read(OpCode::KvSortedIndexRank, &no_key).is_err());
         assert!(sorted_read(OpCode::KvSortedIndexCount, &no_key).is_ok());
+    }
+
+    /// Typed bounds encode as stored values of equal JSON form. `Null` is open.
+    #[test]
+    fn range_bounds_encode_as_stored_values() {
+        use crate::engine::kv::sorted_index::value::encode_json;
+        use nodedb_types::Value;
+
+        let fields = TextFields {
+            index_name: Some("lb".into()),
+            score_min: Some(Value::Float(10.5)),
+            score_max: Some(Value::Integer(11)),
+            ..TextFields::default()
+        };
+        assert_eq!(
+            sorted_read(OpCode::KvSortedIndexRange, &fields)
+                .expect("range")
+                .1,
+            SortedIndexRead::Range {
+                score_min: Some(encode_json(&serde_json::json!(10.5))),
+                score_max: Some(encode_json(&serde_json::json!(11))),
+            }
+        );
+
+        let open = TextFields {
+            index_name: Some("lb".into()),
+            score_min: Some(Value::Null),
+            score_max: Some(Value::String("gold".into())),
+            ..TextFields::default()
+        };
+        assert_eq!(
+            sorted_read(OpCode::KvSortedIndexRange, &open)
+                .expect("range")
+                .1,
+            SortedIndexRead::Range {
+                score_min: None,
+                score_max: Some(encode_json(&serde_json::json!("gold"))),
+            }
+        );
     }
 }
