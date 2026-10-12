@@ -12,8 +12,6 @@ use nodedb_types::protocol::text_fields::TextFields;
 use nodedb_types::protocol::{HelloFrame, NativeResponse, OpCode};
 use nodedb_types::value::Value;
 
-const IDS: [&str; 4] = ["alpha", "bravo", "charlie", "delta"];
-
 fn require_ok(what: &str, response: NativeResponse) -> NativeResponse {
     assert_eq!(
         response.status,
@@ -23,12 +21,28 @@ fn require_ok(what: &str, response: NativeResponse) -> NativeResponse {
     response
 }
 
-/// The ids from `IDS` that a response names, sorted.
-fn ids_in(response: &NativeResponse) -> Vec<&'static str> {
-    let text = format!("{:?}", response.rows);
-    let mut ids: Vec<&'static str> = IDS.into_iter().filter(|id| text.contains(id)).collect();
-    ids.sort_unstable();
-    ids
+/// The `key` column of a range reply, sorted.
+///
+/// SQL `RANGE` and the opcode both answer one row per entry with a `rank` and
+/// a `key` column. The key is the row's primary key as a string.
+fn keys_in(what: &str, response: &NativeResponse) -> Vec<String> {
+    let columns = response.columns.as_deref().unwrap_or_default();
+    let key_at = columns
+        .iter()
+        .position(|column| column == "key")
+        .unwrap_or_else(|| panic!("{what}: no `key` column in {columns:?}"));
+    let mut keys: Vec<String> = response
+        .rows
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|row| match row.get(key_at) {
+            Some(Value::String(key)) => key.clone(),
+            other => panic!("{what}: `key` cell must be a string, got {other:?}"),
+        })
+        .collect();
+    keys.sort_unstable();
+    keys
 }
 
 #[tokio::test]
@@ -99,13 +113,10 @@ async fn native_range_with_typed_bounds_matches_sql_range() {
             send_request(&mut stream, seq, OpCode::KvSortedIndexRange, fields).await,
         );
 
+        let expected: Vec<String> = expected.into_iter().map(String::from).collect();
+        assert_eq!(keys_in(&text, &via_sql), expected, "{text}");
         assert_eq!(
-            ids_in(&via_sql),
-            expected,
-            "SQL RANGE [{sql_min}, {sql_max}]"
-        );
-        assert_eq!(
-            ids_in(&via_op),
+            keys_in("KvSortedIndexRange", &via_op),
             expected,
             "native range [{min:?}, {max:?}] must select what SQL RANGE selects"
         );
