@@ -82,7 +82,7 @@ impl HnswIndex {
                 self.nodes[nid].neighbors[layer].push(new_id);
 
                 if self.nodes[nid].neighbors[layer].len() > m {
-                    let node_bytes = self.nodes[nid].storage.as_bytes().to_vec();
+                    let node_bytes = self.node_bytes(neighbor.id).into_owned();
                     self.prune_neighbors(nid, layer, &node_bytes, m);
                 }
             }
@@ -131,14 +131,13 @@ fn select_neighbors_heuristic(
             break;
         }
 
-        let candidate_bytes = index.nodes[candidate.id as usize].storage.as_bytes();
+        let candidate_bytes = index.node_bytes(candidate.id);
         let is_diverse = selected.iter().all(|s| {
-            let selected_bytes = index.nodes[s.id as usize].storage.as_bytes();
             let dist_to_selected = crate::distance::dispatch::distance_typed(
                 index.params.metric,
                 index.params.dtype,
-                candidate_bytes,
-                selected_bytes,
+                &candidate_bytes,
+                &index.node_bytes(s.id),
                 index.dim,
             )
             .unwrap_or(f32::MAX);
@@ -229,6 +228,133 @@ mod tests {
             let query = idx.get_vector(target).unwrap().to_vec();
             let results = idx.search(&query, 1, 32).unwrap();
             assert_eq!(results[0].id, target, "node {target} not reachable");
+        }
+    }
+
+    /// Deterministic vectors in `[0, 1)` from an xorshift64 stream. `seed` must
+    /// be non-zero.
+    fn seeded_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                (0..dim)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state % 10_000) as f32 / 10_000.0
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A graph-only restore with an attached backing must insert exactly like a
+    /// full restore. Restored nodes hold no local vector, so neighbor pruning
+    /// and the diversity heuristic read them through the backing. A new node
+    /// must gain incoming edges, or search can never reach it.
+    ///
+    /// `segment_backing` is gated off on wasm32, so the test is too.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn inserts_after_graph_only_restore_match_a_full_restore() {
+        use std::sync::Arc;
+
+        use crate::segment_backing::VectorSegmentBacking;
+
+        /// Serves an in-memory copy of the base vectors.
+        struct VecBacking {
+            dim: usize,
+            vectors: Vec<Vec<f32>>,
+        }
+        impl VectorSegmentBacking for VecBacking {
+            fn len(&self) -> usize {
+                self.vectors.len()
+            }
+            fn dim(&self) -> usize {
+                self.dim
+            }
+            fn get_vector(&self, id: u32) -> Option<&[f32]> {
+                self.vectors.get(id as usize).map(Vec::as_slice)
+            }
+            fn get_surrogate(&self, _id: u32) -> Option<u64> {
+                None
+            }
+        }
+
+        const DIM: usize = 8;
+        let params = HnswParams {
+            m: 4,
+            m0: 8,
+            ef_construction: 32,
+            metric: DistanceMetric::L2,
+            dtype: nodedb_types::vector_dtype::VectorStorageDtype::F32,
+        };
+        let base = seeded_vectors(200, DIM, 0x9E37_79B9_7F4A_7C15);
+        let extra = seeded_vectors(5, DIM, 0xD1B5_4A32_D192_ED03);
+
+        let mut src = HnswIndex::with_seed(DIM, params, 12345);
+        for v in &base {
+            src.insert(v.clone()).unwrap();
+        }
+
+        let mut full = HnswIndex::from_checkpoint(&src.checkpoint_to_bytes().unwrap())
+            .unwrap()
+            .expect("full checkpoint must be recognized");
+        let mut graph_only = HnswIndex::from_checkpoint(&src.graph_checkpoint_to_bytes().unwrap())
+            .unwrap()
+            .expect("graph checkpoint must be recognized");
+        graph_only
+            .with_backing(Arc::new(VecBacking {
+                dim: DIM,
+                vectors: base.clone(),
+            }))
+            .expect("a complete backing must attach");
+
+        for v in &extra {
+            full.insert(v.clone()).unwrap();
+            graph_only.insert(v.clone()).unwrap();
+        }
+
+        let neighbors = graph_only.export_neighbors();
+        assert_eq!(
+            full.export_neighbors(),
+            neighbors,
+            "a graph-only restore must build the same graph as a full restore"
+        );
+
+        for (offset, v) in extra.iter().enumerate() {
+            let new_id = (base.len() + offset) as u32;
+            let hits = graph_only.search(v, 1, 64).unwrap();
+            assert_eq!(
+                hits.first().map(|h| h.id),
+                Some(new_id),
+                "exact query for inserted node {new_id} returns it, got {hits:?}"
+            );
+            assert!(
+                hits[0].distance < 1e-6,
+                "exact query for node {new_id} scores ~0, got {}",
+                hits[0].distance
+            );
+            assert!(
+                neighbors
+                    .iter()
+                    .any(|layers| layers.first().is_some_and(|l0| l0.contains(&new_id))),
+                "node {new_id} has no incoming layer-0 edge"
+            );
+        }
+
+        let m = graph_only.params().m;
+        let m0 = graph_only.params().m0;
+        for (id, layers) in neighbors.iter().enumerate() {
+            for (layer, list) in layers.iter().enumerate() {
+                let cap = if layer == 0 { m0 } else { m };
+                assert!(
+                    list.len() <= cap,
+                    "node {id} layer {layer} has {} neighbors, cap {cap}",
+                    list.len()
+                );
+            }
         }
     }
 

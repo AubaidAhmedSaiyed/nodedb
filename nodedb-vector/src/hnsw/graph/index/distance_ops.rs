@@ -2,11 +2,13 @@
 
 //! Layer assignment and distance computation for [`HnswIndex`].
 
+use std::borrow::Cow;
+
 use nodedb_types::vector_dtype::VectorStorageDtype;
 
 use super::HnswIndex;
 use crate::distance::dispatch::distance_typed;
-use crate::distance::distance;
+use crate::distance::{DistanceMetric, distance};
 use crate::dtype::cast_from_f32;
 use crate::hnsw::graph::MAX_LAYER_CAP;
 
@@ -39,54 +41,87 @@ impl HnswIndex {
     /// has no vector source at all; aborting a search worker (and poisoning the
     /// locks it held) is strictly worse than ranking one node last.
     pub(crate) fn dist_to_node(&self, query_bytes: &[u8], node_id: u32) -> f32 {
-        let node_bytes = self.nodes[node_id as usize].storage.as_bytes();
-        #[cfg(not(target_arch = "wasm32"))]
-        let node_bytes: &[u8] = if node_bytes.is_empty() {
-            if let Some(ref b) = self.backing {
-                // Backing stores F32 only; convert slice to bytes for distance_typed.
-                if let Some(v) = b.get_vector(node_id) {
-                    // SAFETY: &[f32] → &[u8] cast via bytemuck is always safe.
-                    bytemuck::cast_slice(v)
-                } else {
-                    node_bytes
-                }
-            } else {
-                node_bytes
-            }
-        } else {
-            node_bytes
-        };
         distance_typed(
             self.params.metric,
             self.params.dtype,
             query_bytes,
-            node_bytes,
+            &self.node_bytes(node_id),
             self.dim,
         )
         .unwrap_or(f32::INFINITY)
     }
 
-    /// Compute distance between a query given as `&[f32]` and a stored node.
+    /// Node `node_id`'s vector bytes, encoded in `self.params.dtype`.
     ///
-    /// For F32 indexes this is a direct call to `distance`. For F16/BF16
-    /// indexes the query is encoded to the storage dtype on each call, which
-    /// is an allocation. Prefer pre-encoding the query once via
-    /// [`crate::dtype::cast_from_f32`] and calling [`Self::dist_to_node`]
-    /// for hot-path code such as search.
-    #[allow(dead_code)]
-    pub(crate) fn dist_to_node_f32(&self, query: &[f32], node_id: u32) -> f32 {
+    /// Every distance computation on the insert, prune, and search paths reads
+    /// node vectors through this accessor. After a graph-checkpoint-only
+    /// restore, local storage is empty and the vector lives in the attached
+    /// backing. Reading `node.storage` directly there yields an empty slice,
+    /// and every distance against it errors.
+    ///
+    /// The backing holds F32 vectors. An F32 index borrows them as bytes. Any
+    /// other dtype encodes them into an owned buffer.
+    ///
+    /// Returns an empty slice when `node_id` is out of range, or the node has
+    /// no local vector and no backing serves one. Distance against an empty
+    /// slice errors, so callers score that node [`f32::INFINITY`].
+    pub(crate) fn node_bytes(&self, node_id: u32) -> Cow<'_, [u8]> {
+        let local = self
+            .nodes
+            .get(node_id as usize)
+            .map_or(&[][..], |n| n.storage.as_bytes());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if local.is_empty()
+                && let Some(v) = self.backing.as_ref().and_then(|b| b.get_vector(node_id))
+            {
+                return match self.params.dtype {
+                    VectorStorageDtype::F32 => Cow::Borrowed(bytemuck::cast_slice(v)),
+                    dtype => Cow::Owned(cast_from_f32(v, dtype)),
+                };
+            }
+        }
+        Cow::Borrowed(local)
+    }
+
+    /// Compute distance between an f32 query and a stored node under `metric`.
+    ///
+    /// `metric` is caller-supplied, so filtered traversals that rank under a
+    /// metric other than the build metric use this accessor too. The node
+    /// vector comes from [`Self::node_bytes`], so restored nodes resolve
+    /// through the attached backing.
+    ///
+    /// F32 indexes compare the query to the node vector without copying.
+    /// F16/BF16 indexes encode the query on each call, which allocates.
+    ///
+    /// A node whose vector cannot be resolved, or a query of the wrong length,
+    /// scores [`f32::INFINITY`].
+    pub(crate) fn dist_to_node_f32(
+        &self,
+        query: &[f32],
+        node_id: u32,
+        metric: DistanceMetric,
+    ) -> f32 {
+        let node_bytes = self.node_bytes(node_id);
         match self.params.dtype {
-            VectorStorageDtype::F32 => distance(
-                query,
-                self.nodes[node_id as usize]
-                    .storage
-                    .as_f32_slice()
-                    .expect("F32 dtype must have F32 storage"),
-                self.params.metric,
-            ),
-            _ => {
-                let query_bytes = cast_from_f32(query, self.params.dtype);
-                self.dist_to_node(&query_bytes, node_id)
+            VectorStorageDtype::F32 => match bytemuck::try_cast_slice::<u8, f32>(&node_bytes) {
+                Ok(node) if node.len() == query.len() => distance(query, node, metric),
+                // Empty node or wrong query length.
+                Ok(_) => f32::INFINITY,
+                // Bytes not aligned to f32: `distance_typed` copies them out.
+                Err(_) => distance_typed(
+                    metric,
+                    VectorStorageDtype::F32,
+                    bytemuck::cast_slice(query),
+                    &node_bytes,
+                    self.dim,
+                )
+                .unwrap_or(f32::INFINITY),
+            },
+            dtype => {
+                let query_bytes = cast_from_f32(query, dtype);
+                distance_typed(metric, dtype, &query_bytes, &node_bytes, self.dim)
+                    .unwrap_or(f32::INFINITY)
             }
         }
     }

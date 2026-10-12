@@ -14,7 +14,6 @@ use std::collections::{BinaryHeap, HashSet};
 
 use roaring::RoaringBitmap;
 
-use crate::distance::distance;
 use crate::error::{VectorError, check_dim};
 use crate::hnsw::graph::{Candidate, HnswIndex};
 use crate::navix::selectivity::{NavixHeuristic, local_selectivity_at, pick_heuristic};
@@ -132,13 +131,12 @@ fn brute_force_on_allowed(
     let mut results: Vec<SearchResult> = allowed
         .iter()
         .filter_map(|id| {
-            if index.is_deleted(id) {
+            if id as usize >= index.len() || index.is_deleted(id) {
                 return None;
             }
-            let v = index.get_vector(id)?;
             Some(SearchResult {
                 id,
-                distance: distance(query, v, metric),
+                distance: index.dist_to_node_f32(query, id, metric),
             })
         })
         .collect();
@@ -470,10 +468,7 @@ fn dist(
     node_id: u32,
     metric: nodedb_types::vector_distance::DistanceMetric,
 ) -> f32 {
-    match index.get_vector(node_id) {
-        Some(v) => distance(query, v, metric),
-        None => f32::INFINITY,
-    }
+    index.dist_to_node_f32(query, node_id, metric)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -481,7 +476,7 @@ fn dist(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distance::DistanceMetric;
+    use crate::distance::{DistanceMetric, distance};
     use crate::hnsw::{HnswIndex, HnswParams};
 
     fn build_index(n: usize) -> HnswIndex {

@@ -9,7 +9,6 @@
 
 use roaring::RoaringBitmap;
 
-use crate::distance::distance;
 use crate::hnsw::{HnswIndex, SearchResult};
 
 /// Filter strategy thresholds.
@@ -100,13 +99,12 @@ pub fn adaptive_search(
             let mut results: Vec<SearchResult> = bitmap
                 .iter()
                 .filter_map(|id| {
-                    let v = index.get_vector(id)?;
-                    if index.is_deleted(id) {
+                    if id as usize >= index.len() || index.is_deleted(id) {
                         return None;
                     }
                     Some(SearchResult {
                         id,
-                        distance: distance(query, v, metric),
+                        distance: index.dist_to_node_f32(query, id, metric),
                     })
                 })
                 .collect();

@@ -16,7 +16,6 @@ mod inner {
 
     use roaring::RoaringBitmap;
 
-    use crate::distance::distance;
     use crate::error::{VectorError, check_dim};
     use crate::hnsw::graph::{Candidate, HnswIndex};
     use crate::navix::traversal::SearchResult;
@@ -225,13 +224,12 @@ mod inner {
         let mut results: Vec<SearchResult> = allowed
             .iter()
             .filter_map(|id| {
-                if index.is_deleted(id) {
+                if id as usize >= index.len() || index.is_deleted(id) {
                     return None;
                 }
-                let v = index.get_vector(id)?;
                 Some(SearchResult {
                     id,
-                    distance: distance(query, v, metric),
+                    distance: index.dist_to_node_f32(query, id, metric),
                 })
             })
             .collect();
@@ -259,10 +257,7 @@ mod inner {
         node_id: u32,
         metric: nodedb_types::vector_distance::DistanceMetric,
     ) -> f32 {
-        match index.get_vector(node_id) {
-            Some(v) => distance(query, v, metric),
-            None => f32::INFINITY,
-        }
+        index.dist_to_node_f32(query, node_id, metric)
     }
 
     #[cfg(test)]
