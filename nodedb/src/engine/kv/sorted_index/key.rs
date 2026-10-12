@@ -12,6 +12,8 @@
 //! Columns are separated by a length prefix (4 bytes, big-endian) to avoid
 //! ambiguity between field boundaries.
 
+use std::borrow::Cow;
+
 /// Sort direction for a column in a sorted index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDirection {
@@ -182,16 +184,26 @@ impl SortKeyEncoder {
         f64::from_bits(bits)
     }
 
-    /// Encode a millisecond timestamp as big-endian bytes.
+    /// The value bytes of column `name` in `sort_key`, as they were passed to
+    /// [`Self::encode`].
     ///
-    /// Timestamps are u64, so they naturally sort ascending in big-endian.
-    pub fn encode_timestamp_ms(ts_ms: u64) -> [u8; 8] {
-        ts_ms.to_be_bytes()
-    }
-
-    /// Decode big-endian bytes back to a millisecond timestamp.
-    pub fn decode_timestamp_ms(bytes: &[u8; 8]) -> u64 {
-        u64::from_be_bytes(*bytes)
+    /// Strips the length prefix and undoes the DESC complement. Returns `None`
+    /// when the encoder has no column `name` or the key is truncated.
+    pub fn column_value<'k>(&self, sort_key: &'k [u8], name: &str) -> Option<Cow<'k, [u8]>> {
+        let mut rest = sort_key;
+        for col in &self.columns {
+            let (len_bytes, tail) = rest.split_first_chunk::<4>()?;
+            let len = u32::from_be_bytes(*len_bytes) as usize;
+            let (value, tail) = tail.split_at_checked(len)?;
+            if col.name == name {
+                return Some(match col.direction {
+                    SortDirection::Asc => Cow::Borrowed(value),
+                    SortDirection::Desc => Cow::Owned(value.iter().map(|b| !b).collect()),
+                });
+            }
+            rest = tail;
+        }
+        None
     }
 }
 
@@ -274,8 +286,8 @@ mod tests {
         // Higher score should sort first (lower bytes due to DESC complement).
         let score_100 = SortKeyEncoder::encode_i64(100);
         let score_200 = SortKeyEncoder::encode_i64(200);
-        let time_early = SortKeyEncoder::encode_timestamp_ms(1000);
-        let time_late = SortKeyEncoder::encode_timestamp_ms(2000);
+        let time_early = SortKeyEncoder::encode_i64(1000);
+        let time_late = SortKeyEncoder::encode_i64(2000);
 
         let key_200_early = encoder.encode(&[&score_200, &time_early]);
         let key_100_early = encoder.encode(&[&score_100, &time_early]);
@@ -304,15 +316,48 @@ mod tests {
         assert!(key_50 < key_150);
     }
 
+    fn score_and_ts(ts_direction: SortDirection) -> SortKeyEncoder {
+        SortKeyEncoder::new(vec![
+            SortColumn {
+                name: "score".into(),
+                direction: SortDirection::Desc,
+            },
+            SortColumn {
+                name: "ts".into(),
+                direction: ts_direction,
+            },
+        ])
+    }
+
     #[test]
-    fn timestamp_roundtrip_and_ordering() {
-        let ts1 = 1714600000000u64;
-        let ts2 = 1714600001000u64;
-        let e1 = SortKeyEncoder::encode_timestamp_ms(ts1);
-        let e2 = SortKeyEncoder::encode_timestamp_ms(ts2);
-        assert_eq!(SortKeyEncoder::decode_timestamp_ms(&e1), ts1);
-        assert_eq!(SortKeyEncoder::decode_timestamp_ms(&e2), ts2);
-        assert!(e1 < e2);
+    fn column_value_returns_the_bytes_passed_to_encode() {
+        for direction in [SortDirection::Asc, SortDirection::Desc] {
+            let enc = score_and_ts(direction);
+            let score = SortKeyEncoder::encode_i64(7);
+            let ts = SortKeyEncoder::encode_i64(1_714_608_000_000);
+            let key = enc.encode(&[&score, &ts]);
+
+            assert_eq!(enc.column_value(&key, "ts").as_deref(), Some(&ts[..]));
+            assert_eq!(enc.column_value(&key, "score").as_deref(), Some(&score[..]));
+        }
+    }
+
+    #[test]
+    fn column_value_of_an_empty_value_is_empty() {
+        let enc = score_and_ts(SortDirection::Asc);
+        let key = enc.encode(&[&SortKeyEncoder::encode_i64(7), b""]);
+        assert_eq!(enc.column_value(&key, "ts").as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn column_value_of_an_unknown_column_or_truncated_key_is_none() {
+        let enc = score_and_ts(SortDirection::Asc);
+        let ts = SortKeyEncoder::encode_i64(1_714_608_000_000);
+        let key = enc.encode(&[&SortKeyEncoder::encode_i64(7), &ts]);
+
+        assert!(enc.column_value(&key, "missing").is_none());
+        assert!(enc.column_value(&key[..key.len() - 1], "ts").is_none());
+        assert!(enc.column_value(&key[..2], "score").is_none());
     }
 
     fn encoder(direction: SortDirection) -> SortKeyEncoder {
