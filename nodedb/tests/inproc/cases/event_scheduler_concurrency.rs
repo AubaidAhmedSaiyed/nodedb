@@ -1,41 +1,36 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression coverage: scheduler must observe shutdown, cap concurrency,
-//! and reject jobs when budget is exceeded.
+//! The scheduled-job dispatcher observes shutdown, caps concurrency, and
+//! refuses a job over its result budget.
 //!
-//! Today `scheduler_loop` fires `tokio::spawn` per due schedule with:
-//!   * no shutdown observation inside the spawned job — long-running jobs
-//!     hold `Arc<SharedState>` and delay teardown;
-//!   * no concurrency cap — N schedules at `* * * * *` with
-//!     `allow_overlap = true` spawn N heavy SQLs at every minute-mark,
-//!     starving request-path queries;
-//!   * no memory ceiling — `execute_job` may materialise unbounded result
-//!     sets through `execute_block`.
-//!
-//! The fix extracts a `JobDispatcher` (or equivalent) that owns a
-//! semaphore bound and a shutdown receiver. This file gates on that type
-//! and its contract.
+//! A refusal at the concurrency cap is `DispatchOutcome::OverBudget`, a typed
+//! and transient outcome: nothing ran, and the same job spawns once a running
+//! job finishes. The scheduler's next tick retries it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use nodedb::event::scheduler::dispatcher::{DispatchOutcome, JobDispatcher, JobDispatcherConfig};
 
+/// How long the test waits for a finished job to free its slot.
+const SLOT_FREE_WAIT: Duration = Duration::from_secs(5);
+
 #[tokio::test]
-async fn dispatcher_rejects_when_concurrency_cap_reached() {
-    // Cap concurrency at 2. Spawn 5 never-returning jobs: the 3rd, 4th, 5th
-    // must be rejected with `OverBudget`, not queued unbounded and not
-    // spawned as free-running tasks.
+async fn dispatcher_refuses_over_cap_then_admits_once_a_slot_frees() {
+    // Cap concurrency at 2. Of five jobs that run until released, the first
+    // two spawn and the other three are refused, neither queued nor spawned.
     let cfg = JobDispatcherConfig {
         max_concurrent_jobs: 2,
         max_result_bytes: 1 << 20,
     };
     let dispatcher = Arc::new(JobDispatcher::new(cfg));
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
 
     let outcomes: Vec<DispatchOutcome> = (0..5)
         .map(|_| {
+            let mut release = release_rx.clone();
             dispatcher.try_spawn(|_shutdown| async move {
-                // Simulate a job that never returns until aborted.
-                std::future::pending::<()>().await;
+                let _ = release.wait_for(|released| *released).await;
                 Ok(())
             })
         })
@@ -45,13 +40,31 @@ async fn dispatcher_rejects_when_concurrency_cap_reached() {
         .iter()
         .filter(|o| matches!(o, DispatchOutcome::Spawned))
         .count();
-    let rejected = outcomes
+    let refused = outcomes
         .iter()
         .filter(|o| matches!(o, DispatchOutcome::OverBudget))
         .count();
 
     assert_eq!(accepted, 2, "only two jobs fit under the concurrency cap");
-    assert_eq!(rejected, 3, "excess jobs must be rejected, not queued");
+    assert_eq!(refused, 3, "jobs over the cap are refused, not queued");
+
+    // The refusal is transient: once the running jobs finish, a job spawns.
+    release_tx
+        .send(true)
+        .expect("the running jobs hold the release receiver");
+    let freed = tokio::time::timeout(SLOT_FREE_WAIT, async {
+        while dispatcher.in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(freed.is_ok(), "the released jobs free their slots");
+    let retried = dispatcher.try_spawn(|_shutdown| async move { Ok(()) });
+    assert_eq!(
+        retried,
+        DispatchOutcome::Spawned,
+        "a refused job spawns once a slot frees"
+    );
 
     dispatcher.shutdown_and_drain().await;
 }

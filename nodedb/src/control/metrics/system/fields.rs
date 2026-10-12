@@ -10,6 +10,7 @@ use super::super::histogram::{AtomicHistogram, WAL_FSYNC_BUCKETS_US};
 use super::super::purge::PurgeMetrics;
 use super::core_fail_stop::CoreFailStops;
 use super::heartbeat::CoreHeartbeats;
+use crate::bridge::dispatch::DispatchCapacityMetrics;
 use crate::data::executor::core_loop::pressure::ThrottleMetrics;
 use crate::data::io::IoMetrics;
 
@@ -257,6 +258,13 @@ pub struct SystemMetrics {
     /// Plane can update counters without crossing the plane boundary.
     /// The Prometheus handler reads from here.
     pub io_metrics: Arc<IoMetrics>,
+
+    // ── Bridge dispatch capacity ──
+    /// Dispatches the bridge dispatcher refused at a capacity limit, by scope.
+    ///
+    /// The dispatcher adopts this `Arc` when the shared state opens, so the
+    /// Prometheus handler reads it without taking the dispatcher lock.
+    pub dispatch_capacity: Arc<DispatchCapacityMetrics>,
 
     // ── SPSC intake throttle ──
     /// Per-level core counts and transition counters for the Data Plane's

@@ -4,7 +4,8 @@
 //! the bridge [`Dispatcher`].
 //!
 //! A capacity limit refuses with [`crate::Error::DispatchCapacity`] and hands
-//! the request back. Every other refusal is terminal.
+//! the request back. `nodedb_dispatch_capacity_busy_total` counts each such
+//! refusal by scope. Every other refusal is terminal.
 
 use tracing::warn;
 
@@ -13,6 +14,7 @@ use crate::bridge::admission_chokepoint::{assert_write_admitted, reject_uninject
 use crate::bridge::envelope;
 use crate::types::{Lsn, VShardId};
 
+use super::capacity_metrics::DispatchCapacityMetrics;
 use super::dispatcher::Dispatcher;
 use super::journal::JournalGroup;
 use super::refusal::DispatchRefusal;
@@ -64,7 +66,7 @@ impl Dispatcher {
                 cap,
             };
             return Err(DispatchRefusal::boxed(
-                crate::Error::DispatchCapacity { scope },
+                capacity_refusal(&self.capacity_metrics, scope),
                 request,
             ));
         }
@@ -89,7 +91,7 @@ impl Dispatcher {
                 core_id,
             };
             return Err(DispatchRefusal::boxed(
-                crate::Error::DispatchCapacity { scope },
+                capacity_refusal(&self.capacity_metrics, scope),
                 request,
             ));
         }
@@ -101,7 +103,7 @@ impl Dispatcher {
                 capacity: self.per_core_capacity,
             };
             return Err(DispatchRefusal::boxed(
-                crate::Error::DispatchCapacity { scope },
+                capacity_refusal(&self.capacity_metrics, scope),
                 request,
             ));
         }
@@ -151,12 +153,11 @@ impl Dispatcher {
         channel.wfq.set_priority(database_id, cls);
 
         channel.wfq.try_enqueue(database_id, request).map_err(|_| {
-            crate::Error::DispatchCapacity {
-                scope: DispatchCapacityScope::QueueFull {
-                    core_id,
-                    capacity: self.per_core_capacity,
-                },
-            }
+            let scope = DispatchCapacityScope::QueueFull {
+                core_id,
+                capacity: self.per_core_capacity,
+            };
+            capacity_refusal(&self.capacity_metrics, scope)
         })?;
 
         self.commit_enqueued(core_id, database_id, tenant_id, req_id, wal_lsn);
@@ -212,6 +213,16 @@ impl Dispatcher {
             notifier.notify();
         }
     }
+}
+
+/// Build the refusal for `scope` and count it. Every capacity refusal is
+/// built here, so the counter sees each one.
+fn capacity_refusal(
+    metrics: &DispatchCapacityMetrics,
+    scope: DispatchCapacityScope,
+) -> crate::Error {
+    metrics.record(&scope);
+    crate::Error::DispatchCapacity { scope }
 }
 
 #[cfg(test)]
@@ -360,6 +371,88 @@ mod tests {
             }
         }
         panic!("the weighted-fair queue never filled");
+    }
+
+    /// Every capacity refusal counts once, under its own scope, in the
+    /// instance the dispatcher adopted.
+    #[test]
+    fn each_capacity_refusal_counts_under_its_scope() {
+        let tenant_scope = DispatchCapacityScope::TenantInflight {
+            tenant_id: TenantId::new(1),
+            inflight: 0,
+            cap: 0,
+        };
+        let database_scope = DispatchCapacityScope::DatabaseSuspended {
+            database_id: DatabaseId::new(1),
+            core_id: 0,
+        };
+        let queue_scope = DispatchCapacityScope::QueueFull {
+            core_id: 0,
+            capacity: 0,
+        };
+        let counts = |metrics: &DispatchCapacityMetrics| {
+            [
+                metrics.refusals(&tenant_scope),
+                metrics.refusals(&database_scope),
+                metrics.refusals(&queue_scope),
+            ]
+        };
+
+        // One tenant holds all four slots.
+        let (mut dispatcher, _sides) = Dispatcher::new(1, 4);
+        let metrics = std::sync::Arc::new(DispatchCapacityMetrics::new());
+        dispatcher.adopt_capacity_metrics(std::sync::Arc::clone(&metrics));
+        for i in 1..=4u64 {
+            dispatcher
+                .dispatch(make_request_for_db(0, i, i))
+                .expect("within the tenant cap");
+        }
+        dispatcher
+            .dispatch(make_request_for_db(0, 99, 99))
+            .expect_err("the tenant is at its cap");
+        assert_eq!(counts(&metrics), [1, 0, 0]);
+
+        // Distinct tenants fill one database's virtual queue.
+        let (mut dispatcher, _sides) = Dispatcher::new(1, 4);
+        let metrics = dispatcher.capacity_metrics();
+        let refused = (1..=64u64)
+            .find_map(|i| {
+                let mut request = make_request_for_db(0, 1, i);
+                request.tenant_id = TenantId::new(i);
+                dispatcher.dispatch(request).err()
+            })
+            .expect("the database's virtual queue suspends");
+        assert!(
+            matches!(
+                refused,
+                crate::Error::DispatchCapacity {
+                    scope: DispatchCapacityScope::DatabaseSuspended { .. }
+                }
+            ),
+            "expected a database-suspended refusal, got: {refused}"
+        );
+        assert_eq!(counts(&metrics), [0, 1, 0]);
+
+        // A direct core dispatch fills the core's queue.
+        let (mut dispatcher, _sides) = Dispatcher::new(1, 4);
+        let metrics = dispatcher.capacity_metrics();
+        let refused = (1..=64u64)
+            .find_map(|i| {
+                let mut request = make_request_for_db(0, i, i);
+                request.tenant_id = TenantId::new(i);
+                dispatcher.dispatch_to_core(0, request).err()
+            })
+            .expect("the core's queue fills");
+        assert!(
+            matches!(
+                refused,
+                crate::Error::DispatchCapacity {
+                    scope: DispatchCapacityScope::QueueFull { .. }
+                }
+            ),
+            "expected a queue-full refusal, got: {refused}"
+        );
+        assert_eq!(counts(&metrics), [0, 0, 1]);
     }
 
     #[test]

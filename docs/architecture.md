@@ -200,7 +200,7 @@ Admission ordering for requests:
 1. Identity & database access (established during authentication)
 2. **Tenant** rate/concurrency check → `TENANT_QUOTA_EXCEEDED`
 3. **Database** rate/concurrency check → `DATABASE_QUOTA_EXCEEDED`
-4. **Global** pressure check → `SERVER_OVERLOAD`
+4. **Dispatch** capacity check (tenant in-flight share, database fair share per core, core queue) → `SERVER_OVERLOAD` (code 1403, SQLSTATE `57P03`). Nothing was enqueued, so the client retries with backoff. `nodedb_dispatch_capacity_busy_total{scope}` counts each refusal.
 
 Memory reservation flips the order (largest scope first to fail fast): global → database → tenant → engine. Failure at any layer aborts before the next is consulted.
 

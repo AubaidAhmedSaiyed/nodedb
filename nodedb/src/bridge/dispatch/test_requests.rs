@@ -11,7 +11,7 @@ use crate::bridge::envelope::*;
 use crate::types::*;
 
 /// A read request with id 1 for tenant 1 in the default database on `vshard`.
-pub(super) fn make_request(vshard: u32) -> envelope::Request {
+pub(crate) fn make_request(vshard: u32) -> envelope::Request {
     envelope::Request {
         request_id: RequestId::new(1),
         tenant_id: TenantId::new(1),
@@ -45,7 +45,7 @@ pub(super) fn make_request(vshard: u32) -> envelope::Request {
 }
 
 /// A read request with id `req_id` for tenant 1 in database `db` on `vshard`.
-pub(super) fn make_request_for_db(vshard: u32, db: u64, req_id: u64) -> envelope::Request {
+pub(crate) fn make_request_for_db(vshard: u32, db: u64, req_id: u64) -> envelope::Request {
     envelope::Request {
         request_id: RequestId::new(req_id),
         tenant_id: TenantId::new(1),

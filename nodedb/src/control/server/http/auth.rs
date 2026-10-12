@@ -11,6 +11,9 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use nodedb_types::error::sqlstate;
+
+use crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate;
 
 use crate::config::auth::AuthMode;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -312,6 +315,13 @@ pub enum ApiError {
         message: String,
         retry_after_secs: u64,
     },
+    /// 503 Service Unavailable for a transient refusal of SQLSTATE `57P03`,
+    /// such as a dispatch capacity refusal. Nothing ran, so the client
+    /// retries after `Retry-After`.
+    Overloaded {
+        message: String,
+        code: nodedb_types::error::ErrorCode,
+    },
     /// Arbitrary HTTP status from gateway error mapping.
     HttpStatus(u16, String),
     /// An error with its NodeDB numeric code preserved (e.g. a DDL refusal),
@@ -340,11 +350,13 @@ impl IntoResponse for ApiError {
                 retry_after_secs,
             } => {
                 let body = HttpError::new(message);
-                let mut resp = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
-                if let Ok(val) = retry_after_secs.to_string().parse() {
-                    resp.headers_mut().insert("Retry-After", val);
-                }
-                resp
+                let resp = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+                with_retry_after(resp, retry_after_secs)
+            }
+            ApiError::Overloaded { message, code } => {
+                let body = HttpError::with_code(message, code.to_string());
+                let resp = (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+                with_retry_after(resp, OVERLOAD_RETRY_AFTER_SECS)
             }
             ApiError::Coded {
                 status,
@@ -352,12 +364,18 @@ impl IntoResponse for ApiError {
                 code,
                 cause,
             } => {
+                let overloaded = numeric_code_to_sqlstate(code) == sqlstate::SERVER_OVERLOAD;
                 let body = HttpError::with_code(message, code.to_string());
                 let body = match cause {
                     Some(cause) => body.caused_by(&cause),
                     None => body,
                 };
-                (status, axum::Json(body)).into_response()
+                let resp = (status, axum::Json(body)).into_response();
+                if overloaded {
+                    with_retry_after(resp, OVERLOAD_RETRY_AFTER_SECS)
+                } else {
+                    resp
+                }
             }
             ApiError::Unauthorized(msg) => plain(StatusCode::UNAUTHORIZED, msg),
             ApiError::Forbidden(msg) => plain(StatusCode::FORBIDDEN, msg),
@@ -369,6 +387,18 @@ impl IntoResponse for ApiError {
             ),
         }
     }
+}
+
+/// Seconds a client waits before it retries a `57P03` capacity refusal.
+const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
+
+/// Set the `Retry-After` header of `resp` to `secs`.
+fn with_retry_after(mut resp: Response, secs: u64) -> Response {
+    resp.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(secs),
+    );
+    resp
 }
 
 /// Axum extractor that resolves and enforces HTTP auth before a handler runs.
@@ -430,7 +460,8 @@ impl FromRequestParts<AppState> for ResolvedAuth {
 
 /// The status and message come from the one gateway mapping,
 /// [`GatewayErrorMap::to_http`](crate::control::gateway::GatewayErrorMap::to_http).
-/// A rate refusal also carries its `Retry-After` hint.
+/// A rate refusal and a `57P03` capacity refusal also carry a `Retry-After`
+/// hint.
 impl From<crate::Error> for ApiError {
     fn from(e: crate::Error) -> Self {
         let (status, message) = crate::control::gateway::GatewayErrorMap::to_http(&e);
@@ -438,6 +469,14 @@ impl From<crate::Error> for ApiError {
             return Self::RateLimited {
                 message,
                 retry_after_secs: retry_after_ms.div_ceil(1000).max(1),
+            };
+        }
+        let (_severity, state, _message) =
+            crate::control::server::pgwire::types::error_to_sqlstate(&e);
+        if state == sqlstate::SERVER_OVERLOAD {
+            return Self::Overloaded {
+                message,
+                code: crate::error_classify::classify(&e).code(),
             };
         }
         Self::HttpStatus(status, message)
@@ -622,6 +661,73 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("2")
         );
+    }
+
+    fn retry_after(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    /// A dispatch capacity refusal answers 503 with `Retry-After` and the
+    /// `SERVER_OVERLOAD` code, raised locally or relayed from a core.
+    #[tokio::test]
+    async fn a_capacity_refusal_is_503_with_retry_after_and_its_code() {
+        let errors = [
+            crate::Error::DispatchCapacity {
+                scope: crate::DispatchCapacityScope::TenantInflight {
+                    tenant_id: TenantId::new(1),
+                    inflight: 4,
+                    cap: 4,
+                },
+            },
+            crate::Error::DataPlane(crate::bridge::envelope::ErrorCode::DispatchCapacity {
+                reason: "core 0 queue is full at 4 requests".into(),
+            }),
+        ];
+        for error in errors {
+            let label = format!("{error:?}");
+            let response = ApiError::from(error).into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{label}"
+            );
+            assert_eq!(retry_after(&response), Some("1"), "{label}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+            assert_eq!(
+                json["code"],
+                nodedb_types::error::ErrorCode::SERVER_OVERLOAD.to_string(),
+                "{label}"
+            );
+        }
+    }
+
+    /// A coded `SERVER_OVERLOAD` answer carries `Retry-After`. Another code
+    /// does not.
+    #[test]
+    fn only_a_coded_overload_carries_retry_after() {
+        let overload = ApiError::Coded {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "busy".into(),
+            code: nodedb_types::error::ErrorCode::SERVER_OVERLOAD,
+            cause: None,
+        }
+        .into_response();
+        assert_eq!(retry_after(&overload), Some("1"));
+
+        let internal = ApiError::Coded {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "boom".into(),
+            code: nodedb_types::error::ErrorCode::INTERNAL,
+            cause: None,
+        }
+        .into_response();
+        assert_eq!(retry_after(&internal), None);
     }
 
     #[test]

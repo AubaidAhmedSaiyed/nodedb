@@ -37,7 +37,7 @@ impl SharedState {
     /// Construct the test state every constructor in [`super::init_variants`]
     /// builds on.
     pub(super) fn new_inner(
-        dispatcher: Dispatcher,
+        mut dispatcher: Dispatcher,
         wal: Arc<WalManager>,
     ) -> crate::Result<Arc<Self>> {
         let shutdown = Arc::new(crate::control::shutdown::ShutdownWatch::new());
@@ -115,6 +115,8 @@ impl SharedState {
             ),
         );
         let hlc_clock = wal.hlc_clock();
+        let system_metrics = Arc::new(crate::control::metrics::SystemMetrics::new());
+        dispatcher.adopt_capacity_metrics(Arc::clone(&system_metrics.dispatch_capacity));
         let state = Arc::new(Self {
             outcome_floor: dispatcher.outcome_floor(),
             dispatcher: Mutex::new(dispatcher),
@@ -321,7 +323,7 @@ impl SharedState {
             raft_propose_leader_change_retries: AtomicU64::new(0),
             request_id_counter: AtomicU64::new(1),
             shuffle_id_counter: AtomicU64::new(1),
-            system_metrics: Some(Arc::new(crate::control::metrics::SystemMetrics::new())),
+            system_metrics: Some(system_metrics),
             database_metrics: Arc::new(crate::control::metrics::DatabaseMetricsRegistry::new()),
             quota_ceiling: Arc::new(std::sync::RwLock::new(
                 crate::control::security::catalog::GlobalQuotaCeiling::default(),

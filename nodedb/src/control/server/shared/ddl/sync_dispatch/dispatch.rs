@@ -226,11 +226,10 @@ async fn dispatch_plan(state: &SharedState, dispatch: PlanDispatch) -> crate::Re
         Err(p) => p.into_inner().dispatch(request),
     };
     if let Err(error) = dispatched {
-        // No response will arrive, and no core applied the plan.
+        // No response will arrive, and no core applied the plan. The refusal
+        // keeps its type, so a capacity refusal stays retryable.
         state.tracker.cancel(&request_id);
-        return Err(crate::Error::Internal {
-            detail: error.to_string(),
-        });
+        return Err(error);
     }
     // Await to the same instant the envelope carries — yields the thread so the
     // response poller can run. Reaching that instant is the statement running

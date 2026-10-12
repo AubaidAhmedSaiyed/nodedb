@@ -20,6 +20,7 @@ use crate::control::router::vshard::VShardRouter;
 use crate::data::eventfd::EventFdNotifier;
 use crate::types::Lsn;
 
+use super::capacity_metrics::DispatchCapacityMetrics;
 use super::core_channel::{CoreChannel, CoreChannelDataSide};
 use super::dispatched_lsns::DispatchedLsns;
 use super::journal::WriteSetJournal;
@@ -131,6 +132,9 @@ pub struct Dispatcher {
 
     /// The floor windows of accepted requests that carry a WAL LSN.
     pub(super) dispatched_lsns: DispatchedLsns,
+
+    /// Capacity refusals by scope, shared with the node's `/metrics`.
+    pub(super) capacity_metrics: Arc<DispatchCapacityMetrics>,
 }
 
 impl Dispatcher {
@@ -187,6 +191,7 @@ impl Dispatcher {
                 capacity_freed: Arc::new(Notify::new()),
                 outcome_floor: OutcomeFloor::new(),
                 dispatched_lsns: DispatchedLsns::default(),
+                capacity_metrics: Arc::new(DispatchCapacityMetrics::new()),
             },
             data_sides,
         )
@@ -200,6 +205,16 @@ impl Dispatcher {
     /// enables its `notified()` future before it checks for refused work.
     pub fn capacity_freed(&self) -> Arc<Notify> {
         Arc::clone(&self.capacity_freed)
+    }
+
+    /// Capacity refusals this dispatcher counted, by scope.
+    pub fn capacity_metrics(&self) -> Arc<DispatchCapacityMetrics> {
+        Arc::clone(&self.capacity_metrics)
+    }
+
+    /// Count capacity refusals into `metrics`, the instance `/metrics` reads.
+    pub fn adopt_capacity_metrics(&mut self, metrics: Arc<DispatchCapacityMetrics>) {
+        self.capacity_metrics = metrics;
     }
 
     /// The node's outcome floor, shared with every write that opens a window.
